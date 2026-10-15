@@ -1,0 +1,17 @@
+# Machine-local state and evidence (spec section 2)
+/work/
+/projects/
+/.harness/state/
+/.harness/observed.log
+/.harness/ledger/
+
+# Claude Code machine-local settings
+/.claude/settings.local.json
+
+# Secrets — never committed (rule 10)
+.env
+.env.*
+!.env.example
+
+# OS noise
+.DS_Store
