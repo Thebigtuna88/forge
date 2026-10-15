@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# FORGE owner-handoff tool (spec section 4).
+#
+#   handoff new <slug> "<title>"   create work/owner/<date>-<slug>/OWNER-RUN.sh + META.json
+#   handoff ready <id>             lint, freeze (read-only + sha in META.json), print the two lines
+#   handoff lint <OWNER-RUN.sh>    reject scripts that skip the runtime or fake evidence
+#   handoff verify <pasted-file>   check the owner's pasted block; write VERIFIED.txt on success
+#
+# Must stay compatible with macOS /bin/bash 3.2.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+RUNTIME="$ROOT/.harness/lib/handoff.sh"
+
+die() {
+  printf 'handoff: %s\n' "$*" >&2
+  exit 1
+}
+sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Evidence lives in the MAIN checkout's work/owner, even when this runs from a worktree.
+owner_root() {
+  local common
+  common="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+    || die "$ROOT is not inside a git repository"
+  printf '%s/work/owner' "$(dirname "$common")"
+}
+
+meta_get() { jq -r --arg k "$2" '.[$k] // empty' "$1/META.json"; }
+
+meta_set() { # <dir> <jq filter> [jq args…]
+  local dir="$1" filter="$2" tmp
+  shift 2
+  tmp="$(mktemp "$dir/.META.XXXXXX")"
+  jq "$@" "$filter" "$dir/META.json" >"$tmp"
+  mv -f "$tmp" "$dir/META.json"
+}
+
+# Lines that are not comments (first non-blank character is not '#').
+code_lines() { grep -v '^[[:space:]]*#' "$1" | grep -v '^[[:space:]]*$' || true; }
+
+# "<name> <kind>" for every declared step, kind = check|info|confirm|secret_to_file.
+declared_steps() {
+  code_lines "$1" \
+    | sed -n -E 's/^[[:space:]]*ho_(check|info|confirm|secret_to_file)[[:space:]]+([^[:space:]]+).*/\2 \1/p'
+}
+
+# ---------------------------------------------------------------------------------------------
+
+cmd_new() {
+  [[ $# -eq 2 ]] || die 'usage: handoff new <slug> "<title>"'
+  local slug="$1" title="$2" id dir
+  [[ "$slug" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || die "slug must be lowercase words joined by hyphens"
+  [[ -n "$title" && "$title" != *$'\n'* ]] || die "title must be one non-empty line"
+  [[ -f "$RUNTIME" ]] || die "runtime missing: $RUNTIME"
+  id="$(date -u +%Y-%m-%d)-$slug"
+  dir="$(owner_root)/$id"
+  [[ ! -e "$dir" ]] || die "$dir already exists"
+  mkdir -p "$dir"
+  cat >"$dir/OWNER-RUN.sh" <<EOF
+#!/usr/bin/env bash
+# HANDOFF: $id — $title
+# Run in your own Terminal window:  bash $dir/OWNER-RUN.sh
+set -uo pipefail
+# shellcheck source=/dev/null
+source "$RUNTIME"
+ho_begin "$id"
+
+# Steps (one per line), for example:
+#   ho_check <name> <command…> || ho_abort
+#   ho_info <name> <command…>
+#   ho_confirm <name> "<question>" || ho_abort
+#   ho_secret_to_file <name> <VAR> <absolute gitignored file> || ho_abort
+
+ho_end
+EOF
+  jq -n --arg id "$id" --arg title "$title" --arg created "$(utc)" --arg runtime "$RUNTIME" \
+    '{id: $id, title: $title, created: $created, state: "draft", runtime: $runtime}' >"$dir/META.json"
+  printf 'created %s/OWNER-RUN.sh\n' "$dir"
+}
+
+# ---------------------------------------------------------------------------------------------
+
+lint_errors() { # prints one error per line; empty output = clean
+  local file="$1" id first last src_count code
+  [[ -f "$file" ]] || {
+    echo "file not found: $file"
+    return 0
+  }
+  id="$(basename "$(cd "$(dirname "$file")" && pwd)")"
+  code="$(code_lines "$file")"
+
+  [[ "$(head -n 1 "$file")" == "#!/usr/bin/env bash" ]] || echo "line 1 must be '#!/usr/bin/env bash'"
+
+  src_count="$(printf '%s\n' "$code" | grep -c -E '^[[:space:]]*(source|\.)[[:space:]]' || true)"
+  if [[ "$src_count" != 1 ]]; then
+    echo "must source exactly one file (the runtime); found $src_count source lines"
+  fi
+  if ! printf '%s\n' "$code" | grep -qxF "source \"$RUNTIME\""; then
+    echo "must contain exactly: source \"$RUNTIME\""
+  fi
+
+  first="$(printf '%s\n' "$code" | grep -E '^[[:space:]]*ho_' | head -n 1 || true)"
+  [[ "$first" == "ho_begin \"$id\"" ]] || echo "first helper call must be: ho_begin \"$id\""
+  last="$(printf '%s\n' "$code" | tail -n 1)"
+  [[ "$last" == "ho_end" ]] || echo "last line must be: ho_end"
+
+  local lit
+  for lit in HANDOFF-RESULT "result: OK" "result: FAILED" script-sha256 runtime-sha256 \
+    RESULT.txt VERIFIED.txt PASTED- CLAUDECODE CLAUDE_CODE_ENTRYPOINT CODEX_SANDBOX pbcopy; do
+    if grep -qF -- "$lit" "$file"; then echo "forbidden text (fakes or bypasses evidence): $lit"; fi
+  done
+  if grep -qE 'check[[:space:]]+[A-Za-z0-9_-]+:[[:space:]]*(PASS|FAIL|INFO)' "$file"; then
+    echo "forbidden text: a 'check <name>: PASS|FAIL|INFO' evidence line"
+  fi
+
+  # A command word is at the start of a line, after ; & | ( {, or after then/do/else.
+  local cmdpos='(^[[:space:]]*|[;&|({][[:space:]]*|[[:space:]](then|do|else)[[:space:]]+)'
+  local -a pats whys
+  pats=(
+    "${cmdpos}(eval|exec|trap|alias|enable|builtin|unset)([[:space:]]|\$)"
+    '(^|[^A-Za-z0-9_])(function[[:space:]]+)?_?ho_[A-Za-z0-9_]*[[:space:]]*\(\)'
+    'function[[:space:]]+_?ho_'
+    '(^|[^A-Za-z0-9_])_ho_'
+    '(^|[^A-Za-z0-9_])_?HO_[A-Z_]*\+?='
+    'set[[:space:]]+[-+][A-Za-z]*x'
+    'xtrace'
+  )
+  whys=(
+    "eval, exec, trap, alias, enable, builtin or unset"
+    "redefining a ho_* function"
+    "redefining a ho_* function"
+    "calling runtime internals (_ho_*)"
+    "assigning runtime variables (HO_*)"
+    "xtrace (set -x) could print secrets"
+    "xtrace (set -o xtrace) could print secrets"
+  )
+  local i
+  for i in "${!pats[@]}"; do
+    if printf '%s\n' "$code" | grep -qE -- "${pats[$i]}"; then echo "forbidden: ${whys[$i]}"; fi
+  done
+
+  local steps names bad dup
+  steps="$(declared_steps "$file")"
+  if [[ -z "$steps" ]]; then
+    echo "no steps: add at least one ho_check, ho_info, ho_confirm or ho_secret_to_file"
+  else
+    names="$(printf '%s\n' "$steps" | awk '{print $1}')"
+    bad="$(printf '%s\n' "$names" | grep -vE '^[a-z0-9]+(-[a-z0-9]+)*$' || true)"
+    [[ -z "$bad" ]] || echo "invalid step name(s): $(printf '%s' "$bad" | tr '\n' ' ')"
+    dup="$(printf '%s\n' "$names" | sort | uniq -d)"
+    [[ -z "$dup" ]] || echo "duplicate step name(s): $(printf '%s' "$dup" | tr '\n' ' ')"
+  fi
+
+  if command -v shellcheck >/dev/null 2>&1; then
+    local sc
+    if ! sc="$(shellcheck -s bash "$file" 2>&1)"; then
+      echo "shellcheck failed:"
+      printf '%s\n' "$sc" | sed 's/^/    /'
+    fi
+  fi
+}
+
+cmd_lint() {
+  [[ $# -eq 1 ]] || die "usage: handoff lint <OWNER-RUN.sh>"
+  local errors
+  errors="$(lint_errors "$1")"
+  if ! command -v shellcheck >/dev/null 2>&1; then
+    echo "LINT WARN: shellcheck is not installed; shell checks skipped" >&2
+  fi
+  if [[ -n "$errors" ]]; then
+    printf 'LINT: %s\n' "$errors" | sed '2,$s/^/LINT: /' >&2
+    printf 'LINT FAILED: %s\n' "$1" >&2
+    return 1
+  fi
+  printf 'LINT OK: %s\n' "$1"
+}
+
+# ---------------------------------------------------------------------------------------------
+
+cmd_ready() {
+  [[ $# -eq 1 ]] || die "usage: handoff ready <id>"
+  local id="$1" dir state
+  dir="$(owner_root)/$id"
+  [[ -f "$dir/OWNER-RUN.sh" && -f "$dir/META.json" ]] || die "no handoff $id"
+  state="$(meta_get "$dir" state)"
+  [[ "$state" == draft ]] || die "handoff $id is '$state', not draft"
+  cmd_lint "$dir/OWNER-RUN.sh"
+  chmod 444 "$dir/OWNER-RUN.sh"
+  meta_set "$dir" '.state = "ready" | .script_sha256 = $sha | .readied = $at' \
+    --arg sha "$(sha256 "$dir/OWNER-RUN.sh")" --arg at "$(utc)"
+  printf '\nReady. Give the owner exactly these two lines:\n\n'
+  printf '  bash %s/OWNER-RUN.sh\n' "$dir"
+  printf '  paste back the HANDOFF-RESULT block\n'
+}
+
+# ---------------------------------------------------------------------------------------------
+
+# Normalise a text file and print the lines of its single HANDOFF-RESULT block (markers included).
+# Exit 2 if there is not exactly one well-formed block.
+extract_block() {
+  local norm begins ends
+  norm="$(LC_ALL=C tr -d '\r' <"$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  begins="$(printf '%s\n' "$norm" | grep -cxF -- '----- HANDOFF-RESULT BEGIN -----' || true)"
+  ends="$(printf '%s\n' "$norm" | grep -cxF -- '----- HANDOFF-RESULT END -----' || true)"
+  [[ "$begins" == 1 && "$ends" == 1 ]] || return 2
+  printf '%s\n' "$norm" | awk '
+    $0 == "----- HANDOFF-RESULT BEGIN -----" { on = 1 }
+    on { print }
+    $0 == "----- HANDOFF-RESULT END -----" { if (!on) exit 2; on = 0; done = 1 }
+    END { if (!done) exit 2 }'
+}
+
+cmd_verify() {
+  [[ $# -eq 1 ]] || die "usage: handoff verify <work/owner/<id>/PASTED-<utc>.txt>"
+  local pasted dir id root fails=""
+  [[ -f "$1" ]] || die "file not found: $1"
+  pasted="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+  dir="$(dirname "$pasted")"
+  id="$(basename "$dir")"
+  root="$(owner_root)"
+  fail() { fails="$fails$1"$'\n'; }
+
+  # 8. input must be the owner's paste, saved next to the handoff
+  [[ "$(basename "$pasted")" =~ ^PASTED-[A-Za-z0-9T:.-]+\.txt$ ]] \
+    || fail "8: input must be named PASTED-<utc>.txt (RESULT.txt is never accepted)"
+  [[ "$(cd "$(dirname "$dir")" 2>/dev/null && pwd)" == "$(mkdir -p "$root" && cd "$root" && pwd)" ]] \
+    || fail "8: pasted file must live in $root/<id>/"
+
+  # 2. the handoff exists and was readied
+  if [[ ! -f "$dir/META.json" || ! -f "$dir/OWNER-RUN.sh" ]]; then
+    fail "2: no handoff '$id' in $root"
+    printf 'VERIFY FAILED: %s\n%s' "$id" "$fails" >&2
+    return 1
+  fi
+  [[ ! -f "$dir/VERIFIED.txt" ]] || fail "2: handoff $id is already verified"
+  [[ "$(meta_get "$dir" state)" == ready ]] || fail "2: handoff $id was never readied (state: $(meta_get "$dir" state))"
+
+  # 1. exactly one well-formed block
+  local block
+  if ! block="$(extract_block "$pasted")"; then
+    fail "1: the paste must contain exactly one HANDOFF-RESULT block"
+    printf 'VERIFY FAILED: %s\n%s' "$id" "$fails" >&2
+    return 1
+  fi
+  local n
+  n="$(printf '%s\n' "$block" | wc -l | tr -d ' ')"
+  local l_id l_script l_runtime l_at l_result checks
+  l_id="$(printf '%s\n' "$block" | sed -n '2p')"
+  l_script="$(printf '%s\n' "$block" | sed -n '3p')"
+  l_runtime="$(printf '%s\n' "$block" | sed -n '4p')"
+  l_at="$(printf '%s\n' "$block" | sed -n '5p')"
+  l_result="$(printf '%s\n' "$block" | sed -n "$((n - 1))p")"
+  checks=""
+  if [[ "$n" -ge 8 ]]; then checks="$(printf '%s\n' "$block" | sed -n "6,$((n - 2))p")"; fi
+  [[ "$l_id" == "id: $id" ]] || fail "1: id line must be 'id: $id'"
+  [[ "$l_script" =~ ^script-sha256:\ [0-9a-f]{64}$ ]] || fail "1: malformed script-sha256 line"
+  [[ "$l_runtime" =~ ^runtime-sha256:\ [0-9a-f]{64}$ ]] || fail "1: malformed runtime-sha256 line"
+  [[ "$l_at" =~ ^at:\ [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || fail "1: malformed at line"
+  [[ "$l_result" =~ ^result:\ (OK|FAILED)$ ]] || fail "1: malformed result line"
+  if printf '%s\n' "$checks" | grep -vE '^check [^ :]+: (PASS|FAIL|INFO) .+$' | grep -q .; then
+    fail "1: malformed check line(s)"
+  fi
+
+  # 3. script unchanged since it was readied and since it ran
+  local frozen ondisk
+  frozen="$(meta_get "$dir" script_sha256)"
+  ondisk="$(sha256 "$dir/OWNER-RUN.sh")"
+  [[ "$l_script" == "script-sha256: $ondisk" ]] || fail "3: script-sha256 does not match OWNER-RUN.sh on disk"
+  [[ "$ondisk" == "$frozen" ]] || fail "3: OWNER-RUN.sh changed after handoff ready"
+
+  # 4. runtime unchanged
+  local runtime
+  runtime="$(meta_get "$dir" runtime)"
+  if [[ ! -f "$runtime" ]]; then
+    fail "4: runtime $runtime no longer exists"
+  elif [[ "$l_runtime" != "runtime-sha256: $(sha256 "$runtime")" ]]; then
+    fail "4: runtime-sha256 does not match $runtime (runtime changed: re-run as a fresh handoff)"
+  fi
+
+  # 5 + 6. every declared step exactly once, nothing undeclared, right status for its kind
+  local steps name kind count line status
+  steps="$(declared_steps "$dir/OWNER-RUN.sh")"
+  while read -r name kind; do
+    [[ -n "$name" ]] || continue
+    count="$(printf '%s\n' "$checks" | grep -c "^check $name: " || true)"
+    if [[ "$count" != 1 ]]; then
+      fail "5: step '$name' appears $count times (expected exactly 1)"
+      continue
+    fi
+    line="$(printf '%s\n' "$checks" | grep "^check $name: ")"
+    status="$(printf '%s\n' "$line" | sed -E 's/^check [^ :]+: ([A-Z]+) .*/\1/')"
+    if [[ "$kind" == info ]]; then
+      [[ "$status" == INFO ]] || fail "6: step '$name' is ho_info but reports $status"
+    else
+      [[ "$status" == PASS ]] || fail "6: step '$name' did not pass: ${line#check }"
+    fi
+  done <<<"$steps"
+  while read -r line; do
+    [[ -n "$line" ]] || continue
+    name="$(printf '%s\n' "$line" | sed -E 's/^check ([^ :]+): .*/\1/')"
+    printf '%s\n' "$steps" | awk '{print $1}' | grep -qxF -- "$name" \
+      || fail "5: undeclared step '$name': ${line#check }"
+  done <<<"$checks"
+  [[ "$l_result" == "result: OK" ]] || fail "6: result is not OK"
+
+  # 7. the paste matches the RESULT.txt the runtime wrote on the owner's run
+  local result_block
+  if [[ ! -f "$dir/RESULT.txt" ]]; then
+    fail "7: RESULT.txt missing (the script was never run here)"
+  elif ! result_block="$(extract_block "$dir/RESULT.txt")"; then
+    fail "7: RESULT.txt does not contain one well-formed block"
+  elif [[ "$result_block" != "$block" ]]; then
+    fail "7: the paste does not match RESULT.txt"
+  fi
+
+  if [[ -n "$fails" ]]; then
+    printf 'VERIFY FAILED: %s\n%s' "$id" "$fails" >&2
+    return 1
+  fi
+  {
+    printf '%s\n' "$block"
+    printf 'verified-at: %s\n' "$(utc)"
+    printf 'pasted-file: %s\n' "$(basename "$pasted")"
+  } >"$dir/VERIFIED.txt"
+  meta_set "$dir" '.state = "verified" | .verified = $at' --arg at "$(utc)"
+  printf 'VERIFIED: %s\n' "$id"
+}
+
+# ---------------------------------------------------------------------------------------------
+
+main() {
+  local sub="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    new) cmd_new "$@" ;;
+    ready) cmd_ready "$@" ;;
+    lint) cmd_lint "$@" ;;
+    verify) cmd_verify "$@" ;;
+    *) die "usage: handoff new|ready|lint|verify …" ;;
+  esac
+}
+
+main "$@"
