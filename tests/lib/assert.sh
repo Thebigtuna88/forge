@@ -37,8 +37,11 @@ run_tests() {
   for t in $(declare -F | awk '{print $3}' | grep '^test_'); do
     (
       _T_CUR_FAILED=0
-      T_TMP="$(mktemp -d)"
-      T_TMP="$(cd "$T_TMP" && pwd -P)"
+      # A test never runs without its own temp folder (it would otherwise write to /h etc.).
+      T_TMP="$(mktemp -d)" && T_TMP="$(cd "$T_TMP" && pwd -P)" && [[ -d "$T_TMP" && "$T_TMP" != / ]] || {
+        printf '  # could not create a temp folder for %s\n' "$t"
+        exit 1
+      }
       "$t" || _t_fail "$t returned non-zero"
       rc=$_T_CUR_FAILED
       rm -rf "$T_TMP"
