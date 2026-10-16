@@ -51,4 +51,25 @@ test_timeout_holds_when_the_child_closes_its_terminal() {
   assert_contains "$out" "[ptyrun: killed after 1 s" # "without output" or "without exiting"
 }
 
+# The parent exits first, so its detached child is re-parented before the driver returns.
+test_detached_child_of_an_exited_parent_is_killed() {
+  cat >"$T_TMP/orphan.py" <<'PY'
+import os, signal, sys, time
+if os.fork() == 0:
+    os.setsid()
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    open(sys.argv[1], "w").write(str(os.getpid()))
+    time.sleep(300)
+else:
+    time.sleep(0.5)
+PY
+  local out pid
+  out="$(PTYRUN_TIMEOUT=5 python3 -I "$TESTLIB/ptyrun.py" -- python3 -I "$T_TMP/orphan.py" "$T_TMP/pid")"
+  pid="$(cat "$T_TMP/pid")"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid"
+    _t_fail "detached child $pid outlived the driver after a normal exit"
+  fi
+}
+
 run_tests

@@ -35,10 +35,14 @@ def descendants(root):
     return found
 
 
-def kill_tree(pid):
-    """Kill every descendant first (script(1) starts its own session, so the child's process
-    group is not enough), then the child's group."""
-    for p in descendants(pid):
+POLL = 0.1  # how often descendants are recorded while the child runs
+
+
+def kill_all(pid, tracked):
+    """Kill every descendant ever seen (a detached one may have outlived its parent and been
+    re-parented, so it can no longer be found from pid), the current ones, then the child's
+    process group. script(1) starts its own session, so the group alone is not enough."""
+    for p in tracked | set(descendants(pid)):
         try:
             os.kill(p, signal.SIGKILL)
         except ProcessLookupError:
@@ -67,12 +71,19 @@ def main() -> int:
 
     out = b""
     sent = 0
+    tracked = set()
+    idle = 0.0
     while True:
-        ready, _, _ = select.select([fd], [], [], IDLE_TIMEOUT)
+        tracked.update(descendants(pid))
+        ready, _, _ = select.select([fd], [], [], POLL)
         if not ready:
-            kill_tree(pid)
-            out += b"\n[ptyrun: killed after %d s without output]\n" % IDLE_TIMEOUT
-            break
+            idle += POLL
+            if idle >= IDLE_TIMEOUT:
+                kill_all(pid, tracked)
+                out += b"\n[ptyrun: killed after %d s without output]\n" % IDLE_TIMEOUT
+                break
+            continue
+        idle = 0.0
         try:
             data = os.read(fd, 4096)
         except OSError:
@@ -90,15 +101,18 @@ def main() -> int:
     # hang), so waiting is bounded by the same timeout.
     deadline = time.monotonic() + IDLE_TIMEOUT
     while True:
+        tracked.update(descendants(pid))
         done, status = os.waitpid(pid, os.WNOHANG)
         if done:
             break
         if time.monotonic() >= deadline:
-            kill_tree(pid)
+            kill_all(pid, tracked)
             out += b"\n[ptyrun: killed after %d s without exiting]\n" % IDLE_TIMEOUT
             _, status = os.waitpid(pid, 0)
             break
         time.sleep(0.05)
+    # Nothing a test started may outlive it, even after a normal exit.
+    kill_all(pid, tracked)
     sys.stdout.write(out.decode("utf-8", "replace"))
     return os.waitstatus_to_exitcode(status)
 
