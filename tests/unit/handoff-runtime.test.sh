@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Tests for .harness/lib/handoff.sh (spec 4.3, 10.3).
+# shellcheck disable=SC2031 # each test sets and reads T_TMP inside its own subshell (assert.sh)
 # shellcheck source=tests/lib/assert.sh
 source "$(dirname "$0")/../lib/assert.sh"
 # shellcheck source=tests/lib/fixture.sh
@@ -147,6 +148,7 @@ test_abort_stops_before_later_steps() {
 
 test_crash_before_ho_end_still_reports_failed() {
   mk_harness
+  # shellcheck disable=SC2016 # literal on purpose: the owner script must crash on it
   mk_script "$ID" 'ho_check ok /usr/bin/true' 'echo "$UNDEFINED_VARIABLE"'
   pty_run -- bash "$SCRIPT"
   assert_exit 1 "$RC"

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Tests for `handoff verify` (spec 4.5, 10.3): passes a genuine run, fails on each of checks 1–8.
+# shellcheck disable=SC2031 # each test sets and reads T_TMP inside its own subshell (assert.sh)
 # shellcheck source=tests/lib/assert.sh
 source "$(dirname "$0")/../lib/assert.sh"
 # shellcheck source=tests/lib/fixture.sh
@@ -16,7 +17,7 @@ genuine_run() {
   body="$(sed '$d' "$DIR/OWNER-RUN.sh")"
   {
     printf '%s\n' "$body"
-    printf '%s\n' 'ho_check ok /usr/bin/true' 'ho_info ver /bin/echo v1.2.3' 'ho_confirm done "Done?"'
+    printf '%s\n' 'ho_check ok /usr/bin/true' 'ho_info ver /bin/echo v1.2.3' 'ho_confirm finished "Done?"'
     printf 'ho_end\n'
   } >"$DIR/OWNER-RUN.sh"
   "$HANDOFF" ready "$ID" >/dev/null || _t_fail "ready failed"
@@ -122,7 +123,7 @@ test_check6_failed_step() {
   genuine_run n
   paste_result
   expect_fail 6 "$PASTE"
-  assert_contains "$VERIFY_OUT" "6: step 'done' did not pass"
+  assert_contains "$VERIFY_OUT" "6: step 'finished' did not pass"
 }
 
 test_check6_info_relabelled_as_pass() {

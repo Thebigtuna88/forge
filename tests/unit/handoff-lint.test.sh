@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Tests for `handoff new`, `handoff lint` and `handoff ready` (spec 4.1, 4.4, 10.3).
+# shellcheck disable=SC2031 # each test sets and reads T_TMP inside its own subshell (assert.sh)
 # shellcheck source=tests/lib/assert.sh
 source "$(dirname "$0")/../lib/assert.sh"
 # shellcheck source=tests/lib/fixture.sh
@@ -55,7 +56,7 @@ test_new_rejects_bad_slug_and_existing_id() {
 test_clean_script_passes() {
   new_with 'ho_check ok /usr/bin/true || ho_abort' \
     'ho_info ver /bin/echo v1' \
-    'ho_confirm done "Is it done?" || ho_abort' \
+    'ho_confirm finished "Is it done?" || ho_abort' \
     "ho_secret_to_file key API_KEY $T_TMP/h/.env || ho_abort" \
     'ho_check repo gh repo edit --enable-squash-merge --delete-branch-on-merge'
   lint

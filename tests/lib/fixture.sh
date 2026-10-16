@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2034 # H, HANDOFF, SCRIPT, OUT and RC are read by the test files
 # Test fixtures: a throwaway harness copy with its own git repo, and a pty runner (spec 10.2).
 
 FORGE_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

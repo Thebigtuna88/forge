@@ -189,6 +189,7 @@ cmd_ready() {
   [[ "$state" == draft ]] || die "handoff $id is '$state', not draft"
   cmd_lint "$dir/OWNER-RUN.sh"
   chmod 444 "$dir/OWNER-RUN.sh"
+  # shellcheck disable=SC2016 # a jq program: $sha and $at are jq variables
   meta_set "$dir" '.state = "ready" | .script_sha256 = $sha | .readied = $at' \
     --arg sha "$(sha256 "$dir/OWNER-RUN.sh")" --arg at "$(utc)"
   printf '\nReady. Give the owner exactly these two lines:\n\n'
@@ -325,6 +326,7 @@ cmd_verify() {
     printf 'verified-at: %s\n' "$(utc)"
     printf 'pasted-file: %s\n' "$(basename "$pasted")"
   } >"$dir/VERIFIED.txt"
+  # shellcheck disable=SC2016 # a jq program: $at is a jq variable
   meta_set "$dir" '.state = "verified" | .verified = $at' --arg at "$(utc)"
   printf 'VERIFIED: %s\n' "$id"
 }
