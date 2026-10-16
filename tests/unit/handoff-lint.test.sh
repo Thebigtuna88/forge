@@ -128,6 +128,7 @@ test_rejects_split_evidence_name() { expect_rejected "RESULT.txt" "ho_check w cp
 test_rejects_command_substitution() { expect_rejected "inside double quotes" 'ho_check w /bin/echo "$(id)"'; }
 # shellcheck disable=SC2016 # literal on purpose: lint must reject the expansion
 test_rejects_variable_expansion() { expect_rejected "unquoted '\$'" 'ho_check w /bin/echo $HOME'; }
+test_rejects_tilde_expansion() { expect_rejected "unquoted '~'" 'ho_info w /usr/bin/printf %s ~root'; }
 test_rejects_redirection() { expect_rejected "unquoted '>'" 'ho_check w /usr/bin/true > /tmp/out'; }
 test_rejects_assignment_prefix() { expect_rejected "only ho_check, ho_info" 'FOO=1 ho_check w /usr/bin/true'; }
 test_rejects_anything_after_abort() { expect_rejected "may only be followed by ho_abort" 'ho_check w /usr/bin/true || true'; }

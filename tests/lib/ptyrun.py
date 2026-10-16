@@ -13,6 +13,7 @@ import select
 import signal
 import subprocess
 import sys
+import time
 
 PROMPT = re.compile(rb"\[y/N\] |\(input hidden\): ")
 IDLE_TIMEOUT = int(os.environ.get("PTYRUN_TIMEOUT", "15"))
@@ -32,6 +33,20 @@ def descendants(root):
             found.append(c)
             todo.append(c)
     return found
+
+
+def kill_tree(pid):
+    """Kill every descendant first (script(1) starts its own session, so the child's process
+    group is not enough), then the child's group."""
+    for p in descendants(pid):
+        try:
+            os.kill(p, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def main() -> int:
@@ -55,17 +70,7 @@ def main() -> int:
     while True:
         ready, _, _ = select.select([fd], [], [], IDLE_TIMEOUT)
         if not ready:
-            # Kill every descendant first (script(1) starts its own session, so the child's
-            # process group is not enough), then the child's group.
-            for p in descendants(pid):
-                try:
-                    os.kill(p, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            kill_tree(pid)
             out += b"\n[ptyrun: killed after %d s without output]\n" % IDLE_TIMEOUT
             break
         try:
@@ -81,7 +86,19 @@ def main() -> int:
             sent += 1
 
     os.close(fd)
-    _, status = os.waitpid(pid, 0)
+    # The terminal may close before the child exits (it can close its own descriptors and
+    # hang), so waiting is bounded by the same timeout.
+    deadline = time.monotonic() + IDLE_TIMEOUT
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        if time.monotonic() >= deadline:
+            kill_tree(pid)
+            out += b"\n[ptyrun: killed after %d s without exiting]\n" % IDLE_TIMEOUT
+            _, status = os.waitpid(pid, 0)
+            break
+        time.sleep(0.05)
     sys.stdout.write(out.decode("utf-8", "replace"))
     return os.waitstatus_to_exitcode(status)
 

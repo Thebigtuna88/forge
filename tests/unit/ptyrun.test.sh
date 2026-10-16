@@ -42,4 +42,13 @@ PY
   fi
 }
 
+test_timeout_holds_when_the_child_closes_its_terminal() {
+  local out start
+  start="$(date +%s)"
+  out="$(PTYRUN_TIMEOUT=1 python3 -I "$TESTLIB/ptyrun.py" -- /bin/bash -c \
+    'exec >/dev/null 2>&1 </dev/null; sleep 30')"
+  [[ $(($(date +%s) - start)) -lt 10 ]] || _t_fail "ptyrun waited for the child instead of timing out"
+  assert_contains "$out" "[ptyrun: killed after 1 s" # "without output" or "without exiting"
+}
+
 run_tests

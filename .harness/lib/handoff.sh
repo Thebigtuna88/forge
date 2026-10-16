@@ -201,9 +201,9 @@ ho_begin() { # <id>
   if [[ -L "$HO_DIR/logs" || -L "$HO_DIR/RESULT.txt" ]]; then
     _ho_refuse "a symlink sits where the runtime writes (logs/ or RESULT.txt); remove it first."
   fi
-  chmod 700 "$HO_DIR" 2>/dev/null || true
-  mkdir -p "$HO_DIR/logs"
-  chmod 700 "$HO_DIR/logs"
+  if ! chmod 700 "$HO_DIR" || ! mkdir -p "$HO_DIR/logs" || ! chmod 700 "$HO_DIR/logs"; then
+    _ho_refuse "could not make the handoff folder private (mode 700): $HO_DIR"
+  fi
   _HO_BEGUN=1
   trap _ho_on_exit EXIT
   trap 'exit 130' INT TERM HUP # leave through the EXIT trap, so cleanup and the block still run

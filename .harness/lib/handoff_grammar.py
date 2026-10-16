@@ -25,7 +25,7 @@ import sys
 HELPERS = ("ho_check", "ho_info", "ho_confirm", "ho_secret_to_file")
 NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 VAR = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-UNQUOTED_OK = re.compile(r"[A-Za-z0-9_@%+=:,./~^-]")
+UNQUOTED_OK = re.compile(r"[A-Za-z0-9_@%+=:,./^-]")  # no ~: bash would expand it
 FORBIDDEN = (
     "HANDOFF-RESULT", "result: OK", "result: FAILED", "script-sha256", "runtime-sha256",
     "RESULT.txt", "VERIFIED.txt", "META.json", "PASTED-", "CLAUDECODE",

@@ -267,6 +267,21 @@ test_refuses_symlinked_outputs() {
   [[ -z "$(ls -A "$T_TMP/elsewhere")" ]] || _t_fail "logs were written through a symlinked folder"
 }
 
+test_refuses_when_the_folder_cannot_be_made_private() {
+  mk_harness
+  mk_script "$ID" 'ho_check ok /usr/bin/true'
+  mkdir "$T_TMP/bin"
+  # shellcheck disable=SC2016 # the stub's own $1
+  printf '#!/bin/bash\n[[ "$1" == 700 ]] && exit 1\nexec /bin/chmod "$@"\n' >"$T_TMP/bin/chmod"
+  /bin/chmod +x "$T_TMP/bin/chmod"
+  OUT="$(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_SANDBOX_NETWORK_DISABLED \
+    PATH="$T_TMP/bin:$STUBS:$PATH" STUB_CLIPBOARD="$T_TMP/clipboard" \
+    python3 -I "$TESTLIB/ptyrun.py" -- bash "$SCRIPT")"
+  RC=$?
+  assert_exit 3 "$RC" "$OUT"
+  assert_contains "$OUT" "could not make the handoff folder private"
+}
+
 test_steps_run_from_the_root_folder() {
   mk_harness
   mk_script "$ID" 'ho_check where /bin/pwd'
