@@ -215,6 +215,73 @@ test_check_runs_shell_builtins() {
   assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check bash-only: PASS"
 }
 
+test_secret_rejects_a_tilde() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env"
+  pty_run --answer 'abc~def' -- bash "$SCRIPT"
+  assert_exit 1 "$RC"
+  [[ ! -e "$H/.env" ]] || _t_fail "a value with ~ was stored (bash would expand it)"
+}
+
+test_overlapping_secrets_are_redacted_whole() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file short A $H/.env" "ho_secret_to_file long B $H/.env" \
+    "ho_info reveal /usr/bin/sort $H/.env"
+  pty_run --answer 'abc' --answer 'abcdef' -- bash "$SCRIPT"
+  local result
+  result="$(cat "$H/work/owner/$ID/RESULT.txt")"
+  assert_contains "$result" "check reveal: INFO B=[REDACTED]"
+  assert_not_contains "$result" "def"
+}
+
+test_refuses_shell_tracing() {
+  mk_harness
+  mk_script "$ID" 'ho_check ok /usr/bin/true'
+  pty_run -- bash -x "$SCRIPT"
+  assert_exit 3 "$RC"
+  assert_contains "$OUT" "shell tracing"
+  [[ ! -f "$H/work/owner/$ID/RESULT.txt" ]] || _t_fail "RESULT.txt written despite refusal"
+}
+
+test_refuses_symlinked_outputs() {
+  mk_harness
+  mk_script "$ID" 'ho_check ok /usr/bin/true'
+  printf 'precious\n' >"$T_TMP/precious"
+  ln -s "$T_TMP/precious" "$H/work/owner/$ID/RESULT.txt"
+  pty_run -- bash "$SCRIPT"
+  assert_exit 3 "$RC"
+  assert_contains "$OUT" "symlink"
+  assert_eq "$(cat "$T_TMP/precious")" precious
+  rm "$H/work/owner/$ID/RESULT.txt"
+  mkdir -p "$H/work/owner/$ID/logs"
+  ln -s "$T_TMP/precious" "$H/work/owner/$ID/logs/ok.log"
+  pty_run -- bash "$SCRIPT"
+  assert_exit 0 "$RC" "$OUT"
+  assert_eq "$(cat "$T_TMP/precious")" precious "a step log was written through a symlink"
+}
+
+test_unsaved_result_is_not_reported_ok() {
+  mk_harness
+  mk_script "$ID" 'ho_check ok /usr/bin/true'
+  mkdir -p "$H/work/owner/$ID/RESULT.txt" # a directory: the block cannot be saved
+  pty_run -- bash "$SCRIPT"
+  assert_exit 1 "$RC"
+  assert_contains "$OUT" "Could not save"
+  [[ ! -s "$T_TMP/clipboard" ]] || _t_fail "an unsaved block was copied to the clipboard"
+}
+
+# at: is when the run started, so a run begun before `handoff ready` cannot pass verify.
+test_at_is_the_start_time() {
+  mk_harness
+  mk_script "$ID" 'ho_check wait /bin/sleep 3'
+  local before at
+  before="$(date -u +%s)"
+  pty_run -- bash "$SCRIPT"
+  at="$(sed -n 's/^at: //p' "$H/work/owner/$ID/RESULT.txt")"
+  at="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$at" +%s)"
+  [[ $((at - before)) -le 1 ]] || _t_fail "at is $((at - before))s after the start (end time, not start)"
+}
+
 test_secret_refuses_empty_input() {
   mk_harness
   mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env"

@@ -112,7 +112,6 @@ def check_step(words, secret_files):
     else:
         if len(rest) != 2 or not VAR.match(rest[0][0]) or not rest[1][0].startswith("/"):
             raise Bad("ho_secret_to_file %s takes <VAR> </absolute/path>" % name)
-        secret_files.append(rest[1][0])
     for text, _ in words:
         for lit in FORBIDDEN:
             if lit in text:
@@ -128,7 +127,15 @@ def main(path, runtime, ident):
         lines.pop()
     header = ["set -uo pipefail", 'source "%s"' % runtime, 'ho_begin "%s"' % ident]
     stage = 0  # 0..2 = expecting header[stage]; 3 = steps; 4 = after ho_end
+    # First pass: every secret target, so no step before or after it may name the file.
     secret_files = []
+    for raw in lines:
+        try:
+            w = split_words(raw)
+        except Bad:
+            continue
+        if len(w) >= 4 and w[0] == ("ho_secret_to_file", False):
+            secret_files.append(w[3][0])
     for no, raw in enumerate(lines, 1):
         line = raw.strip()
         if no == 1:

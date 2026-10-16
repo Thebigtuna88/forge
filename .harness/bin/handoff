@@ -166,7 +166,11 @@ lint_errors() { # prints one error per line; empty output = clean
   fi
 
   if ! command -v shellcheck >/dev/null 2>&1; then
-    echo "shellcheck is not installed (fail closed: install it with the install-tools handoff)"
+    # Bootstrap (spec 4.9): the handoff that installs shellcheck cannot be shellchecked first.
+    if ! printf '%s\n' "$code" \
+      | grep -qE '^ho_check [a-z0-9-]+ brew install( [a-z0-9-]+)* shellcheck( [a-z0-9-]+)*( \|\| ho_abort)?$'; then
+      echo "shellcheck is not installed (fail closed; only a handoff that runs 'brew install shellcheck' may skip it)"
+    fi
   else
     local sc
     if ! sc="$(shellcheck -s bash "$file" 2>&1)"; then

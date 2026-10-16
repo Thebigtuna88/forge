@@ -122,6 +122,21 @@ test_fails_closed_without_shellcheck() {
   assert_contains "$LINT_OUT" "shellcheck is not installed"
 }
 
+test_rejects_reading_a_secret_file_before_it_is_written() {
+  new_with "ho_info snapshot /bin/cat $T_TMP/h/.env" "ho_secret_to_file key API_KEY $T_TMP/h/.env || ho_abort"
+  lint
+  assert_exit 1 "$LINT_RC"
+  assert_contains "$LINT_OUT" "reads the secret file"
+}
+
+# Bootstrap (spec 4.9): the handoff that installs shellcheck may be readied without it.
+test_shellcheck_install_handoff_passes_without_shellcheck() {
+  new_with 'ho_check install-shellcheck brew install shellcheck || ho_abort'
+  LINT_OUT="$(env PATH=/usr/bin:/bin "$HANDOFF" lint "$DIR/OWNER-RUN.sh" 2>&1)"
+  LINT_RC=$?
+  assert_exit 0 "$LINT_RC" "$LINT_OUT"
+}
+
 test_ready_rejects_an_id_outside_the_owner_folder() {
   new_with 'ho_check ok /usr/bin/true'
   mkdir -p "$H/work/other"

@@ -267,8 +267,9 @@ ho_end
 - `CLAUDECODE` (or any other known agent marker: `CLAUDE_CODE_ENTRYPOINT`, `CODEX_SANDBOX`,
   `CODEX_SANDBOX_NETWORK_DISABLED`) is set, even to the empty string;
 - it is executed directly instead of sourced;
-- `OWNER-RUN.sh` is still writable, i.e. it was never frozen by `handoff ready` (added in the
-  FRG-1 review).
+- `OWNER-RUN.sh` is still writable, i.e. it was never frozen by `handoff ready`;
+- shell tracing is on (`bash -x`), which would print secrets;
+- a symlink sits at `logs/` or `RESULT.txt` (the last three added in the FRG-1 review).
 
 The refusal means running the script through Claude Code's `!` prefix fails too. That's
 intended: the owner uses a separate Terminal window.
@@ -278,11 +279,11 @@ can stop before an irreversible step.
 
 | Helper | Records | PASS when |
 |---|---|---|
-| `ho_begin <id>` | id, start time, `script-sha256` (of the calling script), `runtime-sha256` | must be called first; the id must match the folder name |
+| `ho_begin <id>` | id, start time (the block's `at:`), `script-sha256` (of the calling script), `runtime-sha256` | must be called first; the id must match the folder name |
 | `ho_check <name> <cmd…>` | `PASS` or `FAIL` + last non-empty output line | command exits 0 |
 | `ho_info <name> <cmd…>` | `INFO` + last output line | never fails |
 | `ho_confirm <name> "<question>"` | `PASS` (answered `y`) or `FAIL` | owner types `y` at `/dev/tty` |
-| `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty and uses only `A-Z a-z 0-9 . _ ~ + / = : @ % , -`; the target is a regular file (or absent) and gitignored (`git check-ignore`), as is its temp file; and every write step succeeds |
+| `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty and uses only `A-Z a-z 0-9 . _ + / = : @ % , -`; the target is a regular file (or absent) and gitignored (`git check-ignore`), as is its temp file; and every write step succeeds |
 | `ho_abort` | `result: FAILED` | ends the run early with the block |
 | `ho_end` | the block | — |
 
@@ -297,7 +298,11 @@ Details:
   clipboard or the block; if a later step prints it anyway, the runtime replaces it with
   `[REDACTED]` in the evidence and in that step's log.
 - Commands run as `script -q <log> /bin/bash -c '"$@"' …`, so they keep the terminal and shell
-  builtins work. The handoff folder and its logs are mode 700, `RESULT.txt` mode 600.
+  builtins work. The handoff folder and its logs are mode 700, `RESULT.txt` mode 600. Each
+  step's log is removed before the step runs, and `RESULT.txt` is written fresh; if it can't be
+  saved, `ho_end` prints no block and exits 1.
+- Redaction happens after a step ends, so it protects the evidence and the saved log, not the
+  live screen; see limit L11 and FRG-14.
 
 **`ho_end` output**, saved as `RESULT.txt` and copied to the clipboard with `pbcopy`:
 
@@ -334,7 +339,8 @@ In addition, lint rejects a script (and `handoff ready` refuses to freeze it) if
 - redefines any `ho_*` function, or uses `eval`, `source`/`.` of any other file, `exec`
   redirection, `unset CLAUDECODE` or other agent-marker manipulation;
 - writes to `RESULT.txt`, `VERIFIED.txt` or `PASTED-*`;
-- fails `shellcheck`, or shellcheck or python3 is not installed (fail closed).
+- fails `shellcheck`, or shellcheck or python3 is not installed (fail closed). The one
+  exception is the bootstrap handoff that itself runs `brew install … shellcheck` (4.9).
 
 `handoff ready` also refuses an id that is not `<date>-<slug>` (no path traversal) and a
 `META.json` naming a runtime other than this checkout's `.harness/lib/handoff.sh`.
@@ -355,6 +361,10 @@ Passes only if **all** of these hold:
    leading and trailing whitespace.
 8. The pasted file lives at `work/owner/<id>/PASTED-*.txt` and is its own regular file (not a
    symlink or hard link). Verify refuses to take `RESULT.txt` itself as input.
+
+**From FRG-5 on** (owner decision 2026-10-16-handoff-evidence-provenance), the paste file is
+written by the `capture-owner-paste` UserPromptSubmit hook, not by the agent, and verify also
+requires the paste's sha256 to be recorded in `.harness/state/pastes.log` by that hook.
 
 On success, it writes `VERIFIED.txt` (the block + verify time). On failure, it prints which
 check failed. The agent reports that failure to the owner. It never edits the paste.
@@ -1001,7 +1011,8 @@ its mitigation and, where one exists, a stronger option the owner can adopt late
 | L1 | **Indirect commands.** A guarded action inside a script file (`bash x.sh` containing `git push origin main`), or a Node/Python program calling a paid API, isn't seen by the command-matching hooks. | Hooks see the command line, not what a program does. | GitHub branch protection (public repos); no paid key exists while Tier C is in force; `spend` and `security` lenses; charter rule 9. | Run the agent under a separate OS user with no access to keys. |
 | L2 | **Same GitHub identity.** The agent uses the owner's `gh` login, so GitHub can't tell agent from owner; only the local hook stops a `dev`→`main` merge. | Personal accounts can't use bypass lists or required reviewers against yourself. | `gate-merge-on-review` (base must be `dev`, API merges denied), `deny-repo-admin`. | A separate free **machine account** for the agent with write access, with `main` requiring the owner's approving review. |
 | L3 | **Handoff runtime checks are a speed bump.** The TTY and `CLAUDECODE` checks can be faked (the test suite does it). | Any program with a shell can fake a terminal. | Evidence = the owner's paste matching `RESULT.txt`, frozen script sha, unchanged runtime; `handoff lint`. | — (the owner's paste is the real control) |
-| L4 | **The paste file is written by the agent.** The agent saves the owner's pasted text to disk; a dishonest agent could write something else. | Claude Code has no "owner-signed" input. | The paste is visible in the chat transcript; verify cross-checks `RESULT.txt`; charter. | Owner saves the paste themselves (`pbpaste > …` in a handoff). |
+| L4 | **The paste file is written by the agent** (until FRG-5). The agent saves the owner's pasted text to disk; a dishonest agent could write something else, with a matching `RESULT.txt` (FRG-1 review S1). | Claude Code has no "owner-signed" input. | The paste is visible in the chat transcript; verify cross-checks `RESULT.txt`; charter. **Decided 2026-10-16:** FRG-5 adds a UserPromptSubmit hook that captures the paste and a guard on evidence files. | Agent runs as a separate macOS user. |
+| L11 | **Handoff steps run arbitrary programs.** The grammar limits shell syntax, but an allowed step (`python3 -c …`) can do anything the owner can: forge evidence, or print a collected secret to the screen before redaction (FRG-1 review S15, C3, S18). | The agent writes the scripts the owner runs. | Allowlist grammar; secret-file rule; redaction of evidence and logs; owner sees each step's command on screen. | FRG-14: reject inline interpreters, live redaction. |
 | L5 | **Read-proof proves access, not diligence.** A reviewer can hash the diff and still review it badly. | — | Adversarial prompt, structured findings, multiple lenses, stall rule, owner merges `main`. | Owner skims `review.md` for risky PRs. |
 | L6 | **Heuristic hooks.** The Stop hook and the Bash part of `guard-live-checkout` guess from text. | Natural language and shell are open-ended. | They start in observe; the owner promotes them by PR after reviewing `observed.log`. | — |
 | L7 | **Local-only evidence.** `work/` and the spend ledger live on one Mac. | Gitignored by design (may hold logs/screens). | PR comment summary of every review; prepaid wallets as the real spend cap; deleting the ledger doesn't remove a provider's own limits. | Back up `work/` with Time Machine. |

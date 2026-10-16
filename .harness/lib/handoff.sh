@@ -41,6 +41,10 @@ if [[ "$(basename "$HO_SCRIPT")" != "OWNER-RUN.sh" ]]; then
   _ho_refuse "handoff.sh may only be sourced by a file named OWNER-RUN.sh."
 fi
 
+case "$-" in
+  *x*) _ho_refuse "shell tracing (bash -x) is on; it would print secrets. Run: bash OWNER-RUN.sh" ;;
+esac
+
 if [[ -w "$HO_SCRIPT" ]]; then
   _ho_refuse "OWNER-RUN.sh is still writable, so it was never frozen by 'handoff ready' (or you ran it with sudo)."
 fi
@@ -55,6 +59,7 @@ _HO_NAMES=" "
 _HO_LINES=()
 _HO_SCRIPT_SHA=""
 _HO_RUNTIME_SHA=""
+_HO_AT=""
 _HO_SECRETS=() # values collected by ho_secret_to_file in this run, kept only to redact them
 
 _ho_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
@@ -83,6 +88,23 @@ _ho_clean() {
   s="${s% }"
   [[ -n "$s" ]] || s="(no output)"
   printf '%s' "${s:0:200}"
+}
+
+# Remember a secret for redaction, keeping the list longest first (so a secret that contains
+# another is replaced whole).
+_ho_add_secret() {
+  local new=() placed=0 sec
+  if [[ ${#_HO_SECRETS[@]} -gt 0 ]]; then
+    for sec in "${_HO_SECRETS[@]}"; do
+      if [[ $placed == 0 && ${#1} -ge ${#sec} ]]; then
+        new+=("$1")
+        placed=1
+      fi
+      new+=("$sec")
+    done
+  fi
+  [[ $placed == 1 ]] || new+=("$1")
+  _HO_SECRETS=("${new[@]}")
 }
 
 # Replace every secret collected in this run with [REDACTED].
@@ -159,8 +181,12 @@ ho_begin() { # <id>
     _ho_refuse "ho_begin id '$id' does not match the handoff folder '$(basename "$HO_DIR")'."
   fi
   _HO_ID="$id"
+  _HO_AT="$(_ho_utc)" # start time: verify requires the run to start after handoff ready
   _HO_SCRIPT_SHA="$(_ho_sha256 "$HO_SCRIPT")"
   _HO_RUNTIME_SHA="$(_ho_sha256 "$HO_RUNTIME")"
+  if [[ -L "$HO_DIR/logs" || -L "$HO_DIR/RESULT.txt" ]]; then
+    _ho_refuse "a symlink sits where the runtime writes (logs/ or RESULT.txt); remove it first."
+  fi
   chmod 700 "$HO_DIR" 2>/dev/null || true
   mkdir -p "$HO_DIR/logs"
   chmod 700 "$HO_DIR/logs"
@@ -179,6 +205,7 @@ ho_check() { # <name> <command…> — PASS only if the command exits 0
   [[ $# -gt 0 ]] || _ho_fatal "ho_check $name: no command given"
   local log="$HO_DIR/logs/$name.log" rc=0 last
   printf '\n▶ %s: %s\n' "$name" "$*"
+  rm -f "$log"
   _ho_run "$log" "$@" || rc=$?
   _ho_redact_log "$log"
   last="$(_ho_last_line "$log")"
@@ -201,6 +228,7 @@ ho_info() { # <name> <command…> — recorded, never fails
   [[ $# -gt 0 ]] || _ho_fatal "ho_info $name: no command given"
   local log="$HO_DIR/logs/$name.log" rc=0 last
   printf '\n▶ %s: %s\n' "$name" "$*"
+  rm -f "$log"
   _ho_run "$log" "$@" || rc=$?
   _ho_redact_log "$log"
   last="$(_ho_last_line "$log")"
@@ -259,14 +287,11 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
     return 1
   fi
 
-  local had_xtrace=0
-  case "$-" in *x*) had_xtrace=1 ;; esac
-  set +x
+  set +x # tracing is refused at startup; this only guards against a later change
   local value="" tmp
   read -r -s -p "Enter $var (input hidden): " value </dev/tty || value=""
   printf '\n' >/dev/tty
   if [[ -z "$value" ]]; then
-    [[ $had_xtrace == 1 ]] && set -x
     _HO_FAILED=1
     _ho_record FAIL "$name" "empty input; nothing stored"
     printf '  ✘ FAIL (empty input)\n'
@@ -274,15 +299,14 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
   fi
   # Written unquoted as VAR=value, so only characters that mean nothing to a shell or a dotenv
   # parser are accepted (API keys and tokens fit).
-  if [[ ! "$value" =~ ^[A-Za-z0-9._~+/=:@%,-]+$ ]]; then
+  if [[ ! "$value" =~ ^[A-Za-z0-9._+/=:@%,-]+$ ]]; then
     value=""
-    [[ $had_xtrace == 1 ]] && set -x
     _HO_FAILED=1
     _ho_record FAIL "$name" "refused: the value has spaces, quotes or shell characters; nothing stored"
     printf '  ✘ FAIL (unsupported characters in the value; nothing stored)\n'
     return 1
   fi
-  _HO_SECRETS+=("$value")
+  _ho_add_secret "$value"
 
   # Write a private temp file next to the target (it must be gitignored too), then move it.
   local ok=1 rc=0
@@ -299,7 +323,6 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
   if [[ $ok == 1 ]]; then mv -f "$tmp" "$file" || ok=0; fi
   if [[ $ok == 1 ]]; then [[ -f "$file" && ! -e "$tmp" ]] || ok=0; fi
   [[ -n "${tmp:-}" && -e "$tmp" ]] && rm -f "$tmp"
-  [[ $had_xtrace == 1 ]] && set -x
   if [[ $ok != 1 ]]; then
     _HO_FAILED=1
     _ho_record FAIL "$name" "could not write $file; nothing stored"
@@ -332,12 +355,17 @@ ho_end() { # print the block, save RESULT.txt, copy to clipboard, exit
       "id: $_HO_ID" \
       "script-sha256: $_HO_SCRIPT_SHA" \
       "runtime-sha256: $_HO_RUNTIME_SHA" \
-      "at: $(_ho_utc)"
+      "at: $_HO_AT"
     if [[ ${#_HO_LINES[@]} -gt 0 ]]; then printf '%s\n' "${_HO_LINES[@]}"; fi
     printf '%s\n' "result: $result" "----- HANDOFF-RESULT END -----"
   )"
-  (umask 077 && printf '%s\n' "$block" >"$HO_DIR/RESULT.txt")
-  chmod 600 "$HO_DIR/RESULT.txt" 2>/dev/null || true
+  rm -f "$HO_DIR/RESULT.txt"
+  if ! (set -C && umask 077 && printf '%s\n' "$block" >"$HO_DIR/RESULT.txt") 2>/dev/null \
+    || [[ "$(cat "$HO_DIR/RESULT.txt" 2>/dev/null)" != "$block" ]]; then
+    printf '\n✘ Could not save %s/RESULT.txt, so this run cannot be verified.\n' "$HO_DIR" >&2
+    printf 'Nothing to paste back. Tell Claude Code the handoff could not save its result.\n' >&2
+    exit 1
+  fi
   printf '\n%s\n\n' "$block"
   if printf '%s\n' "$block" | pbcopy 2>/dev/null; then
     printf 'Copied to your clipboard. Paste it back into Claude Code.\n'
