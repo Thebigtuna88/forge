@@ -976,17 +976,17 @@ or 1.
 - **`gh` and `codex` are replaced by stubs** (`tests/stubs/`) put first on `PATH` *inside the
   test only*. The stubs record how they were called and return canned replies, for example a
   codex reply with a wrong md5.
-- **Handoff tests need a terminal**, so they run the script under `script -q /dev/null` with
-  `CLAUDECODE` removed. That the test suite can do this is exactly why section 4.8 calls the
-  TTY check a speed bump.
+- **Handoff tests need a terminal**, so they run the script in a pseudo-terminal
+  (`tests/lib/ptyrun.py`, which also types the answers) with all four agent markers removed.
+  That the test suite can do this is exactly why section 4.8 calls the TTY check a speed bump.
 - **Platform:** scripts target macOS (the owner's machine) and use small helpers
   (`hr_md5`, `hr_sha256`) instead of tool-specific flags. Harness CI runs on GitHub's
   **macOS** runners, which are free for public repos.
 
-The pty driver (`tests/lib/ptyrun.py`) kills, when a run ends, every descendant it saw in its
-process snapshots, after checking each is still the same process. A process that double-forks
-and detaches between two snapshots can escape; macOS has no unprivileged containment for that
-(FRG-15). The tests start no such daemons.
+The pty driver kills, when a run ends, every descendant it saw in its process snapshots, after a
+best-effort check that each is still the same process. A process that double-forks and detaches
+between two snapshots can escape, and the identity check has one-second precision; macOS has no
+unprivileged containment or race-free signalling for either (FRG-15). The tests start no daemons.
 
 ### 10.3 Required test coverage (minimum)
 

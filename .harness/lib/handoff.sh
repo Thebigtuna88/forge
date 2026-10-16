@@ -208,7 +208,9 @@ ho_begin() { # <id>
   local st frozen
   st="$(jq -r '.state // empty' "$HO_DIR/META.json" 2>/dev/null)" || st=""
   frozen="$(jq -r '.script_sha256 // empty' "$HO_DIR/META.json" 2>/dev/null)" || frozen=""
-  if [[ "$st" != ready || "$frozen" != "$_HO_SCRIPT_SHA" ]]; then
+  # VERIFIED.txt is the record of verification, even if META.json could not be updated.
+  if [[ "$st" != ready || "$frozen" != "$_HO_SCRIPT_SHA" ]] \
+    || [[ -e "$HO_DIR/VERIFIED.txt" || -L "$HO_DIR/VERIFIED.txt" ]]; then
     _ho_refuse "this script is not the one 'handoff ready' froze (state '${st:-none}'), or it was already verified."
   fi
   if [[ -L "$HO_DIR/logs" || -L "$HO_DIR/RESULT.txt" ]]; then

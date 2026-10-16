@@ -180,6 +180,11 @@ test_verified_txt_is_the_record_if_meta_update_fails() {
   assert_contains "$(cat "$DIR/VERIFIED.txt")" "result: OK"
   verify "$PASTE"
   assert_contains "$VERIFY_OUT" "already verified"
+  local before
+  before="$(cat "$DIR/RESULT.txt")"
+  pty_run --answer y -- bash "$DIR/OWNER-RUN.sh"
+  assert_exit 3 "$RC" "a verified handoff ran again"
+  assert_eq "$(cat "$DIR/RESULT.txt")" "$before" "RESULT.txt was overwritten"
 }
 
 test_check2_verified_txt_directory_is_refused() {
