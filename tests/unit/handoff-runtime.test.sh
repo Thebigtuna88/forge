@@ -215,6 +215,14 @@ test_check_runs_shell_builtins() {
   assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check bash-only: PASS"
 }
 
+test_secret_with_surrounding_spaces_is_refused_not_trimmed() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env"
+  pty_run --answer '  Token-123  ' -- bash "$SCRIPT"
+  assert_exit 1 "$RC"
+  [[ ! -e "$H/.env" ]] || _t_fail "a value with spaces was stored (trimmed)"
+}
+
 test_secret_rejects_a_tilde() {
   mk_harness
   mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env"

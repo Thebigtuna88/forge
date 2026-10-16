@@ -4,6 +4,11 @@ Usage: python3 -I ptyrun.py [--answer TEXT]... -- COMMAND [ARGS...]
 
 Each answer is typed when the next "[y/N] " or "(input hidden): " prompt appears.
 Prints everything the command wrote to the terminal and exits with the command's status.
+
+Cleanup: every descendant seen in a process snapshot (taken every POLL seconds) is killed when
+the run ends, if it is still the same process (pid and start time). Known limit (FRG-15): a
+process that double-forks, detaches and loses its parent between two snapshots is never seen,
+and macOS offers no unprivileged way to contain it. The handoff tests start no such daemons.
 """
 
 import os
@@ -19,18 +24,29 @@ PROMPT = re.compile(rb"\[y/N\] |\(input hidden\): ")
 IDLE_TIMEOUT = int(os.environ.get("PTYRUN_TIMEOUT", "15"))
 
 
-def descendants(root):
-    """Every process below root, found by parent pid (ps), so separate sessions are included."""
-    out = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
-    children = {}
+def process_table():
+    """{pid: (ppid, start time)} from ps; the start time tells a reused pid apart."""
+    out = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid=,lstart="],
+                         capture_output=True, text=True).stdout
+    table = {}
     for line in out.splitlines():
-        parts = line.split()
-        if len(parts) == 2:
-            children.setdefault(int(parts[1]), []).append(int(parts[0]))
-    found, todo = [], [root]
+        parts = line.split(None, 2)
+        if len(parts) == 3:
+            table[int(parts[0])] = (int(parts[1]), parts[2].strip())
+    return table
+
+
+def descendants(root):
+    """{(pid, start time)} of every process below root, found by parent pid, so separate
+    sessions are included."""
+    table = process_table()
+    children = {}
+    for p, (pp, _) in table.items():
+        children.setdefault(pp, []).append(p)
+    found, todo = set(), [root]
     while todo:
         for c in children.get(todo.pop(), []):
-            found.append(c)
+            found.add((c, table[c][1]))
             todo.append(c)
     return found
 
@@ -42,11 +58,13 @@ def kill_all(pid, tracked):
     """Kill every descendant ever seen (a detached one may have outlived its parent and been
     re-parented, so it can no longer be found from pid), the current ones, then the child's
     process group. script(1) starts its own session, so the group alone is not enough."""
-    for p in tracked | set(descendants(pid)):
-        try:
-            os.kill(p, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    alive = process_table()
+    for p, start in tracked | descendants(pid):
+        if p in alive and alive[p][1] == start:  # still the same process, not a reused pid
+            try:
+                os.kill(p, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     try:
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:

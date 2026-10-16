@@ -980,6 +980,11 @@ or 1.
   (`hr_md5`, `hr_sha256`) instead of tool-specific flags. Harness CI runs on GitHub's
   **macOS** runners, which are free for public repos.
 
+The pty driver (`tests/lib/ptyrun.py`) kills, when a run ends, every descendant it saw in its
+process snapshots, after checking each is still the same process. A process that double-forks
+and detaches between two snapshots can escape; macOS has no unprivileged containment for that
+(FRG-15). The tests start no such daemons.
+
 ### 10.3 Required test coverage (minimum)
 
 | Area | Must prove |

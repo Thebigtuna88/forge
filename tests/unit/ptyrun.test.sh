@@ -72,4 +72,24 @@ PY
   fi
 }
 
+# A pid seen earlier but now belonging to a different process must not be killed.
+test_cleanup_checks_process_identity() {
+  local out
+  out="$(python3 -I - "$TESTLIB/ptyrun.py" <<'PY'
+import importlib.util, signal, sys
+spec = importlib.util.spec_from_file_location("ptyrun", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+sent = []
+m.os.kill = lambda p, s: sent.append(("kill", p))
+m.os.killpg = lambda p, s: sent.append(("killpg", p))
+m.process_table = lambda: {12345: (1, "Thu Jan  1 00:00:02 2026")}
+m.descendants = lambda root: set()
+m.kill_all(10000, {(12345, "Thu Jan  1 00:00:01 2026")})
+print(sent)
+PY
+)"
+  assert_eq "$out" "[('killpg', 10000)]" "a reused pid was signalled"
+}
+
 run_tests

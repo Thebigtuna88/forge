@@ -304,7 +304,8 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
 
   set +x # tracing is refused at startup; this only guards against a later change
   local value="" tmp
-  read -r -s -p "Enter $var (input hidden): " value </dev/tty || value=""
+  # IFS= keeps leading and trailing spaces, so the charset check refuses them instead of trimming.
+  IFS= read -r -s -p "Enter $var (input hidden): " value </dev/tty || value=""
   printf '\n' >/dev/tty
   if [[ -z "$value" ]]; then
     _HO_FAILED=1
