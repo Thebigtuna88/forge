@@ -35,9 +35,11 @@ meta_get() { jq -r --arg k "$2" '.[$k] // empty' "$1/META.json"; }
 meta_set() { # <dir> <jq filter> [jq args…]
   local dir="$1" filter="$2" tmp
   shift 2
-  tmp="$(mktemp "$dir/.META.XXXXXX")"
-  jq "$@" "$filter" "$dir/META.json" >"$tmp"
-  mv -f "$tmp" "$dir/META.json"
+  tmp="$(mktemp "$dir/.META.XXXXXX")" || return 1
+  if ! jq "$@" "$filter" "$dir/META.json" >"$tmp" || ! mv -f "$tmp" "$dir/META.json"; then
+    rm -f "$tmp"
+    return 1
+  fi
 }
 
 # Lines that are not comments (first non-blank character is not '#').
@@ -365,13 +367,27 @@ cmd_verify() {
     printf 'VERIFY FAILED: %s\n%s' "$id" "$fails" >&2
     return 1
   fi
-  {
+  # VERIFIED.txt and the verified state land together, or neither does (so a retry works).
+  local vtmp
+  vtmp="$(mktemp "$dir/.VERIFIED.XXXXXX")" || die "could not write in $dir"
+  if ! {
     printf '%s\n' "$block"
     printf 'verified-at: %s\n' "$(utc)"
     printf 'pasted-file: %s\n' "$(basename "$pasted")"
-  } >"$dir/VERIFIED.txt"
+  } >"$vtmp"; then
+    rm -f "$vtmp"
+    die "could not write VERIFIED.txt; nothing changed, verify can be re-run"
+  fi
   # shellcheck disable=SC2016 # a jq program: $at is a jq variable
-  meta_set "$dir" '.state = "verified" | .verified = $at' --arg at "$(utc)"
+  if ! meta_set "$dir" '.state = "verified" | .verified = $at' --arg at "$(utc)"; then
+    rm -f "$vtmp"
+    die "could not update META.json; nothing changed, verify can be re-run"
+  fi
+  if ! mv -f "$vtmp" "$dir/VERIFIED.txt"; then
+    rm -f "$vtmp"
+    meta_set "$dir" '.state = "ready" | del(.verified)' || true
+    die "could not write VERIFIED.txt; nothing changed, verify can be re-run"
+  fi
   printf 'VERIFIED: %s\n' "$id"
 }
 

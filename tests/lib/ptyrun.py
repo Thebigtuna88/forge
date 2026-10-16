@@ -11,10 +11,27 @@ import pty
 import re
 import select
 import signal
+import subprocess
 import sys
 
 PROMPT = re.compile(rb"\[y/N\] |\(input hidden\): ")
 IDLE_TIMEOUT = int(os.environ.get("PTYRUN_TIMEOUT", "15"))
+
+
+def descendants(root):
+    """Every process below root, found by parent pid (ps), so separate sessions are included."""
+    out = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
+    children = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found, todo = [], [root]
+    while todo:
+        for c in children.get(todo.pop(), []):
+            found.append(c)
+            todo.append(c)
+    return found
 
 
 def main() -> int:
@@ -38,7 +55,13 @@ def main() -> int:
     while True:
         ready, _, _ = select.select([fd], [], [], IDLE_TIMEOUT)
         if not ready:
-            # pty.fork() made the child a session and group leader: end the group, then hang up.
+            # Kill every descendant first (script(1) starts its own session, so the child's
+            # process group is not enough), then the child's group.
+            for p in descendants(pid):
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             try:
                 os.killpg(pid, signal.SIGKILL)
             except ProcessLookupError:

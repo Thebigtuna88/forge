@@ -164,6 +164,20 @@ test_check8_hard_link_to_result_is_rejected() {
   assert_contains "$VERIFY_OUT" "not a symlink or hard link"
 }
 
+test_failed_meta_update_leaves_verify_retryable() {
+  genuine_run
+  paste_result
+  mkdir "$T_TMP/bin"
+  # shellcheck disable=SC2016 # the stub's own $*
+  printf '#!/bin/bash\ncase "$*" in *verified*) exit 1 ;; esac\nexec /usr/bin/jq "$@"\n' >"$T_TMP/bin/jq"
+  chmod +x "$T_TMP/bin/jq"
+  VERIFY_OUT="$(env PATH="$T_TMP/bin:$PATH" "$HANDOFF" verify "$PASTE" 2>&1)" && _t_fail "verify passed with a failing jq"
+  [[ ! -e "$DIR/VERIFIED.txt" ]] || _t_fail "VERIFIED.txt written although META.json was not updated"
+  assert_eq "$(jq -r .state "$DIR/META.json")" ready
+  verify "$PASTE"
+  assert_exit 0 "$VERIFY_RC" "retry: $VERIFY_OUT"
+}
+
 test_check7_paste_edited() {
   genuine_run
   sed 's/v1.2.3/v9.9.9/' "$DIR/RESULT.txt" >"$PASTE"

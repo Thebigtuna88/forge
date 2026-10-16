@@ -176,7 +176,9 @@ _ho_new_name() {
 
 _ho_on_exit() {
   local rc=$?
-  if [[ -n "$_HO_TMP" ]]; then rm -f "$_HO_TMP"; fi
+  if [[ -n "$_HO_TMP" ]] && ! rm -f "$_HO_TMP"; then
+    _HO_LINES+=("check _runtime: FAIL could not remove the temp file $_HO_TMP; it may hold the secret")
+  fi
   if [[ "$_HO_BEGUN" == 1 && "$_HO_ENDED" != 1 ]]; then
     _HO_FAILED=1
     _HO_LINES+=("check _runtime: FAIL script exited with status $rc before ho_end")

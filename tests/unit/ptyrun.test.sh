@@ -20,4 +20,26 @@ test_timeout_kills_background_children() {
   fi
 }
 
+# script(1) puts each handoff step in its own session; those processes must not survive either.
+test_timeout_kills_children_in_their_own_session() {
+  cat >"$T_TMP/detach.py" <<'PY'
+import os, signal, sys, time
+if os.fork() == 0:
+    os.setsid()
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    open(sys.argv[1], "w").write(str(os.getpid()))
+    time.sleep(300)
+else:
+    time.sleep(300)
+PY
+  local out pid
+  out="$(PTYRUN_TIMEOUT=2 python3 -I "$TESTLIB/ptyrun.py" -- python3 -I "$T_TMP/detach.py" "$T_TMP/pid")"
+  assert_contains "$out" "killed after 2 s"
+  pid="$(cat "$T_TMP/pid")"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid"
+    _t_fail "detached child $pid survived the timeout"
+  fi
+}
+
 run_tests

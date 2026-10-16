@@ -335,6 +335,22 @@ test_interrupted_secret_write_leaves_no_temp_file() {
   assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check _runtime: FAIL script exited with status 130"
 }
 
+test_interrupted_secret_write_reports_a_temp_file_it_cannot_remove() {
+  mk_harness
+  mkdir "$T_TMP/slow"
+  # For the temp file only: make its folder read-only, then send TERM to the owner's script.
+  # shellcheck disable=SC2016 # the stub's own $2, $PPID and $@
+  printf '#!/bin/bash\ncase "$2" in *ho-tmp*) /bin/chmod 500 "$(dirname "$2")"; kill -TERM "$PPID"; sleep 2; exit 1 ;; esac\nexec /bin/chmod "$@"\n' \
+    >"$T_TMP/slow/chmod"
+  chmod +x "$T_TMP/slow/chmod"
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env"
+  OUT="$(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_SANDBOX_NETWORK_DISABLED \
+    PATH="$T_TMP/slow:$STUBS:$PATH" STUB_CLIPBOARD="$T_TMP/clipboard" \
+    python3 -I "$TESTLIB/ptyrun.py" --answer 'Stuck-1' -- bash "$SCRIPT")"
+  chmod 700 "$H"
+  assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check _runtime: FAIL could not remove the temp file $H/.env.ho-tmp."
+}
+
 test_secret_refuses_empty_input() {
   mk_harness
   mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env"
