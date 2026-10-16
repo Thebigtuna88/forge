@@ -175,4 +175,22 @@ test_evidence_is_one_clean_line() {
   assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check noisy: INFO second END red done"
 }
 
+# gh queries the terminal's colours with OSC sequences (ESC ] … ST or BEL, or cut off); none of it is evidence.
+test_evidence_drops_osc_sequences() {
+  mk_harness
+  mk_script "$ID" \
+    "ho_info st /usr/bin/printf 'kept\\033]11;?\\033\\\\\\n'" \
+    "ho_info bel /usr/bin/printf '\\033]0;title\\007also kept\\n'" \
+    "ho_info only /usr/bin/printf '\\033]11;?\\033\\\\\\n'" \
+    "ho_info cut /usr/bin/printf 'cut ok\\033]11;rgb:00\\n'"
+  pty_run -- bash "$SCRIPT"
+  local result
+  result="$(cat "$H/work/owner/$ID/RESULT.txt")"
+  assert_contains "$result" "check st: INFO kept"$'\n'
+  assert_contains "$result" "check bel: INFO also kept"$'\n'
+  assert_contains "$result" "check only: INFO (no output)"
+  assert_contains "$result" "check cut: INFO cut ok"$'\n'
+  assert_not_contains "$result" "11;?"
+}
+
 run_tests

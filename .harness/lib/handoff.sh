@@ -55,11 +55,13 @@ _HO_RUNTIME_SHA=""
 _ho_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 _ho_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-# Strip terminal escapes, carriage-return overdraws and control characters from a log file,
-# then print its last non-blank line.
+# Strip terminal escapes (CSI; OSC ended by BEL, ESC \ or end of line; charset), carriage-return
+# overdraws and control characters from a log file, then print its last non-blank line.
 _ho_last_line() {
   [[ -f "$1" ]] || return 0
-  LC_ALL=C sed -e $'s|\x1b\\[[0-9;?]*[ -/]*[@-~]||g' -e $'s|\x1b[()][A-Za-z0-9]||g' \
+  LC_ALL=C sed -e $'s|\x1b\\][^\x07\x1b]*\x07||g' -e $'s|\x1b\\][^\x07\x1b]*\x1b\\\\||g' \
+    -e $'s|\x1b\\][^\x07\x1b]*$||' \
+    -e $'s|\x1b\\[[0-9;?]*[ -/]*[@-~]||g' -e $'s|\x1b[()][A-Za-z0-9]||g' \
     -e $'s/\r$//' -e $'s/.*\r//' "$1" \
     | LC_ALL=C tr -d '\000-\010\013\014\016-\037' \
     | grep -v '^[[:space:]]*$' | tail -n 1
