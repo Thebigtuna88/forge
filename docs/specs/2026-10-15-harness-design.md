@@ -304,6 +304,8 @@ Details:
 - Redaction happens after a step ends, so it protects the evidence and the saved log, not the
   live screen; see limit L11 and FRG-14. If a log can't be replaced by its redacted copy, the
   run ends FAILED (the log may hold a secret).
+- Ctrl-C, TERM or a hang-up ends the run through the same exit path: the block reports FAILED
+  and any secret temp file is removed.
 - Steps run from `/`, never from wherever Terminal was opened, so a step names its repository
   (`--repo`, `git -C`) and uses absolute paths.
 - `handoff` itself needs `jq`, `git`, `shasum` and `python3`; macOS 15+ ships `/usr/bin/jq`,

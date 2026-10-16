@@ -67,6 +67,15 @@ cmd_new() {
   [[ ! -e "$dir" ]] || die "$dir already exists"
   mkdir -p "$(dirname "$dir")"
   mkdir -m 700 "$dir"
+  if ! write_skeleton "$dir" "$id" "$title" || ! write_meta "$dir" "$id" "$title"; then
+    rm -rf "$dir"
+    die "could not create the handoff files; nothing was created"
+  fi
+  printf 'created %s/OWNER-RUN.sh\n' "$dir"
+}
+
+write_skeleton() { # <dir> <id> <title>
+  local dir="$1" id="$2" title="$3"
   cat >"$dir/OWNER-RUN.sh" <<EOF
 #!/usr/bin/env bash
 # HANDOFF: $id — $title
@@ -84,12 +93,11 @@ ho_begin "$id"
 
 ho_end
 EOF
-  if ! jq -n --arg id "$id" --arg title "$title" --arg created "$(utc)" --arg runtime "$RUNTIME" \
-    '{id: $id, title: $title, created: $created, state: "draft", runtime: $runtime}' >"$dir/META.json"; then
-    rm -rf "$dir"
-    die "could not write META.json; nothing was created"
-  fi
-  printf 'created %s/OWNER-RUN.sh\n' "$dir"
+}
+
+write_meta() { # <dir> <id> <title>
+  jq -n --arg id "$2" --arg title "$3" --arg created "$(utc)" --arg runtime "$RUNTIME" \
+    '{id: $id, title: $title, created: $created, state: "draft", runtime: $runtime}' >"$1/META.json"
 }
 
 # ---------------------------------------------------------------------------------------------

@@ -58,6 +58,18 @@ test_new_needs_jq_and_leaves_nothing_behind() {
   [[ ! -e "$H/work/owner/$(date -u +%Y-%m-%d)-demo" ]] || _t_fail "a half-made handoff was left behind"
 }
 
+test_new_cleans_up_when_the_script_cannot_be_written() {
+  mk_harness
+  mkdir "$T_TMP/bin"
+  printf '#!/bin/bash\nexit 1\n' >"$T_TMP/bin/cat"
+  chmod +x "$T_TMP/bin/cat"
+  local out
+  out="$(env PATH="$T_TMP/bin:$PATH" "$HANDOFF" new demo "Demo" 2>&1)" && _t_fail "new succeeded"
+  assert_contains "$out" "nothing was created"
+  [[ ! -e "$H/work/owner/$(date -u +%Y-%m-%d)-demo" ]] || _t_fail "a half-made handoff was left behind"
+  "$HANDOFF" new demo "Demo" >/dev/null || _t_fail "retrying the same slug failed"
+}
+
 test_new_rejects_bad_slug_and_existing_id() {
   mk_harness
   "$HANDOFF" new "Bad Slug" "x" >/dev/null 2>&1 && _t_fail "accepted a bad slug"

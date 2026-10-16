@@ -315,6 +315,26 @@ test_at_is_the_start_time() {
   [[ $((at - before)) -le 1 ]] || _t_fail "at is $((at - before))s after the start (end time, not start)"
 }
 
+# Interrupted while the secret's temp file exists: the EXIT trap removes it.
+test_interrupted_secret_write_leaves_no_temp_file() {
+  mk_harness
+  mkdir "$T_TMP/slow"
+  # A chmod that, for the temp file only, sends TERM to the owner's script and waits.
+  # shellcheck disable=SC2016 # the stub's own $2, $PPID and $@
+  printf '#!/bin/bash\ncase "$2" in *ho-tmp*) kill -TERM "$PPID"; sleep 2; exit 1 ;; esac\nexec /bin/chmod "$@"\n' \
+    >"$T_TMP/slow/chmod"
+  chmod +x "$T_TMP/slow/chmod"
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env"
+  OUT="$(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_SANDBOX_NETWORK_DISABLED \
+    PATH="$T_TMP/slow:$STUBS:$PATH" STUB_CLIPBOARD="$T_TMP/clipboard" \
+    python3 -I "$TESTLIB/ptyrun.py" --answer 'Interrupted-9' -- bash "$SCRIPT")"
+  RC=$?
+  assert_exit 1 "$RC" "$OUT"
+  local f
+  for f in "$H"/.env.ho-tmp.*; do [[ ! -e "$f" ]] || _t_fail "temp file with the secret left behind: $f"; done
+  assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check _runtime: FAIL script exited with status 130"
+}
+
 test_secret_refuses_empty_input() {
   mk_harness
   mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env"

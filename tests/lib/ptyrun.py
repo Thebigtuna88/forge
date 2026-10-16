@@ -14,7 +14,7 @@ import signal
 import sys
 
 PROMPT = re.compile(rb"\[y/N\] |\(input hidden\): ")
-IDLE_TIMEOUT = 15
+IDLE_TIMEOUT = int(os.environ.get("PTYRUN_TIMEOUT", "15"))
 
 
 def main() -> int:
@@ -38,7 +38,11 @@ def main() -> int:
     while True:
         ready, _, _ = select.select([fd], [], [], IDLE_TIMEOUT)
         if not ready:
-            os.kill(pid, signal.SIGKILL)
+            # pty.fork() made the child a session and group leader: end the group, then hang up.
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             out += b"\n[ptyrun: killed after %d s without output]\n" % IDLE_TIMEOUT
             break
         try:
@@ -53,6 +57,7 @@ def main() -> int:
             os.write(fd, answers[sent].encode() + b"\n")
             sent += 1
 
+    os.close(fd)
     _, status = os.waitpid(pid, 0)
     sys.stdout.write(out.decode("utf-8", "replace"))
     return os.waitstatus_to_exitcode(status)

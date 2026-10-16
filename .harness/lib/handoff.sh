@@ -64,6 +64,7 @@ _HO_LINES=()
 _HO_SCRIPT_SHA=""
 _HO_RUNTIME_SHA=""
 _HO_AT=""
+_HO_TMP="" # a secret temp file being written; removed on any exit
 _HO_SECRETS=() # values collected by ho_secret_to_file in this run, kept only to redact them
 
 _ho_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
@@ -175,6 +176,7 @@ _ho_new_name() {
 
 _ho_on_exit() {
   local rc=$?
+  if [[ -n "$_HO_TMP" ]]; then rm -f "$_HO_TMP"; fi
   if [[ "$_HO_BEGUN" == 1 && "$_HO_ENDED" != 1 ]]; then
     _HO_FAILED=1
     _HO_LINES+=("check _runtime: FAIL script exited with status $rc before ho_end")
@@ -202,6 +204,7 @@ ho_begin() { # <id>
   chmod 700 "$HO_DIR/logs"
   _HO_BEGUN=1
   trap _ho_on_exit EXIT
+  trap 'exit 130' INT TERM HUP # leave through the EXIT trap, so cleanup and the block still run
   local title
   title="$(sed -n 's/^# HANDOFF: //p' "$HO_SCRIPT" | head -n 1)"
   printf '══ FORGE owner handoff ══\n%s\n' "${title:-$id}"
@@ -321,6 +324,7 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
   # Write a private temp file next to the target (it must be gitignored too), then move it.
   local ok=1 rc=0
   tmp="$(umask 077 && mktemp "$file.ho-tmp.XXXXXX" 2>/dev/null)" || ok=0
+  _HO_TMP="${tmp:-}"
   if [[ $ok == 1 ]] && ! git -C "$dir" check-ignore -q "$tmp"; then ok=0; fi
   if [[ $ok == 1 && -f "$file" ]]; then
     grep -v "^${var}=" "$file" >"$tmp" || rc=$?
@@ -332,7 +336,13 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
   if [[ $ok == 1 ]]; then chmod 600 "$tmp" || ok=0; fi
   if [[ $ok == 1 ]]; then mv -f "$tmp" "$file" || ok=0; fi
   if [[ $ok == 1 ]]; then [[ -f "$file" && ! -e "$tmp" ]] || ok=0; fi
-  [[ -n "${tmp:-}" && -e "$tmp" ]] && rm -f "$tmp"
+  if [[ -n "${tmp:-}" && -e "$tmp" ]] && ! rm -f "$tmp"; then
+    _HO_FAILED=1
+    _ho_record FAIL "$name" "could not remove the temp file $tmp; it may hold the secret"
+    printf '  ✘ FAIL (could not remove %s)\n' "$tmp"
+    return 1
+  fi
+  _HO_TMP=""
   if [[ $ok != 1 ]]; then
     _HO_FAILED=1
     _ho_record FAIL "$name" "could not write $file; nothing stored"
