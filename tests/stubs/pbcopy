@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Test stub for pbcopy: saves the "clipboard" to $STUB_CLIPBOARD instead of the real clipboard.
+cat >"${STUB_CLIPBOARD:-/dev/null}"

@@ -264,8 +264,14 @@ ho_end
 
 **Refuses to run** (exit 3, prints why) when any of these holds:
 - stdin or stdout is not a TTY;
-- `CLAUDECODE` (or any other known agent marker: `CLAUDE_CODE_ENTRYPOINT`, `CODEX_SANDBOX`) is set;
-- it is executed directly instead of sourced.
+- `CLAUDECODE` (or any other known agent marker: `CLAUDE_CODE_ENTRYPOINT`, `CODEX_SANDBOX`,
+  `CODEX_SANDBOX_NETWORK_DISABLED`) is set, even to the empty string;
+- it is executed directly instead of sourced;
+- `OWNER-RUN.sh` is still writable, or `META.json` doesn't say `ready` with this script's
+  sha256 (it was never frozen by `handoff ready`, or it is already verified);
+- its own sha256 or the runtime's can't be computed;
+- shell tracing is on (`bash -x`), which would print secrets;
+- a symlink sits at `logs/` or `RESULT.txt` (the last three added in the FRG-1 review).
 
 The refusal means running the script through Claude Code's `!` prefix fails too. That's
 intended: the owner uses a separate Terminal window.
@@ -275,11 +281,11 @@ can stop before an irreversible step.
 
 | Helper | Records | PASS when |
 |---|---|---|
-| `ho_begin <id>` | id, start time, `script-sha256` (of the calling script), `runtime-sha256` | must be called first; the id must match the folder name |
+| `ho_begin <id>` | id, start time (the block's `at:`), `script-sha256` (of the calling script), `runtime-sha256` | must be called first; the id must match the folder name |
 | `ho_check <name> <cmd…>` | `PASS` or `FAIL` + last non-empty output line | command exits 0 |
 | `ho_info <name> <cmd…>` | `INFO` + last output line | never fails |
 | `ho_confirm <name> "<question>"` | `PASS` (answered `y`) or `FAIL` | owner types `y` at `/dev/tty` |
-| `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty, the target file is gitignored (`git check-ignore`), and the write succeeds |
+| `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty and uses only `A-Z a-z 0-9 . _ + / = : @ % , -`; the target is a regular file (or absent) and gitignored (`git check-ignore`), as is its temp file; and every write step succeeds |
 | `ho_abort` | `result: FAILED` | ends the run early with the block |
 | `ho_end` | the block | — |
 
@@ -288,8 +294,25 @@ Details:
 - Command output still streams to the owner's screen and is saved to `logs/<name>.log`. Only
   the last line (trimmed to 200 characters, newlines and `-----` stripped) goes into the block.
 - `ho_secret_to_file` reads with echo off, writes or replaces the single `VAR=value` line in
-  the file, `chmod 600`, and unsets the variable. The secret never goes to the screen, the logs,
-  the clipboard or the block.
+  the file via a private temp file, `chmod 600`, and unsets the variable. The value is written
+  unquoted, which is why its characters are restricted: it means the same to a shell and a
+  dotenv parser, and can never run as code. The secret never goes to the screen, the logs, the
+  clipboard or the block; if a later step prints it anyway, the runtime replaces it with
+  `[REDACTED]` in the evidence and in that step's log. Evidence is redacted both before and
+  after it is normalised, so stripping `-----` or control characters can't rejoin a secret.
+- Commands run as `script -q <log> /bin/bash -c '"$@"' …`, so they keep the terminal and shell
+  builtins work. The handoff folder and its logs are mode 700, `RESULT.txt` mode 600. Each
+  step's log is removed before the step runs, and `RESULT.txt` is written fresh; if it can't be
+  saved, `ho_end` prints no block and exits 1.
+- Redaction happens after a step ends, so it protects the evidence and the saved log, not the
+  live screen; see limit L11 and FRG-14. If a log can't be replaced by its redacted copy, the
+  run ends FAILED (the log may hold a secret).
+- Ctrl-C, TERM or a hang-up ends the run through the same exit path: the block reports FAILED
+  and any secret temp file is removed.
+- Steps run from `/`, never from wherever Terminal was opened, so a step names its repository
+  (`--repo`, `git -C`) and uses absolute paths.
+- `handoff` itself needs `jq`, `git`, `shasum` and `python3`; macOS 15+ ships `/usr/bin/jq`,
+  and the Command Line Tools provide git and python3. `handoff new` checks them first.
 
 **`ho_end` output**, saved as `RESULT.txt` and copied to the clipboard with `pbcopy`:
 
@@ -309,7 +332,16 @@ result: OK
 
 ### 4.4 `handoff lint`
 
-Rejects a script (and `handoff ready` refuses to freeze it) if it:
+The script must follow an **allowlist grammar** (`.harness/lib/handoff_grammar.py`, added in
+the FRG-1 review because blocklists could be dodged with quoting): apart from blank lines and
+comments it is exactly the shebang, `set -uo pipefail`, the `source` line, `ho_begin "<id>"`,
+step lines, and `ho_end`. Each step line is one helper call made of plain words and quoted
+strings, optionally ending in `|| ho_abort`: no `$` or backticks (except inside single quotes,
+where they stay literal), no other operators, redirection, globs, assignments or function
+definitions. Forbidden names are checked after quote removal, and no `ho_check`/`ho_info` step
+may name a file that a `ho_secret_to_file` step wrote.
+
+In addition, lint rejects a script (and `handoff ready` refuses to freeze it) if it:
 - doesn't source the runtime by its exact absolute path, or doesn't call `ho_begin` first and
   `ho_end` last;
 - contains the literal strings `HANDOFF-RESULT`, `result: OK`, `script-sha256`, or any
@@ -317,7 +349,11 @@ Rejects a script (and `handoff ready` refuses to freeze it) if it:
 - redefines any `ho_*` function, or uses `eval`, `source`/`.` of any other file, `exec`
   redirection, `unset CLAUDECODE` or other agent-marker manipulation;
 - writes to `RESULT.txt`, `VERIFIED.txt` or `PASTED-*`;
-- fails `shellcheck`.
+- fails `shellcheck`, or shellcheck or python3 is not installed (fail closed). The one
+  exception is the bootstrap handoff that itself runs `brew install … shellcheck` (4.9).
+
+`handoff ready` also refuses an id that is not `<date>-<slug>` (no path traversal) and a
+`META.json` naming a runtime other than this checkout's `.harness/lib/handoff.sh`.
 
 ### 4.5 `handoff verify <pasted-file>`
 
@@ -325,16 +361,24 @@ Passes only if **all** of these hold:
 1. The paste contains exactly one well-formed block.
 2. `work/owner/<id>/` exists and its `META.json` marks it ready.
 3. `script-sha256` equals the sha256 of `OWNER-RUN.sh` on disk **and** the sha frozen at
-   `handoff ready`.
-4. `runtime-sha256` equals the sha256 of the current `.harness/lib/handoff.sh`.
+   `handoff ready`, and the run's `at:` is not older than `readied` (no replaying a run made
+   before the script was frozen).
+4. `runtime-sha256` equals the sha256 of the current `.harness/lib/handoff.sh`, and the
+   runtime named in `META.json` is that file.
 5. Every step declared in the script appears exactly once, and no undeclared step appears.
 6. Every step is `PASS` or `INFO`, and `result: OK`.
 7. The paste matches `RESULT.txt` (written by the runtime on the owner's run), ignoring
    leading and trailing whitespace.
-8. The pasted file lives at `work/owner/<id>/PASTED-*.txt`. Verify refuses to take
-   `RESULT.txt` itself as input.
+8. The pasted file lives at `work/owner/<id>/PASTED-*.txt` and is its own regular file (not a
+   symlink or hard link). Verify refuses to take `RESULT.txt` itself as input.
 
-On success, it writes `VERIFIED.txt` (the block + verify time). On failure, it prints which
+**From FRG-5 on** (owner decision 2026-10-16-handoff-evidence-provenance), the paste file is
+written by the `capture-owner-paste` UserPromptSubmit hook, not by the agent, and verify also
+requires the paste's sha256 to be recorded in `.harness/state/pastes.log` by that hook.
+
+On success, it writes `VERIFIED.txt` (the block + verify time) in one step (temp file, then
+rename). `VERIFIED.txt` alone is the record that a handoff is verified; `META.json`'s state
+mirrors it, and failing to update that is only a warning. On failure, it prints which
 check failed. The agent reports that failure to the owner. It never edits the paste.
 
 If `handoff.sh` changes between the run and verification (a runtime update merged), check 4
@@ -932,12 +976,17 @@ or 1.
 - **`gh` and `codex` are replaced by stubs** (`tests/stubs/`) put first on `PATH` *inside the
   test only*. The stubs record how they were called and return canned replies, for example a
   codex reply with a wrong md5.
-- **Handoff tests need a terminal**, so they run the script under `script -q /dev/null` with
-  `CLAUDECODE` removed. That the test suite can do this is exactly why section 4.8 calls the
-  TTY check a speed bump.
+- **Handoff tests need a terminal**, so they run the script in a pseudo-terminal
+  (`tests/lib/ptyrun.py`, which also types the answers) with all four agent markers removed.
+  That the test suite can do this is exactly why section 4.8 calls the TTY check a speed bump.
 - **Platform:** scripts target macOS (the owner's machine) and use small helpers
   (`hr_md5`, `hr_sha256`) instead of tool-specific flags. Harness CI runs on GitHub's
   **macOS** runners, which are free for public repos.
+
+The pty driver kills, when a run ends, every descendant it saw in its process snapshots, after a
+best-effort check that each is still the same process. A process that double-forks and detaches
+between two snapshots can escape, and the identity check has one-second precision; macOS has no
+unprivileged containment or race-free signalling for either (FRG-15). The tests start no daemons.
 
 ### 10.3 Required test coverage (minimum)
 
@@ -979,7 +1028,8 @@ its mitigation and, where one exists, a stronger option the owner can adopt late
 | L1 | **Indirect commands.** A guarded action inside a script file (`bash x.sh` containing `git push origin main`), or a Node/Python program calling a paid API, isn't seen by the command-matching hooks. | Hooks see the command line, not what a program does. | GitHub branch protection (public repos); no paid key exists while Tier C is in force; `spend` and `security` lenses; charter rule 9. | Run the agent under a separate OS user with no access to keys. |
 | L2 | **Same GitHub identity.** The agent uses the owner's `gh` login, so GitHub can't tell agent from owner; only the local hook stops a `dev`→`main` merge. | Personal accounts can't use bypass lists or required reviewers against yourself. | `gate-merge-on-review` (base must be `dev`, API merges denied), `deny-repo-admin`. | A separate free **machine account** for the agent with write access, with `main` requiring the owner's approving review. |
 | L3 | **Handoff runtime checks are a speed bump.** The TTY and `CLAUDECODE` checks can be faked (the test suite does it). | Any program with a shell can fake a terminal. | Evidence = the owner's paste matching `RESULT.txt`, frozen script sha, unchanged runtime; `handoff lint`. | — (the owner's paste is the real control) |
-| L4 | **The paste file is written by the agent.** The agent saves the owner's pasted text to disk; a dishonest agent could write something else. | Claude Code has no "owner-signed" input. | The paste is visible in the chat transcript; verify cross-checks `RESULT.txt`; charter. | Owner saves the paste themselves (`pbpaste > …` in a handoff). |
+| L4 | **The paste file is written by the agent** (until FRG-5). The agent saves the owner's pasted text to disk; a dishonest agent could write something else, with a matching `RESULT.txt` (FRG-1 review S1). | Claude Code has no "owner-signed" input. | The paste is visible in the chat transcript; verify cross-checks `RESULT.txt`; charter. **Decided 2026-10-16:** FRG-5 adds a UserPromptSubmit hook that captures the paste and a guard on evidence files. | Agent runs as a separate macOS user. |
+| L11 | **Handoff steps run arbitrary programs.** The grammar limits shell syntax, but an allowed step (`python3 -c …`) can do anything the owner can: forge evidence, or print a collected secret to the screen before redaction (FRG-1 review S15, C3, S18). | The agent writes the scripts the owner runs. | Allowlist grammar; secret-file rule; redaction of evidence and logs; owner sees each step's command on screen. | FRG-14: reject inline interpreters, live redaction. |
 | L5 | **Read-proof proves access, not diligence.** A reviewer can hash the diff and still review it badly. | — | Adversarial prompt, structured findings, multiple lenses, stall rule, owner merges `main`. | Owner skims `review.md` for risky PRs. |
 | L6 | **Heuristic hooks.** The Stop hook and the Bash part of `guard-live-checkout` guess from text. | Natural language and shell are open-ended. | They start in observe; the owner promotes them by PR after reviewing `observed.log`. | — |
 | L7 | **Local-only evidence.** `work/` and the spend ledger live on one Mac. | Gitignored by design (may hold logs/screens). | PR comment summary of every review; prepaid wallets as the real spend cap; deleting the ledger doesn't remove a provider's own limits. | Back up `work/` with Time Machine. |
