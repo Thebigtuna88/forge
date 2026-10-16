@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs every FORGE test (spec 10.1). The last line is exactly "ALL PASS" or "FAILED (<n>)".
-#   bash tests/run.sh               shellcheck + unit tests + conformance (once it exists)
+#   bash tests/run.sh               shellcheck + unit tests + conformance
 #   bash tests/run.sh --templates   also scaffold and check the project templates (Phase 5)
 set -uo pipefail
 
@@ -49,7 +49,7 @@ for t in tests/unit/*.test.sh; do
   failures=$((failures + n))
 done
 
-# --- 3. conformance (Phase 2) ------------------------------------------------------------------
+# --- 3. conformance (spec 5.5) -----------------------------------------------------------------
 stage conformance
 if [[ -x .harness/bin/conformance ]]; then
   if .harness/bin/conformance; then echo "ok conformance"; else
@@ -57,7 +57,8 @@ if [[ -x .harness/bin/conformance ]]; then
     failures=$((failures + 1))
   fi
 else
-  echo "skip conformance (arrives in Phase 2, FRG-2)"
+  echo "not ok conformance — .harness/bin/conformance is missing or not executable"
+  failures=$((failures + 1))
 fi
 
 # --- 4. templates (Phase 5) --------------------------------------------------------------------

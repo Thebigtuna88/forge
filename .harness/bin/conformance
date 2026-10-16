@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# conformance — proves the gates work as configured right now (spec 5.5).
+#   .harness/bin/conformance
+#
+# 1. Every .claude/hooks/<name>.sh is executable, registered in .claude/settings.json and clean
+#    under shellcheck; every registered hook exists; every tests/conformance/<name>/ has a hook.
+# 2. Each case tests/conformance/<hook>/{deny,allow}/<case>.json is fed on stdin to the hook in a
+#    fresh sandbox: a byte-identical copy of the hooks, runtime and config (live mode.json
+#    included) at <tmp>/code/forge, a git repo on dev with a bare "origin", next to an empty
+#    <tmp>/code/forge-worktrees. In a case, @ROOT@, @WORKTREES@ and @TMP@ become those paths, an
+#    optional "forge_mode_key" names the mode.json key it runs under (default: the hook's name),
+#    and an optional <case>.setup.sh runs first (bash, in <tmp>, with ROOT, WORKTREES and TMP set).
+#    enforce: deny → exit 2, allow → exit 0. observe: deny → exit 0 plus a WOULD-DENY line.
+#    No allow case may log WOULD-DENY. The sandbox copies must still match the live files after.
+# 3. With a missing, a malformed and an unknown-value mode.json, every deny case exits 2.
+# 4. disableAllHooks is not set in ~/.claude/settings{,.local}.json or .claude/settings{,.local}.json.
+# 5. Prints `hook | mode | deny cases | allow cases | result`, then "conformance: PASS" or
+#    "conformance: FAIL (<n>)", and exits 0 or 1.
+# Must run on macOS /bin/bash 3.2.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)" || exit 1
+HOOKS_DIR="$ROOT/.claude/hooks"
+SETTINGS="$ROOT/.claude/settings.json"
+CASES_DIR="$ROOT/tests/conformance"
+failures=0
+
+fail() {
+  printf 'FAIL %s\n' "$1"
+  failures=$((failures + 1))
+}
+
+finish() {
+  echo
+  if [[ $failures -eq 0 ]]; then
+    echo "conformance: PASS"
+    exit 0
+  fi
+  echo "conformance: FAIL ($failures)"
+  exit 1
+}
+
+in_list() { # <word> <list…>
+  local w="$1" x
+  shift
+  for x in "$@"; do [[ "$x" == "$w" ]] && return 0; done
+  return 1
+}
+
+# Must give the same answer as _hr_mode in .harness/lib/hookrt.sh.
+mode_of() { # <key>
+  local m
+  m="$(jq -r --arg k "$1" '.modes[$k]' "$ROOT/.harness/mode.json" 2>/dev/null)" || m=enforce
+  if [[ "$m" == observe ]]; then echo observe; else echo enforce; fi
+}
+
+command -v jq >/dev/null 2>&1 || {
+  fail "jq is not installed"
+  finish
+}
+
+TMP="$(mktemp -d)" && TMP="$(cd "$TMP" && pwd -P)" && [[ -d "$TMP" && "$TMP" != / ]] || {
+  fail "can't create a temporary folder"
+  finish
+}
+trap 'rm -rf "$TMP"' EXIT
+
+# --- 1. hooks, registration, shellcheck ---------------------------------------------------------
+
+hooks=()
+if [[ -d "$HOOKS_DIR" ]]; then
+  for f in "$HOOKS_DIR"/* "$HOOKS_DIR"/.[!.]*; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    name="${f##*/}"
+    if [[ -f "$f" && ! -L "$f" && "$name" == *.sh ]]; then
+      hooks+=("${name%.sh}")
+    else
+      fail ".claude/hooks/$name is not a hook script (only regular <name>.sh files belong there)"
+    fi
+  done
+fi
+
+registered=()
+# shellcheck disable=SC2016 # the literal text "$CLAUDE_PROJECT_DIR" that settings.json must contain
+reg_re='^"\$CLAUDE_PROJECT_DIR"/\.claude/hooks/([A-Za-z0-9._-]+)\.sh$'
+if reg="$(jq -r '
+    (.hooks // {}) | if type == "object" then . else error("hooks is not an object") end
+    | to_entries[] | .value | if type == "array" then .[] else error("event is not a list") end
+    | .hooks | if type == "array" then .[] else error("matcher has no hooks list") end
+    | if .type == "command" and (.command | type) == "string" then .command
+      else error("hook entry is not a command") end' "$SETTINGS" 2>&1)"; then
+  while IFS= read -r cmd; do
+    [[ -n "$cmd" ]] || continue
+    if [[ "$cmd" =~ $reg_re ]]; then
+      registered+=("${BASH_REMATCH[1]}")
+    else
+      fail "unrecognised hook command in .claude/settings.json: $cmd"
+    fi
+  done <<<"$reg"
+else
+  fail ".claude/settings.json is missing or malformed: ${reg//$'\n'/ }"
+fi
+
+for h in ${hooks[@]+"${hooks[@]}"}; do
+  [[ -x "$HOOKS_DIR/$h.sh" ]] || fail "$h.sh is not executable"
+  in_list "$h" ${registered[@]+"${registered[@]}"} || fail "$h.sh is not registered in .claude/settings.json"
+done
+for h in ${registered[@]+"${registered[@]}"}; do
+  in_list "$h" ${hooks[@]+"${hooks[@]}"} || fail "$h.sh is registered but missing from .claude/hooks"
+done
+
+if [[ ${#hooks[@]} -gt 0 ]]; then
+  if command -v shellcheck >/dev/null 2>&1; then
+    for h in "${hooks[@]}"; do
+      if ! out="$(cd "$ROOT" && shellcheck -s bash -x ".claude/hooks/$h.sh" 2>&1)"; then
+        fail "$h.sh fails shellcheck:"
+        printf '%s\n' "$out" | sed 's/^/    /'
+      fi
+    done
+  else
+    fail "shellcheck is not installed"
+  fi
+fi
+
+if [[ -d "$CASES_DIR" ]]; then
+  for d in "$CASES_DIR"/*; do
+    [[ -e "$d" ]] || continue
+    in_list "${d##*/}" ${hooks[@]+"${hooks[@]}"} || fail "tests/conformance/${d##*/} has no hook"
+  done
+fi
+
+# --- sandboxes -----------------------------------------------------------------------------------
+
+COPIED=() # paths relative to ROOT, copied byte for byte into every sandbox
+for f in "$SETTINGS" "$HOOKS_DIR"/*.sh "$ROOT"/.harness/lib/* "$ROOT"/.harness/*.json; do
+  [[ -f "$f" && ! -L "$f" ]] && COPIED+=("${f#"$ROOT"/}")
+done
+
+n_sbx=0
+# mk_sandbox: sets BASE (the sandbox's "home") and SBX (its main checkout).
+mk_sandbox() {
+  local rel
+  n_sbx=$((n_sbx + 1))
+  BASE="$TMP/s$n_sbx"
+  SBX="$BASE/code/forge"
+  mkdir -p "$SBX" "$BASE/code/forge-worktrees" || return 1
+  for rel in ${COPIED[@]+"${COPIED[@]}"}; do
+    mkdir -p "$SBX/$(dirname "$rel")" && cp -p "$ROOT/$rel" "$SBX/$rel" || return 1
+  done
+  git init -q -b dev "$SBX" && git init -q --bare "$BASE/remote.git" &&
+    git -C "$SBX" remote add origin "$BASE/remote.git"
+}
+
+# differs [skip]: print the first copied path whose sandbox copy no longer matches the live file.
+differs() {
+  local rel
+  for rel in ${COPIED[@]+"${COPIED[@]}"}; do
+    [[ "$rel" == "${1:-}" ]] && continue
+    cmp -s "$ROOT/$rel" "$SBX/$rel" || {
+      echo "$rel"
+      return 0
+    }
+  done
+  return 1
+}
+
+# run_case <hook> <case.json> <variant: live | missing | malformed | unknown>
+# Sets CASE_RC, CASE_LOGGED (WOULD-DENY lines written), CASE_DIFF and CASE_ERR.
+run_case() {
+  local hook="$1" json="$2" variant="$3" key setup skip=""
+  CASE_RC="" CASE_LOGGED=0 CASE_DIFF="" CASE_ERR=""
+  key="$(jq -r --arg h "$hook" '.forge_mode_key // $h | strings' "$json" 2>/dev/null)" || key=""
+  [[ -n "$key" ]] || {
+    CASE_ERR="not a readable JSON case"
+    return 0
+  }
+  mk_sandbox || {
+    CASE_ERR="can't build the sandbox"
+    return 0
+  }
+  CASE_DIFF="$(differs)" && return 0
+  case "$variant" in
+    missing) rm -f "$SBX/.harness/mode.json" ;;
+    malformed) printf '{"modes": {' >"$SBX/.harness/mode.json" ;;
+    unknown) jq -n --arg k "$key" '{modes: {($k): "bogus"}}' >"$SBX/.harness/mode.json" ;;
+  esac
+  [[ "$variant" == live ]] || skip=.harness/mode.json
+  setup="${json%.json}.setup.sh"
+  if [[ -f "$setup" ]]; then
+    (cd "$BASE" && env ROOT="$SBX" WORKTREES="$BASE/code/forge-worktrees" TMP="$BASE" bash "$setup") \
+      >"$BASE/setup.out" 2>&1 || {
+      CASE_ERR="setup failed: $(tr '\n' ' ' <"$BASE/setup.out")"
+      return 0
+    }
+  fi
+  sed -e "s|@ROOT@|$SBX|g" -e "s|@WORKTREES@|$BASE/code/forge-worktrees|g" -e "s|@TMP@|$BASE|g" \
+    "$json" >"$BASE/input.json"
+  (cd "$SBX" && env CLAUDE_PROJECT_DIR="$SBX" "$SBX/.claude/hooks/$hook.sh" \
+    <"$BASE/input.json" >"$BASE/stdout" 2>"$BASE/stderr")
+  CASE_RC=$?
+  if [[ -f "$SBX/.harness/observed.log" ]]; then
+    CASE_LOGGED="$(grep -c ' WOULD-DENY ' "$SBX/.harness/observed.log")"
+  fi
+  CASE_DIFF="$(differs "$skip")" || CASE_DIFF=""
+}
+
+# --- 2 and 3. cases ---------------------------------------------------------------------------
+
+rows=()
+for h in ${hooks[@]+"${hooks[@]}"}; do
+  denies=() allows=()
+  for f in "$CASES_DIR/$h"/deny/*.json; do [[ -f "$f" ]] && denies+=("$f"); done
+  for f in "$CASES_DIR/$h"/allow/*.json; do [[ -f "$f" ]] && allows+=("$f"); done
+  before=$failures
+  [[ ${#denies[@]} -gt 0 ]] || fail "$h: no deny cases in tests/conformance/$h/deny/"
+  [[ ${#allows[@]} -gt 0 ]] || fail "$h: no allow cases in tests/conformance/$h/allow/"
+
+  for f in ${denies[@]+"${denies[@]}"} ${allows[@]+"${allows[@]}"}; do
+    kind="${f%/*}"
+    kind="${kind##*/}"
+    label="$h $kind/${f##*/}"
+    run_case "$h" "$f" live
+    if [[ -n "$CASE_ERR" ]]; then
+      fail "$label: $CASE_ERR"
+      continue
+    fi
+    [[ -z "$CASE_DIFF" ]] || fail "$label: the sandbox copy of $CASE_DIFF differs from the live file"
+    mode="$(mode_of "$(jq -r --arg h "$h" '.forge_mode_key // $h' "$f")")"
+    if [[ "$kind" == allow ]]; then
+      [[ "$CASE_RC" == 0 ]] || fail "$label: expected exit 0 (allow), got $CASE_RC: $(head -c 300 "$BASE/stderr")"
+      [[ "$CASE_LOGGED" == 0 ]] || fail "$label: an allow case wrote a WOULD-DENY line"
+    elif [[ "$mode" == enforce ]]; then
+      [[ "$CASE_RC" == 2 ]] || fail "$label: expected exit 2 (enforce), got $CASE_RC"
+    elif [[ "$CASE_RC" != 0 || "$CASE_LOGGED" -lt 1 ]]; then
+      fail "$label: observe expects exit 0 and a WOULD-DENY line; got exit $CASE_RC, $([[ "$CASE_LOGGED" -ge 1 ]] && echo "logged" || echo "no WOULD-DENY line")"
+    fi
+  done
+
+  for variant in missing malformed unknown; do
+    for f in ${denies[@]+"${denies[@]}"}; do
+      run_case "$h" "$f" "$variant"
+      label="$h deny/${f##*/}"
+      if [[ -n "$CASE_ERR" ]]; then
+        fail "$label ($variant mode.json): $CASE_ERR"
+      elif [[ "$CASE_RC" != 2 ]]; then
+        fail "$label: with a $variant mode.json expected exit 2 (enforce), got $CASE_RC"
+      fi
+    done
+  done
+
+  result=PASS
+  [[ $failures -eq $before ]] || result=FAIL
+  rows+=("$(printf '%-28s | %-7s | %-10s | %-11s | %s' "$h" "$(mode_of "$h")" "${#denies[@]}" "${#allows[@]}" "$result")")
+done
+
+# --- 4. hooks not switched off ------------------------------------------------------------------
+
+for f in "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json" "$SETTINGS" \
+  "$ROOT/.claude/settings.local.json"; do
+  [[ -e "$f" ]] || continue
+  if ! v="$(jq -r 'if type == "object" then (.disableAllHooks // false | tostring)
+      else error("not an object") end' "$f" 2>/dev/null)"; then
+    fail "cannot read $f to check disableAllHooks"
+  elif [[ "$v" != false ]]; then
+    fail "disableAllHooks is set in $f"
+  fi
+done
+
+# --- 5. report ----------------------------------------------------------------------------------
+
+echo
+printf '%-28s | %-7s | %-10s | %-11s | %s\n' hook mode "deny cases" "allow cases" result
+for r in ${rows[@]+"${rows[@]}"}; do printf '%s\n' "$r"; done
+[[ ${#hooks[@]} -gt 0 ]] || echo "(0 hooks registered yet)"
+finish
