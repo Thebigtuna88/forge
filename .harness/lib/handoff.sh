@@ -37,6 +37,10 @@ HO_DIR="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
 HO_SCRIPT="$HO_DIR/$(basename "${BASH_SOURCE[1]}")"
 readonly HO_RUNTIME HO_DIR HO_SCRIPT
 
+# Steps run from / so that no command picks up a repository from wherever Terminal was opened:
+# a step names its repository (--repo, git -C) and uses absolute paths.
+cd / || _ho_refuse "cannot change to /"
+
 if [[ "$(basename "$HO_SCRIPT")" != "OWNER-RUN.sh" ]]; then
   _ho_refuse "handoff.sh may only be sourced by a file named OWNER-RUN.sh."
 fi
@@ -116,12 +120,18 @@ _ho_redact() {
   printf '%s' "$s"
 }
 
-# Rewrite a step's log with the collected secrets redacted.
+# Replace a step's log with a redacted copy. Returns 1 if that fails (the log may still hold a
+# secret), and the caller ends the run.
 _ho_redact_log() {
-  [[ ${#_HO_SECRETS[@]} -gt 0 && -f "$1" ]] || return 0
+  [[ ${#_HO_SECRETS[@]} -gt 0 ]] || return 0
+  [[ -e "$1" || -L "$1" ]] || return 0
   local content
-  content="$(cat "$1")"
-  _ho_redact "$content" >"$1"
+  content="$(cat "$1")" || {
+    rm -f "$1"
+    return 1
+  }
+  rm -f "$1" || return 1
+  (set -C && umask 077 && _ho_redact "$content" >"$1") 2>/dev/null || return 1
 }
 
 # Run a step's command under script(1) so it keeps the terminal; builtins work too.
@@ -207,7 +217,7 @@ ho_check() { # <name> <command…> — PASS only if the command exits 0
   printf '\n▶ %s: %s\n' "$name" "$*"
   rm -f "$log"
   _ho_run "$log" "$@" || rc=$?
-  _ho_redact_log "$log"
+  _ho_redact_log "$log" || _ho_fatal "could not redact the log of step $name; it may hold a secret: $log"
   last="$(_ho_last_line "$log")"
   if [[ $rc -eq 0 ]]; then
     _ho_record PASS "$name" "$last"
@@ -230,7 +240,7 @@ ho_info() { # <name> <command…> — recorded, never fails
   printf '\n▶ %s: %s\n' "$name" "$*"
   rm -f "$log"
   _ho_run "$log" "$@" || rc=$?
-  _ho_redact_log "$log"
+  _ho_redact_log "$log" || _ho_fatal "could not redact the log of step $name; it may hold a secret: $log"
   last="$(_ho_last_line "$log")"
   if [[ $rc -ne 0 ]]; then last="exit $rc: $last"; fi
   _ho_record INFO "$name" "$last"

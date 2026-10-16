@@ -258,6 +258,39 @@ test_refuses_symlinked_outputs() {
   pty_run -- bash "$SCRIPT"
   assert_exit 0 "$RC" "$OUT"
   assert_eq "$(cat "$T_TMP/precious")" precious "a step log was written through a symlink"
+  rm -rf "$H/work/owner/$ID/logs" "$H/work/owner/$ID/RESULT.txt"
+  mkdir -p "$T_TMP/elsewhere"
+  ln -s "$T_TMP/elsewhere" "$H/work/owner/$ID/logs"
+  pty_run -- bash "$SCRIPT"
+  assert_exit 3 "$RC"
+  assert_contains "$OUT" "symlink"
+  [[ -z "$(ls -A "$T_TMP/elsewhere")" ]] || _t_fail "logs were written through a symlinked folder"
+}
+
+test_steps_run_from_the_root_folder() {
+  mk_harness
+  mk_script "$ID" 'ho_check where /bin/pwd'
+  OUT="$(cd "$H" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX \
+    -u CODEX_SANDBOX_NETWORK_DISABLED PATH="$STUBS:$PATH" STUB_CLIPBOARD="$T_TMP/clipboard" \
+    python3 -I "$TESTLIB/ptyrun.py" -- bash work/owner/"$ID"/OWNER-RUN.sh)"
+  RC=$?
+  assert_exit 0 "$RC" "$OUT"
+  assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check where: PASS /"$'\n'
+}
+
+test_unredactable_log_ends_the_run() {
+  mk_harness
+  # A step that prints the secret, then makes the log folder read-only so the log can't be replaced.
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
+    "ho_check leak /bin/bash -c 'cat $H/.env; chmod 500 $H/work/owner/$ID/logs'" 'ho_check after /usr/bin/true'
+  pty_run --answer 'Secret-77' -- bash "$SCRIPT"
+  chmod 700 "$H/work/owner/$ID/logs"
+  assert_exit 1 "$RC"
+  local result
+  result="$(cat "$H/work/owner/$ID/RESULT.txt")"
+  assert_contains "$result" "check _runtime: FAIL could not redact the log of step leak"
+  assert_contains "$result" "result: FAILED"
+  assert_not_contains "$result" "check after"
 }
 
 test_unsaved_result_is_not_reported_ok() {

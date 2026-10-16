@@ -45,6 +45,19 @@ test_new_creates_skeleton_and_meta() {
   assert_eq "$(jq -r .runtime "$dir/META.json")" "$H/.harness/lib/handoff.sh"
 }
 
+test_new_needs_jq_and_leaves_nothing_behind() {
+  mk_harness
+  mkdir "$T_TMP/bin"
+  local f
+  for f in /usr/bin/* /bin/*; do
+    [[ "$(basename "$f")" == jq ]] || ln -sf "$f" "$T_TMP/bin/"
+  done
+  local out
+  out="$(env PATH="$T_TMP/bin" "$HANDOFF" new demo "Demo" 2>&1)" && _t_fail "new succeeded without jq"
+  assert_contains "$out" "jq is required"
+  [[ ! -e "$H/work/owner/$(date -u +%Y-%m-%d)-demo" ]] || _t_fail "a half-made handoff was left behind"
+}
+
 test_new_rejects_bad_slug_and_existing_id() {
   mk_harness
   "$HANDOFF" new "Bad Slug" "x" >/dev/null 2>&1 && _t_fail "accepted a bad slug"

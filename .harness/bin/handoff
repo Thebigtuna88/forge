@@ -57,6 +57,10 @@ cmd_new() {
   [[ "$slug" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || die "slug must be lowercase words joined by hyphens"
   [[ -n "$title" && "$title" != *$'\n'* ]] || die "title must be one non-empty line"
   [[ -f "$RUNTIME" ]] || die "runtime missing: $RUNTIME"
+  local tool
+  for tool in jq git shasum python3; do
+    command -v "$tool" >/dev/null 2>&1 || die "$tool is required (macOS 15+ ships jq as /usr/bin/jq)"
+  done
   [[ "$RUNTIME" != *[\"\$\`\\]* ]] || die "runtime path must not contain quotes, \$, backticks or backslashes"
   id="$(date -u +%Y-%m-%d)-$slug"
   dir="$(owner_root)/$id"
@@ -80,8 +84,11 @@ ho_begin "$id"
 
 ho_end
 EOF
-  jq -n --arg id "$id" --arg title "$title" --arg created "$(utc)" --arg runtime "$RUNTIME" \
-    '{id: $id, title: $title, created: $created, state: "draft", runtime: $runtime}' >"$dir/META.json"
+  if ! jq -n --arg id "$id" --arg title "$title" --arg created "$(utc)" --arg runtime "$RUNTIME" \
+    '{id: $id, title: $title, created: $created, state: "draft", runtime: $runtime}' >"$dir/META.json"; then
+    rm -rf "$dir"
+    die "could not write META.json; nothing was created"
+  fi
   printf 'created %s/OWNER-RUN.sh\n' "$dir"
 }
 

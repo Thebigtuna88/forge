@@ -302,7 +302,12 @@ Details:
   step's log is removed before the step runs, and `RESULT.txt` is written fresh; if it can't be
   saved, `ho_end` prints no block and exits 1.
 - Redaction happens after a step ends, so it protects the evidence and the saved log, not the
-  live screen; see limit L11 and FRG-14.
+  live screen; see limit L11 and FRG-14. If a log can't be replaced by its redacted copy, the
+  run ends FAILED (the log may hold a secret).
+- Steps run from `/`, never from wherever Terminal was opened, so a step names its repository
+  (`--repo`, `git -C`) and uses absolute paths.
+- `handoff` itself needs `jq`, `git`, `shasum` and `python3`; macOS 15+ ships `/usr/bin/jq`,
+  and the Command Line Tools provide git and python3. `handoff new` checks them first.
 
 **`ho_end` output**, saved as `RESULT.txt` and copied to the clipboard with `pbcopy`:
 

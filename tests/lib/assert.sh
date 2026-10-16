@@ -31,27 +31,28 @@ assert_file_mode() { # <file> <octal mode>
 }
 
 run_tests() {
-  local file t rc failures=0
+  local file t rc failures=0 out
   file="$(basename "$0" .test.sh)"
+  out="$(mktemp)" || return 1 # private (mode 600), unpredictable name
   for t in $(declare -F | awk '{print $3}' | grep '^test_'); do
     (
       _T_CUR_FAILED=0
       T_TMP="$(mktemp -d)"
       T_TMP="$(cd "$T_TMP" && pwd -P)"
-      "$t"
+      "$t" || _t_fail "$t returned non-zero"
       rc=$_T_CUR_FAILED
       rm -rf "$T_TMP"
       exit "$rc"
-    ) >"${TMPDIR:-/tmp}/forge-test-out.$$" 2>&1
+    ) >"$out" 2>&1
     rc=$?
     if [[ $rc -eq 0 ]]; then
       printf 'ok %s::%s\n' "$file" "$t"
     else
       printf 'not ok %s::%s\n' "$file" "$t"
-      grep '^  # ' "${TMPDIR:-/tmp}/forge-test-out.$$" || printf '  # crashed (status %s)\n' "$rc"
+      grep '^  # ' "$out" || printf '  # crashed (status %s)\n' "$rc"
       failures=$((failures + 1))
     fi
   done
-  rm -f "${TMPDIR:-/tmp}/forge-test-out.$$"
+  rm -f "$out"
   [[ $failures -eq 0 ]]
 }
