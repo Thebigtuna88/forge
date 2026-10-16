@@ -164,18 +164,30 @@ test_check8_hard_link_to_result_is_rejected() {
   assert_contains "$VERIFY_OUT" "not a symlink or hard link"
 }
 
-test_failed_meta_update_leaves_verify_retryable() {
+# VERIFIED.txt is the record: a failed META.json update is only a warning, and never leaves
+# the handoff in a state where it is marked verified without VERIFIED.txt.
+test_verified_txt_is_the_record_if_meta_update_fails() {
   genuine_run
   paste_result
   mkdir "$T_TMP/bin"
   # shellcheck disable=SC2016 # the stub's own $*
   printf '#!/bin/bash\ncase "$*" in *verified*) exit 1 ;; esac\nexec /usr/bin/jq "$@"\n' >"$T_TMP/bin/jq"
   chmod +x "$T_TMP/bin/jq"
-  VERIFY_OUT="$(env PATH="$T_TMP/bin:$PATH" "$HANDOFF" verify "$PASTE" 2>&1)" && _t_fail "verify passed with a failing jq"
-  [[ ! -e "$DIR/VERIFIED.txt" ]] || _t_fail "VERIFIED.txt written although META.json was not updated"
-  assert_eq "$(jq -r .state "$DIR/META.json")" ready
+  VERIFY_OUT="$(env PATH="$T_TMP/bin:$PATH" "$HANDOFF" verify "$PASTE" 2>&1)"
+  VERIFY_RC=$?
+  assert_exit 0 "$VERIFY_RC" "$VERIFY_OUT"
+  assert_contains "$VERIFY_OUT" "VERIFIED.txt is the record"
+  assert_contains "$(cat "$DIR/VERIFIED.txt")" "result: OK"
   verify "$PASTE"
-  assert_exit 0 "$VERIFY_RC" "retry: $VERIFY_OUT"
+  assert_contains "$VERIFY_OUT" "already verified"
+}
+
+test_check2_verified_txt_directory_is_refused() {
+  genuine_run
+  paste_result
+  mkdir "$DIR/VERIFIED.txt"
+  expect_fail 2 "$PASTE"
+  assert_eq "$(jq -r .state "$DIR/META.json")" ready
 }
 
 test_check7_paste_edited() {

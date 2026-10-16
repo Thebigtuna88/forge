@@ -373,7 +373,9 @@ Passes only if **all** of these hold:
 written by the `capture-owner-paste` UserPromptSubmit hook, not by the agent, and verify also
 requires the paste's sha256 to be recorded in `.harness/state/pastes.log` by that hook.
 
-On success, it writes `VERIFIED.txt` (the block + verify time). On failure, it prints which
+On success, it writes `VERIFIED.txt` (the block + verify time) in one step (temp file, then
+rename). `VERIFIED.txt` alone is the record that a handoff is verified; `META.json`'s state
+mirrors it, and failing to update that is only a warning. On failure, it prints which
 check failed. The agent reports that failure to the owner. It never edits the paste.
 
 If `handoff.sh` changes between the run and verification (a runtime update merged), check 4

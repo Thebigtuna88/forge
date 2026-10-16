@@ -275,8 +275,11 @@ cmd_verify() {
     printf 'VERIFY FAILED: %s\n%s' "$id" "$fails" >&2
     return 1
   fi
-  [[ ! -f "$dir/VERIFIED.txt" ]] || fail "2: handoff $id is already verified"
-  [[ "$(meta_get "$dir" state)" == ready ]] || fail "2: handoff $id was never readied (state: $(meta_get "$dir" state))"
+  if [[ -e "$dir/VERIFIED.txt" || -L "$dir/VERIFIED.txt" ]]; then
+    fail "2: handoff $id is already verified (VERIFIED.txt exists)"
+  elif [[ "$(meta_get "$dir" state)" != ready ]]; then
+    fail "2: handoff $id was never readied (state: $(meta_get "$dir" state))"
+  fi
 
   # 1. exactly one well-formed block
   local block
@@ -367,27 +370,21 @@ cmd_verify() {
     printf 'VERIFY FAILED: %s\n%s' "$id" "$fails" >&2
     return 1
   fi
-  # VERIFIED.txt and the verified state land together, or neither does (so a retry works).
-  local vtmp
-  vtmp="$(mktemp "$dir/.VERIFIED.XXXXXX")" || die "could not write in $dir"
-  if ! {
-    printf '%s\n' "$block"
-    printf 'verified-at: %s\n' "$(utc)"
-    printf 'pasted-file: %s\n' "$(basename "$pasted")"
-  } >"$vtmp"; then
+  # VERIFIED.txt alone records verification (status reads it). It is written in full to a temp
+  # file and renamed into place in one step, so it either exists complete or not at all.
+  local vtmp body
+  body="$(printf '%s\nverified-at: %s\npasted-file: %s' "$block" "$(utc)" "$(basename "$pasted")")"
+  vtmp="$(mktemp "$dir/.VERIFIED.XXXXXX")" || die "could not write in $dir; nothing changed"
+  if ! printf '%s\n' "$body" >"$vtmp" || ! mv -f "$vtmp" "$dir/VERIFIED.txt" \
+    || [[ -L "$dir/VERIFIED.txt" || ! -f "$dir/VERIFIED.txt" ]] \
+    || [[ "$(cat "$dir/VERIFIED.txt")" != "$body" ]]; then
     rm -f "$vtmp"
-    die "could not write VERIFIED.txt; nothing changed, verify can be re-run"
+    die "could not write $dir/VERIFIED.txt; the handoff is not verified"
   fi
+  # META.json's state only mirrors VERIFIED.txt, so failing to update it is a warning.
   # shellcheck disable=SC2016 # a jq program: $at is a jq variable
-  if ! meta_set "$dir" '.state = "verified" | .verified = $at' --arg at "$(utc)"; then
-    rm -f "$vtmp"
-    die "could not update META.json; nothing changed, verify can be re-run"
-  fi
-  if ! mv -f "$vtmp" "$dir/VERIFIED.txt"; then
-    rm -f "$vtmp"
-    meta_set "$dir" '.state = "ready" | del(.verified)' || true
-    die "could not write VERIFIED.txt; nothing changed, verify can be re-run"
-  fi
+  meta_set "$dir" '.state = "verified" | .verified = $at' --arg at "$(utc)" \
+    || printf 'handoff: warning: META.json not updated; VERIFIED.txt is the record\n' >&2
   printf 'VERIFIED: %s\n' "$id"
 }
 
