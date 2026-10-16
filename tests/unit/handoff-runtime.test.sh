@@ -300,6 +300,21 @@ test_refuses_when_the_folder_cannot_be_made_private() {
   assert_contains "$OUT" "could not make the handoff folder private"
 }
 
+test_refuses_when_checksums_cannot_be_computed() {
+  mk_harness
+  mk_script "$ID" 'ho_check ok /usr/bin/true'
+  mkdir "$T_TMP/bin"
+  printf '#!/bin/bash\nexit 1\n' >"$T_TMP/bin/shasum"
+  chmod +x "$T_TMP/bin/shasum"
+  OUT="$(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_SANDBOX_NETWORK_DISABLED \
+    PATH="$T_TMP/bin:$STUBS:$PATH" STUB_CLIPBOARD="$T_TMP/clipboard" \
+    python3 -I "$TESTLIB/ptyrun.py" -- bash "$SCRIPT")"
+  RC=$?
+  assert_exit 3 "$RC" "$OUT"
+  assert_contains "$OUT" "could not compute the sha256"
+  [[ ! -e "$H/work/owner/$ID/logs/ok.log" ]] || _t_fail "a step ran without checksums"
+}
+
 test_steps_run_from_the_root_folder() {
   mk_harness
   mk_script "$ID" 'ho_check where /bin/pwd'

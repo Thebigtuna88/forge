@@ -6,9 +6,12 @@ Each answer is typed when the next "[y/N] " or "(input hidden): " prompt appears
 Prints everything the command wrote to the terminal and exits with the command's status.
 
 Cleanup: every descendant seen in a process snapshot (taken every POLL seconds) is killed when
-the run ends, if it is still the same process (pid and start time). Known limit (FRG-15): a
-process that double-forks, detaches and loses its parent between two snapshots is never seen,
-and macOS offers no unprivileged way to contain it. The handoff tests start no such daemons.
+the run ends, if it still looks like the same process (pid and start time). Known limits
+(FRG-15), because macOS has no unprivileged containment and no race-free way to signal a
+process by identity: a process that double-forks, detaches and loses its parent between two
+snapshots is never seen; and the identity check is best-effort (ps start times have one-second
+precision, and a pid can be reused between the snapshot and the kill). The handoff tests start
+no daemons, so in practice cleanup only meets processes of the run itself.
 """
 
 import os

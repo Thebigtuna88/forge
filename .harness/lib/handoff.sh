@@ -198,8 +198,11 @@ ho_begin() { # <id>
   fi
   _HO_ID="$id"
   _HO_AT="$(_ho_utc)" # start time: verify requires the run to start after handoff ready
-  _HO_SCRIPT_SHA="$(_ho_sha256 "$HO_SCRIPT")"
-  _HO_RUNTIME_SHA="$(_ho_sha256 "$HO_RUNTIME")"
+  _HO_SCRIPT_SHA="$(_ho_sha256 "$HO_SCRIPT")" || _HO_SCRIPT_SHA=""
+  _HO_RUNTIME_SHA="$(_ho_sha256 "$HO_RUNTIME")" || _HO_RUNTIME_SHA=""
+  if [[ ! "$_HO_SCRIPT_SHA" =~ ^[0-9a-f]{64}$ || ! "$_HO_RUNTIME_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+    _ho_refuse "could not compute the sha256 of the script and runtime, so this run couldn't be verified."
+  fi
   if [[ -L "$HO_DIR/logs" || -L "$HO_DIR/RESULT.txt" ]]; then
     _ho_refuse "a symlink sits where the runtime writes (logs/ or RESULT.txt); remove it first."
   fi
