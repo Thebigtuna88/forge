@@ -296,7 +296,8 @@ Details:
   unquoted, which is why its characters are restricted: it means the same to a shell and a
   dotenv parser, and can never run as code. The secret never goes to the screen, the logs, the
   clipboard or the block; if a later step prints it anyway, the runtime replaces it with
-  `[REDACTED]` in the evidence and in that step's log.
+  `[REDACTED]` in the evidence and in that step's log. Evidence is redacted both before and
+  after it is normalised, so stripping `-----` or control characters can't rejoin a secret.
 - Commands run as `script -q <log> /bin/bash -c '"$@"' …`, so they keep the terminal and shell
   builtins work. The handoff folder and its logs are mode 700, `RESULT.txt` mode 600. Each
   step's log is removed before the step runs, and `RESULT.txt` is written fresh; if it can't be

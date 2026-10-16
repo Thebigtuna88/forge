@@ -223,6 +223,16 @@ test_secret_with_surrounding_spaces_is_refused_not_trimmed() {
   [[ ! -e "$H/.env" ]] || _t_fail "a value with spaces was stored (trimmed)"
 }
 
+test_secret_split_by_dashes_stays_redacted() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" "ho_info split /usr/bin/printf 'abc-----def\n'"
+  pty_run --answer 'abcdef' -- bash "$SCRIPT"
+  local result
+  result="$(cat "$H/work/owner/$ID/RESULT.txt")"
+  assert_contains "$result" "check split: INFO [REDACTED]"
+  assert_not_contains "$result" "abcdef"
+}
+
 test_secret_rejects_a_tilde() {
   mk_harness
   mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env"

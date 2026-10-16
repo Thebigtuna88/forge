@@ -91,6 +91,8 @@ _ho_clean() {
   s="$(printf '%s' "$s" | tr -s ' ')"
   s="${s# }"
   s="${s% }"
+  # Again after normalising: removing ----- or control characters can join a split secret.
+  s="$(_ho_redact "$s")"
   [[ -n "$s" ]] || s="(no output)"
   printf '%s' "${s:0:200}"
 }

@@ -136,11 +136,13 @@ def main() -> int:
         tracked.update(descendants(pid))
         done, status = os.waitpid(pid, os.WNOHANG)
         if done:
+            CHILD.clear()  # reaped: its pid and group may be reused from now on
             break
         if time.monotonic() >= deadline:
             kill_all(pid, tracked)
             out += b"\n[ptyrun: killed after %d s without exiting]\n" % IDLE_TIMEOUT
             _, status = os.waitpid(pid, 0)
+            CHILD.clear()
             break
         time.sleep(0.05)
     # Nothing a test started may outlive it, even after a normal exit. The child is reaped now, so
@@ -154,7 +156,7 @@ def run() -> int:
     try:
         return main()
     except SnapshotError as e:
-        # The child (if any) is unreaped, so its group is still ours: end it, then fail loudly.
+        # Only a child that is still unreaped (listed in CHILD) may have its group signalled.
         if CHILD:
             try:
                 os.killpg(CHILD[0], signal.SIGKILL)

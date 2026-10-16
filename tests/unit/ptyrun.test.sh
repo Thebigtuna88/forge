@@ -91,6 +91,33 @@ PY
   assert_eq "$out" "[('kill', 777)]" "a reused pid was signalled, or a live one was missed"
 }
 
+# A snapshot failure after the child was reaped must not signal its (possibly reused) group.
+test_snapshot_failure_after_reaping_signals_no_group() {
+  local out
+  out="$(python3 -I - "$TESTLIB/ptyrun.py" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ptyrun", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+sent = []
+m.os.killpg = lambda p, s: sent.append(("killpg", p))
+m.pty.fork = lambda: (12345, 99)
+m.os.close = lambda fd: None
+m.os.read = lambda fd, n: b""
+m.select.select = lambda r, w, x, t: (r, [], [])
+m.os.waitpid = lambda p, f: (p, 0)
+m.descendants = lambda root: set()
+def broken():
+    raise m.SnapshotError("ps failed (test)")
+m.kill_tracked = lambda tracked: broken()
+sys.argv = ["ptyrun.py", "--", "/usr/bin/true"]
+rc = m.run()
+print(rc, sent)
+PY
+)"
+  assert_eq "$out" "125 []" "a reaped child's group was signalled"
+}
+
 test_failed_process_snapshot_fails_the_run() {
   mkdir "$T_TMP/bin"
   printf '#!/bin/bash\nexit 1\n' >"$T_TMP/bin/ps"
