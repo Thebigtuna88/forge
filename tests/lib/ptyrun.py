@@ -24,10 +24,17 @@ PROMPT = re.compile(rb"\[y/N\] |\(input hidden\): ")
 IDLE_TIMEOUT = int(os.environ.get("PTYRUN_TIMEOUT", "15"))
 
 
+class SnapshotError(Exception):
+    """ps failed: without a process table, cleanup can't be trusted, so the run fails."""
+
+
 def process_table():
     """{pid: (ppid, start time)} from ps; the start time tells a reused pid apart."""
-    out = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid=,lstart="],
-                         capture_output=True, text=True).stdout
+    res = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid=,lstart="],
+                         capture_output=True, text=True)
+    if res.returncode != 0 or not res.stdout.strip():
+        raise SnapshotError("ps failed (status %d): %s" % (res.returncode, res.stderr.strip()))
+    out = res.stdout
     table = {}
     for line in out.splitlines():
         parts = line.split(None, 2)
@@ -54,17 +61,23 @@ def descendants(root):
 POLL = 0.1  # how often descendants are recorded while the child runs
 
 
-def kill_all(pid, tracked):
-    """Kill every descendant ever seen (a detached one may have outlived its parent and been
-    re-parented, so it can no longer be found from pid), the current ones, then the child's
-    process group. script(1) starts its own session, so the group alone is not enough."""
+def kill_tracked(tracked):
+    """Kill each recorded (pid, start time) that is still that same process (never a reused pid).
+    A detached descendant may have been re-parented, so it can no longer be found from the child."""
     alive = process_table()
-    for p, start in tracked | descendants(pid):
-        if p in alive and alive[p][1] == start:  # still the same process, not a reused pid
+    for p, start in tracked:
+        if p in alive and alive[p][1] == start:
             try:
                 os.kill(p, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def kill_all(pid, tracked):
+    """For a child that has NOT been reaped yet (so its pid and group can't have been reused):
+    kill every descendant seen or current, then the child's process group. script(1) starts its
+    own session, so the group alone is not enough."""
+    kill_tracked(tracked | descendants(pid))
     try:
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -86,6 +99,7 @@ def main() -> int:
     pid, fd = pty.fork()
     if pid == 0:
         os.execvp(args[0], args)
+    CHILD.append(pid)
 
     out = b""
     sent = 0
@@ -129,11 +143,30 @@ def main() -> int:
             _, status = os.waitpid(pid, 0)
             break
         time.sleep(0.05)
-    # Nothing a test started may outlive it, even after a normal exit.
-    kill_all(pid, tracked)
+    # Nothing a test started may outlive it, even after a normal exit. The child is reaped now, so
+    # its pid and group may already belong to someone else: only identity-checked kills here.
+    kill_tracked(tracked)
     sys.stdout.write(out.decode("utf-8", "replace"))
     return os.waitstatus_to_exitcode(status)
 
 
+def run() -> int:
+    try:
+        return main()
+    except SnapshotError as e:
+        # The child (if any) is unreaped, so its group is still ours: end it, then fail loudly.
+        if CHILD:
+            try:
+                os.killpg(CHILD[0], signal.SIGKILL)
+                os.waitpid(CHILD[0], 0)
+            except OSError:  # already gone, or a finished leader (macOS: EPERM)
+                pass
+        print("ptyrun: %s; process cleanup is unreliable, failing the run" % e, file=sys.stderr)
+        return 125
+
+
+CHILD = []  # the forked child's pid, for run()'s error path
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())

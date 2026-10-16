@@ -83,13 +83,25 @@ spec.loader.exec_module(m)
 sent = []
 m.os.kill = lambda p, s: sent.append(("kill", p))
 m.os.killpg = lambda p, s: sent.append(("killpg", p))
-m.process_table = lambda: {12345: (1, "Thu Jan  1 00:00:02 2026")}
-m.descendants = lambda root: set()
-m.kill_all(10000, {(12345, "Thu Jan  1 00:00:01 2026")})
+m.process_table = lambda: {12345: (1, "Thu Jan  1 00:00:02 2026"), 777: (1, "same")}
+m.kill_tracked({(12345, "Thu Jan  1 00:00:01 2026"), (777, "same")})
 print(sent)
 PY
 )"
-  assert_eq "$out" "[('killpg', 10000)]" "a reused pid was signalled"
+  assert_eq "$out" "[('kill', 777)]" "a reused pid was signalled, or a live one was missed"
+}
+
+test_failed_process_snapshot_fails_the_run() {
+  mkdir "$T_TMP/bin"
+  printf '#!/bin/bash\nexit 1\n' >"$T_TMP/bin/ps"
+  chmod +x "$T_TMP/bin/ps"
+  local out rc
+  # ptyrun calls /bin/ps by path, so swap it through a copy of the driver that uses the stub.
+  sed "s#\"/bin/ps\"#\"$T_TMP/bin/ps\"#" "$TESTLIB/ptyrun.py" >"$T_TMP/ptyrun.py"
+  out="$(python3 -I "$T_TMP/ptyrun.py" -- /usr/bin/true 2>&1)"
+  rc=$?
+  assert_exit 125 "$rc" "$out"
+  assert_contains "$out" "ps failed"
 }
 
 run_tests
