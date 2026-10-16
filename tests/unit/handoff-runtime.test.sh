@@ -12,7 +12,8 @@ test_refuses_without_a_terminal() {
   mk_harness
   mk_script "$ID" 'ho_check ok /usr/bin/true'
   local out rc
-  out="$(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT bash "$SCRIPT" </dev/null 2>&1)"
+  out="$(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_SANDBOX_NETWORK_DISABLED \
+    bash "$SCRIPT" </dev/null 2>&1)"
   rc=$?
   assert_exit 3 "$rc"
   assert_contains "$out" "no terminal attached"
@@ -28,6 +29,29 @@ test_refuses_inside_an_agent_session() {
   [[ ! -f "$H/work/owner/$ID/RESULT.txt" ]] || _t_fail "RESULT.txt written despite refusal"
 }
 
+# Spec 4.3: refuse when a marker is set, even to the empty string.
+test_refuses_an_agent_marker_set_to_empty() {
+  mk_harness
+  mk_script "$ID" 'ho_check ok /usr/bin/true'
+  OUT="$(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX_NETWORK_DISABLED CODEX_SANDBOX= \
+    PATH="$STUBS:$PATH" python3 -I "$TESTLIB/ptyrun.py" -- bash "$SCRIPT")"
+  RC=$?
+  assert_exit 3 "$RC"
+  assert_contains "$OUT" "CODEX_SANDBOX is set"
+  [[ ! -f "$H/work/owner/$ID/RESULT.txt" ]] || _t_fail "RESULT.txt written despite refusal"
+}
+
+# Only a script frozen by `handoff ready` (read-only) may run.
+test_refuses_a_writable_script() {
+  mk_harness
+  mk_script "$ID" 'ho_check ok /usr/bin/true'
+  chmod u+w "$SCRIPT"
+  pty_run -- bash "$SCRIPT"
+  assert_exit 3 "$RC"
+  assert_contains "$OUT" "still writable"
+  [[ ! -f "$H/work/owner/$ID/RESULT.txt" ]] || _t_fail "RESULT.txt written despite refusal"
+}
+
 test_refuses_when_executed_directly() {
   mk_harness
   local rc
@@ -40,7 +64,9 @@ test_refuses_when_executed_directly() {
 test_refuses_id_that_does_not_match_folder() {
   mk_harness
   mk_script "$ID" 'ho_check ok /usr/bin/true'
+  chmod u+w "$SCRIPT"
   sed -i '' "s/ho_begin \"$ID\"/ho_begin \"other-id\"/" "$SCRIPT"
+  chmod 444 "$SCRIPT"
   pty_run -- bash "$SCRIPT"
   assert_exit 3 "$RC"
   assert_contains "$OUT" "does not match the handoff folder"
@@ -124,6 +150,69 @@ test_secret_refuses_a_file_that_is_not_gitignored() {
   assert_exit 1 "$RC"
   [[ ! -e "$H/committed.env" ]] || _t_fail "secret file was created"
   assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check key: FAIL refused: $H/committed.env is not gitignored"
+}
+
+test_secret_write_failure_is_a_fail() {
+  mk_harness
+  mkdir "$H/.env" # gitignored, but a directory: the move would land inside it
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" 'ho_check after /usr/bin/true'
+  pty_run --answer 'value-1' -- bash "$SCRIPT"
+  assert_exit 1 "$RC"
+  assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check key: FAIL refused: $H/.env exists but is not a regular file"
+  [[ -z "$(ls -A "$H/.env")" ]] || _t_fail "something was written inside the directory"
+}
+
+test_secret_temp_file_must_be_gitignored() {
+  mk_harness
+  printf 'only.env\n' >"$H/.gitignore" # the target is ignored, its temp file would not be
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/only.env"
+  pty_run --answer 'value-2' -- bash "$SCRIPT"
+  assert_exit 1 "$RC"
+  assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check key: FAIL could not write $H/only.env"
+  [[ ! -e "$H/only.env" ]] || _t_fail "secret was written"
+  local f
+  for f in "$H"/*ho-tmp* "$H"/.*ho-tmp*; do [[ ! -e "$f" ]] || _t_fail "temp file left behind: $f"; done
+}
+
+test_secret_rejects_shell_characters() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env"
+  # shellcheck disable=SC2016 # literal on purpose: it must never be executed or stored
+  pty_run --answer '$(touch '"$T_TMP"'/executed)' -- bash "$SCRIPT"
+  assert_exit 1 "$RC"
+  assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check key: FAIL refused: the value has spaces, quotes or shell characters"
+  [[ ! -e "$H/.env" ]] || _t_fail "unsafe value was stored"
+  [[ ! -e "$T_TMP/executed" ]] || _t_fail "the value was executed"
+}
+
+test_secret_is_redacted_from_later_steps() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" "ho_info reveal /bin/cat $H/.env"
+  pty_run --answer 'Leaky-Value-42' -- bash "$SCRIPT"
+  local result
+  result="$(cat "$H/work/owner/$ID/RESULT.txt")"
+  assert_contains "$result" "check reveal: INFO API_KEY=[REDACTED]"
+  if grep -rq Leaky-Value-42 "$H/work/owner/$ID/"; then _t_fail "secret found under the handoff folder"; fi
+  assert_not_contains "$(cat "$T_TMP/clipboard")" "Leaky-Value-42" "clipboard"
+}
+
+test_handoff_files_are_private() {
+  mk_harness
+  mk_script "$ID" 'ho_check ok /usr/bin/true'
+  pty_run -- bash "$SCRIPT"
+  assert_file_mode "$H/work/owner/$ID" 700
+  assert_file_mode "$H/work/owner/$ID/logs" 700
+  assert_file_mode "$H/work/owner/$ID/RESULT.txt" 600
+}
+
+# shopt exists only inside bash (unlike command or type, which macOS also ships in /usr/bin).
+test_check_runs_shell_builtins() {
+  mk_harness
+  mk_script "$ID" 'ho_check has-bash command -v bash' 'ho_check bash-only shopt -s nullglob'
+  pty_run -- bash "$SCRIPT"
+  assert_exit 0 "$RC" "$OUT"
+  assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check has-bash: PASS /"
+  assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check bash-only: PASS"
 }
 
 test_secret_refuses_empty_input() {

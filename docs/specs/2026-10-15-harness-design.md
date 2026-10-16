@@ -264,8 +264,11 @@ ho_end
 
 **Refuses to run** (exit 3, prints why) when any of these holds:
 - stdin or stdout is not a TTY;
-- `CLAUDECODE` (or any other known agent marker: `CLAUDE_CODE_ENTRYPOINT`, `CODEX_SANDBOX`) is set;
-- it is executed directly instead of sourced.
+- `CLAUDECODE` (or any other known agent marker: `CLAUDE_CODE_ENTRYPOINT`, `CODEX_SANDBOX`,
+  `CODEX_SANDBOX_NETWORK_DISABLED`) is set, even to the empty string;
+- it is executed directly instead of sourced;
+- `OWNER-RUN.sh` is still writable, i.e. it was never frozen by `handoff ready` (added in the
+  FRG-1 review).
 
 The refusal means running the script through Claude Code's `!` prefix fails too. That's
 intended: the owner uses a separate Terminal window.
@@ -279,7 +282,7 @@ can stop before an irreversible step.
 | `ho_check <name> <cmd…>` | `PASS` or `FAIL` + last non-empty output line | command exits 0 |
 | `ho_info <name> <cmd…>` | `INFO` + last output line | never fails |
 | `ho_confirm <name> "<question>"` | `PASS` (answered `y`) or `FAIL` | owner types `y` at `/dev/tty` |
-| `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty, the target file is gitignored (`git check-ignore`), and the write succeeds |
+| `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty and uses only `A-Z a-z 0-9 . _ ~ + / = : @ % , -`; the target is a regular file (or absent) and gitignored (`git check-ignore`), as is its temp file; and every write step succeeds |
 | `ho_abort` | `result: FAILED` | ends the run early with the block |
 | `ho_end` | the block | — |
 
@@ -288,8 +291,13 @@ Details:
 - Command output still streams to the owner's screen and is saved to `logs/<name>.log`. Only
   the last line (trimmed to 200 characters, newlines and `-----` stripped) goes into the block.
 - `ho_secret_to_file` reads with echo off, writes or replaces the single `VAR=value` line in
-  the file, `chmod 600`, and unsets the variable. The secret never goes to the screen, the logs,
-  the clipboard or the block.
+  the file via a private temp file, `chmod 600`, and unsets the variable. The value is written
+  unquoted, which is why its characters are restricted: it means the same to a shell and a
+  dotenv parser, and can never run as code. The secret never goes to the screen, the logs, the
+  clipboard or the block; if a later step prints it anyway, the runtime replaces it with
+  `[REDACTED]` in the evidence and in that step's log.
+- Commands run as `script -q <log> /bin/bash -c '"$@"' …`, so they keep the terminal and shell
+  builtins work. The handoff folder and its logs are mode 700, `RESULT.txt` mode 600.
 
 **`ho_end` output**, saved as `RESULT.txt` and copied to the clipboard with `pbcopy`:
 
@@ -309,7 +317,16 @@ result: OK
 
 ### 4.4 `handoff lint`
 
-Rejects a script (and `handoff ready` refuses to freeze it) if it:
+The script must follow an **allowlist grammar** (`.harness/lib/handoff_grammar.py`, added in
+the FRG-1 review because blocklists could be dodged with quoting): apart from blank lines and
+comments it is exactly the shebang, `set -uo pipefail`, the `source` line, `ho_begin "<id>"`,
+step lines, and `ho_end`. Each step line is one helper call made of plain words and quoted
+strings, optionally ending in `|| ho_abort`: no `$` or backticks (except inside single quotes,
+where they stay literal), no other operators, redirection, globs, assignments or function
+definitions. Forbidden names are checked after quote removal, and no `ho_check`/`ho_info` step
+may name a file that a `ho_secret_to_file` step wrote.
+
+In addition, lint rejects a script (and `handoff ready` refuses to freeze it) if it:
 - doesn't source the runtime by its exact absolute path, or doesn't call `ho_begin` first and
   `ho_end` last;
 - contains the literal strings `HANDOFF-RESULT`, `result: OK`, `script-sha256`, or any
@@ -317,7 +334,10 @@ Rejects a script (and `handoff ready` refuses to freeze it) if it:
 - redefines any `ho_*` function, or uses `eval`, `source`/`.` of any other file, `exec`
   redirection, `unset CLAUDECODE` or other agent-marker manipulation;
 - writes to `RESULT.txt`, `VERIFIED.txt` or `PASTED-*`;
-- fails `shellcheck`.
+- fails `shellcheck`, or shellcheck or python3 is not installed (fail closed).
+
+`handoff ready` also refuses an id that is not `<date>-<slug>` (no path traversal) and a
+`META.json` naming a runtime other than this checkout's `.harness/lib/handoff.sh`.
 
 ### 4.5 `handoff verify <pasted-file>`
 
@@ -325,14 +345,16 @@ Passes only if **all** of these hold:
 1. The paste contains exactly one well-formed block.
 2. `work/owner/<id>/` exists and its `META.json` marks it ready.
 3. `script-sha256` equals the sha256 of `OWNER-RUN.sh` on disk **and** the sha frozen at
-   `handoff ready`.
-4. `runtime-sha256` equals the sha256 of the current `.harness/lib/handoff.sh`.
+   `handoff ready`, and the run's `at:` is not older than `readied` (no replaying a run made
+   before the script was frozen).
+4. `runtime-sha256` equals the sha256 of the current `.harness/lib/handoff.sh`, and the
+   runtime named in `META.json` is that file.
 5. Every step declared in the script appears exactly once, and no undeclared step appears.
 6. Every step is `PASS` or `INFO`, and `result: OK`.
 7. The paste matches `RESULT.txt` (written by the runtime on the owner's run), ignoring
    leading and trailing whitespace.
-8. The pasted file lives at `work/owner/<id>/PASTED-*.txt`. Verify refuses to take
-   `RESULT.txt` itself as input.
+8. The pasted file lives at `work/owner/<id>/PASTED-*.txt` and is its own regular file (not a
+   symlink or hard link). Verify refuses to take `RESULT.txt` itself as input.
 
 On success, it writes `VERIFIED.txt` (the block + verify time). On failure, it prints which
 check failed. The agent reports that failure to the owner. It never edits the paste.

@@ -132,6 +132,38 @@ test_check6_info_relabelled_as_pass() {
   expect_fail 6 "$PASTE"
 }
 
+test_check3_run_older_than_ready() {
+  genuine_run
+  paste_result
+  jq '.readied = "2999-01-01T00:00:00Z"' "$DIR/META.json" >"$T_TMP/m" && cat "$T_TMP/m" >"$DIR/META.json"
+  expect_fail 3 "$PASTE"
+  assert_contains "$VERIFY_OUT" "older than handoff ready"
+}
+
+test_check4_runtime_path_in_meta_replaced() {
+  genuine_run
+  paste_result
+  mkdir -p "$T_TMP/evil"
+  cp "$H/.harness/lib/handoff.sh" "$T_TMP/evil/handoff.sh"
+  jq --arg r "$T_TMP/evil/handoff.sh" '.runtime = $r' "$DIR/META.json" >"$T_TMP/m" && cat "$T_TMP/m" >"$DIR/META.json"
+  expect_fail 4 "$PASTE"
+  assert_contains "$VERIFY_OUT" "META.json names runtime"
+}
+
+test_check8_symlink_to_result_is_rejected() {
+  genuine_run
+  ln -s RESULT.txt "$PASTE"
+  expect_fail 8 "$PASTE"
+  assert_contains "$VERIFY_OUT" "not a symlink or hard link"
+}
+
+test_check8_hard_link_to_result_is_rejected() {
+  genuine_run
+  ln "$DIR/RESULT.txt" "$PASTE"
+  expect_fail 8 "$PASTE"
+  assert_contains "$VERIFY_OUT" "not a symlink or hard link"
+}
+
 test_check7_paste_edited() {
   genuine_run
   sed 's/v1.2.3/v9.9.9/' "$DIR/RESULT.txt" >"$PASTE"

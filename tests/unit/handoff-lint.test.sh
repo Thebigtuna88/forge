@@ -94,6 +94,62 @@ test_rejects_dot_source() { expect_rejected "exactly one file" '. /etc/profile';
 test_rejects_duplicate_names() { expect_rejected "duplicate step name" 'ho_check ok /usr/bin/true'; }
 test_rejects_invalid_names() { expect_rejected "invalid step name" 'ho_check Bad_Name /usr/bin/true'; }
 
+# Allowlist grammar (spec 4.4): anything that is not a plain helper step is rejected.
+test_rejects_source_after_separator() { expect_rejected "unquoted ';'" 'true; source /dev/null'; }
+test_rejects_redefining_a_dependency() { expect_rejected "unquoted '('" 'script() { return 0; }'; }
+test_rejects_quoted_eval() { expect_rejected "only ho_check, ho_info" "'eval' 'ho_end() { exit 0; }'"; }
+test_rejects_split_evidence_name() { expect_rejected "RESULT.txt" "ho_check w cp /dev/null /x/'RESULT''.''txt'"; }
+# shellcheck disable=SC2016 # literal on purpose: lint must reject the expansion
+test_rejects_command_substitution() { expect_rejected "inside double quotes" 'ho_check w /bin/echo "$(id)"'; }
+# shellcheck disable=SC2016 # literal on purpose: lint must reject the expansion
+test_rejects_variable_expansion() { expect_rejected "unquoted '\$'" 'ho_check w /bin/echo $HOME'; }
+test_rejects_redirection() { expect_rejected "unquoted '>'" 'ho_check w /usr/bin/true > /tmp/out'; }
+test_rejects_assignment_prefix() { expect_rejected "only ho_check, ho_info" 'FOO=1 ho_check w /usr/bin/true'; }
+test_rejects_anything_after_abort() { expect_rejected "may only be followed by ho_abort" 'ho_check w /usr/bin/true || true'; }
+
+test_rejects_reading_a_secret_file() {
+  new_with "ho_secret_to_file key API_KEY $T_TMP/h/.env || ho_abort" "ho_info reveal /bin/cat $T_TMP/h/.env"
+  lint
+  assert_exit 1 "$LINT_RC"
+  assert_contains "$LINT_OUT" "reads the secret file"
+}
+
+test_fails_closed_without_shellcheck() {
+  new_with 'ho_check ok /usr/bin/true'
+  LINT_OUT="$(env PATH=/usr/bin:/bin "$HANDOFF" lint "$DIR/OWNER-RUN.sh" 2>&1)"
+  LINT_RC=$?
+  assert_exit 1 "$LINT_RC"
+  assert_contains "$LINT_OUT" "shellcheck is not installed"
+}
+
+test_ready_rejects_an_id_outside_the_owner_folder() {
+  new_with 'ho_check ok /usr/bin/true'
+  mkdir -p "$H/work/other"
+  cp "$DIR/OWNER-RUN.sh" "$DIR/META.json" "$H/work/other/"
+  local out
+  out="$("$HANDOFF" ready ../other 2>&1)" && _t_fail "ready accepted ../other"
+  assert_contains "$out" "invalid handoff id"
+  assert_eq "$(jq -r .state "$H/work/other/META.json")" draft
+}
+
+test_ready_rejects_a_foreign_runtime() {
+  new_with 'ho_check ok /usr/bin/true'
+  jq '.runtime = "/tmp/evil/handoff.sh"' "$DIR/META.json" >"$T_TMP/m" && cat "$T_TMP/m" >"$DIR/META.json"
+  local out
+  out="$("$HANDOFF" ready "$ID" 2>&1)" && _t_fail "ready accepted a foreign runtime"
+  assert_contains "$out" "names a runtime other than"
+}
+
+test_paths_with_spaces_are_quoted() {
+  mkdir -p "$T_TMP/my code"
+  T_TMP="$T_TMP/my code" new_with 'ho_check ok /usr/bin/true'
+  local out
+  out="$("$HANDOFF" ready "$ID")" || _t_fail "ready failed: $out"
+  assert_contains "$out" "  bash $(printf '%q' "$DIR/OWNER-RUN.sh")"
+  assert_contains "$out" 'my\ code'
+  assert_contains "$(cat "$DIR/OWNER-RUN.sh")" 'my\ code'
+}
+
 test_rejects_wrong_runtime_path() {
   new_with 'ho_check ok /usr/bin/true'
   sed -i '' "s#^source \".*\"#source \"/tmp/fake/handoff.sh\"#" "$DIR/OWNER-RUN.sh"

@@ -28,6 +28,6 @@ Use a ChatGPT plan (Plus or higher). `codex login` is a browser sign-in, so no k
 
 - Cost is flat and predictable. A runaway review loop hits the plan cap and pauses instead of
   running up a bill, which is the fail-closed outcome we want.
-- When the cap is hit, reviews wait for the window to reset. The review runner (FRG-5) must
+- When the cap is hit, reviews wait for the window to reset. The review runner (FRG-7) must
   report a usage-limit error as "lens unavailable", never as CLEAN.
 - No API-key usage limit is needed for codex. Revisit if review volume outgrows Plus.

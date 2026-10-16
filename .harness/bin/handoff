@@ -12,6 +12,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 RUNTIME="$ROOT/.harness/lib/handoff.sh"
+GRAMMAR="$ROOT/.harness/lib/handoff_grammar.py"
+ID_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9]+(-[a-z0-9]+)*$'
 
 die() {
   printf 'handoff: %s\n' "$*" >&2
@@ -55,14 +57,16 @@ cmd_new() {
   [[ "$slug" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || die "slug must be lowercase words joined by hyphens"
   [[ -n "$title" && "$title" != *$'\n'* ]] || die "title must be one non-empty line"
   [[ -f "$RUNTIME" ]] || die "runtime missing: $RUNTIME"
+  [[ "$RUNTIME" != *[\"\$\`\\]* ]] || die "runtime path must not contain quotes, \$, backticks or backslashes"
   id="$(date -u +%Y-%m-%d)-$slug"
   dir="$(owner_root)/$id"
   [[ ! -e "$dir" ]] || die "$dir already exists"
-  mkdir -p "$dir"
+  mkdir -p "$(dirname "$dir")"
+  mkdir -m 700 "$dir"
   cat >"$dir/OWNER-RUN.sh" <<EOF
 #!/usr/bin/env bash
 # HANDOFF: $id — $title
-# Run in your own Terminal window:  bash $dir/OWNER-RUN.sh
+# Run in your own Terminal window:  bash $(printf '%q' "$dir/OWNER-RUN.sh")
 set -uo pipefail
 # shellcheck source=/dev/null
 source "$RUNTIME"
@@ -154,7 +158,16 @@ lint_errors() { # prints one error per line; empty output = clean
     [[ -z "$dup" ]] || echo "duplicate step name(s): $(printf '%s' "$dup" | tr '\n' ' ')"
   fi
 
-  if command -v shellcheck >/dev/null 2>&1; then
+  # The allowlist grammar (spec 4.4): only helper steps of plain words and quoted strings.
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is not installed, so the script grammar cannot be checked"
+  else
+    python3 -I "$GRAMMAR" "$file" "$RUNTIME" "$id" || echo "grammar check could not run"
+  fi
+
+  if ! command -v shellcheck >/dev/null 2>&1; then
+    echo "shellcheck is not installed (fail closed: install it with the install-tools handoff)"
+  else
     local sc
     if ! sc="$(shellcheck -s bash "$file" 2>&1)"; then
       echo "shellcheck failed:"
@@ -167,9 +180,6 @@ cmd_lint() {
   [[ $# -eq 1 ]] || die "usage: handoff lint <OWNER-RUN.sh>"
   local errors
   errors="$(lint_errors "$1")"
-  if ! command -v shellcheck >/dev/null 2>&1; then
-    echo "LINT WARN: shellcheck is not installed; shell checks skipped" >&2
-  fi
   if [[ -n "$errors" ]]; then
     printf 'LINT: %s\n' "$errors" | sed '2,$s/^/LINT: /' >&2
     printf 'LINT FAILED: %s\n' "$1" >&2
@@ -183,17 +193,20 @@ cmd_lint() {
 cmd_ready() {
   [[ $# -eq 1 ]] || die "usage: handoff ready <id>"
   local id="$1" dir state
+  [[ "$id" =~ $ID_RE ]] || die "invalid handoff id '$id' (expected <date>-<slug>)"
   dir="$(owner_root)/$id"
   [[ -f "$dir/OWNER-RUN.sh" && -f "$dir/META.json" ]] || die "no handoff $id"
+  [[ ! -L "$dir" && ! -L "$dir/OWNER-RUN.sh" ]] || die "handoff $id must not be a symlink"
   state="$(meta_get "$dir" state)"
   [[ "$state" == draft ]] || die "handoff $id is '$state', not draft"
+  [[ "$(meta_get "$dir" runtime)" == "$RUNTIME" ]] || die "handoff $id names a runtime other than $RUNTIME"
   cmd_lint "$dir/OWNER-RUN.sh"
   chmod 444 "$dir/OWNER-RUN.sh"
   # shellcheck disable=SC2016 # a jq program: $sha and $at are jq variables
   meta_set "$dir" '.state = "ready" | .script_sha256 = $sha | .readied = $at' \
     --arg sha "$(sha256 "$dir/OWNER-RUN.sh")" --arg at "$(utc)"
   printf '\nReady. Give the owner exactly these two lines:\n\n'
-  printf '  bash %s/OWNER-RUN.sh\n' "$dir"
+  printf '  bash %q\n' "$dir/OWNER-RUN.sh"
   printf '  paste back the HANDOFF-RESULT block\n'
 }
 
@@ -218,16 +231,21 @@ cmd_verify() {
   [[ $# -eq 1 ]] || die "usage: handoff verify <work/owner/<id>/PASTED-<utc>.txt>"
   local pasted dir id root fails=""
   [[ -f "$1" ]] || die "file not found: $1"
-  pasted="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+  pasted="$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")"
   dir="$(dirname "$pasted")"
   id="$(basename "$dir")"
   root="$(owner_root)"
   fail() { fails="$fails$1"$'\n'; }
 
-  # 8. input must be the owner's paste, saved next to the handoff
+  # 8. input must be the owner's paste, saved next to the handoff as its own regular file
   [[ "$(basename "$pasted")" =~ ^PASTED-[A-Za-z0-9T:.-]+\.txt$ ]] \
     || fail "8: input must be named PASTED-<utc>.txt (RESULT.txt is never accepted)"
-  [[ "$(cd "$(dirname "$dir")" 2>/dev/null && pwd)" == "$(mkdir -p "$root" && cd "$root" && pwd)" ]] \
+  if [[ -L "$pasted" || "$(stat -f '%l' "$pasted")" != 1 ]]; then
+    fail "8: the pasted file must be a regular file, not a symlink or hard link"
+  fi
+  [[ ! "$pasted" -ef "$dir/RESULT.txt" ]] || fail "8: the pasted file is RESULT.txt itself"
+  [[ "$id" =~ $ID_RE ]] || fail "8: '$id' is not a handoff id"
+  [[ "$(cd "$(dirname "$dir")" 2>/dev/null && pwd -P)" == "$(mkdir -p "$root" && cd "$root" && pwd -P)" ]] \
     || fail "8: pasted file must live in $root/<id>/"
 
   # 2. the handoff exists and was readied
@@ -271,11 +289,18 @@ cmd_verify() {
   ondisk="$(sha256 "$dir/OWNER-RUN.sh")"
   [[ "$l_script" == "script-sha256: $ondisk" ]] || fail "3: script-sha256 does not match OWNER-RUN.sh on disk"
   [[ "$ondisk" == "$frozen" ]] || fail "3: OWNER-RUN.sh changed after handoff ready"
+  local readied
+  readied="$(meta_get "$dir" readied)"
+  if [[ -z "$readied" || "${l_at#at: }" < "$readied" ]]; then
+    fail "3: the run ($l_at) is older than handoff ready ($readied)"
+  fi
 
   # 4. runtime unchanged
   local runtime
   runtime="$(meta_get "$dir" runtime)"
-  if [[ ! -f "$runtime" ]]; then
+  if [[ "$runtime" != "$RUNTIME" ]]; then
+    fail "4: META.json names runtime $runtime, not $RUNTIME"
+  elif [[ ! -f "$runtime" ]]; then
     fail "4: runtime $runtime no longer exists"
   elif [[ "$l_runtime" != "runtime-sha256: $(sha256 "$runtime")" ]]; then
     fail "4: runtime-sha256 does not match $runtime (runtime changed: re-run as a fresh handoff)"

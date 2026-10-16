@@ -34,9 +34,14 @@ fi
 # --- 2. unit tests -----------------------------------------------------------------------------
 stage "unit tests"
 for t in tests/unit/*.test.sh; do
-  out="$(bash "$t" 2>&1)"
+  rc=0
+  out="$(bash "$t" 2>&1)" || rc=$?
   printf '%s\n' "$out"
   n="$(printf '%s\n' "$out" | grep -c '^not ok ' || true)"
+  if [[ $rc -ne 0 && $n -eq 0 ]]; then
+    echo "not ok $t — exited with status $rc"
+    n=1
+  fi
   if ! printf '%s\n' "$out" | grep -q '^ok '; then
     echo "not ok $t — produced no passing tests"
     n=$((n + 1))

@@ -18,7 +18,7 @@ _ho_refuse() {
 # --- Refusal checks: run by the owner, in a real terminal, outside any agent session ---------
 
 for _ho_marker in CLAUDECODE CLAUDE_CODE_ENTRYPOINT CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED; do
-  if [[ -n "${!_ho_marker:-}" ]]; then
+  if [[ -n "${!_ho_marker+set}" ]]; then
     _ho_refuse "this is an AI agent session (${_ho_marker} is set). Run the script in your own Terminal window."
   fi
 done
@@ -41,6 +41,10 @@ if [[ "$(basename "$HO_SCRIPT")" != "OWNER-RUN.sh" ]]; then
   _ho_refuse "handoff.sh may only be sourced by a file named OWNER-RUN.sh."
 fi
 
+if [[ -w "$HO_SCRIPT" ]]; then
+  _ho_refuse "OWNER-RUN.sh is still writable, so it was never frozen by 'handoff ready' (or you ran it with sudo)."
+fi
+
 # --- Internal state -------------------------------------------------------------------------
 
 _HO_ID=""
@@ -51,6 +55,7 @@ _HO_NAMES=" "
 _HO_LINES=()
 _HO_SCRIPT_SHA=""
 _HO_RUNTIME_SHA=""
+_HO_SECRETS=() # values collected by ho_secret_to_file in this run, kept only to redact them
 
 _ho_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 _ho_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -70,13 +75,39 @@ _ho_last_line() {
 # One-line evidence: no newlines, no control characters, no block markers, at most 200 chars.
 _ho_clean() {
   local s
-  s="$(printf '%s' "$1" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037')"
+  s="$(_ho_redact "$1")"
+  s="$(printf '%s' "$s" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037')"
   while [[ "$s" == *-----* ]]; do s="${s//-----/}"; done
   s="$(printf '%s' "$s" | tr -s ' ')"
   s="${s# }"
   s="${s% }"
   [[ -n "$s" ]] || s="(no output)"
   printf '%s' "${s:0:200}"
+}
+
+# Replace every secret collected in this run with [REDACTED].
+_ho_redact() {
+  local s="$1" sec
+  if [[ ${#_HO_SECRETS[@]} -gt 0 ]]; then
+    for sec in "${_HO_SECRETS[@]}"; do s="${s//"$sec"/[REDACTED]}"; done
+  fi
+  printf '%s' "$s"
+}
+
+# Rewrite a step's log with the collected secrets redacted.
+_ho_redact_log() {
+  [[ ${#_HO_SECRETS[@]} -gt 0 && -f "$1" ]] || return 0
+  local content
+  content="$(cat "$1")"
+  _ho_redact "$content" >"$1"
+}
+
+# Run a step's command under script(1) so it keeps the terminal; builtins work too.
+_ho_run() { # <log> <command…>
+  local log="$1"
+  shift
+  # shellcheck disable=SC2016 # "$@" is expanded by the inner bash, which runs the command
+  /usr/bin/script -q "$log" /bin/bash -c '"$@"' ho-step "$@"
 }
 
 _ho_record() { # <PASS|FAIL|INFO> <name> <evidence>
@@ -130,7 +161,9 @@ ho_begin() { # <id>
   _HO_ID="$id"
   _HO_SCRIPT_SHA="$(_ho_sha256 "$HO_SCRIPT")"
   _HO_RUNTIME_SHA="$(_ho_sha256 "$HO_RUNTIME")"
+  chmod 700 "$HO_DIR" 2>/dev/null || true
   mkdir -p "$HO_DIR/logs"
+  chmod 700 "$HO_DIR/logs"
   _HO_BEGUN=1
   trap _ho_on_exit EXIT
   local title
@@ -146,7 +179,8 @@ ho_check() { # <name> <command…> — PASS only if the command exits 0
   [[ $# -gt 0 ]] || _ho_fatal "ho_check $name: no command given"
   local log="$HO_DIR/logs/$name.log" rc=0 last
   printf '\n▶ %s: %s\n' "$name" "$*"
-  script -q "$log" "$@" || rc=$?
+  _ho_run "$log" "$@" || rc=$?
+  _ho_redact_log "$log"
   last="$(_ho_last_line "$log")"
   if [[ $rc -eq 0 ]]; then
     _ho_record PASS "$name" "$last"
@@ -167,7 +201,8 @@ ho_info() { # <name> <command…> — recorded, never fails
   [[ $# -gt 0 ]] || _ho_fatal "ho_info $name: no command given"
   local log="$HO_DIR/logs/$name.log" rc=0 last
   printf '\n▶ %s: %s\n' "$name" "$*"
-  script -q "$log" "$@" || rc=$?
+  _ho_run "$log" "$@" || rc=$?
+  _ho_redact_log "$log"
   last="$(_ho_last_line "$log")"
   if [[ $rc -ne 0 ]]; then last="exit $rc: $last"; fi
   _ho_record INFO "$name" "$last"
@@ -214,6 +249,8 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
     why="$file is tracked by git"
   elif ! git -C "$dir" check-ignore -q "$file"; then
     why="$file is not gitignored"
+  elif [[ -L "$file" || ( -e "$file" && ! -f "$file" ) ]]; then
+    why="$file exists but is not a regular file"
   fi
   if [[ -n "$why" ]]; then
     _HO_FAILED=1
@@ -235,16 +272,40 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
     printf '  ✘ FAIL (empty input)\n'
     return 1
   fi
-  tmp="$(umask 077 && mktemp "$dir/.ho-secret.XXXXXX")"
-  if [[ -f "$file" ]]; then
-    grep -v "^${var}=" "$file" >"$tmp" || true
+  # Written unquoted as VAR=value, so only characters that mean nothing to a shell or a dotenv
+  # parser are accepted (API keys and tokens fit).
+  if [[ ! "$value" =~ ^[A-Za-z0-9._~+/=:@%,-]+$ ]]; then
+    value=""
+    [[ $had_xtrace == 1 ]] && set -x
+    _HO_FAILED=1
+    _ho_record FAIL "$name" "refused: the value has spaces, quotes or shell characters; nothing stored"
+    printf '  ✘ FAIL (unsupported characters in the value; nothing stored)\n'
+    return 1
   fi
-  printf '%s=%s\n' "$var" "$value" >>"$tmp"
+  _HO_SECRETS+=("$value")
+
+  # Write a private temp file next to the target (it must be gitignored too), then move it.
+  local ok=1 rc=0
+  tmp="$(umask 077 && mktemp "$file.ho-tmp.XXXXXX" 2>/dev/null)" || ok=0
+  if [[ $ok == 1 ]] && ! git -C "$dir" check-ignore -q "$tmp"; then ok=0; fi
+  if [[ $ok == 1 && -f "$file" ]]; then
+    grep -v "^${var}=" "$file" >"$tmp" || rc=$?
+    [[ $rc -le 1 ]] || ok=0
+  fi
+  if [[ $ok == 1 ]]; then printf '%s=%s\n' "$var" "$value" >>"$tmp" || ok=0; fi
   value=""
   unset value
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$file"
+  if [[ $ok == 1 ]]; then chmod 600 "$tmp" || ok=0; fi
+  if [[ $ok == 1 ]]; then mv -f "$tmp" "$file" || ok=0; fi
+  if [[ $ok == 1 ]]; then [[ -f "$file" && ! -e "$tmp" ]] || ok=0; fi
+  [[ -n "${tmp:-}" && -e "$tmp" ]] && rm -f "$tmp"
   [[ $had_xtrace == 1 ]] && set -x
+  if [[ $ok != 1 ]]; then
+    _HO_FAILED=1
+    _ho_record FAIL "$name" "could not write $file; nothing stored"
+    printf '  ✘ FAIL (could not write %s)\n' "$file"
+    return 1
+  fi
   _ho_record PASS "$name" "stored $var in $file (mode 600)"
   printf '  ✔ PASS (stored, not shown)\n'
   return 0
@@ -275,7 +336,8 @@ ho_end() { # print the block, save RESULT.txt, copy to clipboard, exit
     if [[ ${#_HO_LINES[@]} -gt 0 ]]; then printf '%s\n' "${_HO_LINES[@]}"; fi
     printf '%s\n' "result: $result" "----- HANDOFF-RESULT END -----"
   )"
-  printf '%s\n' "$block" >"$HO_DIR/RESULT.txt"
+  (umask 077 && printf '%s\n' "$block" >"$HO_DIR/RESULT.txt")
+  chmod 600 "$HO_DIR/RESULT.txt" 2>/dev/null || true
   printf '\n%s\n\n' "$block"
   if printf '%s\n' "$block" | pbcopy 2>/dev/null; then
     printf 'Copied to your clipboard. Paste it back into Claude Code.\n'
