@@ -21,7 +21,8 @@ mk_harness() {
 }
 
 # mk_script <id> <step lines…>: write a well-formed OWNER-RUN.sh directly (no lint/ready), and
-# make it read-only as `handoff ready` would (the runtime refuses a writable script).
+# make it read-only and record it in a ready META.json, as `handoff ready` would (the runtime
+# refuses anything else).
 mk_script() {
   local id="$1" dir
   shift
@@ -35,6 +36,8 @@ mk_script() {
     printf 'ho_end\n'
   } >"$dir/OWNER-RUN.sh"
   chmod 444 "$dir/OWNER-RUN.sh"
+  jq -n --arg id "$id" --arg sha "$(shasum -a 256 "$dir/OWNER-RUN.sh" | awk '{print $1}')" \
+    '{id: $id, state: "ready", script_sha256: $sha, readied: "2000-01-01T00:00:00Z"}' >"$dir/META.json"
   SCRIPT="$dir/OWNER-RUN.sh"
 }
 

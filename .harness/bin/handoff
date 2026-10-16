@@ -223,9 +223,12 @@ cmd_ready() {
   [[ "$(meta_get "$dir" runtime)" == "$RUNTIME" ]] || die "handoff $id names a runtime other than $RUNTIME"
   cmd_lint "$dir/OWNER-RUN.sh"
   chmod 444 "$dir/OWNER-RUN.sh"
+  local sha
+  sha="$(sha256 "$dir/OWNER-RUN.sh")" || sha=""
+  [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || die "could not compute the sha256 of $dir/OWNER-RUN.sh; still draft"
   # shellcheck disable=SC2016 # a jq program: $sha and $at are jq variables
   meta_set "$dir" '.state = "ready" | .script_sha256 = $sha | .readied = $at' \
-    --arg sha "$(sha256 "$dir/OWNER-RUN.sh")" --arg at "$(utc)"
+    --arg sha "$sha" --arg at "$(utc)" || die "could not update META.json; still draft"
   printf '\nReady. Give the owner exactly these two lines:\n\n'
   printf '  bash %q\n' "$dir/OWNER-RUN.sh"
   printf '  paste back the HANDOFF-RESULT block\n'

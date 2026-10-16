@@ -203,6 +203,14 @@ ho_begin() { # <id>
   if [[ ! "$_HO_SCRIPT_SHA" =~ ^[0-9a-f]{64}$ || ! "$_HO_RUNTIME_SHA" =~ ^[0-9a-f]{64}$ ]]; then
     _ho_refuse "could not compute the sha256 of the script and runtime, so this run couldn't be verified."
   fi
+  # Only a script that `handoff ready` froze may run: META.json must say ready and record this
+  # exact script. (A draft can't be run early and its result replayed after ready.)
+  local st frozen
+  st="$(jq -r '.state // empty' "$HO_DIR/META.json" 2>/dev/null)" || st=""
+  frozen="$(jq -r '.script_sha256 // empty' "$HO_DIR/META.json" 2>/dev/null)" || frozen=""
+  if [[ "$st" != ready || "$frozen" != "$_HO_SCRIPT_SHA" ]]; then
+    _ho_refuse "this script is not the one 'handoff ready' froze (state '${st:-none}'), or it was already verified."
+  fi
   if [[ -L "$HO_DIR/logs" || -L "$HO_DIR/RESULT.txt" ]]; then
     _ho_refuse "a symlink sits where the runtime writes (logs/ or RESULT.txt); remove it first."
   fi

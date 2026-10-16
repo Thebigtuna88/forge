@@ -41,6 +41,20 @@ test_refuses_an_agent_marker_set_to_empty() {
   [[ ! -f "$H/work/owner/$ID/RESULT.txt" ]] || _t_fail "RESULT.txt written despite refusal"
 }
 
+test_refuses_a_script_that_was_never_readied() {
+  mk_harness
+  mk_script "$ID" 'ho_check ok /usr/bin/true'
+  jq '.state = "draft"' "$H/work/owner/$ID/META.json" >"$T_TMP/m" && cat "$T_TMP/m" >"$H/work/owner/$ID/META.json"
+  pty_run -- bash "$SCRIPT"
+  assert_exit 3 "$RC"
+  assert_contains "$OUT" "not the one 'handoff ready' froze"
+  jq '.state = "ready" | .script_sha256 = "0000"' "$H/work/owner/$ID/META.json" >"$T_TMP/m" \
+    && cat "$T_TMP/m" >"$H/work/owner/$ID/META.json"
+  pty_run -- bash "$SCRIPT"
+  assert_exit 3 "$RC"
+  [[ ! -f "$H/work/owner/$ID/RESULT.txt" ]] || _t_fail "RESULT.txt written despite refusal"
+}
+
 # Only a script frozen by `handoff ready` (read-only) may run.
 test_refuses_a_writable_script() {
   mk_harness

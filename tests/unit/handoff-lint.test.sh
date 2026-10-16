@@ -173,6 +173,18 @@ test_ready_rejects_an_id_outside_the_owner_folder() {
   assert_eq "$(jq -r .state "$H/work/other/META.json")" draft
 }
 
+test_ready_stays_draft_when_the_checksum_fails() {
+  new_with 'ho_check ok /usr/bin/true'
+  mkdir "$T_TMP/bin"
+  printf '#!/bin/bash\nexit 1\n' >"$T_TMP/bin/shasum"
+  chmod +x "$T_TMP/bin/shasum"
+  local out
+  out="$(env PATH="$T_TMP/bin:$PATH" "$HANDOFF" ready "$ID" 2>&1)" && _t_fail "ready succeeded without a checksum"
+  assert_contains "$out" "still draft"
+  assert_eq "$(jq -r .state "$DIR/META.json")" draft
+  "$HANDOFF" ready "$ID" >/dev/null || _t_fail "retrying ready failed"
+}
+
 test_ready_rejects_a_foreign_runtime() {
   new_with 'ho_check ok /usr/bin/true'
   jq '.runtime = "/tmp/evil/handoff.sh"' "$DIR/META.json" >"$T_TMP/m" && cat "$T_TMP/m" >"$DIR/META.json"

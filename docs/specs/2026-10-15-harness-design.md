@@ -267,7 +267,9 @@ ho_end
 - `CLAUDECODE` (or any other known agent marker: `CLAUDE_CODE_ENTRYPOINT`, `CODEX_SANDBOX`,
   `CODEX_SANDBOX_NETWORK_DISABLED`) is set, even to the empty string;
 - it is executed directly instead of sourced;
-- `OWNER-RUN.sh` is still writable, i.e. it was never frozen by `handoff ready`;
+- `OWNER-RUN.sh` is still writable, or `META.json` doesn't say `ready` with this script's
+  sha256 (it was never frozen by `handoff ready`, or it is already verified);
+- its own sha256 or the runtime's can't be computed;
 - shell tracing is on (`bash -x`), which would print secrets;
 - a symlink sits at `logs/` or `RESULT.txt` (the last three added in the FRG-1 review).
 
