@@ -25,6 +25,8 @@ case "${MISBEHAVE:-}" in
     ;;
   exec-true) exec /usr/bin/true ;;
   exec-false) exec /usr/bin/false ;;
+  command-exec) command exec /usr/bin/true ;;
+  builtin-exec) builtin exec /usr/bin/true ;;
   subst-error-then-allow)
     checked="$(no_such_command_frg2 2>/dev/null; printf unchecked)"
     printf '%s\n' "$checked"

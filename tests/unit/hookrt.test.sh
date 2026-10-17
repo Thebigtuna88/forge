@@ -219,7 +219,7 @@ test_crash_or_no_decision_denies() {
   mk_hook_harness
   local how
   for how in unbound exit0 exit1 missing-command term usr1 quit error-then-allow false-then-allow \
-    unset-decided exec-true exec-false subst-error-then-allow fall-off-the-end; do
+    unset-decided exec-true exec-false command-exec builtin-exec subst-error-then-allow fall-off-the-end; do
     run_hook misbehave "$(bash_input ls)" MISBEHAVE="$how"
     assert_exit 2 "$RC" "misbehave=$how"
   done
@@ -317,7 +317,8 @@ test_guarded_detection() {
     '2>/dev/null /usr/bin/g[i]t push origin main' '/usr/bin/env /usr/bin/g[i]t push origin main' \
     'env -u FOO /usr/bin/g[i]t push origin main' 'exec -a x g?t push' 'coproc g?t push' \
     'nice -n 5 g?t push' 'ls; 3<f g?t push' 'cat <(g?t push origin main)' \
-    'diff <(/usr/bin/g[i]t push origin main) /dev/null' 'tee >(g?t push) </dev/null'; do
+    'diff <(/usr/bin/g[i]t push origin main) /dev/null' 'tee >(g?t push) </dev/null' \
+    "bash -c \$'git\\x20push\\x20origin\\x20main'" "sh -c \$'\\147it push'"; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done
@@ -462,6 +463,26 @@ test_md5_and_sha256() {
   printf 'abc\n' >"$T_TMP/f"
   run_hook probe "$(jq -n --arg f "$T_TMP/f" '{tool_name: "Read", tool_input: {file_path: $f}}')" PROBE=sums
   assert_eq "$OUT" "md5=0bee89b07a248e27c83fc3d5951213c1 sha256=edeaaff3f1774ad2888673770c6d64097e391bc362d7d6fb34982ddf0efd18cb"
+}
+
+test_checksum_of_option_like_name_denies() {
+  mk_hook_harness
+  local f what
+  for what in md5 sha256; do
+    for f in --help -sabc -a; do
+      run_hook probe "$(jq -n --arg f "$f" '{tool_name: "Read", tool_input: {file_path: $f}}')" PROBE="$what"
+      assert_exit 2 "$RC" "$what of '$f' (got: $OUT)"
+    done
+  done
+}
+
+test_inherited_git_exec_path_is_ignored() {
+  mk_hook_harness
+  mkdir "$T_TMP/gx"
+  printf '#!/bin/sh\nexit 0\n' >"$T_TMP/gx/git-launch"
+  chmod 755 "$T_TMP/gx/git-launch"
+  run_hook sample-gate "$(bash_input 'git launch' "$H")" GIT_EXEC_PATH="$T_TMP/gx"
+  assert_exit 2 "$RC" "git-launch is not one of git's own commands"
 }
 
 test_checksum_of_missing_file_denies() {

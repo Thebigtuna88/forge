@@ -38,6 +38,14 @@ case "${PROBE:-}" in
     s="$(hr_sha256 "$HR_FILE")"
     printf 'md5=%s sha256=%s\n' "$m" "$s"
     ;;
+  md5)
+    m="$(hr_md5 "$HR_FILE")"
+    printf 'md5=%s\n' "$m"
+    ;;
+  sha256)
+    s="$(hr_sha256 "$HR_FILE")"
+    printf 'sha256=%s\n' "$s"
+    ;;
   deny)
     hr_deny "probe was told to deny"
     ;;

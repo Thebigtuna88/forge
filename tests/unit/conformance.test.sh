@@ -456,4 +456,42 @@ test_bad_mode_runs_check_the_mode_variant_survives() {
   assert_contains "$OUT" "(malformed mode.json): the sandbox copy of .harness/mode.json (the malformed variant)"
 }
 
+test_fails_on_deny_case_with_invalid_input() {
+  mk_conf_harness
+  jq '.tool_input.command = 42' "$H/tests/conformance/sample-gate/deny/push-main.json" >"$T_TMP/c.json"
+  mv "$T_TMP/c.json" "$H/tests/conformance/sample-gate/deny/push-main.json"
+  expect_fail "not valid hook input"
+}
+
+test_setup_cannot_redirect_the_runner_files() {
+  # probe allows everything it can read; an unreadable (empty) input would make it deny.
+  mk_conf_harness sample-gate probe
+  case_json probe deny anything 'git push origin main'
+  case_json probe allow other 'ls'
+  printf 'ln -s /dev/null "$TMP/input.json"\nln -s /dev/null "$TMP/r/input.json" 2>/dev/null || true\n' \
+    >"$H/tests/conformance/probe/deny/anything.setup.sh"
+  expect_fail "probe deny/anything.json: expected exit 2 (enforce), got 0"
+}
+
+test_setup_cannot_symlink_the_hooks() {
+  mk_conf_harness
+  cat >"$H/tests/conformance/sample-gate/allow/push-feature.setup.sh" <<'EOF'
+mkdir -p "$TMP/fake/.claude"
+cp -R "$ROOT/.claude/hooks" "$TMP/fake/.claude/hooks"
+rm -rf "$ROOT/.claude/hooks"
+ln -s "$TMP/fake/.claude/hooks" "$ROOT/.claude/hooks"
+EOF
+  expect_fail "setup"
+  assert_contains "$OUT" "symlink"
+}
+
+test_bash_env_cannot_fake_a_pass() {
+  mk_conf_harness
+  register
+  printf 'echo "conformance: PASS"\nexit 0\n' >"$T_TMP/benv.sh"
+  OUT="$(cd "$H" && env HOME="$T_TMP/home" BASH_ENV="$T_TMP/benv.sh" "$H/.harness/bin/conformance" 2>&1)"
+  RC=$?
+  assert_exit 1 "$RC" "$OUT"
+}
+
 run_tests

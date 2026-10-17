@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # conformance — proves the gates work as configured right now (spec 5.5).
 #   .harness/bin/conformance
 #
@@ -26,8 +26,14 @@
 #    conformance ran.
 # 6. Prints `hook | mode | deny cases | allow cases | result`, then "conformance: PASS" or
 #    "conformance: FAIL (<n>)", and exits 0 or 1.
+# Runs as `bash -p` (no exported functions, no BASH_ENV) with its own PATH, like the hooks.
 # Must run on macOS /bin/bash 3.2.
 set -uo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
+export PATH
+for v in $(compgen -e); do
+  case "$v" in GIT_* | DEVELOPER_DIR) unset "$v" ;; esac
+done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)" || exit 1
 HOOKS_DIR="$ROOT/.claude/hooks"
@@ -225,13 +231,16 @@ if [[ -d "$CASES_DIR" ]] && [[ -n "$(find "$CASES_DIR" -name '*.setup.sh' -print
 fi
 
 n_sbx=0
-# mk_sandbox: sets BASE (the sandbox's home folder and temp root) and SBX (its main checkout).
+# mk_sandbox: sets BASE (the sandbox's home folder and temp root), SBX (its main checkout) and
+# RUN (the runner's own files: input, output, saved variant). A setup can write only inside BASE,
+# so it can't plant links where the runner writes.
 mk_sandbox() {
   local rel
   n_sbx=$((n_sbx + 1))
   BASE="$TMP/s$n_sbx"
+  RUN="$TMP/r$n_sbx"
   SBX="$BASE/code/forge"
-  mkdir -p "$SBX" "$BASE/code/forge-worktrees" "$BASE/home" || return 1
+  mkdir -p "$SBX" "$BASE/code/forge-worktrees" "$BASE/home" "$RUN" || return 1
   for rel in ${COPIED[@]+"${COPIED[@]}"}; do
     mkdir -p "$SBX/$(dirname "$rel")" && cp -p "$ROOT/$rel" "$SBX/$rel" || return 1
   done
@@ -276,6 +285,17 @@ run_case() {
     CASE_ERR="not a readable JSON case with a hook_event_name"
     return 0
   fi
+  # The same shape hr_init accepts, so a deny case can't "pass" by being unreadable input.
+  if ! jq -se 'length == 1 and (.[0] | type) == "object" and (.[0] |
+      (.hook_event_name | type) == "string"
+      and ([.tool_name, .cwd] | all(. == null or type == "string"))
+      and ((.tool_input | type) as $t | $t == "null" or $t == "object")
+      and ([.tool_input.command?, .tool_input.file_path?, .tool_input.notebook_path?]
+        | all(. == null or (type == "string" and (any(explode[]; . == 0) | not)))))' \
+    "$json" >/dev/null 2>&1; then
+    CASE_ERR="not valid hook input (one JSON object; event, tool, command, file path and cwd must be strings)"
+    return 0
+  fi
   if [[ "$event" == *ToolUse* && -z "$tool" ]]; then
     CASE_ERR="a $event case needs a tool_name"
     return 0
@@ -295,11 +315,17 @@ run_case() {
     (cd "$BASE" && env -i PATH="$PATH" HOME="$BASE/home" ROOT="$SBX" \
       WORKTREES="$BASE/code/forge-worktrees" TMP="$BASE" \
       sandbox-exec -D BASE="$BASE" -p "$SETUP_PROFILE" /bin/bash "$BASE/setup.sh") \
-      >"$BASE/setup.out" 2>&1 || {
-      CASE_ERR="setup failed: $(tr '\n' ' ' <"$BASE/setup.out")"
+      >"$RUN/setup.out" 2>&1 || {
+      CASE_ERR="setup failed: $(tr '\n' ' ' <"$RUN/setup.out")"
       return 0
     }
-    # A setup prepares the scene (aliases, repos); it may not touch the hooks, runtime or config.
+    # A setup prepares the scene (aliases, repos); it may not touch the hooks, runtime or config,
+    # nor swap in links that point the hook at other files.
+    if [[ "$(cd "$SBX" 2>/dev/null && pwd -P)" != "$SBX" ]] ||
+      [[ -n "$(find "$SBX/.claude" "$SBX/.harness" -type l -print -quit 2>/dev/null)" ]]; then
+      CASE_ERR="setup put a symlink in the sandbox's hook, runtime or config paths"
+      return 0
+    fi
     if CASE_DIFF="$(differs)"; then
       CASE_ERR="setup changed $CASE_DIFF in the sandbox"
       return 0
@@ -313,25 +339,25 @@ run_case() {
   esac
   if [[ "$variant" != live ]]; then
     skip=.harness/mode.json
-    [[ "$variant" == missing ]] || cp "$SBX/.harness/mode.json" "$BASE/mode.variant"
+    [[ "$variant" == missing ]] || cp "$SBX/.harness/mode.json" "$RUN/mode.variant"
   fi
   jq --arg r "$SBX" --arg w "$BASE/code/forge-worktrees" --arg t "$BASE" \
     'walk(if type == "string"
       then split("@ROOT@") | join($r) | split("@WORKTREES@") | join($w) | split("@TMP@") | join($t)
-      else . end)' "$json" >"$BASE/input.json" || {
+      else . end)' "$json" >"$RUN/input.json" || {
     CASE_ERR="can't fill in the placeholders"
     return 0
   }
   before="$(logged "$key")"
   (cd "$SBX" && env -i PATH="$PATH" HOME="$BASE/home" CLAUDE_PROJECT_DIR="$SBX" \
-    "$SBX/.claude/hooks/$hook.sh" <"$BASE/input.json" >"$BASE/stdout" 2>"$BASE/stderr")
+    "$SBX/.claude/hooks/$hook.sh" <"$RUN/input.json" >"$RUN/stdout" 2>"$RUN/stderr")
   CASE_RC=$?
   CASE_NEW=$(($(logged "$key") - before))
   CASE_DIFF="$(differs "$skip")" || CASE_DIFF=""
   if [[ -z "$CASE_DIFF" && "$variant" == missing && -e "$SBX/.harness/mode.json" ]]; then
     CASE_DIFF=".harness/mode.json (should be missing)"
   elif [[ -z "$CASE_DIFF" && "$variant" != live && "$variant" != missing ]] &&
-    ! cmp -s "$BASE/mode.variant" "$SBX/.harness/mode.json"; then
+    ! cmp -s "$RUN/mode.variant" "$SBX/.harness/mode.json"; then
     CASE_DIFF=".harness/mode.json (the $variant variant)"
   fi
 }
@@ -360,7 +386,7 @@ for h in ${hooks[@]+"${hooks[@]}"}; do
     mode="$(mode_of "$(case_key "$h" "$f")")"
     [[ " $modes " == *" $mode "* ]] || modes="$modes $mode"
     if [[ "$kind" == allow ]]; then
-      [[ "$CASE_RC" == 0 ]] || fail "$label: expected exit 0 (allow), got $CASE_RC: $(head -c 300 "$BASE/stderr")"
+      [[ "$CASE_RC" == 0 ]] || fail "$label: expected exit 0 (allow), got $CASE_RC: $(head -c 300 "$RUN/stderr")"
       [[ "$CASE_NEW" == 0 ]] || fail "$label: an allow case wrote a WOULD-DENY line"
     elif [[ "$mode" == enforce ]]; then
       [[ "$CASE_RC" == 2 ]] || fail "$label: expected exit 2 (enforce), got $CASE_RC"

@@ -56,10 +56,19 @@ export LC_ALL=C
 # System tools first: jq, python3, git, shasum and md5 come from root-owned /usr/bin and /sbin.
 PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
 export PATH
+# Git reads these to find its programs, repository and config; the hook must see git's defaults
+# (DEVELOPER_DIR steers the /usr/bin/git shim).
+for _hr_v in $(compgen -e); do
+  case "$_hr_v" in GIT_* | DEVELOPER_DIR) unset "$_hr_v" ;; esac
+done
+unset _hr_v
 
-exec() { # replacing the shell would skip the EXIT trap, so a hook may not do it
+# Replacing the shell would skip the EXIT trap, so a hook may not do it in any form: the builtin
+# is switched off (so `builtin exec` and `command exec` fail) and plain `exec` explains why.
+exec() {
   _hr_fatal "a hook may not use exec (it would skip the fail-closed exit check)"
 }
+enable -n exec
 
 _hr_lib="${BASH_SOURCE[0]%/*}"
 [[ "$_hr_lib" != "${BASH_SOURCE[0]}" ]] || _hr_lib=.
@@ -298,6 +307,8 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   local -a words
   _hr_load
   cmd="${cmd//\\$'\n'/}" # line continuations, removed as the shell does
+  # $'…' and $"…" can spell any word or separator in escapes, so nothing below could see it.
+  if [[ "$cmd" == *"\$'"* || "$cmd" == *'$"'* ]]; then return 0; fi
   # 1. The words with quotes and backslashes removed, split on anything else, lower case.
   #    Catches g"i"t p\ush, `git push`, sh -c "git push", GIT PUSH (case-insensitive disk).
   read -r -a words <<<"$(printf '%s' "${cmd//[\'\"\\]/}" | LC_ALL=C tr -c 'A-Za-z0-9_.-' ' ' | LC_ALL=C tr '[:upper:]' '[:lower:]')"
@@ -478,19 +489,22 @@ hr_git_sub() { # uses HR_TOK (a git command): sets HR_GIT_SUB, HR_GIT_ARGS, HR_G
 
 # --- checksums ---------------------------------------------------------------------------------
 
+# The file is read on stdin, so a name like --help or -s is never taken for an option.
 hr_md5() { # <file>: its md5 in hex; fails if the file can't be read
   local s
-  if s="$(md5 -q "$1" 2>/dev/null)"; then
+  [[ -f "$1" && -r "$1" ]] || return 1
+  if s="$(md5 -q <"$1" 2>/dev/null)"; then
     printf '%s\n' "$s"
     return 0
   fi
-  s="$(md5sum "$1" 2>/dev/null)" || return 1
+  s="$(md5sum <"$1" 2>/dev/null)" || return 1
   printf '%s\n' "${s%% *}"
 }
 
 hr_sha256() { # <file>: its sha256 in hex; fails if the file can't be read
   local s
-  s="$(shasum -a 256 "$1" 2>/dev/null)" || return 1
+  [[ -f "$1" && -r "$1" ]] || return 1
+  s="$(shasum -a 256 <"$1" 2>/dev/null)" || return 1
   printf '%s\n' "${s%% *}"
 }
 
