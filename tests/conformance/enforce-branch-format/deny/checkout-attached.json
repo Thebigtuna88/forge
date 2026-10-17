@@ -5,5 +5,5 @@
     "command": "git checkout -btopic"
   },
   "cwd": "@ROOT@",
-  "forge_reason": "branch names must be feature/"
+  "forge_reason": "not an option this gate knows"
 }

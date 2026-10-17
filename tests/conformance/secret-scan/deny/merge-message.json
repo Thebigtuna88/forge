@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git merge -m x dev"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "merge only as"
+}

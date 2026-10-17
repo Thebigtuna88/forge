@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git branch --forc feature/FRG-3-a dev"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "rewrites history"
+}

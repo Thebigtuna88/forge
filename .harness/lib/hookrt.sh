@@ -113,11 +113,12 @@ _HR_LOADED="" _HR_TOOLS=() _HR_GIT_CMDS="" _HR_SUBI=-1 _HR_UNKNOWABLE=0 _HR_CDS=
 # .harness/deploy-targets.json ("tools") on top of this floor, so a missing file can't open them.
 _HR_GUARDED_SEQS=("git push" "git commit" "git send pack" "git http push" "git rebase" "git filter branch"
   "git filter repo" "git replace" "git update ref" "git am" "git cherry pick" "git revert"
-  "git checkout" "git switch" "git branch" "git worktree" "gh pr merge" "gh api" "gh repo"
-  "gh workflow run")
+  "git checkout" "git switch" "git branch" "git worktree" "git reset" "git merge" "git pull" "git fetch"
+  "gh pr merge" "gh api" "gh repo" "gh workflow run")
 # The git subcommands those name; an alias for any of them is refused (hr_require_simple).
 _HR_GIT_GUARDED_SUBS=" push commit send-pack http-push rebase filter-branch filter-repo replace "
 _HR_GIT_GUARDED_SUBS+="update-ref commit-tree am cherry-pick revert checkout switch branch worktree "
+_HR_GIT_GUARDED_SUBS+="reset merge pull fetch "
 _HR_DEPLOY_FLOOR=("vercel" "fastlane" "eas" "xcrun altool")
 # With `$` or a backtick the shell can build words the hook never sees, so any of these words
 # in such a command makes it guarded.

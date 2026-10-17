@@ -338,7 +338,8 @@ test_guarded_detection() {
     'ls; gh pr m*e 16' 'vercel dep[l]oy --pr?d' 'cd /x && git rebase dev' \
     'git checkout -b feature/FRG-3-a && ls' 'git branch -f x; ls' 'git update-ref -d refs/heads/main | cat' \
     'git cherry-pick abc && ls' 'git commit-tree abc' 'git worktree add -b x /y && ls' 'git switch -c x; ls' \
-    'git filter-branch' 'git replace a b' 'git revert HEAD' 'git am p.patch'; do
+    'git filter-branch' 'git replace a b' 'git revert HEAD' 'git am p.patch' 'git merge dev && ls' \
+    'cd /x; git reset --hard HEAD' 'git pull origin dev | cat' 'git fetch origin main:main && ls'; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done
@@ -349,7 +350,7 @@ test_plain_detection() {
   local c
   for c in 'ls -la' 'git status && git log --oneline -5' 'git log --grep fix | head' \
     'gh pr view 3 | head' 'gh issue list' 'echo hi > f.txt' 'git -C /x diff | wc -l' \
-    'cat README.md' 'git merge dev' 'for f in *.sh; do echo "$f"; done' '' \
+    'cat README.md' 'for f in *.sh; do echo "$f"; done' '' \
     'ls *.sh | wc -l' 'rm -rf build/* && ls' 'for f in a b; do bash "$f"; done' 'ls * | head' \
     'ls work/*/manual | head' 'find work -type f | head' 'for d in a b; do git -C "$d" status; done'; do
     probe guarded "$c"
@@ -367,7 +368,8 @@ test_simple_guarded_commands_pass() {
     'gh api repos/Thebigtuna88/forge/pulls' 'vercel deploy' \
     'git --no-pager -c color.ui=never push origin feature/FRG-2-a' \
     'git -c core.quotepath=false -c advice.detachedHead=false push origin feature/FRG-2-a' \
-    'gh repo view Thebigtuna88/forge' 'gh actions' 'gh copilot explain x' 'gh repo list'; do
+    'gh repo view Thebigtuna88/forge' 'gh actions' 'gh copilot explain x' 'gh repo list' 'git merge dev' \
+    'git pull --ff-only origin dev'; do
     expect_allow "$c"
   done
 }

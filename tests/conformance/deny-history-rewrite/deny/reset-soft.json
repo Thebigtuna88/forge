@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git reset --soft abc123"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "git reset moves the branch"
+}
