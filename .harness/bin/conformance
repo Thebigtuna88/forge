@@ -406,8 +406,8 @@ for n, raw in logical:
                 start = True
             prev = w
             continue
-        if start and w in REDIRS:
-            target = True
+        if w in REDIRS:
+            target = True  # the next word is a file name, wherever the redirection stands
             prev = w
             continue
         if start and ((w.isdigit() and nxt in REDIRS) or ASSIGNMENT.match(w)):

@@ -837,4 +837,12 @@ test_command_names_must_be_plain_and_allowed() {
   done
 }
 
+test_redirection_targets_are_not_command_names() {
+  mk_conf_harness
+  printf '%s\n' 'printf hello > "$HR_ROOT/output"' 'echo hi >&2' 'printf x 2>"$HR_FILE"' \
+    'printf x >>"$HR_ROOT/log" 2>&1' >>"$H/.claude/hooks/sample-gate.sh"
+  conform
+  assert_not_contains "$OUT" "plain word"
+}
+
 run_tests
