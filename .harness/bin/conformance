@@ -1,0 +1,849 @@
+#!/bin/bash -p
+# conformance — proves the gates work as configured right now (spec 5.5).
+#   .harness/bin/conformance
+#
+# 1. Every .claude/hooks/<name>.sh starts with #!/bin/bash -p, is executable, registered in
+#    .claude/settings.json (as a synchronous command) and clean under shellcheck; every registered
+#    hook exists. A hook uses $(…) only as the whole value of a plain assignment, one per line and
+#    not nested (no backticks, no <( >( ), and defines no functions or multi-line groups, so bash
+#    can't hide a failure inside it. Nothing else lives in .claude/hooks or
+#    tests/conformance: no hidden or stray files, and no symlinks there or in the hook, runtime and
+#    config paths.
+# 2. Each case tests/conformance/<hook>/{deny,allow}/<case>.json is fed on stdin to the hook in a
+#    fresh sandbox: a byte-identical copy of the hooks, runtime and config (live mode.json
+#    included) at <tmp>/code/forge, a git repo on dev with a bare "origin", next to an empty
+#    <tmp>/code/forge-worktrees, with its own HOME. The hook must be registered for the case's
+#    hook_event_name and tool_name. In a case, @ROOT@, @WORKTREES@ and @TMP@ become those paths,
+#    an optional "forge_mode_key" names the mode.json key it runs under (default: the hook's
+#    name), and an optional <case>.setup.sh runs first: copied into the sandbox and run by bash
+#    under macOS sandbox-exec, with only PATH, HOME, ROOT, WORKTREES and TMP set. It (and anything
+#    it leaves running) may write only inside the sandbox, never to the copied hooks, runtime or
+#    config, and may not send signals. A setup is trusted, reviewed,
+#    owner-only code: it shapes the scene a case runs in. A *ToolUse case must name its tool_name.
+#    enforce: deny → exit 2 with the runtime's "BLOCKED by FORGE hook <key>:" decision on stderr
+#    (a crash also exits 2, but doesn't count), allow → exit 0. observe: deny → exit 0 plus a new
+#    "<key> WOULD-DENY" line. An optional "forge_reason" must appear in that decision. No allow case may log WOULD-DENY. Afterwards the sandbox copies must
+#    still match the live files.
+# 3. With a missing, a malformed and an unknown-value mode.json, every deny case exits 2.
+# 4. Hooks are not switched off: no disableAllHooks and no allowManagedHooksOnly in the user
+#    settings (~/.claude and $CLAUDE_CONFIG_DIR), the project and local settings (of this
+#    checkout and, from a worktree, of the main checkout) or the macOS managed settings.
+# 5. No live file in the checkout (outside .git, work/, projects/, .harness/state/) changed while
+#    conformance ran.
+# 6. Prints `hook | mode | deny cases | allow cases | result`, then "conformance: PASS" or
+#    "conformance: FAIL (<n>)", and exits 0 or 1.
+# Runs as `bash -p` (no exported functions, no BASH_ENV) with its own PATH and only HOME, USER,
+# LOGNAME, TMPDIR and CLAUDE_CONFIG_DIR kept from the environment, like the hooks.
+# Must run on macOS /bin/bash 3.2.
+set -uo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
+export PATH LC_ALL=C
+for v in $(compgen -e); do
+  case "$v" in
+    HOME | USER | LOGNAME | TMPDIR | CLAUDE_CONFIG_DIR | PATH | LC_ALL) ;;
+    *) unset "$v" 2>/dev/null || true ;;
+  esac
+done
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)" || exit 1
+HOOKS_DIR="$ROOT/.claude/hooks"
+SETTINGS="$ROOT/.claude/settings.json"
+CASES_DIR="$ROOT/tests/conformance"
+MANAGED_DIR="/Library/Application Support/ClaudeCode"
+failures=0
+
+fail() {
+  printf 'FAIL %s\n' "$1"
+  failures=$((failures + 1))
+}
+
+finish() {
+  echo
+  if [[ $failures -eq 0 ]]; then
+    echo "conformance: PASS"
+    exit 0
+  fi
+  echo "conformance: FAIL ($failures)"
+  exit 1
+}
+
+in_list() { # <word> <list…>
+  local w="$1" x
+  shift
+  for x in "$@"; do [[ "$x" == "$w" ]] && return 0; done
+  return 1
+}
+
+# Must give the same answer as _hr_mode in .harness/lib/hookrt.sh.
+mode_of() { # <key>
+  if jq -se --arg k "$1" 'length == 1 and (.[0] | type) == "object"
+      and (.[0].modes | type) == "object" and .[0].modes[$k] == "observe"' \
+    "$ROOT/.harness/mode.json" >/dev/null 2>&1; then
+    echo observe
+  else
+    echo enforce
+  fi
+}
+
+entries() { # <dir>: every entry in <dir>, hidden ones included, one per line
+  local f
+  for f in "$1"/* "$1"/.*; do
+    case "${f##*/}" in . | ..) continue ;; esac
+    [[ -e "$f" || -L "$f" ]] && printf '%s\n' "$f"
+  done
+}
+
+snapshot() { # sha256 of every file in the checkout except git data and scratch areas
+  find "$ROOT" \( -path "$ROOT/.git" -o -path "$ROOT/work" -o -path "$ROOT/projects" \
+    -o -path "$ROOT/.harness/state" -o -name node_modules \) -prune -o \( -type f -o -type l \) -print0 |
+    xargs -0 shasum -a 256 2>&1 | sort
+}
+
+command -v jq >/dev/null 2>&1 || {
+  fail "jq is not installed"
+  finish
+}
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/forge-conformance.XXXXXX")" && TMP="$(cd "$TMP" && pwd -P)" && [[ -d "$TMP" && "$TMP" != / ]] || {
+  fail "can't create a temporary folder"
+  finish
+}
+trap 'rm -rf "$TMP"' EXIT
+
+# --- 1. hooks, registration, shellcheck, case layout --------------------------------------------
+
+for p in "$ROOT/.claude" "$HOOKS_DIR" "$SETTINGS" "$ROOT/.harness" "$ROOT/.harness/lib" \
+  "$ROOT/.harness/bin" "$ROOT/.harness/bin/conformance" "$ROOT/tests" "$CASES_DIR" \
+  "$ROOT"/.harness/lib/* "$ROOT"/.harness/*.json; do
+  [[ -L "$p" ]] && fail "${p#"$ROOT"/} is a symlink (the hooks, runtime and config must be real files)"
+done
+
+hooks=()
+if [[ -d "$HOOKS_DIR" ]]; then
+  while IFS= read -r f; do
+    name="${f##*/}"
+    if [[ -f "$f" && ! -L "$f" && "$name" == [!.]*.sh ]]; then
+      hooks+=("${name%.sh}")
+    else
+      fail ".claude/hooks/$name is not a hook script (only regular <name>.sh files belong there)"
+    fi
+  done < <(entries "$HOOKS_DIR")
+fi
+
+# One line per registered command: <event> US <matcher> US <async> US <command> (US = \x1f, not
+# whitespace, so an empty matcher stays a field of its own).
+registered=() regs=()
+# shellcheck disable=SC2016 # the literal text "$CLAUDE_PROJECT_DIR" that settings.json must contain
+reg_re='^"\$CLAUDE_PROJECT_DIR"/\.claude/hooks/([A-Za-z0-9._-]+)\.sh$'
+if reg="$(jq -r '
+    (.hooks // {}) | if type == "object" then . else error("hooks is not an object") end
+    | to_entries[] | .key as $event
+    | .value | if type == "array" then .[] else error("event is not a list") end
+    | (.matcher // "") as $m | if ($m | type) == "string" then . else error("matcher is not a string") end
+    | .hooks | if type == "array" then .[] else error("matcher has no hooks list") end
+    | if .type == "command" and (.command | type) == "string"
+      then [$event, $m, (.async // false | tostring), .command]
+        | if any(.[]; explode | any(. < 32)) then error("control character in a registration")
+          else join("\u001f") end
+      else error("hook entry is not a command") end' "$SETTINGS" 2>&1)"; then
+  while IFS=$'\x1f' read -r event matcher async cmd; do
+    [[ -n "$event" ]] || continue
+    if [[ "$cmd" =~ $reg_re ]]; then
+      h="${BASH_REMATCH[1]}"
+      registered+=("$h")
+      if [[ "$async" == false ]]; then
+        regs+=("$h"$'\x1f'"$event"$'\x1f'"$matcher")
+      else
+        fail "$h.sh is registered with async: an async hook can't block anything"
+      fi
+    else
+      fail "unrecognised hook command in .claude/settings.json: $cmd"
+    fi
+  done <<<"$reg"
+else
+  fail ".claude/settings.json is missing or malformed: ${reg//$'\n'/ }"
+fi
+
+# registered_for <hook> <event> <tool>: a synchronous registration whose matcher covers the tool.
+registered_for() {
+  local r h e m
+  for r in ${regs[@]+"${regs[@]}"}; do
+    IFS=$'\x1f' read -r h e m <<<"$r"
+    [[ "$h" == "$1" && "$e" == "$2" ]] || continue
+    [[ -z "$3" || -z "$m" || "$m" == "*" ]] && return 0
+    [[ "$3" =~ ^($m)$ ]] && return 0
+  done
+  return 1
+}
+
+for h in ${hooks[@]+"${hooks[@]}"}; do
+  [[ "$(head -n 1 "$HOOKS_DIR/$h.sh")" == "#!/bin/bash -p" ]] ||
+    fail "$h.sh must start with #!/bin/bash -p (so exported functions and BASH_ENV are ignored)"
+  [[ -x "$HOOKS_DIR/$h.sh" ]] || fail "$h.sh is not executable"
+  in_list "$h" ${registered[@]+"${registered[@]}"} || fail "$h.sh is not registered in .claude/settings.json"
+done
+for h in ${registered[@]+"${registered[@]}"}; do
+  in_list "$h" ${hooks[@]+"${hooks[@]}"} || fail "$h.sh is registered but missing from .claude/hooks"
+done
+
+if [[ ${#hooks[@]} -gt 0 ]]; then
+  if command -v shellcheck >/dev/null 2>&1; then
+    for h in "${hooks[@]}"; do
+      if ! out="$(cd "$ROOT" && shellcheck -s bash -x ".claude/hooks/$h.sh" 2>&1)"; then
+        fail "$h.sh fails shellcheck:"
+        printf '%s\n' "$out" | sed 's/^/    /'
+      fi
+    done
+  else
+    fail "shellcheck is not installed"
+  fi
+fi
+
+# $(…) inside `local x=…`, an argument, a pipeline, a second assignment on the line or another
+# $(…) hides the failure of what runs inside it. So a line holds at most one $(…), as the whole
+# value of one plain assignment; the only exception is the standard header line. Bash also stops
+# checking for errors inside a function or a { } / ( ) group used as a condition, so a hook
+# defines no functions, and every group closes on the line it opens (a line with a $(…) can't
+# hold a group), and no $(…) may sit in a condition (if/elif/while/until … then/do), in a block
+# that is itself tested (`fi || true`, `! while …`, `done | cat`) or in a && || | list.
+# Continued lines are joined first, as the shell does. Groups and conditions are found in real shell words (shlex: quoting and comments
+# understood), not by matching text. Prints "G<line>" for a function or group, "C<line>" for a
+# substitution in a condition, "<line>" for any other substitution problem.
+# shellcheck disable=SC2016 # Python source; its $ signs are for Python, not the shell
+SOURCE_CHECK_PY='
+import re, shlex, sys
+# The standard header lines are the only place a hook may use $(dirname …), unset or source.
+headers = {sys.argv[2], sys.argv[3], "unset HOOKRT_LOADED"}
+raw_lines = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read().split("\n")
+assign = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\"\$\(.*\)\"$")
+LIST_OPS = ("&&", "||", "|", "|&", "!")
+
+
+def shell_code(raw):
+    # The line as the shell parses it, with every quoted part and backslash escape replaced by
+    # the mark \x01 and any comment dropped, so a quoted "(" or "if" is never taken for syntax,
+    # and a word holding the mark is known to contain quoting.
+    # Returns (code, quote still open at the end of the line, where a comment starts (or the
+    # length of the line), whether the line ends in a continuing backslash outside quotes and
+    # comments).
+    out, i, quote, word_start, joins = [], 0, None, True, False
+    while i < len(raw):
+        c = raw[i]
+        if quote == "\x27":
+            if c == "\x27":
+                quote = None
+                out.append("\x01")
+            i += 1
+            continue
+        if quote == "\x22":
+            if c == "\\":
+                i += 2
+                continue
+            if c == "\x22":
+                quote = None
+                out.append("\x01")
+            i += 1
+            continue
+        if c == "\\":
+            if i == len(raw) - 1:
+                joins = True
+            out.append("\x01")
+            i += 2
+            word_start = False
+            continue
+        if c in "\x27\x22":
+            quote = c
+            word_start = False
+            i += 1
+            continue
+        if c == "#" and word_start:
+            return "".join(out), False, i, False
+        out.append(c)
+        word_start = c in " \t;&|()<>"
+        i += 1
+    return "".join(out), quote is not None, len(raw), joins
+
+
+def simple_body(body):
+    # The inside of a permitted $(…) must be one simple command or a pipeline (the runtime sets
+    # pipefail): no ; && || &, no groups, no ! and no compound commands, where bash would ignore
+    # a failure inside it.
+    code, open_quote, cut, joins = shell_code(body)
+    if open_quote or cut != len(body) or joins:
+        return False
+    lex = shlex.shlex(code, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    words = list(lex)
+    start, target = True, False
+    for k, w in enumerate(words):
+        if target:
+            target = False  # the file of a redirection
+            continue
+        if set(w) <= set("();<>|&!"):
+            if w not in ("|",) + REDIRS:
+                return False
+            if w == "|":
+                start = True
+            else:
+                target = True
+            continue
+        if w in ("{", "}", "!"):
+            return False
+        if start:
+            nxt = words[k + 1] if k + 1 < len(words) else ""
+            if (w.isdigit() and nxt in REDIRS) or ASSIGNMENT.match(w):
+                continue  # a file descriptor or an assignment before the command
+            if w in RESERVED or name_problem(w, BODY_FORBIDDEN):
+                return False
+            start = False
+    return bool(words)
+
+
+def name_problem(w, forbidden):
+    # "N" if a command name is not a plain word, "E" if it names a forbidden command, else "".
+    if w not in ("[[", "[") and not PLAIN.match(w):
+        return "N"
+    if w.rsplit("/", 1)[-1] in forbidden:
+        return "E"
+    return ""
+
+
+RESERVED = ("if", "then", "elif", "else", "fi", "while", "until", "do", "done", "case", "esac",
+            "for", "select", "function", "coproc", "time", "[[", "]]")
+PLAIN = re.compile(r"^[A-Za-z0-9_./:+@%-]+$")
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+REDIRS = ("<", ">", ">>", ">&", "<&", ">|", "<>", "&>", "&>>", "<<<")
+# Commands a hook may not run: they run code from a string or file the check cannot read, or
+# switch off the safety net (set +e, trap, unset of the runtime state, a fresh shell).
+TOP_FORBIDDEN = ("eval", "source", ".", "command", "builtin", "exec", "env", "trap", "set",
+                 "shopt", "enable", "unset", "sh", "bash", "zsh", "dash", "ksh", "fish")
+# Inside $(…) also no wrapper that runs another command, whose failures would be out of view.
+BODY_FORBIDDEN = TOP_FORBIDDEN + ("xargs", "nohup", "nice", "timeout", "arch", "xcrun", "sudo",
+                                  "doas", "script", "caffeinate", "stdbuf", "taskpolicy",
+                                  "sandbox-exec", "chroot", "su", "launchctl", "time")
+
+# 1. Logical lines: a backslash at the end of a line (outside quotes) joins the next line, as the
+#    shell does, so a word split across lines is still one word.
+logical, i = [], 0
+while i < len(raw_lines):
+    first, text = i + 1, raw_lines[i]
+    while i + 1 < len(raw_lines) and shell_code(text)[3]:
+        i += 1
+        text = text[:-1] + raw_lines[i]
+    logical.append((first, text))
+    i += 1
+
+# 2. Walk the shell words. blocks holds the open compound commands: kind is "cond" (between
+#    if/elif/while/until and then/do), "body", "for" or "case"; tested is set when the block is
+#    itself part of a condition or a && || | ! list, where bash ignores errors in all of it; subs
+#    are the $(…) lines inside it (nested blocks included).
+stack = []     # open groups: [kind, line]; kind is "{", "(" or "$(" (a substitution)
+blocks = []
+lost = False   # the block structure stopped adding up: treat everything after as a condition
+cont = False   # the previous line ended in && || | ! , so this line is part of a list
+case_in = False  # inside "case WORD", waiting for "in"
+pattern = False  # at a case pattern (up to its ")"), whose words are not commands
+bad = []
+for n, raw in logical:
+    line = raw.strip()
+    if not line or line.startswith("#") or line in headers:
+        continue
+    code, open_quote, cut, _ = shell_code(raw)
+    line = raw[:cut].strip()  # the line without its comment, quoting kept
+    in_list = lost or cont or any(b["kind"] == "cond" for b in blocks)
+    if "`" in line or "<(" in line or ">(" in line:
+        bad.append(str(n))
+    count = line.count("$(")  # $(( counts too: bash may read it as $( ( … ) … )
+    if count and (count > 1 or not assign.match(line)):
+        bad.append(str(n))
+    elif count and not simple_body(line[line.index("=") + 4:-2]):
+        bad.append("S%d" % n)
+    elif count and in_list:
+        bad.append("C%d" % n)
+    elif count and blocks:
+        blocks[-1]["subs"].append(n)
+    if open_quote:
+        bad.append("G%d" % n)  # quoting that does not close on this line
+        continue
+    lex = shlex.shlex(code, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    words = list(lex)
+    if words[:1] == ["function"]:
+        bad.append("G%d" % n)
+    if "<<" in words or "<<-" in words:
+        bad.append("H%d" % n)  # a here-document: its lines are text, not code
+        lost = True
+    prev = ""
+    start = True  # a command (and so a reserved word) may start here
+    timing = False  # after `time`: its options (-p) still come before the command
+    target = False  # the next word is the file of a redirection
+    testing = False  # inside [[ … ]], whose words (and && ||) are a test, not commands
+    for k, w in enumerate(words):
+        nxt = words[k + 1] if k + 1 < len(words) else ""
+        if target:
+            target = False
+            prev = w
+            continue
+        if testing:
+            if w == "]]":
+                testing = False
+            prev = w
+            continue
+        if start and w == "[[":
+            testing = True
+            start = False
+            prev = w
+            continue
+        if case_in and w == "in":
+            case_in, pattern = False, True  # case WORD in: patterns follow
+            prev = w
+            continue
+        if pattern and w != "esac":
+            if w == ")" or w.endswith(")"):
+                pattern = False
+                start = True
+            prev = w
+            continue
+        if w in REDIRS:
+            target = True  # the next word is a file name, wherever the redirection stands
+            prev = w
+            continue
+        if start and ((w.isdigit() and nxt in REDIRS) or ASSIGNMENT.match(w)):
+            prev = w
+            continue  # a file descriptor or an assignment before the command
+        if start and w not in RESERVED and w not in ("{", "}", "(", ")", "!") and not set(w) <= set("();<>|&!"):
+            problem = name_problem(w, TOP_FORBIDDEN)
+            if problem:
+                bad.append("%s%d" % (problem, n))
+        tested = cont if k == 0 else prev in LIST_OPS
+        if start and w in ("if", "while", "until"):
+            blocks.append({"kind": "cond", "tested": tested, "subs": []})
+        elif start and w in ("for", "select"):
+            blocks.append({"kind": "for", "tested": tested, "subs": []})
+        elif start and w == "case":
+            blocks.append({"kind": "case", "tested": tested, "subs": []})
+            case_in = True
+        elif start and w == "elif":
+            if blocks and blocks[-1]["kind"] == "body":
+                blocks[-1]["kind"] = "cond"
+            else:
+                lost = True
+        elif start and w in ("then", "do"):
+            if blocks and blocks[-1]["kind"] in ("cond", "for"):
+                blocks[-1]["kind"] = "body"
+            else:
+                lost = True
+        elif start and w == "else":
+            if not (blocks and blocks[-1]["kind"] == "body"):
+                lost = True
+        elif start and w in ("fi", "done", "esac"):
+            want = "case" if w == "esac" else "body"
+            if blocks and blocks[-1]["kind"] == want:
+                pattern = False
+                b = blocks.pop()
+                # Tested if a && || | ! follows before the command ends (past any redirections).
+                rest = []
+                for r in words[k + 1:]:
+                    if r in (";", "&", ";;", ";&", ";;&"):
+                        break
+                    rest.append(r)
+                if b["tested"] or any(r in LIST_OPS for r in rest):
+                    bad.extend("C%d" % s for s in b["subs"])
+                elif blocks:
+                    blocks[-1]["subs"].extend(b["subs"])
+            else:
+                lost = True
+        if w == "{":
+            stack.append(["{", n])
+        elif w == "}":
+            if stack and stack[-1][0] == "{":
+                if stack.pop()[1] != n:
+                    bad.append("G%d" % n)
+        elif set(w) <= set("();<>|&!"):
+            if "()" in w:
+                bad.append("G%d" % n)  # name() — a function definition
+            for j, c in enumerate(w):
+                if c == "(":
+                    stack.append(["$(" if j == 0 and prev.endswith("$") else "(", n])
+                elif c == ")" and stack and stack[-1][0] in ("(", "$("):
+                    if stack.pop()[1] != n:
+                        bad.append("G%d" % n)
+        prev = w
+        if timing and w.startswith("-"):
+            continue  # still before the command
+        timing = start and w == "time"
+        # The next word starts a command after an operator, a reserved word or an assignment.
+        start = (set(w) <= set("();<>|&!{}")
+                 or w in ("if", "elif", "while", "until", "then", "do", "else", "time")
+                 or (start and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w) is not None))
+        if w in (";;", ";&", ";;&") and blocks and blocks[-1]["kind"] == "case":
+            pattern = True  # the next case pattern follows
+    if any(kind in ("{", "(") for kind, opened in stack):
+        bad.append("G%d" % n)  # a group still open at the end of the line
+        stack = [g for g in stack if g[0] == "$("]
+    cont = bool(words) and words[-1] in LIST_OPS
+for b in dict.fromkeys(bad):
+    print(b)
+'
+# shellcheck disable=SC2016 # the literal header text
+HEADER_LINE='here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
+# shellcheck disable=SC2016 # the literal header text
+HEADER_SOURCE='source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&2; exit 2; }'
+for h in ${hooks[@]+"${hooks[@]}"}; do
+  while IFS= read -r n; do
+    if [[ "$n" == E* ]]; then
+      fail "$h.sh line ${n#E}: a hook may not run eval, source, ., command, builtin, exec, env, trap, set, shopt, enable, unset or a shell (they run or change code the source check can't see)"
+      continue
+    fi
+    if [[ "$n" == N* ]]; then
+      fail "$h.sh line ${n#N}: a command name must be a plain word (no quotes, escapes, \$ or globs), so the source check reads it as bash does"
+      continue
+    fi
+    if [[ "$n" == S* ]]; then
+      fail "$h.sh line ${n#S}: the inside of a command substitution must be a simple command or a pipeline (no ; && || &, groups, !, compound commands, eval, shells or wrappers), so a failure inside it can't be hidden"
+      continue
+    fi
+    if [[ "$n" == H* ]]; then
+      fail "$h.sh line ${n#H}: a hook may not use a here-document (<<); its text would be read as code here"
+      continue
+    fi
+    if [[ "$n" == C* ]]; then
+      fail "$h.sh line ${n#C}: a command substitution may not be part of a condition (if/elif/while/until … then/do) or of a && || | list (bash ignores errors there)"
+      continue
+    fi
+    if [[ "$n" == G* ]]; then
+      fail "$h.sh line ${n#G}: a hook may not define functions or open { } or ( ) groups that span lines (bash stops checking for errors inside them when they are used as a condition)"
+      continue
+    fi
+    fail "$h.sh line $n: a command substitution may only be the whole value of a plain assignment (name=\"\$(…)\", one per line, not nested); backticks and <( >( aren't allowed, so a failure inside can't be hidden"
+  done < <(python3 -I -c "$SOURCE_CHECK_PY" "$HOOKS_DIR/$h.sh" "$HEADER_LINE" "$HEADER_SOURCE" || echo "G0")
+done
+
+if [[ -e "$CASES_DIR" || -L "$CASES_DIR" ]]; then
+  while IFS= read -r l; do
+    fail "${l#"$ROOT"/} is a symlink (cases must be real files under tests/conformance)"
+  done < <(find "$CASES_DIR" -type l)
+  while IFS= read -r d; do
+    if [[ ! -d "$d" || -L "$d" ]] || ! in_list "${d##*/}" ${hooks[@]+"${hooks[@]}"}; then
+      fail "tests/conformance/${d##*/} has no hook"
+      continue
+    fi
+    while IFS= read -r k; do
+      if [[ "${k##*/}" != deny && "${k##*/}" != allow ]] || [[ ! -d "$k" || -L "$k" ]]; then
+        fail "${k#"$ROOT"/} is not a deny/ or allow/ folder"
+        continue
+      fi
+      while IFS= read -r f; do
+        name="${f##*/}"
+        if [[ -f "$f" && ! -L "$f" && "$name" == [!.]*.json ]]; then
+          continue
+        elif [[ -f "$f" && ! -L "$f" && "$name" == [!.]*.setup.sh && -f "${f%.setup.sh}.json" ]]; then
+          continue
+        fi
+        fail "${f#"$ROOT"/} is not a case (<name>.json, or <name>.setup.sh beside one)"
+      done < <(entries "$k")
+    done < <(entries "$d")
+  done < <(entries "$CASES_DIR")
+fi
+
+# --- sandboxes -----------------------------------------------------------------------------------
+
+COPIED=() # paths relative to ROOT, copied byte for byte into every sandbox
+for f in "$SETTINGS" "$HOOKS_DIR"/*.sh "$ROOT"/.harness/lib/* "$ROOT"/.harness/*.json; do
+  [[ -f "$f" && ! -L "$f" ]] && COPIED+=("${f#"$ROOT"/}")
+done
+BEFORE="$(snapshot)"
+
+# The hook under test runs sandboxed too: it (and any program git starts for it, say a
+# core.fsmonitor a setup configured) may write only inside its sandbox, and may not send signals.
+HOOK_PROFILE='(version 1) (allow default) (deny file-write*)
+  (allow file-write* (subpath (param "BASE")) (literal "/dev/null") (literal "/dev/tty"))
+  (deny signal)'
+# Setup scripts (and anything they leave running) may write only inside their own sandbox, never
+# to the copied hooks, runtime and config or the folders holding them, and may not send signals
+# at all (so it can't kill the hook under test).
+SETUP_PROFILE='(version 1) (allow default) (deny file-write*)
+  (allow file-write* (subpath (param "BASE")) (literal "/dev/null") (literal "/dev/tty"))
+  (deny file-write* (subpath (string-append (param "SBX") "/.claude"))
+    (subpath (string-append (param "SBX") "/.harness")) (literal (param "SBX"))
+    (literal (string-append (param "BASE") "/code")) (literal (param "BASE")))
+  (deny signal)'
+if [[ ${#hooks[@]} -gt 0 ]] && ! command -v sandbox-exec >/dev/null 2>&1; then
+  fail "sandbox-exec is missing, so hooks and setup scripts can't be confined to their sandbox"
+fi
+
+n_sbx=0
+# mk_sandbox: sets BASE (the sandbox's home folder and temp root), SBX (its main checkout) and
+# RUN (the runner's own files: input, output, saved variant). A setup can write only inside BASE,
+# so it can't plant links where the runner writes.
+mk_sandbox() {
+  local rel
+  n_sbx=$((n_sbx + 1))
+  BASE="$TMP/s$n_sbx"
+  RUN="$TMP/r$n_sbx"
+  SBX="$BASE/code/forge"
+  mkdir -p "$SBX" "$BASE/code/forge-worktrees" "$BASE/home" "$BASE/tmp" "$RUN" || return 1
+  for rel in ${COPIED[@]+"${COPIED[@]}"}; do
+    mkdir -p "$SBX/$(dirname "$rel")" && cp -p "$ROOT/$rel" "$SBX/$rel" || return 1
+  done
+  git init -q -b dev "$SBX" && git init -q --bare "$BASE/remote.git" &&
+    git -C "$SBX" remote add origin "$BASE/remote.git"
+}
+
+# differs [skip]: print the first copied path whose sandbox copy no longer matches the live file.
+differs() {
+  local rel
+  for rel in ${COPIED[@]+"${COPIED[@]}"}; do
+    [[ "$rel" == "${1:-}" ]] && continue
+    cmp -s "$ROOT/$rel" "$SBX/$rel" || {
+      echo "$rel"
+      return 0
+    }
+  done
+  return 1
+}
+
+logged() { # <key>: number of "<key> WOULD-DENY" lines in the sandbox's observed.log
+  [[ -f "$SBX/.harness/observed.log" ]] || {
+    echo 0
+    return 0
+  }
+  awk -v k="$1" '$2 == k && $3 == "WOULD-DENY" {n++} END {print n + 0}' "$SBX/.harness/observed.log"
+}
+
+case_key() { # <hook> <case.json>: the mode.json key the case runs under ("" if unreadable)
+  jq -r --arg h "$1" '(.forge_mode_key // $h) | strings' "$2" 2>/dev/null || true
+}
+
+# run_case <hook> <case.json> <variant: live | missing | malformed | unknown>
+# Sets CASE_RC, CASE_NEW (new WOULD-DENY lines under the case's key), CASE_DIFF and CASE_ERR.
+run_case() {
+  local hook="$1" json="$2" variant="$3" key event tool setup skip="" before
+  CASE_RC="" CASE_NEW=0 CASE_NEW_ANY=0 CASE_DIFF="" CASE_ERR=""
+  key="$(case_key "$hook" "$json")"
+  event="$(jq -r '.hook_event_name | strings' "$json" 2>/dev/null)" || event=""
+  tool="$(jq -r '.tool_name // "" | strings' "$json" 2>/dev/null)" || tool=""
+  if [[ -z "$key" || -z "$event" ]]; then
+    CASE_ERR="not a readable JSON case with a hook_event_name"
+    return 0
+  fi
+  # The same shape hr_init accepts, so a deny case can't "pass" by being unreadable input.
+  if ! jq -se 'length == 1 and (.[0] | type) == "object" and (.[0] |
+      (.hook_event_name | type) == "string"
+      and ((.tool_input | type) as $t | $t == "null" or $t == "object")
+      and (.forge_reason == null or (.forge_reason | type) == "string")
+      and ([.hook_event_name, .tool_name, .cwd, .tool_input.command?, .tool_input.file_path?,
+          .tool_input.notebook_path?]
+        | all(. == null or (type == "string" and (any(explode[]; . == 0) | not)))))' \
+    "$json" >/dev/null 2>&1; then
+    CASE_ERR="not valid hook input (one JSON object; event, tool, command, file path and cwd must be strings)"
+    return 0
+  fi
+  if [[ "$event" == *ToolUse* && -z "$tool" ]]; then
+    CASE_ERR="a $event case needs a tool_name"
+    return 0
+  fi
+  if ! registered_for "$hook" "$event" "$tool"; then
+    CASE_ERR="$hook is not registered for $event${tool:+/$tool}, so Claude Code would never run it here"
+    return 0
+  fi
+  mk_sandbox || {
+    CASE_ERR="can't build the sandbox"
+    return 0
+  }
+  CASE_DIFF="$(differs)" && return 0
+  setup="${json%.json}.setup.sh"
+  if [[ -f "$setup" ]]; then
+    cp "$setup" "$BASE/setup.sh"
+    (cd "$BASE" && env -i PATH="$PATH" HOME="$BASE/home" ROOT="$SBX" \
+      WORKTREES="$BASE/code/forge-worktrees" TMP="$BASE" \
+      sandbox-exec -D BASE="$BASE" -D SBX="$SBX" -p "$SETUP_PROFILE" /bin/bash "$BASE/setup.sh") \
+      >"$RUN/setup.out" 2>&1 || {
+      CASE_ERR="setup failed: $(tr '\n' ' ' <"$RUN/setup.out")"
+      return 0
+    }
+    # A setup prepares the scene (aliases, repos); it may not touch the hooks, runtime or config,
+    # nor swap in links that point the hook at other files.
+    if [[ "$(cd "$SBX" 2>/dev/null && pwd -P)" != "$SBX" ]] ||
+      [[ -n "$(find "$SBX/.claude" "$SBX/.harness" -type l -print -quit 2>/dev/null)" ]]; then
+      CASE_ERR="setup put a symlink in the sandbox's hook, runtime or config paths"
+      return 0
+    fi
+    if CASE_DIFF="$(differs)"; then
+      CASE_ERR="setup changed $CASE_DIFF in the sandbox"
+      return 0
+    fi
+  fi
+  # The bad-mode variant goes in after setup, and must still be there after the hook ran.
+  case "$variant" in
+    missing) rm -f "$SBX/.harness/mode.json" ;;
+    malformed) printf '{"modes": {' >"$SBX/.harness/mode.json" ;;
+    unknown) jq -n --arg k "$key" '{modes: {($k): "bogus"}}' >"$SBX/.harness/mode.json" ;;
+  esac
+  if [[ "$variant" != live ]]; then
+    skip=.harness/mode.json
+    [[ "$variant" == missing ]] || cp "$SBX/.harness/mode.json" "$RUN/mode.variant"
+  fi
+  jq --arg r "$SBX" --arg w "$BASE/code/forge-worktrees" --arg t "$BASE" \
+    'walk(if type == "string"
+      then split("@ROOT@") | join($r) | split("@WORKTREES@") | join($w) | split("@TMP@") | join($t)
+      else . end)' "$json" >"$RUN/input.json" || {
+    CASE_ERR="can't fill in the placeholders"
+    return 0
+  }
+  before="$(logged "$key")"
+  CASE_LOG_BEFORE=0
+  if [[ -f "$SBX/.harness/observed.log" ]]; then
+    CASE_LOG_BEFORE="$(wc -l <"$SBX/.harness/observed.log" | tr -d ' ')"
+  fi
+  (cd "$SBX" && env -i PATH="$PATH" HOME="$BASE/home" TMPDIR="$BASE/tmp" CLAUDE_PROJECT_DIR="$SBX" \
+    sandbox-exec -D BASE="$BASE" -p "$HOOK_PROFILE" "$SBX/.claude/hooks/$hook.sh" \
+    <"$RUN/input.json" >"$RUN/stdout" 2>"$RUN/stderr")
+  CASE_RC=$?
+  CASE_NEW=$(($(logged "$key") - before))
+  CASE_NEW_ANY=0
+  if [[ -f "$SBX/.harness/observed.log" ]]; then
+    CASE_NEW_ANY=$(($(tail -n "+$((CASE_LOG_BEFORE + 1))" "$SBX/.harness/observed.log" |
+      awk '$3 == "WOULD-DENY" {n++} END {print n + 0}')))
+  fi
+  CASE_DIFF="$(differs "$skip")" || CASE_DIFF=""
+  if [[ -z "$CASE_DIFF" && "$variant" == missing && -e "$SBX/.harness/mode.json" ]]; then
+    CASE_DIFF=".harness/mode.json (should be missing)"
+  elif [[ -z "$CASE_DIFF" && "$variant" != live && "$variant" != missing ]] &&
+    ! cmp -s "$RUN/mode.variant" "$SBX/.harness/mode.json"; then
+    CASE_DIFF=".harness/mode.json (the $variant variant)"
+  fi
+}
+
+# --- 2 and 3. cases ---------------------------------------------------------------------------
+
+# denied_by_decision <key> <case.json>: the last run printed the runtime's deny for this key (and
+# the case's forge_reason, if it has one), so the exit 2 wasn't a crash.
+denied_by_decision() {
+  local reason
+  reason="$(jq -r '.forge_reason // "" | strings' "$2" 2>/dev/null)" || reason=""
+  grep -F "BLOCKED by FORGE hook $1: " "$RUN/stderr" 2>/dev/null | grep -qF -- "$reason"
+}
+
+# logged_with_reason <key> <case.json>: a WOULD-DENY line this run added for the key carries the
+# case's forge_reason in its reason field ("<utc> <key> WOULD-DENY <reason> :: <subject>").
+logged_with_reason() {
+  local reason
+  reason="$(jq -r '.forge_reason // "" | strings' "$2" 2>/dev/null)" || reason=""
+  tail -n "+$((CASE_LOG_BEFORE + 1))" "$SBX/.harness/observed.log" 2>/dev/null |
+    FORGE_REASON="$reason" awk -v k="$1" '$2 == k && $3 == "WOULD-DENY" {
+        text = $0; sub(/^[^ ]+ [^ ]+ WOULD-DENY /, "", text)
+        cut = index(text, " :: "); if (cut) text = substr(text, 1, cut - 1)
+        if (index(text, ENVIRON["FORGE_REASON"])) found = 1
+      } END { exit !found }'
+}
+
+decision_note() { # <case.json>: how a missing decision is reported
+  local reason
+  reason="$(jq -r '.forge_reason // "" | strings' "$1" 2>/dev/null)" || reason=""
+  if [[ -n "$reason" ]]; then printf ' with the reason "%s"' "$reason"; fi
+}
+
+rows=()
+for h in ${hooks[@]+"${hooks[@]}"}; do
+  denies=() allows=() modes=""
+  for f in "$CASES_DIR/$h"/deny/[!.]*.json; do [[ -f "$f" && ! -L "$f" ]] && denies+=("$f"); done
+  for f in "$CASES_DIR/$h"/allow/[!.]*.json; do [[ -f "$f" && ! -L "$f" ]] && allows+=("$f"); done
+  before=$failures
+  [[ ${#denies[@]} -gt 0 ]] || fail "$h: no deny cases in tests/conformance/$h/deny/"
+  [[ ${#allows[@]} -gt 0 ]] || fail "$h: no allow cases in tests/conformance/$h/allow/"
+
+  for f in ${denies[@]+"${denies[@]}"} ${allows[@]+"${allows[@]}"}; do
+    kind="${f%/*}"
+    kind="${kind##*/}"
+    label="$h $kind/${f##*/}"
+    run_case "$h" "$f" live
+    if [[ -n "$CASE_ERR" ]]; then
+      fail "$label: $CASE_ERR"
+      continue
+    fi
+    [[ -z "$CASE_DIFF" ]] || fail "$label: the sandbox copy of $CASE_DIFF differs from the live file"
+    mode="$(mode_of "$(case_key "$h" "$f")")"
+    [[ " $modes " == *" $mode "* ]] || modes="$modes $mode"
+    if [[ "$kind" == allow ]]; then
+      [[ "$CASE_RC" == 0 ]] || fail "$label: expected exit 0 (allow), got $CASE_RC: $(head -c 300 "$RUN/stderr")"
+      [[ "$CASE_NEW_ANY" == 0 ]] || fail "$label: an allow case wrote a WOULD-DENY line"
+    elif [[ "$mode" == enforce ]]; then
+      key="$(case_key "$h" "$f")"
+      if [[ "$CASE_RC" != 2 ]]; then
+        fail "$label: expected exit 2 (enforce), got $CASE_RC"
+      elif ! denied_by_decision "$key" "$f"; then
+        fail "$label: exit 2 without a \"BLOCKED by FORGE hook $key:\" decision$(decision_note "$f") (a crash or an unexpected path)"
+      fi
+    elif [[ "$CASE_RC" != 0 || "$CASE_NEW" -lt 1 ]]; then
+      fail "$label: observe expects exit 0 and a new \"$(case_key "$h" "$f") WOULD-DENY\" line; got exit $CASE_RC, $([[ "$CASE_NEW" -ge 1 ]] && echo "logged" || echo "no WOULD-DENY line")"
+    elif ! logged_with_reason "$(case_key "$h" "$f")" "$f"; then
+      fail "$label: the WOULD-DENY line lacks the reason$(decision_note "$f")"
+    fi
+  done
+
+  for variant in missing malformed unknown; do
+    for f in ${denies[@]+"${denies[@]}"}; do
+      run_case "$h" "$f" "$variant"
+      label="$h deny/${f##*/}"
+      if [[ -n "$CASE_ERR" ]]; then
+        fail "$label ($variant mode.json): $CASE_ERR"
+        continue
+      fi
+      [[ -z "$CASE_DIFF" ]] ||
+        fail "$label ($variant mode.json): the sandbox copy of $CASE_DIFF differs from the live file"
+      key="$(case_key "$h" "$f")"
+      if [[ "$CASE_RC" != 2 ]]; then
+        fail "$label: with a $variant mode.json expected exit 2 (enforce), got $CASE_RC"
+      elif ! denied_by_decision "$key" "$f"; then
+        fail "$label ($variant mode.json): exit 2 without a \"BLOCKED by FORGE hook $key:\" decision$(decision_note "$f")"
+      fi
+    done
+  done
+
+  result=PASS
+  [[ $failures -eq $before ]] || result=FAIL
+  # shellcheck disable=SC2086 # $modes is a space-separated list on purpose
+  modes="$(printf '%s\n' $modes | sort | tr '\n' '/')"
+  rows+=("$(printf '%-28s | %-15s | %-10s | %-11s | %s' "$h" "${modes%/}" "${#denies[@]}" "${#allows[@]}" "$result")")
+done
+
+# --- 4. hooks not switched off ------------------------------------------------------------------
+
+settings_files=("$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json")
+if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+  settings_files+=("$CLAUDE_CONFIG_DIR/settings.json" "$CLAUDE_CONFIG_DIR/settings.local.json")
+fi
+settings_files+=("$SETTINGS" "$ROOT/.claude/settings.local.json")
+common="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || common=""
+if [[ "$common" == */.git && "${common%/.git}" != "$ROOT" ]]; then
+  settings_files+=("${common%/.git}/.claude/settings.json" "${common%/.git}/.claude/settings.local.json")
+fi
+settings_files+=("$MANAGED_DIR/managed-settings.json")
+for f in "$MANAGED_DIR/managed-settings.d"/*.json; do settings_files+=("$f"); done
+
+for f in "${settings_files[@]}"; do
+  [[ -e "$f" ]] || continue
+  if ! v="$(jq -r 'if type == "object"
+      then "\(.disableAllHooks // false) \(.allowManagedHooksOnly // false)"
+      else error("not an object") end' "$f" 2>/dev/null)"; then
+    fail "cannot read $f to check disableAllHooks and allowManagedHooksOnly"
+    continue
+  fi
+  [[ "${v% *}" == false ]] || fail "disableAllHooks is set in $f"
+  [[ "${v#* }" == false ]] || fail "allowManagedHooksOnly is set in $f (it would stop the project's hooks)"
+done
+
+# --- 5. live files unchanged --------------------------------------------------------------------
+
+[[ "$(snapshot)" == "$BEFORE" ]] || fail "a live hook, config or case file changed while conformance ran"
+
+# --- 6. report ----------------------------------------------------------------------------------
+
+echo
+printf '%-28s | %-15s | %-10s | %-11s | %s\n' hook mode "deny cases" "allow cases" result
+for r in ${rows[@]+"${rows[@]}"}; do printf '%s\n' "$r"; done
+[[ ${#hooks[@]} -gt 0 ]] || echo "(0 hooks registered yet)"
+finish

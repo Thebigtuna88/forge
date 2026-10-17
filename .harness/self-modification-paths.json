@@ -1,0 +1,15 @@
+{
+  "description": "Owner-only paths (rule 7, spec 2.2, docs/decisions/2026-10-16-owner-only-conformance.md). A PR touching any of them is merged only by the owner. A path ending in / covers everything under it.",
+  "paths": [
+    ".harness/spend-limits.json",
+    ".harness/deploy-targets.json",
+    ".harness/mode.json",
+    ".harness/self-modification-paths.json",
+    ".claude/hooks/",
+    ".claude/settings.json",
+    ".harness/lib/",
+    ".github/workflows/",
+    ".harness/bin/conformance",
+    "tests/conformance/"
+  ]
+}
