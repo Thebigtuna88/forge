@@ -31,7 +31,7 @@ rename=0    # git branch -m / -c: the last name is the new one
 listing=0   # git branch lists or deletes: its names are not new branches
 track=0     # --track / -t without an explicit name: the name comes from the remote branch
 detach=0    # --detach: no branch at all
-paths=0     # after --: paths, not branches
+paths=0     # after --: no more options (and for checkout, paths rather than branches)
 names=()    # plain words after the subcommand (and after "add" for worktree)
 first=1
 for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
@@ -50,6 +50,7 @@ for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
     continue
   fi
   if [[ $paths == 1 ]]; then
+    [[ "$HR_GIT_SUB" == checkout ]] || names+=("$a")
     continue
   fi
   case "$HR_GIT_SUB:$a" in

@@ -4,7 +4,9 @@
 #   git branch --force/-f/-M/-C (and abbreviations or clusters of them);
 #   git checkout -B, git switch -C/--force-create, git worktree add -B (they reset a branch);
 #   git reset, except unstaging: git reset [-q] [HEAD] [-- <paths>];
-#   git fetch with --force/-f/--update-head-ok or a refspec with ":" or "+" (it moves local branches);
+#   git fetch other than `git fetch [-q] [--prune] [<repository> [<branch>…]]` with plain branch names
+#   (a refspec with ":" or "+", --refmap, --force or --update-head-ok moves local branches);
+#   git fast-import and writing with git symbolic-ref (they write refs directly);
 #   git pull --rebase/-r.
 # A forced push is refused by deny-push-to-protected. A branch is updated with `git merge dev`.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +24,22 @@ case "$HR_GIT_SUB" in
   rebase | filter-branch | filter-repo | replace | update-ref)
     hr_deny "git $HR_GIT_SUB rewrites history; update a branch with git merge dev instead"
     ;;
+  fast-import)
+    hr_deny "git fast-import writes refs directly (and makes unscanned commits)"
+    ;;
+  symbolic-ref)
+    # Reading (git symbolic-ref [-q] [--short] <name>) is fine; anything else writes a ref.
+    count=0
+    for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
+      case "$a" in
+        -q | --quiet | --short) ;;
+        -*) hr_deny "git symbolic-ref $a writes refs directly" ;;
+        *) ((count += 1)) ;;
+      esac
+    done
+    [[ $count -le 1 ]] || hr_deny "git symbolic-ref with a target writes refs directly"
+    hr_allow
+    ;;
   commit | branch | checkout | switch | worktree | reset | fetch | pull) ;;
   *) hr_allow ;;
 esac
@@ -29,6 +47,7 @@ esac
 moves="git reset moves the branch; to unstage, use git reset -- <path> (or git reset HEAD <path>)"
 head=0     # git reset: HEAD came first, so the words after it are paths
 paths=0    # after --
+fetched=0  # git fetch: positional words so far (the first is the repository)
 for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
   if [[ $paths == 1 ]]; then
     continue
@@ -52,14 +71,19 @@ for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
     reset:-*) hr_deny "$moves" ;;
     reset:HEAD) head=1 ;;
     reset:*) [[ $head == 1 ]] || hr_deny "$moves" ;;
-    fetch:-f | fetch:--force | fetch:--forc | fetch:--for | fetch:-u | fetch:--update-head-ok)
-      hr_deny "git fetch $a updates local branches directly; fetch without it and merge"
+    fetch:-q | fetch:--quiet | fetch:-p | fetch:--prune) ;;
+    fetch:-*)
+      hr_deny "fetch only as: git fetch [-q] [--prune] [<repository> [<branch>…]] (not $a, which updates local branches directly or isn't checked here)"
       ;;
-    fetch:-*) ;;
     fetch:*)
-      case "$a" in
-        *:* | +*) hr_deny "git fetch $a updates local branches directly; fetch without a refspec and merge" ;;
-      esac
+      ((fetched += 1))
+      if [[ $fetched -gt 1 ]]; then
+        case "$a" in
+          *:* | +*)
+            hr_deny "fetch only as: git fetch [-q] [--prune] [<repository> [<branch>…]] ($a updates local branches directly)"
+            ;;
+        esac
+      fi
       ;;
     pull:-r | pull:--rebase | pull:--rebase=*)
       hr_deny "git pull $a rewrites history; use git pull --ff-only"

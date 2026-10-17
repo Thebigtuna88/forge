@@ -2,8 +2,10 @@
 # deny-commit-on-shared-checkout (spec 5.3, FRG-3). A commit runs only in a ticket worktree: a
 # linked worktree under ~/code/forge-worktrees/, on a feature/… branch. The main checkout
 # (~/code/forge) and each project's main checkout (~/code/forge/projects/<name>) stay on dev and
-# are never edited by hand: there git merge and git pull may only fast-forward (--ff-only), so they
-# never make a commit. A command whose folder or branch can't be determined is refused.
+# are never edited by hand: there git merge and git pull may only fast-forward (--ff-only and no
+# other option), so they never make a commit. In a ticket worktree, merge and pull get the same
+# worktree and branch checks as commit. A command whose folder or branch can't be determined is
+# refused.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset HOOKRT_LOADED
 # shellcheck source=.harness/lib/hookrt.sh
@@ -31,28 +33,36 @@ case "$top/" in
   "$HR_WORKTREES"/?*/) worktree=1 ;;
 esac
 
-if [[ "$HR_GIT_SUB" != commit ]]; then
-  # merge / pull: in a ticket worktree they are fine (secret-scan rules their form); elsewhere
-  # (a main checkout) they may only fast-forward.
-  [[ $worktree == 0 ]] || hr_allow
+if [[ $worktree == 0 ]]; then
+  # A main checkout: no commit at all; merge and pull only as a fast-forward, with no option
+  # that could turn it into a merge commit (a later --no-ff overrides --ff-only).
+  [[ "$HR_GIT_SUB" != commit ]] ||
+    hr_deny "commits happen only in a ticket worktree, not in $top (main checkouts stay on dev and are never edited by hand); commit inside $where"
+  ffonly=0
   for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
-    [[ "$a" != --ff-only ]] || hr_allow
+    case "$a" in
+      --ff-only) ffonly=1 ;;
+      -q | --quiet) ;;
+      -*) ffonly=-1 ;;
+    esac
+    [[ $ffonly != -1 ]] || break
   done
-  hr_deny "in a main checkout ($top), git $HR_GIT_SUB is allowed only --ff-only, so it never makes a commit there"
+  [[ $ffonly == 1 ]] ||
+    hr_deny "in a main checkout ($top), git $HR_GIT_SUB is allowed only --ff-only (with no other option), so it never makes a commit there"
+  hr_allow
 fi
 
-[[ $worktree == 1 ]] ||
-  hr_deny "commits happen only in a ticket worktree, not in $top (main checkouts stay on dev and are never edited by hand); commit inside $where"
-# A linked worktree has its own git folder, separate from the repository's common one.
+# A ticket worktree: a linked worktree (its own git folder, separate from the repository's common
+# one), on a feature branch.
 git -C "$HR_GIT_DIR" rev-parse --path-format=absolute --git-dir --git-common-dir >"$HR_TMP/dirs"
 gitdir="$(head -n 1 "$HR_TMP/dirs")"
 common="$(tail -n 1 "$HR_TMP/dirs")"
 [[ "$gitdir" != "$common" ]] ||
   hr_deny "$top is a standalone repository, not a linked worktree of the project; create the ticket worktree with git worktree add"
 if ! git -C "$HR_GIT_DIR" symbolic-ref --quiet --short HEAD >"$HR_TMP/branch" 2>/dev/null; then
-  hr_deny "this worktree is not on a branch (detached HEAD); commit on its feature/<KEY>-<n>-<slug> branch"
+  hr_deny "this worktree is not on a branch (detached HEAD); work on its feature/<KEY>-<n>-<slug> branch"
 fi
 branch="$(cat "$HR_TMP/branch")"
 [[ "$branch" == feature/* ]] ||
-  hr_deny "commits happen only on a feature/<KEY>-<n>-<slug> branch, not '$branch'"
+  hr_deny "commits and merges happen only on a feature/<KEY>-<n>-<slug> branch, not '$branch'"
 hr_allow

@@ -62,8 +62,9 @@ web-UI click), **write a script, never instructions**:
   redirection. Use `git -C <dir>` instead of `cd … &&`.
 - Push with an explicit target: `git push -u origin feature/<KEY>-<n>-<slug>`.
 - Update a branch with `git merge dev` in its worktree. Never rebase, amend or force-push.
-- Update a main checkout with `git -C ~/code/forge pull --ff-only origin dev` (it may only
-  fast-forward; it never gets a commit of its own).
+- Update a main checkout with `git -C /Users/atl/code/forge pull --ff-only origin dev` (an
+  absolute path: the gates refuse `~` in guarded commands). It may only fast-forward and never gets
+  a commit of its own.
 - Merge: `gh pr merge <n> --squash --match-head-commit <sha>`, only into `dev`, only after review.
 - No git aliases for guarded commands.
 

@@ -7,16 +7,17 @@
 
 ## Context
 
-The `secret-scan` gate (FRG-3) runs `gitleaks git --staged` before every commit. gitleaks looks
+The `secret-scan` gate (FRG-3) runs gitleaks before every commit. gitleaks looks
 for rules in several places, including a `.gitleaks.toml` inside the repository being scanned, a
 `.gitleaksignore` file and inline `gitleaks:allow` comments. Anyone who can edit the repository
 could use those to switch the scan off.
 
 ## Decision
 
-The gate always passes `--config .harness/gitleaks.toml` (gitleaks' default rules, owned by
-FORGE). It points `--gitleaks-ignore-path` at an empty folder and passes
-`--ignore-gitleaks-allow`. `.harness/gitleaks.toml` is added to
+The gate reads the staged files as raw blobs from git's index and scans them, and the message
+file, with `gitleaks dir`. It always passes `--config .harness/gitleaks.toml` (gitleaks' default
+rules, owned by FORGE) and `--ignore-gitleaks-allow`, and it points `--gitleaks-ignore-path` at an
+empty folder of its own. `.harness/gitleaks.toml` is added to
 `.harness/self-modification-paths.json`.
 
 ## Consequences
