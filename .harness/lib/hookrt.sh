@@ -396,7 +396,7 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   for w in "${words[@]}"; do
     if [[ "$_HR_DYNAMIC_WORDS" == *" $w "* ]]; then verbs=1; fi
   done
-  local i n=${#HR_TOK[@]} t u base rc=1 cmdpos=1 wrapped=0 skip=0 op='^[;&|()<>]+$'
+  local i n=${#HR_TOK[@]} t u base rc=1 cmdpos=1 wrapped=0 skip=0 op='^[;&|()<>]+$' toolargs=0
   for ((i = 0; i < n; i++)); do
     t="${HR_TOK[$i]}"
     if [[ $skip == 1 ]]; then # the target of a redirection
@@ -413,6 +413,7 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
         *)
           cmdpos=1
           wrapped=0
+          toolargs=0
           ;;
       esac
       continue
@@ -420,6 +421,14 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     if [[ "$t" == '`'* ]]; then cmdpos=1; fi
     u="${t//\`/}"
     base="$(_hr_lower "${u##*/}")"
+    # After gh, a word the shell expands could become its guarded subcommand (gh pr m???e →
+    # gh pr merge), so the command counts as guarded. (git's subcommand is checked exactly below,
+    # and any deploy tool already makes a command guarded.)
+    if [[ $toolargs == 1 && "$t" == *[*?[\{\$\`]* ]]; then
+      rc=0
+      break
+    fi
+    if [[ "$base" == gh ]]; then toolargs=1; fi
     if [[ $cmdpos == 1 ]]; then
       if [[ "$u" =~ ^[0-9]+$ && $((i + 1)) -lt $n && "${HR_TOK[$((i + 1))]}" == *[\<\>]* ]]; then
         continue # a file descriptor in front of a redirection (2>f): still before the command

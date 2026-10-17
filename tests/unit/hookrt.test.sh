@@ -333,7 +333,9 @@ test_guarded_detection() {
     'frobnicate /usr/bin/{g,}it push' 'frobnicate /usr/bin/[g][i][t] push' \
     'find . -maxdepth 0 -exec /tmp/bin/??? push origin main \;' 'frobnicate /tmp/bin/??? push origin main' \
     'find . -exec /tmp/bin/??? {} \;' '/Library/Developer/CommandLineTools/usr/libexec/git-core/git-push origin main' \
-    'git-commit -F m' 'git send-pack origin main' 'git http-push origin main'; do
+    'git-commit -F m' 'git send-pack origin main' 'git http-push origin main' \
+    'gh pr m???e 16 --squash' 'gh workflow r?n build.yml' 'gh pr $X 16' 'gh pr {merge,view} 16' \
+    'ls; gh pr m*e 16' 'vercel dep[l]oy --pr?d'; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done
@@ -346,7 +348,7 @@ test_plain_detection() {
     'gh pr view 3 | head' 'gh issue list' 'echo hi > f.txt' 'git -C /x diff | wc -l' \
     'cat README.md' 'git merge dev' 'for f in *.sh; do echo "$f"; done' '' \
     'ls *.sh | wc -l' 'rm -rf build/* && ls' 'for f in a b; do bash "$f"; done' 'ls * | head' \
-    'ls work/*/manual | head' 'find work -type f | head'; do
+    'ls work/*/manual | head' 'find work -type f | head' 'for d in a b; do git -C "$d" status; done'; do
     probe guarded "$c"
     assert_eq "$OUT" PLAIN "plain: $c"
   done
