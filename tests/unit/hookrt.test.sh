@@ -220,7 +220,7 @@ test_crash_or_no_decision_denies() {
   local how
   for how in unbound exit0 exit1 missing-command term usr1 quit error-then-allow false-then-allow \
     unset-decided exec-true exec-false command-exec builtin-exec subst-error-then-allow \
-    local-subst-then-allow arg-subst-then-allow fall-off-the-end; do
+    local-subst-then-allow local-deny-then-allow arg-subst-then-allow fall-off-the-end; do
     run_hook misbehave "$(bash_input ls)" MISBEHAVE="$how"
     assert_exit 2 "$RC" "misbehave=$how"
   done
@@ -273,6 +273,15 @@ test_fields_are_exposed() {
   assert_contains "$OUT" "event=PreToolUse|tool=Write|file=/a/b.txt|cwd=/w|mode=enforce|root=$H|worktrees=$T_TMP/code/forge-worktrees"
   run_hook probe "$(jq -n '{tool_name: "NotebookEdit", tool_input: {notebook_path: "/n.ipynb"}}')" PROBE=fields
   assert_contains "$OUT" "file=/n.ipynb"
+}
+
+test_worktrees_folder_from_a_worktree() {
+  mk_hook_harness
+  mkdir -p "$T_TMP/code/forge-worktrees"
+  mv "$H" "$T_TMP/code/forge-worktrees/FRG-9-x"
+  H="$T_TMP/code/forge-worktrees/FRG-9-x"
+  probe fields 'ls'
+  assert_contains "$OUT" "|root=$H|worktrees=$T_TMP/code/forge-worktrees"$'\n'"cmd="
 }
 
 test_command_keeps_trailing_newlines() {

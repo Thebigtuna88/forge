@@ -39,6 +39,12 @@ case "$how" in
     check
     hr_allow
     ;;
+  local-deny-then-allow)
+    # shellcheck disable=SC2034,SC2155 # masking the deny is the point of this case
+    check2() { local result="$(hr_deny "denied inside")"; }
+    check2
+    hr_allow
+    ;;
   arg-subst-then-allow)
     printf 'value=[%s]\n' "$(false)"
     hr_allow

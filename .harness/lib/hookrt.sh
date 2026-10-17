@@ -14,7 +14,10 @@
 # an ERR trap inherited by command substitutions (it leaves a "failed" mark that the exit check
 # reads, so even `local x="$(cmd)"` or "$(cmd)" as an argument counts), and an EXIT trap turn a
 # crash, a failed command, a catchable signal, a bare `exit`, `exec` or falling off the end into a
-# deny (fail closed, rule 9). So a hook writes `x="$(cmd || true)"` where a failure is expected. `bash -p` makes bash ignore exported functions,
+# deny (fail closed, rule 9). So a hook writes `x="$(cmd || true)"` where a failure is expected.
+# A hook uses $(…) only as the whole value of a plain assignment, `name="$(…)"` (conformance
+# checks its source): then a deny, an unset variable or a signal inside it fails the assignment,
+# which errexit turns into a deny, where `local x="$(…)"` or an argument would hide it. `bash -p` makes bash ignore exported functions,
 # BASH_ENV, SHELLOPTS and CDPATH; the runtime then clears every environment variable except
 # HOME, USER, LOGNAME, TMPDIR and CLAUDE_PROJECT_DIR (no PERL5OPT, GIT_*, DEVELOPER_DIR, …) and
 # sets PATH itself, system folders first. So nothing in the environment can change what jq, git,
@@ -46,7 +49,7 @@ _hr_on_exit() {
     rm -rf "$_HR_TMPD"
   fi
   if [[ $failed == 0 && "${_HR_DECISION:-}" == allow && "$rc" == 0 ]]; then exit 0; fi
-  if [[ $failed == 1 ]]; then
+  if [[ $failed == 1 && "${_HR_DECISION:-}" != deny ]]; then
     printf 'FORGE hook %s: a command failed (perhaps inside a command substitution), so it denies, fail closed.\n' "${HR_HOOK:-?}" >&2
   elif [[ "${_HR_DECISION:-}" != deny ]]; then
     printf 'FORGE hook %s ended without a decision (status %s): denied, fail closed.\n' "${HR_HOOK:-?}" "$rc" >&2
@@ -90,7 +93,10 @@ enable -n exec
 _hr_lib="${BASH_SOURCE[0]%/*}"
 [[ "$_hr_lib" != "${BASH_SOURCE[0]}" ]] || _hr_lib=.
 HR_ROOT="$(cd "$_hr_lib/../.." && pwd -P)"
-HR_WORKTREES="${HR_ROOT%/*}/forge-worktrees"
+case "${HR_ROOT%/*}" in # the main checkout's sibling, or the folder a ticket worktree sits in
+  */forge-worktrees) HR_WORKTREES="${HR_ROOT%/*}" ;;
+  *) HR_WORKTREES="${HR_ROOT%/*}/forge-worktrees" ;;
+esac
 unset _hr_lib
 
 # All state is set here, so nothing inherited from the environment can steer the runtime.
@@ -142,8 +148,13 @@ sys.stdout.buffer.write(out)
 
 # --- decisions ---------------------------------------------------------------------------------
 
+_hr_mark_failed() { # so a deny inside a $(…) whose status is lost still denies at the end
+  if [[ -n "${_HR_TMPD:-}" ]]; then : >"$_HR_TMPD/failed" 2>/dev/null || true; fi
+}
+
 _hr_fatal() { # <reason>: deny in every mode, because the hook cannot judge the command
-  printf 'BLOCKED by FORGE hook %s: %s\n' "${HR_HOOK:-?}" "$1" >&2
+  printf "FORGE hook %s can't judge this command, so it denies: %s\n" "${HR_HOOK:-?}" "$1" >&2
+  _hr_mark_failed
   _HR_DECISION=deny
   exit 2
 }
@@ -166,6 +177,7 @@ hr_deny() { # <reason>: enforce → block with the reason; observe → log WOULD
   fi
   printf 'BLOCKED by FORGE hook %s: %s\n' "$HR_HOOK" "$1" >&2
   printf 'FORGE rule 9: fix the code or config through a PR; never route around a guard.\n' >&2
+  _hr_mark_failed
   _HR_DECISION=deny
   exit 2
 }

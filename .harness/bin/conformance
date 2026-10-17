@@ -4,8 +4,10 @@
 #
 # 1. Every .claude/hooks/<name>.sh starts with #!/bin/bash -p, is executable, registered in
 #    .claude/settings.json (as a synchronous command) and clean under shellcheck; every registered
-#    hook exists. Nothing else lives in .claude/hooks or tests/conformance: no hidden or stray
-#    files, and no symlinks there or in the hook, runtime and config paths.
+#    hook exists. A hook uses $(…) only as the whole value of a plain assignment (no backticks,
+#    no <( >( ), so bash can't hide a failure inside it. Nothing else lives in .claude/hooks or
+#    tests/conformance: no hidden or stray files, and no symlinks there or in the hook, runtime and
+#    config paths.
 # 2. Each case tests/conformance/<hook>/{deny,allow}/<case>.json is fed on stdin to the hook in a
 #    fresh sandbox: a byte-identical copy of the hooks, runtime and config (live mode.json
 #    included) at <tmp>/code/forge, a git repo on dev with a bare "origin", next to an empty
@@ -17,8 +19,9 @@
 #    it leaves running) may write only inside the sandbox, never to the copied hooks, runtime or
 #    config, and may not send signals. A setup is trusted, reviewed,
 #    owner-only code: it shapes the scene a case runs in. A *ToolUse case must name its tool_name.
-#    enforce: deny → exit 2, allow → exit 0. observe: deny → exit 0 plus a new
-#    "<key> WOULD-DENY" line. No allow case may log WOULD-DENY. Afterwards the sandbox copies must
+#    enforce: deny → exit 2 with the runtime's "BLOCKED by FORGE hook <key>:" decision on stderr
+#    (a crash also exits 2, but doesn't count), allow → exit 0. observe: deny → exit 0 plus a new
+#    "<key> WOULD-DENY" line. An optional "forge_reason" must appear in that decision. No allow case may log WOULD-DENY. Afterwards the sandbox copies must
 #    still match the live files.
 # 3. With a missing, a malformed and an unknown-value mode.json, every deny case exits 2.
 # 4. Hooks are not switched off: no disableAllHooks and no allowManagedHooksOnly in the user
@@ -193,6 +196,19 @@ if [[ ${#hooks[@]} -gt 0 ]]; then
   fi
 fi
 
+# $(…) inside `local x=…`, an argument or a pipeline hides the failure of what runs inside it.
+for h in ${hooks[@]+"${hooks[@]}"}; do
+  while IFS= read -r n; do
+    fail "$h.sh line $n: a command substitution may only be the whole value of a plain assignment (name=\"\$(…)\"); backticks and <( >( aren't allowed, so a failure inside can't be hidden"
+  done < <(awk '{
+      line = $0; sub(/^[ \t]+/, "", line)
+      if (line ~ /^#/) next
+      if (index(line, "`") || index(line, "<(") || index(line, ">(")) { print NR; next }
+      probe = line; gsub(/\$\(\(/, "", probe)
+      if (index(probe, "$(") && line !~ /^[A-Za-z_][A-Za-z0-9_]*="\$\(.*\)"[ \t]*$/) print NR
+    }' "$HOOKS_DIR/$h.sh")
+done
+
 if [[ -e "$CASES_DIR" || -L "$CASES_DIR" ]]; then
   while IFS= read -r l; do
     fail "${l#"$ROOT"/} is a symlink (cases must be real files under tests/conformance)"
@@ -301,6 +317,7 @@ run_case() {
   if ! jq -se 'length == 1 and (.[0] | type) == "object" and (.[0] |
       (.hook_event_name | type) == "string"
       and ((.tool_input | type) as $t | $t == "null" or $t == "object")
+      and (.forge_reason == null or (.forge_reason | type) == "string")
       and ([.hook_event_name, .tool_name, .cwd, .tool_input.command?, .tool_input.file_path?,
           .tool_input.notebook_path?]
         | all(. == null or (type == "string" and (any(explode[]; . == 0) | not)))))' \
@@ -376,6 +393,26 @@ run_case() {
 
 # --- 2 and 3. cases ---------------------------------------------------------------------------
 
+# denied_by_decision <key> <case.json>: the last run printed the runtime's deny for this key (and
+# the case's forge_reason, if it has one), so the exit 2 wasn't a crash.
+denied_by_decision() {
+  local reason
+  reason="$(jq -r '.forge_reason // "" | strings' "$2" 2>/dev/null)" || reason=""
+  grep -F "BLOCKED by FORGE hook $1: " "$RUN/stderr" 2>/dev/null | grep -qF -- "$reason"
+}
+
+logged_with_reason() { # <key> <case.json>: the new WOULD-DENY line carries the case's forge_reason
+  local reason
+  reason="$(jq -r '.forge_reason // "" | strings' "$2" 2>/dev/null)" || reason=""
+  awk -v k="$1" '$2 == k && $3 == "WOULD-DENY"' "$SBX/.harness/observed.log" 2>/dev/null | grep -qF -- "$reason"
+}
+
+decision_note() { # <case.json>: how a missing decision is reported
+  local reason
+  reason="$(jq -r '.forge_reason // "" | strings' "$1" 2>/dev/null)" || reason=""
+  if [[ -n "$reason" ]]; then printf ' with the reason "%s"' "$reason"; fi
+}
+
 rows=()
 for h in ${hooks[@]+"${hooks[@]}"}; do
   denies=() allows=() modes=""
@@ -401,9 +438,16 @@ for h in ${hooks[@]+"${hooks[@]}"}; do
       [[ "$CASE_RC" == 0 ]] || fail "$label: expected exit 0 (allow), got $CASE_RC: $(head -c 300 "$RUN/stderr")"
       [[ "$CASE_NEW" == 0 ]] || fail "$label: an allow case wrote a WOULD-DENY line"
     elif [[ "$mode" == enforce ]]; then
-      [[ "$CASE_RC" == 2 ]] || fail "$label: expected exit 2 (enforce), got $CASE_RC"
+      key="$(case_key "$h" "$f")"
+      if [[ "$CASE_RC" != 2 ]]; then
+        fail "$label: expected exit 2 (enforce), got $CASE_RC"
+      elif ! denied_by_decision "$key" "$f"; then
+        fail "$label: exit 2 without a \"BLOCKED by FORGE hook $key:\" decision$(decision_note "$f") (a crash or an unexpected path)"
+      fi
     elif [[ "$CASE_RC" != 0 || "$CASE_NEW" -lt 1 ]]; then
       fail "$label: observe expects exit 0 and a new \"$(case_key "$h" "$f") WOULD-DENY\" line; got exit $CASE_RC, $([[ "$CASE_NEW" -ge 1 ]] && echo "logged" || echo "no WOULD-DENY line")"
+    elif ! logged_with_reason "$(case_key "$h" "$f")" "$f"; then
+      fail "$label: the WOULD-DENY line lacks the reason$(decision_note "$f")"
     fi
   done
 
@@ -417,7 +461,12 @@ for h in ${hooks[@]+"${hooks[@]}"}; do
       fi
       [[ -z "$CASE_DIFF" ]] ||
         fail "$label ($variant mode.json): the sandbox copy of $CASE_DIFF differs from the live file"
-      [[ "$CASE_RC" == 2 ]] || fail "$label: with a $variant mode.json expected exit 2 (enforce), got $CASE_RC"
+      key="$(case_key "$h" "$f")"
+      if [[ "$CASE_RC" != 2 ]]; then
+        fail "$label: with a $variant mode.json expected exit 2 (enforce), got $CASE_RC"
+      elif ! denied_by_decision "$key" "$f"; then
+        fail "$label ($variant mode.json): exit 2 without a \"BLOCKED by FORGE hook $key:\" decision$(decision_note "$f")"
+      fi
     done
   done
 

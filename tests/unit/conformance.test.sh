@@ -539,4 +539,30 @@ test_setup_cannot_signal_outside_processes() {
   assert_exit 0 "$RC" "$OUT"
 }
 
+test_fails_when_deny_comes_from_a_crash() {
+  mk_conf_harness sample-gate crashy-gate
+  case_json crashy-gate deny main 'git push origin main'
+  case_json crashy-gate allow other 'ls'
+  expect_fail "crashy-gate deny/main.json: exit 2 without a \"BLOCKED by FORGE hook crashy-gate:\" decision"
+}
+
+test_case_can_name_the_expected_reason() {
+  mk_conf_harness
+  jq '. + {forge_reason: "push to main"}' "$H/tests/conformance/sample-gate/deny/push-main.json" >"$T_TMP/c.json"
+  mv "$T_TMP/c.json" "$H/tests/conformance/sample-gate/deny/push-main.json"
+  conform
+  assert_exit 0 "$RC" "$OUT"
+  jq '.forge_reason = "some other reason"' "$H/tests/conformance/sample-gate/deny/push-main.json" >"$T_TMP/c.json"
+  mv "$T_TMP/c.json" "$H/tests/conformance/sample-gate/deny/push-main.json"
+  expect_fail "reason \"some other reason\""
+}
+
+test_fails_on_masked_command_substitution_in_a_hook() {
+  mk_conf_harness sample-gate masked-gate
+  case_json masked-gate deny main 'git push origin main'
+  case_json masked-gate allow other 'ls'
+  expect_fail "masked-gate.sh line"
+  assert_contains "$OUT" "plain assignment"
+}
+
 run_tests
