@@ -581,4 +581,32 @@ test_standard_header_passes_the_source_check() {
   assert_not_contains "$OUT" "a command substitution may only"
 }
 
+test_observe_reason_is_read_from_the_reason_field() {
+  # sample-gate logs "push to main :: git push origin main"; "origin" is only in the command part.
+  mk_conf_harness
+  printf '{"modes": {"sample-gate": "observe"}}\n' >"$H/.harness/mode.json"
+  jq '. + {forge_reason: "origin"}' "$H/tests/conformance/sample-gate/deny/push-main.json" >"$T_TMP/c.json"
+  mv "$T_TMP/c.json" "$H/tests/conformance/sample-gate/deny/push-main.json"
+  expect_fail "the WOULD-DENY line lacks the reason"
+}
+
+test_fails_on_function_or_group_in_a_hook() {
+  local body
+  for body in $'check() {\n  x="$(printf %s "$HR_CMD")"\n}' 'function check { true; }' \
+    $'{\n  x="$(printf %s "$HR_CMD")"\n} || true' $'true && (\n  x="$(printf %s "$HR_CMD")"\n)'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    printf '%s\n' "$body" >>"$H/.claude/hooks/sample-gate.sh"
+    expect_fail "may not define functions or open"
+  done
+}
+
+test_fails_on_control_characters_in_settings() {
+  mk_conf_harness
+  jq '{hooks: {("PreToolUse\u001fBash\u001ffalse\u001f\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/sample-gate.sh\nBogus"):
+    .hooks.PreToolUse}}' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  expect_fail "settings.json is missing or malformed"
+}
+
 run_tests
