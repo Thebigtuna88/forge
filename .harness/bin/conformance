@@ -13,8 +13,10 @@
 #    hook_event_name and tool_name. In a case, @ROOT@, @WORKTREES@ and @TMP@ become those paths,
 #    an optional "forge_mode_key" names the mode.json key it runs under (default: the hook's
 #    name), and an optional <case>.setup.sh runs first: copied into the sandbox and run by bash
-#    under macOS sandbox-exec, able to write only inside the sandbox, with only PATH, HOME, ROOT,
-#    WORKTREES and TMP set. A *ToolUse case must name its tool_name.
+#    under macOS sandbox-exec, with only PATH, HOME, ROOT, WORKTREES and TMP set. It (and anything
+#    it leaves running) may write only inside the sandbox, never to the copied hooks, runtime or
+#    config, and may not send signals. A setup is trusted, reviewed,
+#    owner-only code: it shapes the scene a case runs in. A *ToolUse case must name its tool_name.
 #    enforce: deny → exit 2, allow → exit 0. observe: deny → exit 0 plus a new
 #    "<key> WOULD-DENY" line. No allow case may log WOULD-DENY. Afterwards the sandbox copies must
 #    still match the live files.
@@ -26,13 +28,17 @@
 #    conformance ran.
 # 6. Prints `hook | mode | deny cases | allow cases | result`, then "conformance: PASS" or
 #    "conformance: FAIL (<n>)", and exits 0 or 1.
-# Runs as `bash -p` (no exported functions, no BASH_ENV) with its own PATH, like the hooks.
+# Runs as `bash -p` (no exported functions, no BASH_ENV) with its own PATH and only HOME, USER,
+# LOGNAME, TMPDIR and CLAUDE_CONFIG_DIR kept from the environment, like the hooks.
 # Must run on macOS /bin/bash 3.2.
 set -uo pipefail
 PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
-export PATH
+export PATH LC_ALL=C
 for v in $(compgen -e); do
-  case "$v" in GIT_* | DEVELOPER_DIR) unset "$v" ;; esac
+  case "$v" in
+    HOME | USER | LOGNAME | TMPDIR | CLAUDE_CONFIG_DIR | PATH | LC_ALL) ;;
+    *) unset "$v" 2>/dev/null || true ;;
+  esac
 done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)" || exit 1
@@ -222,9 +228,15 @@ for f in "$SETTINGS" "$HOOKS_DIR"/*.sh "$ROOT"/.harness/lib/* "$ROOT"/.harness/*
 done
 BEFORE="$(snapshot)"
 
-# Setup scripts may write only inside their own sandbox (and to /dev/null and /dev/tty).
+# Setup scripts (and anything they leave running) may write only inside their own sandbox, never
+# to the copied hooks, runtime and config or the folders holding them, and may not send signals
+# at all (so it can't kill the hook under test).
 SETUP_PROFILE='(version 1) (allow default) (deny file-write*)
-  (allow file-write* (subpath (param "BASE")) (literal "/dev/null") (literal "/dev/tty"))'
+  (allow file-write* (subpath (param "BASE")) (literal "/dev/null") (literal "/dev/tty"))
+  (deny file-write* (subpath (string-append (param "SBX") "/.claude"))
+    (subpath (string-append (param "SBX") "/.harness")) (literal (param "SBX"))
+    (literal (string-append (param "BASE") "/code")) (literal (param "BASE")))
+  (deny signal)'
 if [[ -d "$CASES_DIR" ]] && [[ -n "$(find "$CASES_DIR" -name '*.setup.sh' -print -quit)" ]] &&
   ! command -v sandbox-exec >/dev/null 2>&1; then
   fail "sandbox-exec is missing, so setup scripts can't be confined to their sandbox"
@@ -288,9 +300,9 @@ run_case() {
   # The same shape hr_init accepts, so a deny case can't "pass" by being unreadable input.
   if ! jq -se 'length == 1 and (.[0] | type) == "object" and (.[0] |
       (.hook_event_name | type) == "string"
-      and ([.tool_name, .cwd] | all(. == null or type == "string"))
       and ((.tool_input | type) as $t | $t == "null" or $t == "object")
-      and ([.tool_input.command?, .tool_input.file_path?, .tool_input.notebook_path?]
+      and ([.hook_event_name, .tool_name, .cwd, .tool_input.command?, .tool_input.file_path?,
+          .tool_input.notebook_path?]
         | all(. == null or (type == "string" and (any(explode[]; . == 0) | not)))))' \
     "$json" >/dev/null 2>&1; then
     CASE_ERR="not valid hook input (one JSON object; event, tool, command, file path and cwd must be strings)"
@@ -314,7 +326,7 @@ run_case() {
     cp "$setup" "$BASE/setup.sh"
     (cd "$BASE" && env -i PATH="$PATH" HOME="$BASE/home" ROOT="$SBX" \
       WORKTREES="$BASE/code/forge-worktrees" TMP="$BASE" \
-      sandbox-exec -D BASE="$BASE" -p "$SETUP_PROFILE" /bin/bash "$BASE/setup.sh") \
+      sandbox-exec -D BASE="$BASE" -D SBX="$SBX" -p "$SETUP_PROFILE" /bin/bash "$BASE/setup.sh") \
       >"$RUN/setup.out" 2>&1 || {
       CASE_ERR="setup failed: $(tr '\n' ' ' <"$RUN/setup.out")"
       return 0

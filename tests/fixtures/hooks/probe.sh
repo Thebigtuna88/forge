@@ -1,6 +1,7 @@
 #!/bin/bash -p
 # Test-only hook: prints what hookrt worked out, selected by $PROBE, then allows. Lets the unit
 # tests check hookrt's parsing through the same entry point a real hook uses.
+probe_what="${PROBE:-}" # read before the runtime clears the environment
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset HOOKRT_LOADED
 # shellcheck source=.harness/lib/hookrt.sh
@@ -8,7 +9,7 @@ source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&
 [ "${HOOKRT_LOADED:-}" = 1 ] || { echo "hookrt not loaded" >&2; exit 2; }
 
 hr_init probe
-case "${PROBE:-}" in
+case "$probe_what" in
   fields)
     printf 'event=%s|tool=%s|file=%s|cwd=%s|mode=%s|root=%s|worktrees=%s\n' \
       "$HR_EVENT" "$HR_TOOL" "$HR_FILE" "$HR_CWD" "$HR_MODE" "$HR_ROOT" "$HR_WORKTREES"

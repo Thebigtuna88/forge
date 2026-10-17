@@ -11,11 +11,14 @@
 #
 # then calls `hr_init <hook-name>` and ends every path with hr_allow or hr_deny. Claude Code
 # treats any exit status other than 2 as "allow", so only an explicit hr_allow allows: errexit,
-# an ERR trap inherited by command substitutions, and an EXIT trap turn a crash, a failed command
-# (also inside $(…)), a catchable signal, a bare `exit`, `exec` or falling off the end into a deny
-# (fail closed, rule 9). So a hook writes `x="$(cmd || true)"` where a failure is expected. `bash -p` makes bash ignore exported functions,
-# BASH_ENV, SHELLOPTS and CDPATH, and the runtime sets PATH itself (system folders first), so
-# nothing in the environment can replace jq, git or the runtime's own functions. A hook whose parts have their own modes calls
+# an ERR trap inherited by command substitutions (it leaves a "failed" mark that the exit check
+# reads, so even `local x="$(cmd)"` or "$(cmd)" as an argument counts), and an EXIT trap turn a
+# crash, a failed command, a catchable signal, a bare `exit`, `exec` or falling off the end into a
+# deny (fail closed, rule 9). So a hook writes `x="$(cmd || true)"` where a failure is expected. `bash -p` makes bash ignore exported functions,
+# BASH_ENV, SHELLOPTS and CDPATH; the runtime then clears every environment variable except
+# HOME, USER, LOGNAME, TMPDIR and CLAUDE_PROJECT_DIR (no PERL5OPT, GIT_*, DEVELOPER_DIR, …) and
+# sets PATH itself, system folders first. So nothing in the environment can change what jq, git,
+# shasum or the runtime's own functions do. A hook whose parts have their own modes calls
 # `hr_part <part>` once it knows which part applies (mode key "<hook>:<part>").
 #
 # A guard for git commands calls hr_require_simple (which also fills HR_TOK and HR_GIT_*) and
@@ -34,17 +37,29 @@ fi
 set -eEu
 
 _HR_DECISION="" # "allow" only after hr_allow; anything else ends in exit 2
+_HR_TMPD=""     # private folder holding the "failed" mark
 _hr_on_exit() {
-  local rc=$?
+  local rc=$? failed=0
   set +eu
-  if [[ "${_HR_DECISION:-}" == allow && "$rc" == 0 ]]; then exit 0; fi
-  if [[ "${_HR_DECISION:-}" != deny ]]; then
+  if [[ -n "${_HR_TMPD:-}" ]]; then
+    if [[ -e "$_HR_TMPD/failed" ]]; then failed=1; fi
+    rm -rf "$_HR_TMPD"
+  fi
+  if [[ $failed == 0 && "${_HR_DECISION:-}" == allow && "$rc" == 0 ]]; then exit 0; fi
+  if [[ $failed == 1 ]]; then
+    printf 'FORGE hook %s: a command failed (perhaps inside a command substitution), so it denies, fail closed.\n' "${HR_HOOK:-?}" >&2
+  elif [[ "${_HR_DECISION:-}" != deny ]]; then
     printf 'FORGE hook %s ended without a decision (status %s): denied, fail closed.\n' "${HR_HOOK:-?}" "$rc" >&2
   fi
   exit 2
 }
+_hr_on_err() { # runs in the hook and in every $(…) inside it
+  if [[ -n "${_HR_TMPD:-}" ]]; then : >"$_HR_TMPD/failed" 2>/dev/null || true; fi
+  exit 2
+}
 trap _hr_on_exit EXIT
-trap 'exit 2' ERR HUP INT QUIT ILL TRAP ABRT EMT FPE BUS SEGV SYS PIPE ALRM TERM XCPU XFSZ VTALRM PROF USR1 USR2
+trap _hr_on_err ERR
+trap 'exit 2' HUP INT QUIT ILL TRAP ABRT EMT FPE BUS SEGV SYS PIPE ALRM TERM XCPU XFSZ VTALRM PROF USR1 USR2
 
 if [[ "$-" != *p* ]]; then
   echo "FORGE hook runtime: the hook must start with #!/bin/bash -p (privileged mode, no inherited functions)" >&2
@@ -56,12 +71,14 @@ export LC_ALL=C
 # System tools first: jq, python3, git, shasum and md5 come from root-owned /usr/bin and /sbin.
 PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
 export PATH
-# Git reads these to find its programs, repository and config; the hook must see git's defaults
-# (DEVELOPER_DIR steers the /usr/bin/git shim).
 for _hr_v in $(compgen -e); do
-  case "$_hr_v" in GIT_* | DEVELOPER_DIR) unset "$_hr_v" ;; esac
+  case "$_hr_v" in
+    HOME | USER | LOGNAME | TMPDIR | CLAUDE_PROJECT_DIR | PATH | LC_ALL) ;;
+    *) unset "$_hr_v" 2>/dev/null || true ;;
+  esac
 done
 unset _hr_v
+_HR_TMPD="$(mktemp -d "${TMPDIR:-/tmp}/forge-hook.XXXXXX")"
 
 # Replacing the shell would skip the EXIT trap, so a hook may not do it in any form: the builtin
 # is switched off (so `builtin exec` and `command exec` fail) and plain `exec` explains why.
@@ -91,7 +108,8 @@ _HR_DEPLOY_FLOOR=("vercel" "fastlane" "eas" "xcrun altool")
 _HR_DYNAMIC_WORDS=" push commit merge api repo workflow "
 # Words after which the next word is still a command name.
 _HR_KEYWORDS=" if then else elif do while until ! { coproc "
-_HR_WRAPPERS=" env command exec nohup nice sudo doas xargs builtin eval time timeout caffeinate stdbuf "
+_HR_WRAPPERS=" env command exec nohup nice sudo doas xargs builtin eval time timeout caffeinate stdbuf
+  arch xcrun script taskpolicy sandbox-exec su chroot launchctl "
 # Git global options that don't change which repository or program git uses. Anything else
 # before the subcommand makes it "?".
 _HR_GIT_FLAGS=" --no-pager -p -P --paginate --no-optional-locks --literal-pathspecs --no-replace-objects "
@@ -158,7 +176,8 @@ _hr_field() { # <var> <jq path>: a string field into <var> ("" if absent or null
   local v
   v="$(jq -j "($2) | if . == null then \"\"
     elif type == \"string\" and (any(explode[]; . == 0) | not) then .
-    else error(\"not a string\") end | . + \".\"" <<<"$HR_INPUT" 2>/dev/null)" || return 1
+    else error(\"not a string\") end | . + \".\"" <<<"$HR_INPUT" 2>/dev/null || true)"
+  [[ -n "$v" ]] || return 1 # the trailing "." is there on success, even for ""
   printf -v "$1" '%s' "${v%.}"
 }
 
@@ -204,7 +223,7 @@ hr_tokens() { # <text> [punct]: shell words of <text> into HR_TOK; returns 1 if 
   local n="" t
   while IFS= read -r -d '' t; do
     if [[ -z "$n" ]]; then n="$t"; else HR_TOK+=("$t"); fi
-  done < <(python3 -I -c "$_HR_PY_TOKENS" "${2:-plain}" "$1" 2>/dev/null)
+  done < <(python3 -I -c "$_HR_PY_TOKENS" "${2:-plain}" "$1" 2>/dev/null || true)
   if [[ -z "$n" || "$n" != "${#HR_TOK[@]}" ]]; then
     HR_TOK=()
     return 1
@@ -253,6 +272,22 @@ _hr_could_be_tool() {
   case "$1" in *'$'* | *'{'*) return 0 ;; esac
   case "$1" in *[*?[]*) ;; *) return 1 ;; esac
   base="$(_hr_lower "${1##*/}")"
+  for name in git gh "${_HR_TOOLS[@]%% *}"; do
+    # shellcheck disable=SC2053 # $base is a glob pattern on purpose
+    if [[ "$name" == $base ]]; then return 0; fi
+  done
+  return 1
+}
+
+# _hr_glob_could_be_tool <word>: 0 if the word is a glob (with at least one letter or digit, so
+# not just `*`) whose last part matches git, gh or a deploy tool, or a brace expansion; such an
+# argument may be run by a wrapper the runtime doesn't know (`arch -arm64 /usr/bin/g[i]t`).
+_hr_glob_could_be_tool() {
+  local base name brace='\{[^}]*(,|\.\.)[^}]*\}'
+  if [[ "$1" =~ $brace ]]; then return 0; fi
+  case "$1" in *[*?[]*) ;; *) return 1 ;; esac
+  base="$(_hr_lower "${1##*/}")"
+  case "$base" in *[a-z0-9]*) ;; *) return 1 ;; esac
   for name in git gh "${_HR_TOOLS[@]%% *}"; do
     # shellcheck disable=SC2053 # $base is a glob pattern on purpose
     if [[ "$name" == $base ]]; then return 0; fi
@@ -380,6 +415,9 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     elif [[ $wrapped == 1 ]] && _hr_could_be_tool "$u"; then
       rc=0
       break
+    elif _hr_glob_could_be_tool "$u"; then
+      rc=0
+      break
     fi
     if [[ "$u" == *[[:space:]]* ]]; then
       local -a inner=("${HR_TOK[@]}")
@@ -477,7 +515,8 @@ hr_git_sub() { # uses HR_TOK (a git command): sets HR_GIT_SUB, HR_GIT_ARGS, HR_G
       break
     fi
     [[ "$sub" =~ ^[A-Za-z0-9-]+$ && -n "$HR_GIT_DIR" ]] || break
-    exp="$(git -C "$HR_GIT_DIR" config --get "alias.$sub" 2>/dev/null)" || break
+    exp="$(git -C "$HR_GIT_DIR" config --get "alias.$sub" 2>/dev/null || true)"
+    [[ -n "$exp" ]] || break
     [[ "$exp" != '!'* ]] || break
     hr_tokens "$exp" && [[ ${#HR_TOK[@]} -gt 0 ]] || break
     sub="${HR_TOK[0]}"
@@ -493,18 +532,17 @@ hr_git_sub() { # uses HR_TOK (a git command): sets HR_GIT_SUB, HR_GIT_ARGS, HR_G
 hr_md5() { # <file>: its md5 in hex; fails if the file can't be read
   local s
   [[ -f "$1" && -r "$1" ]] || return 1
-  if s="$(md5 -q <"$1" 2>/dev/null)"; then
-    printf '%s\n' "$s"
-    return 0
-  fi
-  s="$(md5sum <"$1" 2>/dev/null)" || return 1
+  s="$(md5 -q <"$1" 2>/dev/null || true)"
+  [[ -n "$s" ]] || s="$(md5sum <"$1" 2>/dev/null || true)"
+  [[ -n "$s" ]] || return 1
   printf '%s\n' "${s%% *}"
 }
 
 hr_sha256() { # <file>: its sha256 in hex; fails if the file can't be read
   local s
   [[ -f "$1" && -r "$1" ]] || return 1
-  s="$(shasum -a 256 <"$1" 2>/dev/null)" || return 1
+  s="$(shasum -a 256 <"$1" 2>/dev/null || true)"
+  [[ -n "$s" ]] || return 1
   printf '%s\n' "${s%% *}"
 }
 

@@ -1,5 +1,6 @@
 #!/bin/bash -p
 # Test-only hook that goes wrong in the way $MISBEHAVE says. Every one of these must deny.
+how="${MISBEHAVE:-}" # read before the runtime clears the environment
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset HOOKRT_LOADED
 # shellcheck source=.harness/lib/hookrt.sh
@@ -7,7 +8,7 @@ source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&
 [ "${HOOKRT_LOADED:-}" = 1 ] || { echo "hookrt not loaded" >&2; exit 2; }
 
 hr_init misbehave
-case "${MISBEHAVE:-}" in
+case "$how" in
   unbound) echo "${no_such_variable_here:?}" ;;
   exit0) exit 0 ;;
   exit1) exit 1 ;;
@@ -30,6 +31,16 @@ case "${MISBEHAVE:-}" in
   subst-error-then-allow)
     checked="$(no_such_command_frg2 2>/dev/null; printf unchecked)"
     printf '%s\n' "$checked"
+    hr_allow
+    ;;
+  local-subst-then-allow)
+    # shellcheck disable=SC2034,SC2155 # masking the failure is the point of this case
+    check() { local result="$(false)"; }
+    check
+    hr_allow
+    ;;
+  arg-subst-then-allow)
+    printf 'value=[%s]\n' "$(false)"
     hr_allow
     ;;
   unset-decided)

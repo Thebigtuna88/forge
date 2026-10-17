@@ -219,7 +219,8 @@ test_crash_or_no_decision_denies() {
   mk_hook_harness
   local how
   for how in unbound exit0 exit1 missing-command term usr1 quit error-then-allow false-then-allow \
-    unset-decided exec-true exec-false command-exec builtin-exec subst-error-then-allow fall-off-the-end; do
+    unset-decided exec-true exec-false command-exec builtin-exec subst-error-then-allow \
+    local-subst-then-allow arg-subst-then-allow fall-off-the-end; do
     run_hook misbehave "$(bash_input ls)" MISBEHAVE="$how"
     assert_exit 2 "$RC" "misbehave=$how"
   done
@@ -230,7 +231,7 @@ test_missing_jq_denies() {
   mk_hook_harness
   local bin="$T_TMP/bin" tool
   mkdir "$bin"
-  for tool in bash dirname cat python3 git date tr; do ln -s "$(command -v "$tool")" "$bin/$tool"; done
+  for tool in bash dirname cat python3 git date tr mktemp rm; do ln -s "$(command -v "$tool")" "$bin/$tool"; done
   sed -i '' "s|^PATH=.*|PATH=$bin|" "$H/.harness/lib/hookrt.sh"
   run_hook probe "$(bash_input ls)"
   assert_exit 2 "$RC"
@@ -241,7 +242,7 @@ test_missing_python3_denies() {
   mk_hook_harness
   local bin="$T_TMP/bin" tool
   mkdir "$bin"
-  for tool in bash dirname cat jq git date tr; do ln -s "$(command -v "$tool")" "$bin/$tool"; done
+  for tool in bash dirname cat jq git date tr mktemp rm; do ln -s "$(command -v "$tool")" "$bin/$tool"; done
   sed -i '' "s|^PATH=.*|PATH=$bin|" "$H/.harness/lib/hookrt.sh"
   run_hook probe "$(bash_input ls)"
   assert_exit 2 "$RC"
@@ -318,7 +319,9 @@ test_guarded_detection() {
     'env -u FOO /usr/bin/g[i]t push origin main' 'exec -a x g?t push' 'coproc g?t push' \
     'nice -n 5 g?t push' 'ls; 3<f g?t push' 'cat <(g?t push origin main)' \
     'diff <(/usr/bin/g[i]t push origin main) /dev/null' 'tee >(g?t push) </dev/null' \
-    "bash -c \$'git\\x20push\\x20origin\\x20main'" "sh -c \$'\\147it push'"; do
+    "bash -c \$'git\\x20push\\x20origin\\x20main'" "sh -c \$'\\147it push'" \
+    'arch -arm64 /usr/bin/g[i]t push origin main' 'xcrun g?t push' 'frobnicate -x /usr/bin/g[i]t push' \
+    'frobnicate /usr/bin/{g,}it push' 'frobnicate /usr/bin/[g][i][t] push'; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done
@@ -330,7 +333,8 @@ test_plain_detection() {
   for c in 'ls -la' 'git status && git log --oneline -5' 'git log --grep fix | head' \
     'gh pr view 3 | head' 'gh issue list' 'echo hi > f.txt' 'git -C /x diff | wc -l' \
     'cat README.md' 'git merge dev' 'for f in *.sh; do echo "$f"; done' '' \
-    'ls *.sh | wc -l' 'rm -rf build/* && ls' 'for f in a b; do bash "$f"; done'; do
+    'ls *.sh | wc -l' 'rm -rf build/* && ls' 'for f in a b; do bash "$f"; done' 'ls * | head' \
+    'ls work/*/manual | head'; do
     probe guarded "$c"
     assert_eq "$OUT" PLAIN "plain: $c"
   done
@@ -474,6 +478,14 @@ test_checksum_of_option_like_name_denies() {
       assert_exit 2 "$RC" "$what of '$f' (got: $OUT)"
     done
   done
+}
+
+test_inherited_perl_options_cannot_forge_checksums() {
+  mk_hook_harness
+  printf 'abc\n' >"$T_TMP/f"
+  run_hook probe "$(jq -n --arg f "$T_TMP/f" '{tool_name: "Read", tool_input: {file_path: $f}}')" \
+    PROBE=sha256 PERL5OPT='-MConfig;print("forged\n");exit(0)'
+  assert_eq "$OUT" "sha256=edeaaff3f1774ad2888673770c6d64097e391bc362d7d6fb34982ddf0efd18cb"
 }
 
 test_inherited_git_exec_path_is_ignored() {

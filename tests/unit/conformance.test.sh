@@ -283,7 +283,8 @@ test_fails_when_observe_log_was_seeded() {
   printf 'printf "2000-01-01T00:00:00Z always-allow WOULD-DENY seeded :: x\\n" >"$ROOT/.harness/observed.log"\n' \
     >"$H/tests/conformance/always-allow/deny/anything.setup.sh"
   printf '{"modes": {"always-allow": "observe"}}\n' >"$H/.harness/mode.json"
-  expect_fail "no WOULD-DENY line"
+  expect_fail "setup failed"
+  assert_contains "$OUT" "observed.log: Operation not permitted"
 }
 
 test_fails_on_hidden_or_stray_case_files() {
@@ -416,7 +417,8 @@ test_setup_cannot_undo_a_bad_mode_file() {
   case_json lenient-gate allow other 'ls'
   printf 'printf %s >"$ROOT/.harness/mode.json"\n' "'{\"modes\": {}}'" \
     >"$H/tests/conformance/lenient-gate/deny/main.setup.sh"
-  expect_fail "setup changed .harness/mode.json in the sandbox"
+  expect_fail "setup failed"
+  assert_contains "$OUT" "mode.json: Operation not permitted"
 }
 
 test_setup_cannot_swap_the_hook() {
@@ -428,7 +430,8 @@ cp "$ROOT/.claude/hooks/always-allow.sh" "$TMP/original"
 printf '#!/bin/bash -p\ncp "%s" "%s"\nexit 2\n' "$TMP/original" "$ROOT/.claude/hooks/always-allow.sh" \
   >"$ROOT/.claude/hooks/always-allow.sh"
 EOF
-  expect_fail "setup changed"
+  expect_fail "setup failed"
+  assert_contains "$OUT" "always-allow.sh: Operation not permitted"
 }
 
 # touch_case <path>: a toucher allow case whose hook appends to <path> (inside the sandbox).
@@ -481,8 +484,8 @@ cp -R "$ROOT/.claude/hooks" "$TMP/fake/.claude/hooks"
 rm -rf "$ROOT/.claude/hooks"
 ln -s "$TMP/fake/.claude/hooks" "$ROOT/.claude/hooks"
 EOF
-  expect_fail "setup"
-  assert_contains "$OUT" "symlink"
+  expect_fail "setup failed"
+  assert_contains "$OUT" "Operation not permitted"
 }
 
 test_bash_env_cannot_fake_a_pass() {
@@ -492,6 +495,48 @@ test_bash_env_cannot_fake_a_pass() {
   OUT="$(cd "$H" && env HOME="$T_TMP/home" BASH_ENV="$T_TMP/benv.sh" "$H/.harness/bin/conformance" 2>&1)"
   RC=$?
   assert_exit 1 "$RC" "$OUT"
+}
+
+test_fails_on_deny_case_with_nul_in_any_field() {
+  mk_conf_harness sample-gate probe
+  case_json probe allow other 'ls'
+  mkdir -p "$H/tests/conformance/probe/deny"
+  jq -n '{hook_event_name: "PreToolUse", tool_name: "Bash", cwd: "\u0000",
+    tool_input: {command: "git push origin main"}}' >"$H/tests/conformance/probe/deny/nul.json"
+  expect_fail "not valid hook input"
+}
+
+test_perl_options_cannot_hide_a_live_change() {
+  mk_conf_harness sample-gate toucher
+  printf 'charter\n' >"$H/CLAUDE.md"
+  case_json toucher deny main 'git push origin main'
+  mkdir -p "$H/tests/conformance/toucher/allow"
+  jq -n --arg f "$H/CLAUDE.md" '{hook_event_name: "PreToolUse", tool_name: "Bash",
+    tool_input: {command: "ls", file_path: $f}, cwd: "@ROOT@"}' >"$H/tests/conformance/toucher/allow/touch.json"
+  OUT="$(cd "$H" && env HOME="$T_TMP/home" PERL5OPT='-MConfig;print("same  -\n");exit(0)' \
+    "$H/.harness/bin/conformance" 2>&1)"
+  RC=$?
+  assert_exit 1 "$RC"
+  assert_contains "$OUT" "changed while conformance ran"
+}
+
+test_setup_cannot_write_the_copies_at_all() {
+  # The sandbox refuses the write itself (so a background child can't do it later either);
+  # the case then runs against the untouched copy and passes.
+  mk_conf_harness
+  printf 'printf "\\n# x\\n" >>"$ROOT/.claude/hooks/sample-gate.sh" 2>/dev/null\nexit 0\n' \
+    >"$H/tests/conformance/sample-gate/allow/push-feature.setup.sh"
+  conform
+  assert_exit 0 "$RC" "$OUT"
+  assert_not_contains "$OUT" "setup changed"
+}
+
+test_setup_cannot_signal_outside_processes() {
+  mk_conf_harness
+  printf 'if kill -WINCH "$PPID" 2>/dev/null; then echo "could signal its parent" >&2; exit 1; fi\n' \
+    >"$H/tests/conformance/sample-gate/allow/push-feature.setup.sh"
+  conform
+  assert_exit 0 "$RC" "$OUT"
 }
 
 run_tests
