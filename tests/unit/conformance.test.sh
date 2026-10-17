@@ -641,4 +641,16 @@ test_quoted_punctuation_is_not_a_group() {
   assert_not_contains "$OUT" "may not define functions or open"
 }
 
+test_permitted_substitutions_pass_the_source_check() {
+  mk_conf_harness
+  # Appended after hr_allow (never runs): only the source check reads these lines.
+  printf '%s\n' 'x="$(true)"' 'm="$(hr_md5 "$HR_FILE")"' 'k="$(printf %s "a b" | tr a b)"' \
+    "echo 'it''s' # a comment with ( and {" 'if [[ "$x" == "(" ]]; then echo "{"; fi' \
+    >>"$H/.claude/hooks/sample-gate.sh"
+  conform
+  assert_not_contains "$OUT" "may not define functions or open"
+  assert_not_contains "$OUT" "a command substitution"
+  assert_not_contains "$OUT" "part of a condition"
+}
+
 run_tests

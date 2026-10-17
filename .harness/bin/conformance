@@ -214,6 +214,45 @@ import re, shlex, sys
 header = sys.argv[2]
 lines = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read().split("\n")
 assign = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\"\$\(.*\)\"$")
+def shell_code(raw):
+    # The line as the shell parses it, with every quoted part and backslash escape replaced by
+    # "x" and any comment dropped, so a quoted "(" or "if" is never taken for syntax.
+    # Returns (code, quote still open at the end of the line).
+    out, i, quote, word_start = [], 0, None, True
+    while i < len(raw):
+        c = raw[i]
+        if quote == "\x27":
+            if c == "\x27":
+                quote = None
+                out.append("x")
+            i += 1
+            continue
+        if quote == "\x22":
+            if c == "\\":
+                i += 2
+                continue
+            if c == "\x22":
+                quote = None
+                out.append("x")
+            i += 1
+            continue
+        if c == "\\":
+            out.append("x")
+            i += 2
+            word_start = False
+            continue
+        if c in "\x27\x22":
+            quote = c
+            word_start = False
+            i += 1
+            continue
+        if c == "#" and word_start:
+            break
+        out.append(c)
+        word_start = c in " \t;&|()<>"
+        i += 1
+    return "".join(out), quote is not None
+
 stack = []        # open groups: [kind, line]; kind is "{", "(" or "$(" (a substitution)
 cond = False      # inside if/elif/while/until … then/do: bash ignores errors there
 cont = False      # the previous line ended in && || | ! or \, so this line is part of a list
@@ -231,15 +270,14 @@ for n, raw in enumerate(lines, 1):
         bad.append(str(n))
     elif count and in_list:
         bad.append("C%d" % n)
-    # Non-POSIX shlex keeps the quotes on a word, so a quoted "(" or "{" is not taken for syntax.
-    lex = shlex.shlex(raw, posix=False, punctuation_chars=True)
-    lex.whitespace_split = True
-    lex.commenters = "#"
-    try:
-        words = list(lex)
-    except ValueError:
+    code, open_quote = shell_code(raw)
+    if open_quote:
         bad.append("G%d" % n)  # quoting that does not close on this line
         continue
+    lex = shlex.shlex(code, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    words = list(lex)
     if words[:1] == ["function"]:
         bad.append("G%d" % n)
     prev = ""
