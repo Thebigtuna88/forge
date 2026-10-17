@@ -232,4 +232,153 @@ test_fails_on_unreadable_user_settings() {
   expect_fail "cannot read"
 }
 
+# --- round 1 review fixes -----------------------------------------------------------------------
+
+test_fails_when_registered_for_another_tool() {
+  mk_conf_harness
+  jq '.hooks.PreToolUse[0].matcher = "Read"' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  expect_fail "not registered for PreToolUse/Bash"
+}
+
+test_fails_when_registered_for_another_event() {
+  mk_conf_harness
+  jq '{hooks: {PostToolUse: .hooks.PreToolUse}}' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  expect_fail "not registered for PreToolUse/Bash"
+}
+
+test_fails_on_async_hook() {
+  mk_conf_harness
+  jq '.hooks.PreToolUse[0].hooks[0].async = true' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  expect_fail "async"
+}
+
+test_setup_and_hooks_get_a_sandbox_home() {
+  mk_conf_harness
+  case_json sample-gate allow global-alias 'git frg2st'
+  printf 'git config --global alias.frg2st status\n' >"$H/tests/conformance/sample-gate/allow/global-alias.setup.sh"
+  conform
+  assert_exit 0 "$RC" "the hook must see the sandbox's global alias: $OUT"
+  [[ ! -e "$T_TMP/home/.gitconfig" ]] || _t_fail "setup wrote the caller's ~/.gitconfig"
+}
+
+test_fails_when_a_live_file_changes() {
+  mk_conf_harness
+  printf 'printf " " >>"%s/.harness/mode.json"\n' "$H" >"$H/tests/conformance/sample-gate/allow/push-feature.setup.sh"
+  expect_fail "changed while conformance ran"
+}
+
+test_fails_when_bad_mode_runs_tamper_with_the_sandbox() {
+  mk_conf_harness sample-gate lenient-gate
+  case_json lenient-gate deny main 'git push origin main'
+  case_json lenient-gate allow other 'ls'
+  cat >"$H/tests/conformance/lenient-gate/deny/main.setup.sh" <<'EOF'
+if ! jq -e '.modes == {}' "$ROOT/.harness/mode.json" >/dev/null 2>&1; then
+  printf '#!/bin/bash\nexit 2\n' >"$ROOT/.claude/hooks/lenient-gate.sh"
+fi
+EOF
+  expect_fail "differs from the live file"
+}
+
+test_fails_when_observe_log_was_seeded() {
+  mk_conf_harness sample-gate always-allow
+  case_json always-allow deny anything 'git push origin main'
+  case_json always-allow allow other 'ls'
+  printf 'printf "2000-01-01T00:00:00Z always-allow WOULD-DENY seeded :: x\\n" >"$ROOT/.harness/observed.log"\n' \
+    >"$H/tests/conformance/always-allow/deny/anything.setup.sh"
+  printf '{"modes": {"always-allow": "observe"}}\n' >"$H/.harness/mode.json"
+  expect_fail "no WOULD-DENY line"
+}
+
+test_fails_on_hidden_or_stray_case_files() {
+  mk_conf_harness
+  case_json sample-gate deny .push-feature 'git push origin feature/FRG-2-c'
+  expect_fail ".push-feature.json"
+  rm "$H/tests/conformance/sample-gate/deny/.push-feature.json"
+  printf 'x\n' >"$H/tests/conformance/sample-gate/deny/notes.txt"
+  expect_fail "notes.txt"
+}
+
+test_fails_on_dot_dot_hook_file() {
+  mk_conf_harness
+  printf '#!/bin/bash\n' >"$H/.claude/hooks/..extra.sh"
+  expect_fail "..extra.sh"
+}
+
+test_fails_on_symlinked_case() {
+  mk_conf_harness
+  mkdir -p "$H/tests/elsewhere"
+  mv "$H/tests/conformance/sample-gate/deny/push-main.json" "$H/tests/elsewhere/"
+  ln -s ../../../elsewhere/push-main.json "$H/tests/conformance/sample-gate/deny/push-main.json"
+  expect_fail "symlink"
+}
+
+test_placeholders_survive_odd_temp_paths() {
+  mk_conf_harness sample-gate cwd-gate
+  case_json cwd-gate deny in-main 'ls' '@ROOT@'
+  case_json cwd-gate allow in-worktree 'ls' '@WORKTREES@/FRG-2-x'
+  mkdir -p "$T_TMP/a&b|c\\d"
+  OUT="$(cd "$H" && env HOME="$T_TMP/home" TMPDIR="$T_TMP/a&b|c\\d" "$H/.harness/bin/conformance" 2>&1)"
+  RC=$?
+  assert_exit 0 "$RC" "$OUT"
+}
+
+test_mode_column_shows_every_part() {
+  mk_conf_harness
+  jq '.hooks.PreToolUse[0].matcher = "Bash|BashAlt"' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  mkdir -p "$H/tests/conformance/sample-gate/deny"
+  jq -n '{hook_event_name: "PreToolUse", tool_name: "BashAlt", forge_mode_key: "sample-gate:alt",
+    tool_input: {command: "git push origin main"}, cwd: "@ROOT@"}' \
+    >"$H/tests/conformance/sample-gate/deny/alt.json"
+  printf '{"modes": {"sample-gate:alt": "observe"}}\n' >"$H/.harness/mode.json"
+  conform
+  assert_exit 0 "$RC" "$OUT"
+  [[ "$OUT" =~ sample-gate\ +\|\ enforce/observe\ +\| ]] || _t_fail "mode column: $OUT"
+}
+
+test_observe_line_must_name_the_case_key() {
+  mk_conf_harness
+  jq '.hooks.PreToolUse[0].matcher = "Bash|BashAlt"' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  # The hook really logs under sample-gate:alt; a case claiming another key must not pass.
+  jq -n '{hook_event_name: "PreToolUse", tool_name: "BashAlt", forge_mode_key: "sample-gate:other",
+    tool_input: {command: "git push origin main"}, cwd: "@ROOT@"}' \
+    >"$H/tests/conformance/sample-gate/deny/alt.json"
+  printf '{"modes": {"sample-gate:alt": "observe", "sample-gate:other": "observe"}}\n' >"$H/.harness/mode.json"
+  expect_fail "no WOULD-DENY line"
+}
+
+test_fails_when_hooks_disabled_in_claude_config_dir() {
+  mk_conf_harness
+  mkdir -p "$T_TMP/profile"
+  printf '{"disableAllHooks": true}\n' >"$T_TMP/profile/settings.json"
+  OUT="$(cd "$H" && env HOME="$T_TMP/home" CLAUDE_CONFIG_DIR="$T_TMP/profile" "$H/.harness/bin/conformance" 2>&1)"
+  RC=$?
+  assert_exit 1 "$RC"
+  assert_contains "$OUT" "disableAllHooks is set in $T_TMP/profile/settings.json"
+}
+
+test_fails_when_managed_hooks_only() {
+  mk_conf_harness
+  mkdir -p "$T_TMP/home/.claude"
+  printf '{"allowManagedHooksOnly": true}\n' >"$T_TMP/home/.claude/settings.json"
+  expect_fail "allowManagedHooksOnly"
+}
+
+test_fails_when_main_checkout_disables_hooks() {
+  mk_conf_harness
+  local main="$T_TMP/main" wt="$T_TMP/wt"
+  git init -q -b dev "$main"
+  git -C "$main" -c user.name=t -c user.email=t@t commit -q --allow-empty -m root
+  git -C "$main" worktree add -q -b feature/FRG-2-t "$wt"
+  cp -R "$H/." "$wt/"
+  H="$wt"
+  mkdir -p "$main/.claude"
+  printf '{"disableAllHooks": true}\n' >"$main/.claude/settings.local.json"
+  expect_fail "disableAllHooks is set in $main/.claude/settings.local.json"
+}
+
 run_tests

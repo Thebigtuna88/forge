@@ -58,6 +58,27 @@ test_missing_mode_key_means_enforce() {
   expect_deny 'git push origin main'
 }
 
+test_observe_with_trailing_newline_means_enforce() {
+  mk_hook_harness
+  printf '{"modes": {"sample-gate": "observe\\n"}}\n' >"$H/.harness/mode.json"
+  expect_deny 'git push origin main'
+}
+
+test_two_mode_documents_mean_enforce() {
+  mk_hook_harness
+  printf '{"modes": {}}\n{"modes": {"sample-gate": "observe"}}\n' >"$H/.harness/mode.json"
+  expect_deny 'git push origin main'
+}
+
+test_part_has_its_own_mode() {
+  mk_hook_harness
+  printf '{"modes": {"sample-gate:alt": "observe"}}\n' >"$H/.harness/mode.json"
+  run_hook sample-gate "$(jq -n '{tool_name: "BashAlt", tool_input: {command: "git push origin main"}}')"
+  assert_exit 0 "$RC" "the alt part observes"
+  assert_contains "$(cat "$H/.harness/observed.log")" " sample-gate:alt WOULD-DENY push to main"
+  expect_deny 'git push origin main'
+}
+
 test_wrong_mode_shape_means_enforce() {
   mk_hook_harness
   printf '{"modes": ["sample-gate", "observe"]}\n' >"$H/.harness/mode.json"
@@ -128,6 +149,20 @@ test_runtime_that_does_not_load_denies() {
   assert_contains "$ERR" "hookrt not loaded"
 }
 
+test_inherited_loaded_flag_does_not_skip_the_runtime() {
+  mk_hook_harness
+  : >"$H/.harness/lib/hookrt.sh"
+  run_hook sample-gate "$(bash_input ls)" HOOKRT_LOADED=1
+  assert_exit 2 "$RC"
+}
+
+test_inherited_private_state_is_ignored() {
+  mk_hook_harness
+  run_hook sample-gate "$(bash_input 'xcrun altool --upload-app && ls')" \
+    _HR_LOADED=1 _HR_TOOLS=bogus _HR_GIT_CMDS=' status ' _HR_DECISION=allow
+  assert_exit 2 "$RC" "deploy floor must still apply"
+}
+
 test_runtime_refuses_to_run_directly() {
   mk_hook_harness
   local rc=0
@@ -138,7 +173,8 @@ test_runtime_refuses_to_run_directly() {
 test_crash_or_no_decision_denies() {
   mk_hook_harness
   local how
-  for how in unbound exit0 exit1 missing-command term fall-off-the-end; do
+  for how in unbound exit0 exit1 missing-command term usr1 quit error-then-allow false-then-allow \
+    unset-decided fall-off-the-end; do
     run_hook misbehave "$(bash_input ls)" MISBEHAVE="$how"
     assert_exit 2 "$RC" "misbehave=$how"
   done
@@ -172,7 +208,9 @@ test_bad_input_denies() {
     '{"tool_name": "Bash", "tool_input": {"command": 42}}' \
     '{"tool_name": "Bash", "tool_input": "git push"}' \
     '{"tool_name": "Bash", "tool_input": {"command": "ls\u0000; git push origin main"}}' \
-    '{"tool_name": "Bash", "cwd": ["/"]}'; do
+    '{"tool_name": "Bash", "cwd": ["/"]}' '{"tool_name": false}' \
+    '{"tool_name": "Bash", "tool_input": {"command": false}}' \
+    '{"tool_name": "Write", "tool_input": {"file_path": false}}'; do
     run_hook probe "$input" PROBE=fields
     assert_exit 2 "$RC" "input: $input"
   done
@@ -224,7 +262,10 @@ test_guarded_detection() {
     'echo "git push"' 'g"i"t p\ush origin x' 'GIT PUSH' 'cd x && git -C /y push' \
     $'git status\ngit push origin x' 'bash -c "git commit -F m"' '`git push`' \
     'x=$(printf pu)sh; git $x' 'git p origin main' 'git --exec-path=/x status' \
-    'git -c alias.s=status s' 'gh m 3' 'ls node_modules/.bin/vercel'; do
+    'git -c alias.s=status s' 'gh m 3' 'ls node_modules/.bin/vercel' \
+    $'gi\\\nt pu\\\nsh origin main' '/usr/bin/g[i]t push origin main' 'g?t push origin main' \
+    '{g,}it push origin main' "\$'\\x67it' \$'\\x70ush' origin main" 'ls; G*T push' \
+    'echo `g?t push`' 'x=1 g[i]t push' 'env -i g[i]t push' '> f g?t push' '"$G" push'; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done
@@ -235,7 +276,8 @@ test_plain_detection() {
   local c
   for c in 'ls -la' 'git status && git log --oneline -5' 'git log --grep fix | head' \
     'gh pr view 3 | head' 'gh issue list' 'echo hi > f.txt' 'git -C /x diff | wc -l' \
-    'cat README.md' 'git merge dev' 'for f in *.sh; do echo "$f"; done' ''; do
+    'cat README.md' 'git merge dev' 'for f in *.sh; do echo "$f"; done' '' \
+    'ls *.sh | wc -l' 'rm -rf build/* && ls' 'for f in a b; do bash "$f"; done'; do
     probe guarded "$c"
     assert_eq "$OUT" PLAIN "plain: $c"
   done
@@ -248,7 +290,7 @@ test_simple_guarded_commands_pass() {
   local c
   for c in 'git push -u origin feature/FRG-2-hook-runtime' 'git -C /x push origin feature/FRG-2-a' \
     'git commit -F /tmp/msg.txt' 'git log --grep commit' 'gh pr merge 3 --squash' \
-    'gh api repos/Thebigtuna88/forge/pulls' 'vercel deploy' 'git -C ~/code/x push origin feature/FRG-2-a' \
+    'gh api repos/Thebigtuna88/forge/pulls' 'vercel deploy' \
     'git --no-pager -c color.ui=never push origin feature/FRG-2-a'; do
     expect_allow "$c"
   done
@@ -265,6 +307,8 @@ test_chained_or_expanded_guarded_commands_deny() {
     'git push origin feature/*' 'git push origin {feature/FRG-2-a,main}' \
     'git push origin feature/FRG-2-a # main' 'git push origin feature/FRG-2-?' \
     'git -C ~- push origin feature/FRG-2-a' 'git push origin (main)' \
+    'git -C ~/code/x push origin feature/FRG-2-a' 'git -C "~/x" push origin feature/FRG-2-a' \
+    $'gi\\\nt pu\\\nsh origin feature/FRG-2-a' 'g?t push origin feature/FRG-2-a' \
     'git log | grep commit' 'echo "git push"' 'env git push origin feature/FRG-2-a' \
     'command git push origin feature/FRG-2-a' 'bash -c "git push origin feature/FRG-2-a"' \
     'eval git push origin feature/FRG-2-a' 'GIT push origin feature/FRG-2-a' \
@@ -310,7 +354,11 @@ test_git_sub_skips_global_options() {
   probe git 'git -C /abs -C rel status' /w
   assert_eq "$OUT" "sub=status|dir=/abs/rel|alias=0|args="
   probe git 'git -C ~/x log' /w
-  assert_eq "$OUT" "sub=log|dir=$T_TMP/home/x|alias=0|args="
+  assert_eq "$OUT" "sub=log|dir=|alias=0|args=" "a ~ directory is unknown (quoting is lost)"
+  probe git 'git -C "~/x" log' /w
+  assert_eq "$OUT" "sub=log|dir=|alias=0|args="
+  probe git 'git -C / -C tmp status' /w
+  assert_eq "$OUT" "sub=status|dir=/tmp|alias=0|args="
   probe git 'git -C "" status' /w
   assert_eq "$OUT" "sub=status|dir=/w|alias=0|args="
 }
@@ -362,6 +410,12 @@ test_md5_and_sha256() {
   printf 'abc\n' >"$T_TMP/f"
   run_hook probe "$(jq -n --arg f "$T_TMP/f" '{tool_name: "Read", tool_input: {file_path: $f}}')" PROBE=sums
   assert_eq "$OUT" "md5=0bee89b07a248e27c83fc3d5951213c1 sha256=edeaaff3f1774ad2888673770c6d64097e391bc362d7d6fb34982ddf0efd18cb"
+}
+
+test_checksum_of_missing_file_denies() {
+  mk_hook_harness
+  run_hook probe "$(jq -n --arg f "$T_TMP/nope" '{tool_name: "Read", tool_input: {file_path: $f}}')" PROBE=sums
+  assert_exit 2 "$RC"
 }
 
 run_tests

@@ -2,6 +2,7 @@
 # Test-only hook: prints what hookrt worked out, selected by $PROBE, then allows. Lets the unit
 # tests check hookrt's parsing through the same entry point a real hook uses.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+unset HOOKRT_LOADED
 # shellcheck source=.harness/lib/hookrt.sh
 source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&2; exit 2; }
 [ "${HOOKRT_LOADED:-}" = 1 ] || { echo "hookrt not loaded" >&2; exit 2; }
@@ -33,7 +34,9 @@ case "${PROBE:-}" in
     printf '\n'
     ;;
   sums)
-    printf 'md5=%s sha256=%s\n' "$(hr_md5 "$HR_FILE")" "$(hr_sha256 "$HR_FILE")"
+    m="$(hr_md5 "$HR_FILE")"
+    s="$(hr_sha256 "$HR_FILE")"
+    printf 'md5=%s sha256=%s\n' "$m" "$s"
     ;;
   deny)
     hr_deny "probe was told to deny"
