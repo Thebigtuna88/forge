@@ -202,28 +202,72 @@ fi
 # $(…) inside `local x=…`, an argument, a pipeline, a second assignment on the line or another
 # $(…) hides the failure of what runs inside it. So a line holds at most one $(…), as the whole
 # value of one plain assignment; the only exception is the standard header line. Bash also stops
-# checking for errors inside a function or { } / ( ) group used as a condition, so a hook defines
-# no functions and opens no multi-line groups: every $(…) sits where a failure stops the hook.
+# checking for errors inside a function or a { } / ( ) group used as a condition, so a hook
+# defines no functions, and every group closes on the line it opens (a line with a $(…) can't
+# hold a group). Groups are found in real shell words (shlex: quoting and comments understood),
+# not by matching text. Prints "G<line>" for a function or group, "<line>" for a substitution.
+# shellcheck disable=SC2016 # Python source; its $ signs are for Python, not the shell
+SOURCE_CHECK_PY='
+import shlex, sys
+header = sys.argv[2]
+lines = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read().split("\n")
+assign = __import__("re").compile(r"^[A-Za-z_][A-Za-z0-9_]*=\"\$\(.*\)\"$")
+stack = []  # open groups: [kind, line]; kind is "{", "(" or "$(" (a substitution)
+bad = []
+for n, raw in enumerate(lines, 1):
+    line = raw.strip()
+    if not line or line.startswith("#") or line == header:
+        continue
+    if "`" in line or "<(" in line or ">(" in line:
+        bad.append(str(n))
+    probe = line.replace("$((", "")
+    count = probe.count("$(")
+    if count and (count > 1 or not assign.match(line)):
+        bad.append(str(n))
+    lex = shlex.shlex(raw, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = "#"
+    try:
+        words = list(lex)
+    except ValueError:
+        bad.append("G%d" % n)  # quoting that does not close on this line
+        continue
+    if words[:1] == ["function"]:
+        bad.append("G%d" % n)
+    prev = ""
+    for w in words:
+        if w == "{":
+            stack.append(["{", n])
+        elif w == "}":
+            if stack and stack[-1][0] == "{":
+                if stack.pop()[1] != n:
+                    bad.append("G%d" % n)
+        elif set(w) <= set("();<>|&"):
+            if "()" in w:
+                bad.append("G%d" % n)  # name() — a function definition
+            for i, c in enumerate(w):
+                if c == "(":
+                    stack.append(["$(" if i == 0 and prev.endswith("$") else "(", n])
+                elif c == ")" and stack and stack[-1][0] in ("(", "$("):
+                    if stack.pop()[1] != n:
+                        bad.append("G%d" % n)
+        prev = w
+    if any(kind in ("{", "(") for kind, opened in stack):
+        bad.append("G%d" % n)  # a group still open at the end of the line
+        stack = [g for g in stack if g[0] == "$("]
+for b in dict.fromkeys(bad):
+    print(b)
+'
 # shellcheck disable=SC2016 # the literal header text
 HEADER_LINE='here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
 for h in ${hooks[@]+"${hooks[@]}"}; do
   while IFS= read -r n; do
     if [[ "$n" == G* ]]; then
-      fail "$h.sh line ${n#G}: a hook may not define functions or open multi-line { } or ( ) groups (bash stops checking for errors inside them when they are used as a condition)"
+      fail "$h.sh line ${n#G}: a hook may not define functions or open { } or ( ) groups that span lines (bash stops checking for errors inside them when they are used as a condition)"
       continue
     fi
     fail "$h.sh line $n: a command substitution may only be the whole value of a plain assignment (name=\"\$(…)\", one per line, not nested); backticks and <( >( aren't allowed, so a failure inside can't be hidden"
-  done < <(awk -v header="$HEADER_LINE" '{
-      line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
-      if (line ~ /^#/ || line == header) next
-      if (line ~ /^function[ \t]/ || line ~ /^[A-Za-z_][A-Za-z0-9_:.-]*[ \t]*\(\)/ ||
-          line ~ /^[{}()]/ || line ~ /[{(]$/) { print "G" NR; next }
-      if (index(line, "`") || index(line, "<(") || index(line, ">(")) { print NR; next }
-      probe = line; gsub(/\$\(\(/, "", probe)
-      count = gsub(/\$\(/, "", probe)
-      if (count == 0) next
-      if (count > 1 || line !~ /^[A-Za-z_][A-Za-z0-9_]*="\$\(.*\)"$/) print NR
-    }' "$HOOKS_DIR/$h.sh")
+  done < <(python3 -I -c "$SOURCE_CHECK_PY" "$HOOKS_DIR/$h.sh" "$HEADER_LINE" || echo "G0")
 done
 
 if [[ -e "$CASES_DIR" || -L "$CASES_DIR" ]]; then

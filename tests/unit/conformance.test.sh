@@ -609,4 +609,16 @@ test_fails_on_control_characters_in_settings() {
   expect_fail "settings.json is missing or malformed"
 }
 
+test_fails_on_group_hidden_behind_a_comment() {
+  local body
+  for body in $'if { # conditional group\nx="$(printf %s "$HR_CMD")"\n:; }; then :; fi' \
+    $'if { # conditional group\nx="$(printf %s "$HR_CMD")"\ntrue; }; then\n  :\nfi' \
+    $'while ( # subshell\nx="$(printf %s "$HR_CMD")"\nfalse ); do :; done'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    printf '%s\n' "$body" >>"$H/.claude/hooks/sample-gate.sh"
+    expect_fail "may not define functions or open"
+  done
+}
+
 run_tests
