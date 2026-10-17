@@ -204,16 +204,20 @@ fi
 # value of one plain assignment; the only exception is the standard header line. Bash also stops
 # checking for errors inside a function or a { } / ( ) group used as a condition, so a hook
 # defines no functions, and every group closes on the line it opens (a line with a $(…) can't
-# hold a group), and no $(…) may sit in a condition (if/elif/while/until … then/do) or a
-# && || | list. Groups and conditions are found in real shell words (shlex: quoting and comments
+# hold a group), and no $(…) may sit in a condition (if/elif/while/until … then/do), in a block
+# that is itself tested (`fi || true`, `! while …`, `done | cat`) or in a && || | list.
+# Continued lines are joined first, as the shell does. Groups and conditions are found in real shell words (shlex: quoting and comments
 # understood), not by matching text. Prints "G<line>" for a function or group, "C<line>" for a
 # substitution in a condition, "<line>" for any other substitution problem.
 # shellcheck disable=SC2016 # Python source; its $ signs are for Python, not the shell
 SOURCE_CHECK_PY='
 import re, shlex, sys
 header = sys.argv[2]
-lines = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read().split("\n")
+raw_lines = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read().split("\n")
 assign = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\"\$\(.*\)\"$")
+LIST_OPS = ("&&", "||", "|", "|&", "!")
+
+
 def shell_code(raw):
     # The line as the shell parses it, with every quoted part and backslash escape replaced by
     # "x" and any comment dropped, so a quoted "(" or "if" is never taken for syntax.
@@ -253,17 +257,33 @@ def shell_code(raw):
         i += 1
     return "".join(out), quote is not None
 
-stack = []        # open groups: [kind, line]; kind is "{", "(" or "$(" (a substitution)
-blocks = []       # compound commands: "cond" (if/elif/while/until … then/do), "body", "for", "case"
-lost = False      # the block structure stopped adding up: treat everything after as a condition
-cont = False      # the previous line ended in && || | ! or \, so this line is part of a list
-OPENERS = {";", "&&", "||", "|", "&", "|&", "(", ")", ";;", "{", "}", "!"}
+
+# 1. Logical lines: a backslash at the end of a line (outside quotes) joins the next line, as the
+#    shell does, so a word split across lines is still one word.
+logical, i = [], 0
+while i < len(raw_lines):
+    first, text = i + 1, raw_lines[i]
+    while (i + 1 < len(raw_lines) and not shell_code(text)[1]
+           and (len(text) - len(text.rstrip("\\"))) % 2 == 1):
+        i += 1
+        text = text[:-1] + raw_lines[i]
+    logical.append((first, text))
+    i += 1
+
+# 2. Walk the shell words. blocks holds the open compound commands: kind is "cond" (between
+#    if/elif/while/until and then/do), "body", "for" or "case"; tested is set when the block is
+#    itself part of a condition or a && || | ! list, where bash ignores errors in all of it; subs
+#    are the $(…) lines inside it (nested blocks included).
+stack = []     # open groups: [kind, line]; kind is "{", "(" or "$(" (a substitution)
+blocks = []
+lost = False   # the block structure stopped adding up: treat everything after as a condition
+cont = False   # the previous line ended in && || | ! , so this line is part of a list
 bad = []
-for n, raw in enumerate(lines, 1):
+for n, raw in logical:
     line = raw.strip()
     if not line or line.startswith("#") or line == header:
         continue
-    in_list = lost or cont or "cond" in blocks
+    in_list = lost or cont or any(b["kind"] == "cond" for b in blocks)
     if "`" in line or "<(" in line or ">(" in line:
         bad.append(str(n))
     probe = line.replace("$((", "")
@@ -272,6 +292,8 @@ for n, raw in enumerate(lines, 1):
         bad.append(str(n))
     elif count and in_list:
         bad.append("C%d" % n)
+    elif count and blocks:
+        blocks[-1]["subs"].append(n)
     code, open_quote = shell_code(raw)
     if open_quote:
         bad.append("G%d" % n)  # quoting that does not close on this line
@@ -284,34 +306,36 @@ for n, raw in enumerate(lines, 1):
         bad.append("G%d" % n)
     prev = ""
     start = True  # a command (and so a reserved word) may start here
-    for w in words:
+    for k, w in enumerate(words):
+        nxt = words[k + 1] if k + 1 < len(words) else ""
+        tested = cont if k == 0 else prev in LIST_OPS
         if start and w in ("if", "while", "until"):
-            blocks.append("cond")
+            blocks.append({"kind": "cond", "tested": tested, "subs": []})
+        elif start and w in ("for", "select"):
+            blocks.append({"kind": "for", "tested": tested, "subs": []})
+        elif start and w == "case":
+            blocks.append({"kind": "case", "tested": tested, "subs": []})
         elif start and w == "elif":
-            if blocks and blocks[-1] == "body":
-                blocks[-1] = "cond"
+            if blocks and blocks[-1]["kind"] == "body":
+                blocks[-1]["kind"] = "cond"
             else:
                 lost = True
         elif start and w in ("then", "do"):
-            if blocks and blocks[-1] in ("cond", "for"):
-                blocks[-1] = "body"
+            if blocks and blocks[-1]["kind"] in ("cond", "for"):
+                blocks[-1]["kind"] = "body"
             else:
                 lost = True
         elif start and w == "else":
-            if not (blocks and blocks[-1] == "body"):
+            if not (blocks and blocks[-1]["kind"] == "body"):
                 lost = True
-        elif start and w in ("fi", "done"):
-            if blocks and blocks[-1] == "body":
-                blocks.pop()
-            else:
-                lost = True
-        elif start and w in ("for", "select"):
-            blocks.append("for")
-        elif start and w == "case":
-            blocks.append("case")
-        elif start and w == "esac":
-            if blocks and blocks[-1] == "case":
-                blocks.pop()
+        elif start and w in ("fi", "done", "esac"):
+            want = "case" if w == "esac" else "body"
+            if blocks and blocks[-1]["kind"] == want:
+                b = blocks.pop()
+                if b["tested"] or nxt in LIST_OPS:
+                    bad.extend("C%d" % s for s in b["subs"])
+                elif blocks:
+                    blocks[-1]["subs"].extend(b["subs"])
             else:
                 lost = True
         if w == "{":
@@ -323,23 +347,23 @@ for n, raw in enumerate(lines, 1):
         elif set(w) <= set("();<>|&!"):
             if "()" in w:
                 bad.append("G%d" % n)  # name() — a function definition
-            for i, c in enumerate(w):
+            for j, c in enumerate(w):
                 if c == "(":
-                    stack.append(["$(" if i == 0 and prev.endswith("$") else "(", n])
+                    stack.append(["$(" if j == 0 and prev.endswith("$") else "(", n])
                 elif c == ")" and stack and stack[-1][0] in ("(", "$("):
                     if stack.pop()[1] != n:
                         bad.append("G%d" % n)
         prev = w
         # The next word starts a command after an operator, a reserved word or an assignment.
-        start = (w in OPENERS or set(w) <= set("();<>|&!")
+        start = (set(w) <= set("();<>|&!{}")
                  or w in ("if", "elif", "while", "until", "then", "do", "else", "time")
                  or (start and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w) is not None))
-        if blocks and blocks[-1] == "case" and w.endswith(")"):
+        if blocks and blocks[-1]["kind"] == "case" and w.endswith(")"):
             start = True  # a case pattern: its commands follow
     if any(kind in ("{", "(") for kind, opened in stack):
         bad.append("G%d" % n)  # a group still open at the end of the line
         stack = [g for g in stack if g[0] == "$("]
-    cont = raw.rstrip().endswith("\\") or (bool(words) and words[-1] in ("&&", "||", "|", "!", "|&"))
+    cont = bool(words) and words[-1] in LIST_OPS
 for b in dict.fromkeys(bad):
     print(b)
 '

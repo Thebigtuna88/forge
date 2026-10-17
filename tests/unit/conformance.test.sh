@@ -624,13 +624,18 @@ test_fails_on_group_hidden_behind_a_comment() {
 test_fails_on_substitution_inside_a_condition() {
   local body
   for body in $'if\nx="$(printf %s "$HR_CMD")"\nthen\n  :\nfi' $'while\nx="$(printf %s "$HR_CMD")"\ndo\n  break\ndone' \
-    $'true &&\nx="$(printf %s "$HR_CMD")"' $'false ||\nx="$(printf %s "$HR_CMD")"' \
-    $'printf x | \\\nx="$(printf %s "$HR_CMD")"'; do
+    $'true &&\nx="$(printf %s "$HR_CMD")"' $'false ||\nx="$(printf %s "$HR_CMD")"'; do
     rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
     mk_conf_harness
     printf '%s\n' "$body" >>"$H/.claude/hooks/sample-gate.sh"
     expect_fail "part of a condition"
   done
+  # A \ continuation joins the lines first, so this is one line, refused as a substitution
+  # that isn't the whole value of an assignment.
+  rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+  mk_conf_harness
+  printf '%s\n' $'printf x | \\\nx="$(printf %s "$HR_CMD")"' >>"$H/.claude/hooks/sample-gate.sh"
+  expect_fail "a command substitution may only"
 }
 
 test_quoted_punctuation_is_not_a_group() {
@@ -673,6 +678,21 @@ test_keywords_as_arguments_and_loop_bodies_are_fine() {
   conform
   assert_not_contains "$OUT" "part of a condition"
   assert_not_contains "$OUT" "may not define functions or open"
+}
+
+test_tested_blocks_and_split_keywords_are_tracked() {
+  local body
+  for body in $'if true; then\nx="$(printf %s "$HR_CMD")"\ntrue\nfi || true' \
+    $'true && if true; then\nx="$(printf %s "$HR_CMD")"\nfi' \
+    $'for f in a; do\nx="$(printf %s "$f")"\ndone | cat' \
+    $'if true; then\n  if true; then\n    x="$(printf %s "$HR_CMD")"\n  fi\nfi || true' \
+    $'! while true; do\nx="$(printf %s "$HR_CMD")"\nbreak\ndone' \
+    $'i\\\nf\nx="$(printf %s "$HR_CMD")"\nthen\n  :\nfi'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    printf '%s\n' "$body" >>"$H/.claude/hooks/sample-gate.sh"
+    expect_fail "part of a condition"
+  done
 }
 
 run_tests
