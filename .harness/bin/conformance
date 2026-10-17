@@ -221,8 +221,10 @@ LIST_OPS = ("&&", "||", "|", "|&", "!")
 def shell_code(raw):
     # The line as the shell parses it, with every quoted part and backslash escape replaced by
     # "x" and any comment dropped, so a quoted "(" or "if" is never taken for syntax.
-    # Returns (code, quote still open at the end of the line).
-    out, i, quote, word_start = [], 0, None, True
+    # Returns (code, quote still open at the end of the line, where a comment starts (or the
+    # length of the line), whether the line ends in a continuing backslash outside quotes and
+    # comments).
+    out, i, quote, word_start, joins = [], 0, None, True, False
     while i < len(raw):
         c = raw[i]
         if quote == "\x27":
@@ -241,6 +243,8 @@ def shell_code(raw):
             i += 1
             continue
         if c == "\\":
+            if i == len(raw) - 1:
+                joins = True
             out.append("x")
             i += 2
             word_start = False
@@ -251,11 +255,11 @@ def shell_code(raw):
             i += 1
             continue
         if c == "#" and word_start:
-            break
+            return "".join(out), False, i, False
         out.append(c)
         word_start = c in " \t;&|()<>"
         i += 1
-    return "".join(out), quote is not None
+    return "".join(out), quote is not None, len(raw), joins
 
 
 # 1. Logical lines: a backslash at the end of a line (outside quotes) joins the next line, as the
@@ -263,8 +267,7 @@ def shell_code(raw):
 logical, i = [], 0
 while i < len(raw_lines):
     first, text = i + 1, raw_lines[i]
-    while (i + 1 < len(raw_lines) and not shell_code(text)[1]
-           and (len(text) - len(text.rstrip("\\"))) % 2 == 1):
+    while i + 1 < len(raw_lines) and shell_code(text)[3]:
         i += 1
         text = text[:-1] + raw_lines[i]
     logical.append((first, text))
@@ -283,6 +286,8 @@ for n, raw in logical:
     line = raw.strip()
     if not line or line.startswith("#") or line == header:
         continue
+    code, open_quote, cut, _ = shell_code(raw)
+    line = raw[:cut].strip()  # the line without its comment, quoting kept
     in_list = lost or cont or any(b["kind"] == "cond" for b in blocks)
     if "`" in line or "<(" in line or ">(" in line:
         bad.append(str(n))
@@ -294,7 +299,6 @@ for n, raw in logical:
         bad.append("C%d" % n)
     elif count and blocks:
         blocks[-1]["subs"].append(n)
-    code, open_quote = shell_code(raw)
     if open_quote:
         bad.append("G%d" % n)  # quoting that does not close on this line
         continue
@@ -304,6 +308,9 @@ for n, raw in logical:
     words = list(lex)
     if words[:1] == ["function"]:
         bad.append("G%d" % n)
+    if "<<" in words or "<<-" in words:
+        bad.append("H%d" % n)  # a here-document: its lines are text, not code
+        lost = True
     prev = ""
     start = True  # a command (and so a reserved word) may start here
     timing = False  # after `time`: its options (-p) still come before the command
@@ -380,6 +387,10 @@ for b in dict.fromkeys(bad):
 HEADER_LINE='here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
 for h in ${hooks[@]+"${hooks[@]}"}; do
   while IFS= read -r n; do
+    if [[ "$n" == H* ]]; then
+      fail "$h.sh line ${n#H}: a hook may not use a here-document (<<); its text would be read as code here"
+      continue
+    fi
     if [[ "$n" == C* ]]; then
       fail "$h.sh line ${n#C}: a command substitution may not be part of a condition (if/elif/while/until … then/do) or of a && || | list (bash ignores errors there)"
       continue

@@ -707,4 +707,25 @@ test_redirection_or_time_cannot_hide_a_tested_block() {
   done
 }
 
+test_comment_backslash_does_not_join_lines() {
+  mk_conf_harness
+  # shellcheck disable=SC1003 # the trailing backslash in the comment is the point of this case
+  printf '%s\n' '# comment \' 'if true; then' 'x="$(printf %s "$HR_CMD")"' 'fi || true' \
+    >>"$H/.claude/hooks/sample-gate.sh"
+  expect_fail "part of a condition"
+}
+
+test_assignment_with_trailing_comment_passes() {
+  mk_conf_harness
+  printf '%s\n' 'sum="$(hr_md5 "$HR_FILE")" # checksum for review' >>"$H/.claude/hooks/sample-gate.sh"
+  conform
+  assert_not_contains "$OUT" "a command substitution may only"
+}
+
+test_fails_on_here_document_in_a_hook() {
+  mk_conf_harness
+  printf '%s\n' 'cat <<EOF' 'fi' 'EOF' >>"$H/.claude/hooks/sample-gate.sh"
+  expect_fail "here-document"
+}
+
 run_tests
