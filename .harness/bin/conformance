@@ -213,6 +213,7 @@ fi
 SOURCE_CHECK_PY='
 import re, shlex, sys
 header = sys.argv[2]
+header_source = sys.argv[3]  # the header line that loads the runtime: the one allowed source
 raw_lines = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read().split("\n")
 assign = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\"\$\(.*\)\"$")
 LIST_OPS = ("&&", "||", "|", "|&", "!")
@@ -280,7 +281,7 @@ def simple_body(body):
                 return False
             start = w == "|"
             continue
-        if w in ("{", "}", "!") or (start and w in RESERVED):
+        if w in ("{", "}", "!") or (start and (w in RESERVED or w.rsplit("/", 1)[-1] in RUNNERS)):
             return False
         start = False
     return bool(words)
@@ -288,6 +289,9 @@ def simple_body(body):
 
 RESERVED = ("if", "then", "elif", "else", "fi", "while", "until", "do", "done", "case", "esac",
             "for", "select", "function", "coproc", "time", "[[", "]]")
+# Commands that run other shell code from their arguments, where a failure would be out of view.
+RUNNERS = ("eval", "source", ".", "sh", "bash", "zsh", "dash", "ksh", "fish", "env", "xargs",
+           "exec", "command", "builtin", "nohup", "trap", "nice", "timeout")
 
 # 1. Logical lines: a backslash at the end of a line (outside quotes) joins the next line, as the
 #    shell does, so a word split across lines is still one word.
@@ -344,6 +348,8 @@ for n, raw in logical:
     timing = False  # after `time`: its options (-p) still come before the command
     for k, w in enumerate(words):
         tested = cont if k == 0 else prev in LIST_OPS
+        if start and w in ("eval", "source", ".") and line != header_source:
+            bad.append("E%d" % n)  # runs code from a string or file the check cannot read
         if start and w in ("if", "while", "until"):
             blocks.append({"kind": "cond", "tested": tested, "subs": []})
         elif start and w in ("for", "select"):
@@ -413,10 +419,16 @@ for b in dict.fromkeys(bad):
 '
 # shellcheck disable=SC2016 # the literal header text
 HEADER_LINE='here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
+# shellcheck disable=SC2016 # the literal header text
+HEADER_SOURCE='source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&2; exit 2; }'
 for h in ${hooks[@]+"${hooks[@]}"}; do
   while IFS= read -r n; do
+    if [[ "$n" == E* ]]; then
+      fail "$h.sh line ${n#E}: a hook may not use eval, source or . (they run code the source check can't read)"
+      continue
+    fi
     if [[ "$n" == S* ]]; then
-      fail "$h.sh line ${n#S}: the inside of a command substitution must be a simple command or a pipeline (no ; && || &, groups, ! or compound commands), so a failure inside it can't be hidden"
+      fail "$h.sh line ${n#S}: the inside of a command substitution must be a simple command or a pipeline (no ; && || &, groups, !, compound commands, eval, shells or wrappers), so a failure inside it can't be hidden"
       continue
     fi
     if [[ "$n" == H* ]]; then
@@ -432,7 +444,7 @@ for h in ${hooks[@]+"${hooks[@]}"}; do
       continue
     fi
     fail "$h.sh line $n: a command substitution may only be the whole value of a plain assignment (name=\"\$(…)\", one per line, not nested); backticks and <( >( aren't allowed, so a failure inside can't be hidden"
-  done < <(python3 -I -c "$SOURCE_CHECK_PY" "$HOOKS_DIR/$h.sh" "$HEADER_LINE" || echo "G0")
+  done < <(python3 -I -c "$SOURCE_CHECK_PY" "$HOOKS_DIR/$h.sh" "$HEADER_LINE" "$HEADER_SOURCE" || echo "G0")
 done
 
 if [[ -e "$CASES_DIR" || -L "$CASES_DIR" ]]; then
@@ -470,6 +482,11 @@ for f in "$SETTINGS" "$HOOKS_DIR"/*.sh "$ROOT"/.harness/lib/* "$ROOT"/.harness/*
 done
 BEFORE="$(snapshot)"
 
+# The hook under test runs sandboxed too: it (and any program git starts for it, say a
+# core.fsmonitor a setup configured) may write only inside its sandbox, and may not send signals.
+HOOK_PROFILE='(version 1) (allow default) (deny file-write*)
+  (allow file-write* (subpath (param "BASE")) (literal "/dev/null") (literal "/dev/tty"))
+  (deny signal)'
 # Setup scripts (and anything they leave running) may write only inside their own sandbox, never
 # to the copied hooks, runtime and config or the folders holding them, and may not send signals
 # at all (so it can't kill the hook under test).
@@ -479,9 +496,8 @@ SETUP_PROFILE='(version 1) (allow default) (deny file-write*)
     (subpath (string-append (param "SBX") "/.harness")) (literal (param "SBX"))
     (literal (string-append (param "BASE") "/code")) (literal (param "BASE")))
   (deny signal)'
-if [[ -d "$CASES_DIR" ]] && [[ -n "$(find "$CASES_DIR" -name '*.setup.sh' -print -quit)" ]] &&
-  ! command -v sandbox-exec >/dev/null 2>&1; then
-  fail "sandbox-exec is missing, so setup scripts can't be confined to their sandbox"
+if [[ ${#hooks[@]} -gt 0 ]] && ! command -v sandbox-exec >/dev/null 2>&1; then
+  fail "sandbox-exec is missing, so hooks and setup scripts can't be confined to their sandbox"
 fi
 
 n_sbx=0
@@ -494,7 +510,7 @@ mk_sandbox() {
   BASE="$TMP/s$n_sbx"
   RUN="$TMP/r$n_sbx"
   SBX="$BASE/code/forge"
-  mkdir -p "$SBX" "$BASE/code/forge-worktrees" "$BASE/home" "$RUN" || return 1
+  mkdir -p "$SBX" "$BASE/code/forge-worktrees" "$BASE/home" "$BASE/tmp" "$RUN" || return 1
   for rel in ${COPIED[@]+"${COPIED[@]}"}; do
     mkdir -p "$SBX/$(dirname "$rel")" && cp -p "$ROOT/$rel" "$SBX/$rel" || return 1
   done
@@ -608,8 +624,9 @@ run_case() {
   if [[ -f "$SBX/.harness/observed.log" ]]; then
     CASE_LOG_BEFORE="$(wc -l <"$SBX/.harness/observed.log" | tr -d ' ')"
   fi
-  (cd "$SBX" && env -i PATH="$PATH" HOME="$BASE/home" CLAUDE_PROJECT_DIR="$SBX" \
-    "$SBX/.claude/hooks/$hook.sh" <"$RUN/input.json" >"$RUN/stdout" 2>"$RUN/stderr")
+  (cd "$SBX" && env -i PATH="$PATH" HOME="$BASE/home" TMPDIR="$BASE/tmp" CLAUDE_PROJECT_DIR="$SBX" \
+    sandbox-exec -D BASE="$BASE" -p "$HOOK_PROFILE" "$SBX/.claude/hooks/$hook.sh" \
+    <"$RUN/input.json" >"$RUN/stdout" 2>"$RUN/stderr")
   CASE_RC=$?
   CASE_NEW=$(($(logged "$key") - before))
   CASE_NEW_ANY=0

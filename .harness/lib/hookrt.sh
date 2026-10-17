@@ -490,7 +490,9 @@ hr_require_simple() { # deny unless a guarded command is one plain command; fill
       fi
       if [[ "$HR_GIT_VIA_ALIAS" == 1 ]]; then
         case "$HR_GIT_SUB" in
-          push | commit) hr_deny "git alias for a guarded command ($HR_GIT_SUB); use the command itself" ;;
+          push | commit | send-pack | http-push)
+            hr_deny "git alias for a guarded command ($HR_GIT_SUB); use the command itself"
+            ;;
         esac
       fi
       return 0

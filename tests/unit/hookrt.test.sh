@@ -461,9 +461,15 @@ test_git_alias_to_guarded_command_denies() {
   git -C "$H" config alias.p push
   git -C "$H" config alias.ci 'commit -m x'
   git -C "$H" config alias.sh '!git push origin main'
+  git -C "$H" config alias.sp send-pack
+  git -C "$H" config alias.hp http-push
   expect_deny 'git p origin feature/FRG-2-a' "$H"
   assert_contains "$ERR" "alias"
   expect_deny 'git ci' "$H"
+  expect_deny 'git sp origin main' "$H"
+  assert_contains "$ERR" "alias"
+  expect_deny 'git hp origin main' "$H"
+  assert_contains "$ERR" "alias"
   expect_deny 'git sh' "$H"
   expect_deny 'git st && ls' "$H"
 }

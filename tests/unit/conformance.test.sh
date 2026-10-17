@@ -265,14 +265,35 @@ test_setup_cannot_write_the_live_checkout() {
   assert_eq "$(cat "$H/.harness/mode.json")" '{"modes": {}}' "live mode.json untouched"
 }
 
+# conform_while_editing <file>: run conformance while this test appends to a live file mid-run
+# (a slow setup keeps conformance busy). Nothing a case does can reach the live checkout now.
+conform_while_editing() {
+  local file="$1"
+  shift
+  printf 'sleep 3\n' >"$H/tests/conformance/sample-gate/allow/push-feature.setup.sh"
+  (sleep 1 && printf 'edited\n' >>"$file") &
+  OUT="$(cd "$H" && env HOME="$T_TMP/home" "$@" "$H/.harness/bin/conformance" 2>&1)"
+  RC=$?
+  wait
+}
+
 test_fails_when_a_live_file_changes() {
+  mk_conf_harness
+  printf 'charter\n' >"$H/CLAUDE.md"
+  conform_while_editing "$H/CLAUDE.md"
+  assert_exit 1 "$RC" "$OUT"
+  assert_contains "$OUT" "changed while conformance ran"
+}
+
+test_hook_cannot_write_the_live_checkout() {
   mk_conf_harness sample-gate toucher
   printf 'charter\n' >"$H/CLAUDE.md"
   case_json toucher deny main 'git push origin main'
   mkdir -p "$H/tests/conformance/toucher/allow"
   jq -n --arg f "$H/CLAUDE.md" '{hook_event_name: "PreToolUse", tool_name: "Bash",
     tool_input: {command: "ls", file_path: $f}, cwd: "@ROOT@"}' >"$H/tests/conformance/toucher/allow/touch.json"
-  expect_fail "changed while conformance ran"
+  expect_fail "toucher allow/touch.json: expected exit 0"
+  assert_eq "$(cat "$H/CLAUDE.md")" "charter" "the hook's write was refused"
 }
 
 
@@ -507,16 +528,15 @@ test_fails_on_deny_case_with_nul_in_any_field() {
 }
 
 test_perl_options_cannot_hide_a_live_change() {
-  mk_conf_harness sample-gate toucher
+  mk_conf_harness
   printf 'charter\n' >"$H/CLAUDE.md"
-  case_json toucher deny main 'git push origin main'
-  mkdir -p "$H/tests/conformance/toucher/allow"
-  jq -n --arg f "$H/CLAUDE.md" '{hook_event_name: "PreToolUse", tool_name: "Bash",
-    tool_input: {command: "ls", file_path: $f}, cwd: "@ROOT@"}' >"$H/tests/conformance/toucher/allow/touch.json"
+  printf 'sleep 3\n' >"$H/tests/conformance/sample-gate/allow/push-feature.setup.sh"
+  (sleep 1 && printf 'edited\n' >>"$H/CLAUDE.md") &
   OUT="$(cd "$H" && env HOME="$T_TMP/home" PERL5OPT='-MConfig;print("same  -\n");exit(0)' \
     "$H/.harness/bin/conformance" 2>&1)"
   RC=$?
-  assert_exit 1 "$RC"
+  wait
+  assert_exit 1 "$RC" "$OUT"
   assert_contains "$OUT" "changed while conformance ran"
 }
 
@@ -765,6 +785,34 @@ test_arithmetic_prefix_cannot_hide_a_substitution() {
   mk_conf_harness
   printf '%s\n' 'x="$((echo "$HR_CMD") || echo safe)"' >>"$H/.claude/hooks/sample-gate.sh"
   expect_fail "the inside of a command substitution must be a simple command"
+}
+
+test_fails_on_eval_or_source_in_a_hook() {
+  local line
+  for line in "x=\"\$(eval 'f(){ false; echo survived; }; f || true')\"" 'x="$(sh -c "false; echo ok")"' \
+    "eval 'if true; then :; fi'" 'source /dev/null' '. /dev/null' 'x="$(env sh -c true)"'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    printf '%s\n' "$line" >>"$H/.claude/hooks/sample-gate.sh"
+    expect_fail "sample-gate.sh line"
+    assert_contains "$OUT" "eval" "message for: $line"
+  done
+}
+
+test_git_programs_from_setup_run_in_the_hook_sandbox() {
+  mk_conf_harness sample-gate status-gate
+  case_json status-gate deny main 'git push origin main'
+  case_json status-gate allow other 'ls'
+  cat >"$H/tests/conformance/status-gate/allow/other.setup.sh" <<EOF
+printf '#!/bin/sh\nprintf leaked > "%s/leak.txt"\nexit 1\n' >"\$TMP/fsmon"
+chmod 755 "\$TMP/fsmon"
+: >"\$ROOT/a"
+git -C "\$ROOT" add a
+git -C "\$ROOT" config core.fsmonitor "\$TMP/fsmon"
+EOF
+  sed -i '' "s|%s/leak.txt|$T_TMP/leak.txt|" "$H/tests/conformance/status-gate/allow/other.setup.sh"
+  conform
+  [[ ! -e "$T_TMP/leak.txt" ]] || _t_fail "a git program from setup wrote outside the sandbox"
 }
 
 run_tests
