@@ -750,4 +750,21 @@ test_substitution_body_must_be_simple() {
   done
 }
 
+test_observe_reason_with_backslash_is_literal() {
+  mk_conf_harness sample-gate reason-gate
+  mkdir -p "$H/tests/conformance/reason-gate/deny"
+  jq -n '{hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {command: "git push origin main"},
+    cwd: "@ROOT@", forge_reason: "path\\tname"}' >"$H/tests/conformance/reason-gate/deny/main.json"
+  case_json reason-gate allow other 'ls'
+  printf '{"modes": {"reason-gate": "observe"}}\n' >"$H/.harness/mode.json"
+  conform
+  assert_exit 0 "$RC" "$OUT"
+}
+
+test_arithmetic_prefix_cannot_hide_a_substitution() {
+  mk_conf_harness
+  printf '%s\n' 'x="$((echo "$HR_CMD") || echo safe)"' >>"$H/.claude/hooks/sample-gate.sh"
+  expect_fail "the inside of a command substitution must be a simple command"
+}
+
 run_tests

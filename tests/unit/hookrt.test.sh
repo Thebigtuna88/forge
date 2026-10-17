@@ -332,7 +332,8 @@ test_guarded_detection() {
     'arch -arm64 /usr/bin/g[i]t push origin main' 'xcrun g?t push' 'frobnicate -x /usr/bin/g[i]t push' \
     'frobnicate /usr/bin/{g,}it push' 'frobnicate /usr/bin/[g][i][t] push' \
     'find . -maxdepth 0 -exec /tmp/bin/??? push origin main \;' 'frobnicate /tmp/bin/??? push origin main' \
-    'find . -exec /tmp/bin/??? {} \;'; do
+    'find . -exec /tmp/bin/??? {} \;' '/Library/Developer/CommandLineTools/usr/libexec/git-core/git-push origin main' \
+    'git-commit -F m' 'git send-pack origin main' 'git http-push origin main'; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done
@@ -359,7 +360,8 @@ test_simple_guarded_commands_pass() {
   for c in 'git push -u origin feature/FRG-2-hook-runtime' 'git -C /x push origin feature/FRG-2-a' \
     'git commit -F /tmp/msg.txt' 'git log --grep commit' 'gh pr merge 3 --squash' \
     'gh api repos/Thebigtuna88/forge/pulls' 'vercel deploy' \
-    'git --no-pager -c color.ui=never push origin feature/FRG-2-a'; do
+    'git --no-pager -c color.ui=never push origin feature/FRG-2-a' \
+    'git -c core.quotepath=false -c advice.detachedHead=false push origin feature/FRG-2-a'; do
     expect_allow "$c"
   done
 }
@@ -390,7 +392,7 @@ test_quoting_tricks_still_reach_the_gate() {
   mk_hook_harness
   local c
   for c in 'git push origin main' 'g"i"t p\ush origin "ma"in' "git push origin 'HEAD:main'" \
-    'git -C /x push origin refs/heads/main' 'git -C a -C b -c x.y=1 push origin main'; do
+    'git -C /x push origin refs/heads/main' 'git -C a -C b -c color.ui=never push origin main'; do
     expect_deny "$c"
     assert_contains "$ERR" "push to main" "reason for: $c"
   done
@@ -401,7 +403,8 @@ test_git_unknown_global_option_denies() {
   local c
   for c in '--git-dir=/x/.git push origin feature/FRG-2-a' '--exec-path=/tmp push origin feature/FRG-2-a' \
     '--work-tree /x push origin feature/FRG-2-a' '-c alias.p=push p origin feature/FRG-2-a' \
-    '-c ALIAS.p=push p origin feature/FRG-2-a'; do
+    '-c ALIAS.p=push p origin feature/FRG-2-a' "-c core.editor=\"sh -c 'git push origin main'\" config --edit" \
+    '-c core.sshCommand=evil push origin feature/FRG-2-a' '-c x.y=1 push origin feature/FRG-2-a'; do
     expect_deny "git $c"
   done
 }
@@ -417,7 +420,7 @@ test_gh_alias_or_extension_denies() {
 
 test_git_sub_skips_global_options() {
   mk_hook_harness
-  probe git 'git -C a -C b -c x.y=1 --no-pager push -u origin f' /w
+  probe git 'git -C a -C b -c color.ui=never --no-pager push -u origin f' /w
   assert_eq "$OUT" "sub=push|dir=/w/a/b|alias=0|args=[-u][origin][f]"
   probe git 'git -C /abs -C rel status' /w
   assert_eq "$OUT" "sub=status|dir=/abs/rel|alias=0|args="
@@ -434,7 +437,8 @@ test_git_sub_skips_global_options() {
 test_git_sub_unknown_is_question_mark() {
   mk_hook_harness
   local c
-  for c in 'git --git-dir=/x status' 'git frobnicate' 'git -c alias.s=status s' 'git' 'git -C'; do
+  for c in 'git --git-dir=/x status' 'git frobnicate' 'git -c alias.s=status s' 'git' 'git -C' \
+    'git -c core.pager=less status'; do
     probe git "$c" "$H"
     assert_contains "$OUT" "sub=?|" "unknown: $c"
   done

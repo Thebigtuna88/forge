@@ -318,8 +318,7 @@ for n, raw in logical:
     in_list = lost or cont or any(b["kind"] == "cond" for b in blocks)
     if "`" in line or "<(" in line or ">(" in line:
         bad.append(str(n))
-    probe = line.replace("$((", "")
-    count = probe.count("$(")
+    count = line.count("$(")  # $(( counts too: bash may read it as $( ( … ) … )
     if count and (count > 1 or not assign.match(line)):
         bad.append(str(n))
     elif count and not simple_body(line[line.index("=") + 4:-2]):
@@ -643,10 +642,10 @@ logged_with_reason() {
   local reason
   reason="$(jq -r '.forge_reason // "" | strings' "$2" 2>/dev/null)" || reason=""
   tail -n "+$((CASE_LOG_BEFORE + 1))" "$SBX/.harness/observed.log" 2>/dev/null |
-    awk -v k="$1" -v r="$reason" '$2 == k && $3 == "WOULD-DENY" {
+    FORGE_REASON="$reason" awk -v k="$1" '$2 == k && $3 == "WOULD-DENY" {
         text = $0; sub(/^[^ ]+ [^ ]+ WOULD-DENY /, "", text)
         cut = index(text, " :: "); if (cut) text = substr(text, 1, cut - 1)
-        if (index(text, r)) found = 1
+        if (index(text, ENVIRON["FORGE_REASON"])) found = 1
       } END { exit !found }'
 }
 

@@ -14,7 +14,8 @@
 # an ERR trap inherited by command substitutions (it leaves a "failed" mark that the exit check
 # reads, so even `local x="$(cmd)"` or "$(cmd)" as an argument counts), and an EXIT trap turn a
 # crash, a failed command, a catchable signal, a bare `exit`, `exec` or falling off the end into a
-# deny (fail closed, rule 9). So a hook writes `x="$(cmd || true)"` where a failure is expected.
+# deny (fail closed, rule 9). So a hook puts only commands that must succeed inside $(…); an
+# expected failure is tested directly (`if cmd; then …`), never inside a substitution.
 # A hook uses $(…) only as the whole value of a plain assignment, `name="$(…)"`, one per line
 # and not nested, never inside a condition or a && || | list, and defines no functions or { } / ( )
 # groups spanning lines, where bash stops checking for errors (conformance checks its source): then a deny, an unset variable or a signal inside it fails the assignment,
@@ -106,9 +107,11 @@ HR_TOK=() HR_GIT_ARGS=()
 HR_GIT_SUB="?" HR_GIT_DIR="" HR_GIT_VIA_ALIAS=0
 _HR_LOADED="" _HR_TOOLS=() _HR_GIT_CMDS="" _HR_SUBI=-1 _HR_UNKNOWABLE=0 _HR_CDS=()
 
-# Guarded actions (spec 5.2), as words that must appear in this order. Deploy tools come from
+# Guarded actions (spec 5.2), as words that must appear in this order (hyphens split words, so
+# send-pack is "send pack"). Deploy tools come from
 # .harness/deploy-targets.json ("tools") on top of this floor, so a missing file can't open them.
-_HR_GUARDED_SEQS=("git push" "git commit" "gh pr merge" "gh api" "gh repo" "gh workflow run")
+_HR_GUARDED_SEQS=("git push" "git commit" "git send pack" "git http push" "gh pr merge" "gh api" "gh repo"
+  "gh workflow run")
 _HR_DEPLOY_FLOOR=("vercel" "fastlane" "eas" "xcrun altool")
 # With `$` or a backtick the shell can build words the hook never sees, so any of these words
 # in such a command makes it guarded.
@@ -310,7 +313,7 @@ _hr_glob_could_be_tool() {
 
 # _hr_git_globals <index of "git" in HR_TOK>: sets _HR_SUBI to the index of git's subcommand
 # after global options, or -1 if there is none. _HR_UNKNOWABLE=1 when an option makes it
-# unknowable (unknown option, -c alias.*/include.*, missing argument). --version and --help just
+# unknowable (unknown option, -c other than color.*/core.quotepath/advice.*, missing argument). --version and --help just
 # print, so they end the scan with no subcommand. -C arguments are collected in _HR_CDS.
 _hr_git_globals() {
   local i=$(($1 + 1)) n=${#HR_TOK[@]} t
@@ -330,9 +333,11 @@ _hr_git_globals() {
         i=$((i + 2))
         ;;
       -c)
+        # Only display settings: many others run programs (core.editor, core.sshCommand, …).
         [[ $((i + 1)) -lt $n ]] || return 0
         case "$(_hr_lower "${HR_TOK[$((i + 1))]}")" in
-          alias.* | include.* | includeif.*) return 0 ;;
+          color.* | core.quotepath=* | advice.*) ;;
+          *) return 0 ;;
         esac
         i=$((i + 2))
         ;;
@@ -359,7 +364,8 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   if [[ "$cmd" == *"\$'"* || "$cmd" == *'$"'* ]]; then return 0; fi
   # 1. The words with quotes and backslashes removed, split on anything else, lower case.
   #    Catches g"i"t p\ush, `git push`, sh -c "git push", GIT PUSH (case-insensitive disk).
-  read -r -a words <<<"$(printf '%s' "${cmd//[\'\"\\]/}" | LC_ALL=C tr -c 'A-Za-z0-9_.-' ' ' | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  # Hyphens split words too, so git's own git-push and git-commit programs read as git push.
+  read -r -a words <<<"$(printf '%s' "${cmd//[\'\"\\]/}" | LC_ALL=C tr -c 'A-Za-z0-9_.' ' ' | LC_ALL=C tr '[:upper:]' '[:lower:]')"
   [[ ${#words[@]} -gt 0 ]] || return 1
   for seq in "${_HR_GUARDED_SEQS[@]}" "${_HR_TOOLS[@]}"; do
     if _hr_seq_in "$seq" "${words[@]}"; then return 0; fi
