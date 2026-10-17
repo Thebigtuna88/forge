@@ -190,6 +190,24 @@ test_hook_without_privileged_shebang_denies() {
   assert_contains "$ERR" "#!/bin/bash -p"
 }
 
+test_inherited_path_cannot_replace_tools() {
+  mk_hook_harness
+  mkdir "$T_TMP/evil"
+  printf '#!/bin/sh\nprintf .\n' >"$T_TMP/evil/jq"
+  chmod 755 "$T_TMP/evil/jq"
+  run_hook sample-gate "$(bash_input 'git push origin main')" PATH="$T_TMP/evil:$PATH"
+  assert_exit 2 "$RC"
+  assert_contains "$ERR" "push to main"
+}
+
+test_raw_nul_byte_in_input_denies() {
+  mk_hook_harness
+  local rc=0
+  (cd "$H" && printf '{"tool_name":"Ba\000sh","tool_input":{"command":"git push origin main"}}' |
+    HOME="$T_TMP/home" ./.claude/hooks/probe.sh >/dev/null 2>&1) || rc=$?
+  assert_exit 2 "$rc"
+}
+
 test_runtime_refuses_to_run_directly() {
   mk_hook_harness
   local rc=0
@@ -201,7 +219,7 @@ test_crash_or_no_decision_denies() {
   mk_hook_harness
   local how
   for how in unbound exit0 exit1 missing-command term usr1 quit error-then-allow false-then-allow \
-    unset-decided fall-off-the-end; do
+    unset-decided exec-true exec-false subst-error-then-allow fall-off-the-end; do
     run_hook misbehave "$(bash_input ls)" MISBEHAVE="$how"
     assert_exit 2 "$RC" "misbehave=$how"
   done
@@ -213,7 +231,8 @@ test_missing_jq_denies() {
   local bin="$T_TMP/bin" tool
   mkdir "$bin"
   for tool in bash dirname cat python3 git date tr; do ln -s "$(command -v "$tool")" "$bin/$tool"; done
-  run_hook probe "$(bash_input ls)" PATH="$bin"
+  sed -i '' "s|^PATH=.*|PATH=$bin|" "$H/.harness/lib/hookrt.sh"
+  run_hook probe "$(bash_input ls)"
   assert_exit 2 "$RC"
   assert_contains "$ERR" "jq is not installed"
 }
@@ -223,7 +242,8 @@ test_missing_python3_denies() {
   local bin="$T_TMP/bin" tool
   mkdir "$bin"
   for tool in bash dirname cat jq git date tr; do ln -s "$(command -v "$tool")" "$bin/$tool"; done
-  run_hook probe "$(bash_input ls)" PATH="$bin"
+  sed -i '' "s|^PATH=.*|PATH=$bin|" "$H/.harness/lib/hookrt.sh"
+  run_hook probe "$(bash_input ls)"
   assert_exit 2 "$RC"
   assert_contains "$ERR" "python3 is not installed"
 }
@@ -296,7 +316,8 @@ test_guarded_detection() {
     'echo `g?t push`' 'x=1 g[i]t push' 'env -i g[i]t push' '> f g?t push' '"$G" push' \
     '2>/dev/null /usr/bin/g[i]t push origin main' '/usr/bin/env /usr/bin/g[i]t push origin main' \
     'env -u FOO /usr/bin/g[i]t push origin main' 'exec -a x g?t push' 'coproc g?t push' \
-    'nice -n 5 g?t push' 'ls; 3<f g?t push'; do
+    'nice -n 5 g?t push' 'ls; 3<f g?t push' 'cat <(g?t push origin main)' \
+    'diff <(/usr/bin/g[i]t push origin main) /dev/null' 'tee >(g?t push) </dev/null'; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done

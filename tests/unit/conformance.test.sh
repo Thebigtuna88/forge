@@ -193,12 +193,6 @@ test_setup_script_runs_in_the_sandbox() {
   assert_eq "$(git -C "$H" config --get alias.st 2>/dev/null)" "" "setup must not touch the live harness"
 }
 
-test_fails_when_a_sandbox_copy_is_changed() {
-  mk_conf_harness
-  printf 'printf "\\n# tampered\\n" >>"$ROOT/.claude/hooks/sample-gate.sh"\n' \
-    >"$H/tests/conformance/sample-gate/allow/push-feature.setup.sh"
-  expect_fail "differs from the live file"
-}
 
 test_fails_when_hooks_are_disabled() {
   local f
@@ -281,17 +275,6 @@ test_fails_when_a_live_file_changes() {
   expect_fail "changed while conformance ran"
 }
 
-test_fails_when_bad_mode_runs_tamper_with_the_sandbox() {
-  mk_conf_harness sample-gate lenient-gate
-  case_json lenient-gate deny main 'git push origin main'
-  case_json lenient-gate allow other 'ls'
-  cat >"$H/tests/conformance/lenient-gate/deny/main.setup.sh" <<'EOF'
-if ! jq -e '.modes == {}' "$ROOT/.harness/mode.json" >/dev/null 2>&1; then
-  printf '#!/bin/bash\nexit 2\n' >"$ROOT/.claude/hooks/lenient-gate.sh"
-fi
-EOF
-  expect_fail "differs from the live file"
-}
 
 test_fails_when_observe_log_was_seeded() {
   mk_conf_harness sample-gate always-allow
@@ -425,6 +408,52 @@ test_fails_on_hook_without_privileged_shebang() {
   mk_conf_harness
   sed -i '' '1s|.*|#!/usr/bin/env bash|' "$H/.claude/hooks/sample-gate.sh"
   expect_fail "#!/bin/bash -p"
+}
+
+test_setup_cannot_undo_a_bad_mode_file() {
+  mk_conf_harness sample-gate lenient-gate
+  case_json lenient-gate deny main 'git push origin main'
+  case_json lenient-gate allow other 'ls'
+  printf 'printf %s >"$ROOT/.harness/mode.json"\n' "'{\"modes\": {}}'" \
+    >"$H/tests/conformance/lenient-gate/deny/main.setup.sh"
+  expect_fail "setup changed .harness/mode.json in the sandbox"
+}
+
+test_setup_cannot_swap_the_hook() {
+  mk_conf_harness sample-gate always-allow
+  case_json always-allow deny anything 'git push origin main'
+  case_json always-allow allow other 'ls'
+  cat >"$H/tests/conformance/always-allow/deny/anything.setup.sh" <<'EOF'
+cp "$ROOT/.claude/hooks/always-allow.sh" "$TMP/original"
+printf '#!/bin/bash -p\ncp "%s" "%s"\nexit 2\n' "$TMP/original" "$ROOT/.claude/hooks/always-allow.sh" \
+  >"$ROOT/.claude/hooks/always-allow.sh"
+EOF
+  expect_fail "setup changed"
+}
+
+# touch_case <path>: a toucher allow case whose hook appends to <path> (inside the sandbox).
+touch_case() {
+  mkdir -p "$H/tests/conformance/toucher/allow"
+  jq -n --arg f "$1" '{hook_event_name: "PreToolUse", tool_name: "Bash",
+    tool_input: {command: "ls", file_path: $f}, cwd: "@ROOT@"}' >"$H/tests/conformance/toucher/allow/touch.json"
+}
+
+test_fails_when_a_hook_changes_its_sandbox_copy() {
+  mk_conf_harness sample-gate toucher
+  case_json toucher deny main 'git push origin main'
+  touch_case '@ROOT@/.claude/hooks/toucher.sh'
+  expect_fail "toucher allow/touch.json: the sandbox copy of .claude/hooks/toucher.sh differs from the live file"
+}
+
+test_bad_mode_runs_check_the_mode_variant_survives() {
+  mk_conf_harness sample-gate toucher
+  mkdir -p "$H/tests/conformance/toucher/deny"
+  jq -n '{hook_event_name: "PreToolUse", tool_name: "Bash",
+    tool_input: {command: "git push origin main", file_path: "@ROOT@/.harness/mode.json"}, cwd: "@ROOT@"}' \
+    >"$H/tests/conformance/toucher/deny/main.json"
+  case_json toucher allow other 'ls'
+  expect_fail "(missing mode.json): the sandbox copy of .harness/mode.json (should be missing)"
+  assert_contains "$OUT" "(malformed mode.json): the sandbox copy of .harness/mode.json (the malformed variant)"
 }
 
 run_tests

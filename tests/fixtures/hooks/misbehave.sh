@@ -23,6 +23,13 @@ case "${MISBEHAVE:-}" in
     false
     hr_allow
     ;;
+  exec-true) exec /usr/bin/true ;;
+  exec-false) exec /usr/bin/false ;;
+  subst-error-then-allow)
+    checked="$(no_such_command_frg2 2>/dev/null; printf unchecked)"
+    printf '%s\n' "$checked"
+    hr_allow
+    ;;
   unset-decided)
     unset _HR_DECISION
     exit 0

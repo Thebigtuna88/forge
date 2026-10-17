@@ -10,11 +10,12 @@
 #   [ "${HOOKRT_LOADED:-}" = 1 ] || { echo "hookrt not loaded" >&2; exit 2; }
 #
 # then calls `hr_init <hook-name>` and ends every path with hr_allow or hr_deny. Claude Code
-# treats any exit status other than 2 as "allow", so only an explicit hr_allow allows: errexit
-# and an EXIT trap turn a crash, a failed command, a catchable signal, a bare `exit` or falling
-# off the end into a deny (fail closed, rule 9). `bash -p` makes bash ignore exported functions,
-# BASH_ENV, SHELLOPTS and CDPATH, so nothing in the environment can replace jq, git or the
-# runtime's own functions. A hook whose parts have their own modes calls
+# treats any exit status other than 2 as "allow", so only an explicit hr_allow allows: errexit,
+# an ERR trap inherited by command substitutions, and an EXIT trap turn a crash, a failed command
+# (also inside $(…)), a catchable signal, a bare `exit`, `exec` or falling off the end into a deny
+# (fail closed, rule 9). So a hook writes `x="$(cmd || true)"` where a failure is expected. `bash -p` makes bash ignore exported functions,
+# BASH_ENV, SHELLOPTS and CDPATH, and the runtime sets PATH itself (system folders first), so
+# nothing in the environment can replace jq, git or the runtime's own functions. A hook whose parts have their own modes calls
 # `hr_part <part>` once it knows which part applies (mode key "<hook>:<part>").
 #
 # A guard for git commands calls hr_require_simple (which also fills HR_TOK and HR_GIT_*) and
@@ -30,7 +31,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   exit 2
 fi
 
-set -eu
+set -eEu
 
 _HR_DECISION="" # "allow" only after hr_allow; anything else ends in exit 2
 _hr_on_exit() {
@@ -43,7 +44,7 @@ _hr_on_exit() {
   exit 2
 }
 trap _hr_on_exit EXIT
-trap 'exit 2' HUP INT QUIT ILL TRAP ABRT EMT FPE BUS SEGV SYS PIPE ALRM TERM XCPU XFSZ VTALRM PROF USR1 USR2
+trap 'exit 2' ERR HUP INT QUIT ILL TRAP ABRT EMT FPE BUS SEGV SYS PIPE ALRM TERM XCPU XFSZ VTALRM PROF USR1 USR2
 
 if [[ "$-" != *p* ]]; then
   echo "FORGE hook runtime: the hook must start with #!/bin/bash -p (privileged mode, no inherited functions)" >&2
@@ -52,6 +53,13 @@ if [[ "$-" != *p* ]]; then
 fi
 IFS=$' \t\n'
 export LC_ALL=C
+# System tools first: jq, python3, git, shasum and md5 come from root-owned /usr/bin and /sbin.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
+export PATH
+
+exec() { # replacing the shell would skip the EXIT trap, so a hook may not do it
+  _hr_fatal "a hook may not use exec (it would skip the fail-closed exit check)"
+}
 
 _hr_lib="${BASH_SOURCE[0]%/*}"
 [[ "$_hr_lib" != "${BASH_SOURCE[0]}" ]] || _hr_lib=.
@@ -160,7 +168,8 @@ hr_init() { # <hook-name>; reads the hook JSON on stdin
   HR_HOOK="$1"
   command -v jq >/dev/null 2>&1 || _hr_fatal "jq is not installed"
   command -v python3 >/dev/null 2>&1 || _hr_fatal "python3 is not installed"
-  HR_INPUT="$(cat)" || _hr_fatal "can't read the hook input"
+  # Command substitution silently drops NUL bytes; turned into U+0001 instead, jq rejects them.
+  HR_INPUT="$(tr '\000' '\001')" || _hr_fatal "can't read the hook input"
   jq -se 'length == 1 and (.[0] | type) == "object"' >/dev/null 2>&1 <<<"$HR_INPUT" ||
     _hr_fatal "hook input is not exactly one JSON object"
   _hr_field HR_EVENT '.hook_event_name' || _hr_fatal "bad hook_event_name in the hook input"
@@ -325,6 +334,10 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     fi
     if [[ "$t" =~ $op ]]; then
       case "$t" in
+        *'('*) # ( or <( >( : a command starts inside
+          cmdpos=1
+          wrapped=0
+          ;;
         *'<'* | *'>'*) skip=1 ;;
         *)
           cmdpos=1

@@ -289,12 +289,6 @@ run_case() {
     return 0
   }
   CASE_DIFF="$(differs)" && return 0
-  case "$variant" in
-    missing) rm -f "$SBX/.harness/mode.json" ;;
-    malformed) printf '{"modes": {' >"$SBX/.harness/mode.json" ;;
-    unknown) jq -n --arg k "$key" '{modes: {($k): "bogus"}}' >"$SBX/.harness/mode.json" ;;
-  esac
-  [[ "$variant" == live ]] || skip=.harness/mode.json
   setup="${json%.json}.setup.sh"
   if [[ -f "$setup" ]]; then
     cp "$setup" "$BASE/setup.sh"
@@ -305,6 +299,21 @@ run_case() {
       CASE_ERR="setup failed: $(tr '\n' ' ' <"$BASE/setup.out")"
       return 0
     }
+    # A setup prepares the scene (aliases, repos); it may not touch the hooks, runtime or config.
+    if CASE_DIFF="$(differs)"; then
+      CASE_ERR="setup changed $CASE_DIFF in the sandbox"
+      return 0
+    fi
+  fi
+  # The bad-mode variant goes in after setup, and must still be there after the hook ran.
+  case "$variant" in
+    missing) rm -f "$SBX/.harness/mode.json" ;;
+    malformed) printf '{"modes": {' >"$SBX/.harness/mode.json" ;;
+    unknown) jq -n --arg k "$key" '{modes: {($k): "bogus"}}' >"$SBX/.harness/mode.json" ;;
+  esac
+  if [[ "$variant" != live ]]; then
+    skip=.harness/mode.json
+    [[ "$variant" == missing ]] || cp "$SBX/.harness/mode.json" "$BASE/mode.variant"
   fi
   jq --arg r "$SBX" --arg w "$BASE/code/forge-worktrees" --arg t "$BASE" \
     'walk(if type == "string"
@@ -319,6 +328,12 @@ run_case() {
   CASE_RC=$?
   CASE_NEW=$(($(logged "$key") - before))
   CASE_DIFF="$(differs "$skip")" || CASE_DIFF=""
+  if [[ -z "$CASE_DIFF" && "$variant" == missing && -e "$SBX/.harness/mode.json" ]]; then
+    CASE_DIFF=".harness/mode.json (should be missing)"
+  elif [[ -z "$CASE_DIFF" && "$variant" != live && "$variant" != missing ]] &&
+    ! cmp -s "$BASE/mode.variant" "$SBX/.harness/mode.json"; then
+    CASE_DIFF=".harness/mode.json (the $variant variant)"
+  fi
 }
 
 # --- 2 and 3. cases ---------------------------------------------------------------------------
