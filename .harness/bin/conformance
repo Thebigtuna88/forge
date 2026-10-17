@@ -254,14 +254,16 @@ def shell_code(raw):
     return "".join(out), quote is not None
 
 stack = []        # open groups: [kind, line]; kind is "{", "(" or "$(" (a substitution)
-cond = False      # inside if/elif/while/until … then/do: bash ignores errors there
+blocks = []       # compound commands: "cond" (if/elif/while/until … then/do), "body", "for", "case"
+lost = False      # the block structure stopped adding up: treat everything after as a condition
 cont = False      # the previous line ended in && || | ! or \, so this line is part of a list
+OPENERS = {";", "&&", "||", "|", "&", "|&", "(", ")", ";;", "{", "}", "!"}
 bad = []
 for n, raw in enumerate(lines, 1):
     line = raw.strip()
     if not line or line.startswith("#") or line == header:
         continue
-    in_list = cond or cont
+    in_list = lost or cont or "cond" in blocks
     if "`" in line or "<(" in line or ">(" in line:
         bad.append(str(n))
     probe = line.replace("$((", "")
@@ -281,12 +283,38 @@ for n, raw in enumerate(lines, 1):
     if words[:1] == ["function"]:
         bad.append("G%d" % n)
     prev = ""
+    start = True  # a command (and so a reserved word) may start here
     for w in words:
-        if w in ("if", "elif", "while", "until"):
-            cond = True
-        elif w in ("then", "do"):
-            cond = False
-        elif w == "{":
+        if start and w in ("if", "while", "until"):
+            blocks.append("cond")
+        elif start and w == "elif":
+            if blocks and blocks[-1] == "body":
+                blocks[-1] = "cond"
+            else:
+                lost = True
+        elif start and w in ("then", "do"):
+            if blocks and blocks[-1] in ("cond", "for"):
+                blocks[-1] = "body"
+            else:
+                lost = True
+        elif start and w == "else":
+            if not (blocks and blocks[-1] == "body"):
+                lost = True
+        elif start and w in ("fi", "done"):
+            if blocks and blocks[-1] == "body":
+                blocks.pop()
+            else:
+                lost = True
+        elif start and w in ("for", "select"):
+            blocks.append("for")
+        elif start and w == "case":
+            blocks.append("case")
+        elif start and w == "esac":
+            if blocks and blocks[-1] == "case":
+                blocks.pop()
+            else:
+                lost = True
+        if w == "{":
             stack.append(["{", n])
         elif w == "}":
             if stack and stack[-1][0] == "{":
@@ -302,6 +330,12 @@ for n, raw in enumerate(lines, 1):
                     if stack.pop()[1] != n:
                         bad.append("G%d" % n)
         prev = w
+        # The next word starts a command after an operator, a reserved word or an assignment.
+        start = (w in OPENERS or set(w) <= set("();<>|&!")
+                 or w in ("if", "elif", "while", "until", "then", "do", "else", "time")
+                 or (start and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w) is not None))
+        if blocks and blocks[-1] == "case" and w.endswith(")"):
+            start = True  # a case pattern: its commands follow
     if any(kind in ("{", "(") for kind, opened in stack):
         bad.append("G%d" % n)  # a group still open at the end of the line
         stack = [g for g in stack if g[0] == "$("]

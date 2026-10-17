@@ -653,4 +653,26 @@ test_permitted_substitutions_pass_the_source_check() {
   assert_not_contains "$OUT" "part of a condition"
 }
 
+test_nested_or_spoofed_conditions_are_tracked() {
+  local body
+  for body in $'if\n  if true; then :; fi\n  x="$(printf %s "$HR_CMD")"\n  true\nthen\n  :\nfi' \
+    $'if printf %s then\nx="$(printf %s "$HR_CMD")"\nthen\n  :\nfi' \
+    $'while\n  until false; do break; done\n  x="$(printf %s "$HR_CMD")"\ndo\n  break\ndone'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    printf '%s\n' "$body" >>"$H/.claude/hooks/sample-gate.sh"
+    expect_fail "part of a condition"
+  done
+}
+
+test_keywords_as_arguments_and_loop_bodies_are_fine() {
+  mk_conf_harness
+  printf '%s\n' "printf '%s\\n' if" 'x="$(printf ok)"' 'for f in a b; do' '  y="$(printf %s "$f")"' 'done' \
+    'while true; do' '  z="$(printf ok)"' '  break' 'done' 'case "$x" in' '  ok)' '    w="$(printf ok)"' \
+    '    ;;' 'esac' 'if true; then' '  v="$(printf ok)"' 'fi' >>"$H/.claude/hooks/sample-gate.sh"
+  conform
+  assert_not_contains "$OUT" "part of a condition"
+  assert_not_contains "$OUT" "may not define functions or open"
+}
+
 run_tests
