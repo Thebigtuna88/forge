@@ -38,7 +38,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   exit 2
 fi
 
-set -eEu
+set -eEu -o pipefail # pipefail: a failure anywhere in a pipeline counts
 
 _HR_DECISION="" # "allow" only after hr_allow; anything else ends in exit 2
 _HR_TMPD=""     # private folder holding the "failed" mark

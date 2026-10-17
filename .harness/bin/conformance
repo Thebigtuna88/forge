@@ -262,6 +262,33 @@ def shell_code(raw):
     return "".join(out), quote is not None, len(raw), joins
 
 
+def simple_body(body):
+    # The inside of a permitted $(…) must be one simple command or a pipeline (the runtime sets
+    # pipefail): no ; && || &, no groups, no ! and no compound commands, where bash would ignore
+    # a failure inside it.
+    code, open_quote, cut, joins = shell_code(body)
+    if open_quote or cut != len(body) or joins:
+        return False
+    lex = shlex.shlex(code, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    words = list(lex)
+    start = True
+    for w in words:
+        if set(w) <= set("();<>|&!"):
+            if w not in ("|", "<", ">", ">>", ">&", "<&", ">|", "<>"):
+                return False
+            start = w == "|"
+            continue
+        if w in ("{", "}", "!") or (start and w in RESERVED):
+            return False
+        start = False
+    return bool(words)
+
+
+RESERVED = ("if", "then", "elif", "else", "fi", "while", "until", "do", "done", "case", "esac",
+            "for", "select", "function", "coproc", "time", "[[", "]]")
+
 # 1. Logical lines: a backslash at the end of a line (outside quotes) joins the next line, as the
 #    shell does, so a word split across lines is still one word.
 logical, i = [], 0
@@ -295,6 +322,8 @@ for n, raw in logical:
     count = probe.count("$(")
     if count and (count > 1 or not assign.match(line)):
         bad.append(str(n))
+    elif count and not simple_body(line[line.index("=") + 4:-2]):
+        bad.append("S%d" % n)
     elif count and in_list:
         bad.append("C%d" % n)
     elif count and blocks:
@@ -387,6 +416,10 @@ for b in dict.fromkeys(bad):
 HEADER_LINE='here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
 for h in ${hooks[@]+"${hooks[@]}"}; do
   while IFS= read -r n; do
+    if [[ "$n" == S* ]]; then
+      fail "$h.sh line ${n#S}: the inside of a command substitution must be a simple command or a pipeline (no ; && || &, groups, ! or compound commands), so a failure inside it can't be hidden"
+      continue
+    fi
     if [[ "$n" == H* ]]; then
       fail "$h.sh line ${n#H}: a hook may not use a here-document (<<); its text would be read as code here"
       continue
@@ -499,7 +532,7 @@ case_key() { # <hook> <case.json>: the mode.json key the case runs under ("" if 
 # Sets CASE_RC, CASE_NEW (new WOULD-DENY lines under the case's key), CASE_DIFF and CASE_ERR.
 run_case() {
   local hook="$1" json="$2" variant="$3" key event tool setup skip="" before
-  CASE_RC="" CASE_NEW=0 CASE_DIFF="" CASE_ERR=""
+  CASE_RC="" CASE_NEW=0 CASE_NEW_ANY=0 CASE_DIFF="" CASE_ERR=""
   key="$(case_key "$hook" "$json")"
   event="$(jq -r '.hook_event_name | strings' "$json" 2>/dev/null)" || event=""
   tool="$(jq -r '.tool_name // "" | strings' "$json" 2>/dev/null)" || tool=""
@@ -580,6 +613,11 @@ run_case() {
     "$SBX/.claude/hooks/$hook.sh" <"$RUN/input.json" >"$RUN/stdout" 2>"$RUN/stderr")
   CASE_RC=$?
   CASE_NEW=$(($(logged "$key") - before))
+  CASE_NEW_ANY=0
+  if [[ -f "$SBX/.harness/observed.log" ]]; then
+    CASE_NEW_ANY=$(($(tail -n "+$((CASE_LOG_BEFORE + 1))" "$SBX/.harness/observed.log" |
+      awk '$3 == "WOULD-DENY" {n++} END {print n + 0}')))
+  fi
   CASE_DIFF="$(differs "$skip")" || CASE_DIFF=""
   if [[ -z "$CASE_DIFF" && "$variant" == missing && -e "$SBX/.harness/mode.json" ]]; then
     CASE_DIFF=".harness/mode.json (should be missing)"
@@ -641,7 +679,7 @@ for h in ${hooks[@]+"${hooks[@]}"}; do
     [[ " $modes " == *" $mode "* ]] || modes="$modes $mode"
     if [[ "$kind" == allow ]]; then
       [[ "$CASE_RC" == 0 ]] || fail "$label: expected exit 0 (allow), got $CASE_RC: $(head -c 300 "$RUN/stderr")"
-      [[ "$CASE_NEW" == 0 ]] || fail "$label: an allow case wrote a WOULD-DENY line"
+      [[ "$CASE_NEW_ANY" == 0 ]] || fail "$label: an allow case wrote a WOULD-DENY line"
     elif [[ "$mode" == enforce ]]; then
       key="$(case_key "$h" "$f")"
       if [[ "$CASE_RC" != 2 ]]; then

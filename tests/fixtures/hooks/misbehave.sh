@@ -45,6 +45,12 @@ case "$how" in
     check2
     hr_allow
     ;;
+  pipe-subst-unset)
+    # shellcheck disable=SC2154 # the unset variable is the point of this case
+    checked="$(printf '%s' "${no_such_variable_frg2}" | cat)"
+    printf '%s\n' "$checked"
+    hr_allow
+    ;;
   arg-subst-then-allow)
     printf 'value=[%s]\n' "$(false)"
     hr_allow

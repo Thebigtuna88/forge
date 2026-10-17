@@ -220,7 +220,7 @@ test_crash_or_no_decision_denies() {
   local how
   for how in unbound exit0 exit1 missing-command term usr1 quit error-then-allow false-then-allow \
     unset-decided exec-true exec-false command-exec builtin-exec subst-error-then-allow \
-    local-subst-then-allow local-deny-then-allow arg-subst-then-allow fall-off-the-end; do
+    local-subst-then-allow local-deny-then-allow arg-subst-then-allow pipe-subst-unset fall-off-the-end; do
     run_hook misbehave "$(bash_input ls)" MISBEHAVE="$how"
     assert_exit 2 "$RC" "misbehave=$how"
   done

@@ -728,4 +728,26 @@ test_fails_on_here_document_in_a_hook() {
   expect_fail "here-document"
 }
 
+test_allow_case_may_not_log_under_any_key() {
+  mk_conf_harness
+  jq '.hooks.PreToolUse[0].matcher = "Bash|BashAlt"' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  # Runs under the default key "sample-gate", but the hook picks its "alt" part and observes.
+  jq -n '{hook_event_name: "PreToolUse", tool_name: "BashAlt", tool_input: {command: "git push origin main"},
+    cwd: "@ROOT@"}' >"$H/tests/conformance/sample-gate/allow/alt.json"
+  printf '{"modes": {"sample-gate:alt": "observe"}}\n' >"$H/.harness/mode.json"
+  expect_fail "sample-gate allow/alt.json: an allow case wrote a WOULD-DENY line"
+}
+
+test_substitution_body_must_be_simple() {
+  local line
+  for line in 'x="$(if (v="$HR_CMD"; hr_deny no); then :; fi; echo safe)"' 'x="$(true; printf ok)"' \
+    'x="$(false || printf ok)"' 'x="$({ printf ok; })"' 'x="$(! false)"'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    printf '%s\n' "$line" >>"$H/.claude/hooks/sample-gate.sh"
+    expect_fail "simple command or a pipeline"
+  done
+}
+
 run_tests
