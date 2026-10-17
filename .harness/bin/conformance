@@ -2,17 +2,19 @@
 # conformance — proves the gates work as configured right now (spec 5.5).
 #   .harness/bin/conformance
 #
-# 1. Every .claude/hooks/<name>.sh is executable, registered in .claude/settings.json (as a
-#    synchronous command) and clean under shellcheck; every registered hook exists. Nothing else
-#    lives in .claude/hooks or tests/conformance: no symlinks, no hidden or stray files.
+# 1. Every .claude/hooks/<name>.sh starts with #!/bin/bash -p, is executable, registered in
+#    .claude/settings.json (as a synchronous command) and clean under shellcheck; every registered
+#    hook exists. Nothing else lives in .claude/hooks or tests/conformance: no hidden or stray
+#    files, and no symlinks there or in the hook, runtime and config paths.
 # 2. Each case tests/conformance/<hook>/{deny,allow}/<case>.json is fed on stdin to the hook in a
 #    fresh sandbox: a byte-identical copy of the hooks, runtime and config (live mode.json
 #    included) at <tmp>/code/forge, a git repo on dev with a bare "origin", next to an empty
 #    <tmp>/code/forge-worktrees, with its own HOME. The hook must be registered for the case's
 #    hook_event_name and tool_name. In a case, @ROOT@, @WORKTREES@ and @TMP@ become those paths,
 #    an optional "forge_mode_key" names the mode.json key it runs under (default: the hook's
-#    name), and an optional <case>.setup.sh runs first (copied into the sandbox, run by bash with
-#    only PATH, HOME, ROOT, WORKTREES and TMP set).
+#    name), and an optional <case>.setup.sh runs first: copied into the sandbox and run by bash
+#    under macOS sandbox-exec, able to write only inside the sandbox, with only PATH, HOME, ROOT,
+#    WORKTREES and TMP set. A *ToolUse case must name its tool_name.
 #    enforce: deny → exit 2, allow → exit 0. observe: deny → exit 0 plus a new
 #    "<key> WOULD-DENY" line. No allow case may log WOULD-DENY. Afterwards the sandbox copies must
 #    still match the live files.
@@ -20,7 +22,8 @@
 # 4. Hooks are not switched off: no disableAllHooks and no allowManagedHooksOnly in the user
 #    settings (~/.claude and $CLAUDE_CONFIG_DIR), the project and local settings (of this
 #    checkout and, from a worktree, of the main checkout) or the macOS managed settings.
-# 5. No live file (copied file or case) changed while conformance ran.
+# 5. No live file in the checkout (outside .git, work/, projects/, .harness/state/) changed while
+#    conformance ran.
 # 6. Prints `hook | mode | deny cases | allow cases | result`, then "conformance: PASS" or
 #    "conformance: FAIL (<n>)", and exits 0 or 1.
 # Must run on macOS /bin/bash 3.2.
@@ -74,11 +77,10 @@ entries() { # <dir>: every entry in <dir>, hidden ones included, one per line
   done
 }
 
-snapshot() { # sha256 of every copied file and every case, to spot live changes
-  {
-    for rel in ${COPIED[@]+"${COPIED[@]}"}; do shasum -a 256 "$ROOT/$rel"; done
-    [[ -d "$CASES_DIR" ]] && find "$CASES_DIR" -type f -exec shasum -a 256 {} + | sort
-  } 2>&1
+snapshot() { # sha256 of every file in the checkout except git data and scratch areas
+  find "$ROOT" \( -path "$ROOT/.git" -o -path "$ROOT/work" -o -path "$ROOT/projects" \
+    -o -path "$ROOT/.harness/state" -o -name node_modules \) -prune -o \( -type f -o -type l \) -print0 |
+    xargs -0 shasum -a 256 2>&1 | sort
 }
 
 command -v jq >/dev/null 2>&1 || {
@@ -94,6 +96,12 @@ trap 'rm -rf "$TMP"' EXIT
 
 # --- 1. hooks, registration, shellcheck, case layout --------------------------------------------
 
+for p in "$ROOT/.claude" "$HOOKS_DIR" "$SETTINGS" "$ROOT/.harness" "$ROOT/.harness/lib" \
+  "$ROOT/.harness/bin" "$ROOT/.harness/bin/conformance" "$ROOT/tests" "$CASES_DIR" \
+  "$ROOT"/.harness/lib/* "$ROOT"/.harness/*.json; do
+  [[ -L "$p" ]] && fail "${p#"$ROOT"/} is a symlink (the hooks, runtime and config must be real files)"
+done
+
 hooks=()
 if [[ -d "$HOOKS_DIR" ]]; then
   while IFS= read -r f; do
@@ -106,7 +114,8 @@ if [[ -d "$HOOKS_DIR" ]]; then
   done < <(entries "$HOOKS_DIR")
 fi
 
-# One line per registered command: <event> TAB <matcher> TAB <async> TAB <command>.
+# One line per registered command: <event> US <matcher> US <async> US <command> (US = \x1f, not
+# whitespace, so an empty matcher stays a field of its own).
 registered=() regs=()
 # shellcheck disable=SC2016 # the literal text "$CLAUDE_PROJECT_DIR" that settings.json must contain
 reg_re='^"\$CLAUDE_PROJECT_DIR"/\.claude/hooks/([A-Za-z0-9._-]+)\.sh$'
@@ -117,15 +126,15 @@ if reg="$(jq -r '
     | (.matcher // "") as $m | if ($m | type) == "string" then . else error("matcher is not a string") end
     | .hooks | if type == "array" then .[] else error("matcher has no hooks list") end
     | if .type == "command" and (.command | type) == "string"
-      then [$event, $m, (.async // false | tostring), .command] | join("\t")
+      then [$event, $m, (.async // false | tostring), .command] | join("\u001f")
       else error("hook entry is not a command") end' "$SETTINGS" 2>&1)"; then
-  while IFS=$'\t' read -r event matcher async cmd; do
+  while IFS=$'\x1f' read -r event matcher async cmd; do
     [[ -n "$event" ]] || continue
     if [[ "$cmd" =~ $reg_re ]]; then
       h="${BASH_REMATCH[1]}"
       registered+=("$h")
       if [[ "$async" == false ]]; then
-        regs+=("$h"$'\t'"$event"$'\t'"$matcher")
+        regs+=("$h"$'\x1f'"$event"$'\x1f'"$matcher")
       else
         fail "$h.sh is registered with async: an async hook can't block anything"
       fi
@@ -141,7 +150,7 @@ fi
 registered_for() {
   local r h e m
   for r in ${regs[@]+"${regs[@]}"}; do
-    IFS=$'\t' read -r h e m <<<"$r"
+    IFS=$'\x1f' read -r h e m <<<"$r"
     [[ "$h" == "$1" && "$e" == "$2" ]] || continue
     [[ -z "$3" || -z "$m" || "$m" == "*" ]] && return 0
     [[ "$3" =~ ^($m)$ ]] && return 0
@@ -150,6 +159,8 @@ registered_for() {
 }
 
 for h in ${hooks[@]+"${hooks[@]}"}; do
+  [[ "$(head -n 1 "$HOOKS_DIR/$h.sh")" == "#!/bin/bash -p" ]] ||
+    fail "$h.sh must start with #!/bin/bash -p (so exported functions and BASH_ENV are ignored)"
   [[ -x "$HOOKS_DIR/$h.sh" ]] || fail "$h.sh is not executable"
   in_list "$h" ${registered[@]+"${registered[@]}"} || fail "$h.sh is not registered in .claude/settings.json"
 done
@@ -205,6 +216,14 @@ for f in "$SETTINGS" "$HOOKS_DIR"/*.sh "$ROOT"/.harness/lib/* "$ROOT"/.harness/*
 done
 BEFORE="$(snapshot)"
 
+# Setup scripts may write only inside their own sandbox (and to /dev/null and /dev/tty).
+SETUP_PROFILE='(version 1) (allow default) (deny file-write*)
+  (allow file-write* (subpath (param "BASE")) (literal "/dev/null") (literal "/dev/tty"))'
+if [[ -d "$CASES_DIR" ]] && [[ -n "$(find "$CASES_DIR" -name '*.setup.sh' -print -quit)" ]] &&
+  ! command -v sandbox-exec >/dev/null 2>&1; then
+  fail "sandbox-exec is missing, so setup scripts can't be confined to their sandbox"
+fi
+
 n_sbx=0
 # mk_sandbox: sets BASE (the sandbox's home folder and temp root) and SBX (its main checkout).
 mk_sandbox() {
@@ -257,6 +276,10 @@ run_case() {
     CASE_ERR="not a readable JSON case with a hook_event_name"
     return 0
   fi
+  if [[ "$event" == *ToolUse* && -z "$tool" ]]; then
+    CASE_ERR="a $event case needs a tool_name"
+    return 0
+  fi
   if ! registered_for "$hook" "$event" "$tool"; then
     CASE_ERR="$hook is not registered for $event${tool:+/$tool}, so Claude Code would never run it here"
     return 0
@@ -276,7 +299,8 @@ run_case() {
   if [[ -f "$setup" ]]; then
     cp "$setup" "$BASE/setup.sh"
     (cd "$BASE" && env -i PATH="$PATH" HOME="$BASE/home" ROOT="$SBX" \
-      WORKTREES="$BASE/code/forge-worktrees" TMP="$BASE" bash "$BASE/setup.sh") \
+      WORKTREES="$BASE/code/forge-worktrees" TMP="$BASE" \
+      sandbox-exec -D BASE="$BASE" -p "$SETUP_PROFILE" /bin/bash "$BASE/setup.sh") \
       >"$BASE/setup.out" 2>&1 || {
       CASE_ERR="setup failed: $(tr '\n' ' ' <"$BASE/setup.out")"
       return 0

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Test-only hook that goes wrong in the way $MISBEHAVE says. Every one of these must deny.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset HOOKRT_LOADED

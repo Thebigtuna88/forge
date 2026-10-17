@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Test-only gate (never registered in the real settings.json): denies `git push` to main, the
 # way a real FRG-3 gate will, so hookrt and conformance can be proved before real hooks exist.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

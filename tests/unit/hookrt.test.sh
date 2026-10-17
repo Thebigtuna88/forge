@@ -163,6 +163,33 @@ test_inherited_private_state_is_ignored() {
   assert_exit 2 "$RC" "deploy floor must still apply"
 }
 
+test_inherited_functions_are_not_used() {
+  mk_hook_harness
+  # A jq function that claims every mode.json says "observe" would turn a deny into an allow.
+  local out rc=0
+  out="$(cd "$H" && HOME="$T_TMP/home" /bin/bash -c '
+    jq() { if [[ "$1" == -se ]]; then return 0; fi; command jq "$@"; }
+    export -f jq
+    bash_input() { command jq -n --arg c "$1" "{tool_name: \"Bash\", tool_input: {command: \$c}}"; }
+    bash_input "git push origin main" | ./.claude/hooks/sample-gate.sh' 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "exported function must not be imported: $out"
+}
+
+test_bash_env_is_ignored() {
+  mk_hook_harness
+  printf 'exit 0\n' >"$T_TMP/benv.sh"
+  run_hook sample-gate "$(bash_input 'git push origin main')" BASH_ENV="$T_TMP/benv.sh"
+  assert_exit 2 "$RC"
+}
+
+test_hook_without_privileged_shebang_denies() {
+  mk_hook_harness
+  sed -i '' '1s|.*|#!/bin/bash|' "$H/.claude/hooks/probe.sh"
+  probe fields 'ls'
+  assert_exit 2 "$RC"
+  assert_contains "$ERR" "#!/bin/bash -p"
+}
+
 test_runtime_refuses_to_run_directly() {
   mk_hook_harness
   local rc=0
@@ -210,7 +237,8 @@ test_bad_input_denies() {
     '{"tool_name": "Bash", "tool_input": {"command": "ls\u0000; git push origin main"}}' \
     '{"tool_name": "Bash", "cwd": ["/"]}' '{"tool_name": false}' \
     '{"tool_name": "Bash", "tool_input": {"command": false}}' \
-    '{"tool_name": "Write", "tool_input": {"file_path": false}}'; do
+    '{"tool_name": "Write", "tool_input": {"file_path": false}}' \
+    '{"tool_name": "Bash", "tool_input": {"command": "git push"}} {"tool_input": {"command": " origin main"}}'; do
     run_hook probe "$input" PROBE=fields
     assert_exit 2 "$RC" "input: $input"
   done
@@ -265,7 +293,10 @@ test_guarded_detection() {
     'git -c alias.s=status s' 'gh m 3' 'ls node_modules/.bin/vercel' \
     $'gi\\\nt pu\\\nsh origin main' '/usr/bin/g[i]t push origin main' 'g?t push origin main' \
     '{g,}it push origin main' "\$'\\x67it' \$'\\x70ush' origin main" 'ls; G*T push' \
-    'echo `g?t push`' 'x=1 g[i]t push' 'env -i g[i]t push' '> f g?t push' '"$G" push'; do
+    'echo `g?t push`' 'x=1 g[i]t push' 'env -i g[i]t push' '> f g?t push' '"$G" push' \
+    '2>/dev/null /usr/bin/g[i]t push origin main' '/usr/bin/env /usr/bin/g[i]t push origin main' \
+    'env -u FOO /usr/bin/g[i]t push origin main' 'exec -a x g?t push' 'coproc g?t push' \
+    'nice -n 5 g?t push' 'ls; 3<f g?t push'; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done

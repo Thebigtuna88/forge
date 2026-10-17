@@ -264,9 +264,20 @@ test_setup_and_hooks_get_a_sandbox_home() {
   [[ ! -e "$T_TMP/home/.gitconfig" ]] || _t_fail "setup wrote the caller's ~/.gitconfig"
 }
 
-test_fails_when_a_live_file_changes() {
+test_setup_cannot_write_the_live_checkout() {
   mk_conf_harness
   printf 'printf " " >>"%s/.harness/mode.json"\n' "$H" >"$H/tests/conformance/sample-gate/allow/push-feature.setup.sh"
+  expect_fail "setup failed"
+  assert_eq "$(cat "$H/.harness/mode.json")" '{"modes": {}}' "live mode.json untouched"
+}
+
+test_fails_when_a_live_file_changes() {
+  mk_conf_harness sample-gate toucher
+  printf 'charter\n' >"$H/CLAUDE.md"
+  case_json toucher deny main 'git push origin main'
+  mkdir -p "$H/tests/conformance/toucher/allow"
+  jq -n --arg f "$H/CLAUDE.md" '{hook_event_name: "PreToolUse", tool_name: "Bash",
+    tool_input: {command: "ls", file_path: $f}, cwd: "@ROOT@"}' >"$H/tests/conformance/toucher/allow/touch.json"
   expect_fail "changed while conformance ran"
 }
 
@@ -379,6 +390,41 @@ test_fails_when_main_checkout_disables_hooks() {
   mkdir -p "$main/.claude"
   printf '{"disableAllHooks": true}\n' >"$main/.claude/settings.local.json"
   expect_fail "disableAllHooks is set in $main/.claude/settings.local.json"
+}
+
+test_registration_without_matcher_covers_every_tool() {
+  mk_conf_harness
+  jq 'del(.hooks.PreToolUse[0].matcher)' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  conform
+  assert_exit 0 "$RC" "$OUT"
+}
+
+test_fails_on_tool_case_without_tool_name() {
+  mk_conf_harness
+  jq 'del(.tool_name)' "$H/tests/conformance/sample-gate/deny/push-main.json" >"$T_TMP/c.json"
+  mv "$T_TMP/c.json" "$H/tests/conformance/sample-gate/deny/push-main.json"
+  expect_fail "tool_name"
+}
+
+test_fails_on_symlinked_hooks_folder() {
+  mk_conf_harness
+  mv "$H/.claude/hooks" "$T_TMP/elsewhere-hooks"
+  ln -s "$T_TMP/elsewhere-hooks" "$H/.claude/hooks"
+  expect_fail "symlink"
+}
+
+test_fails_on_symlinked_runtime() {
+  mk_conf_harness
+  mv "$H/.harness/lib/hookrt.sh" "$T_TMP/hookrt.sh"
+  ln -s "$T_TMP/hookrt.sh" "$H/.harness/lib/hookrt.sh"
+  expect_fail "symlink"
+}
+
+test_fails_on_hook_without_privileged_shebang() {
+  mk_conf_harness
+  sed -i '' '1s|.*|#!/usr/bin/env bash|' "$H/.claude/hooks/sample-gate.sh"
+  expect_fail "#!/bin/bash -p"
 }
 
 run_tests

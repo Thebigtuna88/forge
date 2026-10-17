@@ -2,6 +2,7 @@
 # shellcheck disable=SC2034 # the HR_* variables are read by the hooks that source this file
 # FORGE hook runtime (spec 5.2). Every .claude/hooks/<name>.sh starts with:
 #
+#   #!/bin/bash -p
 #   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   unset HOOKRT_LOADED
 #   # shellcheck source=.harness/lib/hookrt.sh
@@ -11,7 +12,9 @@
 # then calls `hr_init <hook-name>` and ends every path with hr_allow or hr_deny. Claude Code
 # treats any exit status other than 2 as "allow", so only an explicit hr_allow allows: errexit
 # and an EXIT trap turn a crash, a failed command, a catchable signal, a bare `exit` or falling
-# off the end into a deny (fail closed, rule 9). A hook whose parts have their own modes calls
+# off the end into a deny (fail closed, rule 9). `bash -p` makes bash ignore exported functions,
+# BASH_ENV, SHELLOPTS and CDPATH, so nothing in the environment can replace jq, git or the
+# runtime's own functions. A hook whose parts have their own modes calls
 # `hr_part <part>` once it knows which part applies (mode key "<hook>:<part>").
 #
 # A guard for git commands calls hr_require_simple (which also fills HR_TOK and HR_GIT_*) and
@@ -42,6 +45,14 @@ _hr_on_exit() {
 trap _hr_on_exit EXIT
 trap 'exit 2' HUP INT QUIT ILL TRAP ABRT EMT FPE BUS SEGV SYS PIPE ALRM TERM XCPU XFSZ VTALRM PROF USR1 USR2
 
+if [[ "$-" != *p* ]]; then
+  echo "FORGE hook runtime: the hook must start with #!/bin/bash -p (privileged mode, no inherited functions)" >&2
+  _HR_DECISION=deny
+  exit 2
+fi
+IFS=$' \t\n'
+export LC_ALL=C
+
 _hr_lib="${BASH_SOURCE[0]%/*}"
 [[ "$_hr_lib" != "${BASH_SOURCE[0]}" ]] || _hr_lib=.
 HR_ROOT="$(cd "$_hr_lib/../.." && pwd -P)"
@@ -62,7 +73,7 @@ _HR_DEPLOY_FLOOR=("vercel" "fastlane" "eas" "xcrun altool")
 # in such a command makes it guarded.
 _HR_DYNAMIC_WORDS=" push commit merge api repo workflow "
 # Words after which the next word is still a command name.
-_HR_KEYWORDS=" if then else elif do while until ! { "
+_HR_KEYWORDS=" if then else elif do while until ! { coproc "
 _HR_WRAPPERS=" env command exec nohup nice sudo doas xargs builtin eval time timeout caffeinate stdbuf "
 # Git global options that don't change which repository or program git uses. Anything else
 # before the subcommand makes it "?".
@@ -150,7 +161,8 @@ hr_init() { # <hook-name>; reads the hook JSON on stdin
   command -v jq >/dev/null 2>&1 || _hr_fatal "jq is not installed"
   command -v python3 >/dev/null 2>&1 || _hr_fatal "python3 is not installed"
   HR_INPUT="$(cat)" || _hr_fatal "can't read the hook input"
-  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$HR_INPUT" || _hr_fatal "hook input is not a JSON object"
+  jq -se 'length == 1 and (.[0] | type) == "object"' >/dev/null 2>&1 <<<"$HR_INPUT" ||
+    _hr_fatal "hook input is not exactly one JSON object"
   _hr_field HR_EVENT '.hook_event_name' || _hr_fatal "bad hook_event_name in the hook input"
   _hr_field HR_TOOL '.tool_name' || _hr_fatal "bad tool_name in the hook input"
   _hr_field HR_CMD '.tool_input.command' || _hr_fatal "bad tool_input.command in the hook input"
@@ -325,20 +337,25 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     u="${t//\`/}"
     base="$(_hr_lower "${u##*/}")"
     if [[ $cmdpos == 1 ]]; then
-      if [[ $wrapped == 1 && ("$u" == -* || "$u" == *=* || "$u" =~ ^[0-9]+$) ]]; then
-        continue # an option of env, nice, timeout, xargs …: still before the command name
+      if [[ "$u" =~ ^[0-9]+$ && $((i + 1)) -lt $n && "${HR_TOK[$((i + 1))]}" == *[\<\>]* ]]; then
+        continue # a file descriptor in front of a redirection (2>f): still before the command
       elif [[ "$u" =~ ^[A-Za-z_][A-Za-z0-9_]*= || "$_HR_KEYWORDS" == *" $u "* ]]; then
         continue
-      elif [[ "$_HR_WRAPPERS" == *" $u "* ]]; then
+      elif [[ "$_HR_WRAPPERS" == *" $base "* ]]; then
+        # env, nice, xargs … take options with arguments of their own, so every later word up to
+        # the next operator may be the command they run.
         wrapped=1
+        cmdpos=0
         continue
       fi
       cmdpos=0
-      wrapped=0
       if _hr_could_be_tool "$u"; then
         rc=0
         break
       fi
+    elif [[ $wrapped == 1 ]] && _hr_could_be_tool "$u"; then
+      rc=0
+      break
     fi
     if [[ "$u" == *[[:space:]]* ]]; then
       local -a inner=("${HR_TOK[@]}")

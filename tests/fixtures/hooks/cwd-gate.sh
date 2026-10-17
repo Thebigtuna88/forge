@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Test-only gate: denies any command whose working folder is the harness root (the "main
 # checkout"). Proves conformance's sandbox layout and its @ROOT@ / @WORKTREES@ placeholders.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Test-only broken hook: blocks any command mentioning "main", but treats a missing or unreadable
 # mode.json as "allow everything" (fails open). Conformance's mode-failure check must catch it.
 input="$(cat)"

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Test-only hook: prints what hookrt worked out, selected by $PROBE, then allows. Lets the unit
 # tests check hookrt's parsing through the same entry point a real hook uses.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
