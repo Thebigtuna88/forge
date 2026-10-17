@@ -4,8 +4,8 @@
 #
 # 1. Every .claude/hooks/<name>.sh starts with #!/bin/bash -p, is executable, registered in
 #    .claude/settings.json (as a synchronous command) and clean under shellcheck; every registered
-#    hook exists. A hook uses $(…) only as the whole value of a plain assignment (no backticks,
-#    no <( >( ), so bash can't hide a failure inside it. Nothing else lives in .claude/hooks or
+#    hook exists. A hook uses $(…) only as the whole value of a plain assignment, one per line and
+#    not nested (no backticks, no <( >( ), so bash can't hide a failure inside it. Nothing else lives in .claude/hooks or
 #    tests/conformance: no hidden or stray files, and no symlinks there or in the hook, runtime and
 #    config paths.
 # 2. Each case tests/conformance/<hook>/{deny,allow}/<case>.json is fed on stdin to the hook in a
@@ -196,16 +196,22 @@ if [[ ${#hooks[@]} -gt 0 ]]; then
   fi
 fi
 
-# $(…) inside `local x=…`, an argument or a pipeline hides the failure of what runs inside it.
+# $(…) inside `local x=…`, an argument, a pipeline, a second assignment on the line or another
+# $(…) hides the failure of what runs inside it. So a line holds at most one $(…), as the whole
+# value of one plain assignment; the only exception is the standard header line.
+# shellcheck disable=SC2016 # the literal header text
+HEADER_LINE='here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
 for h in ${hooks[@]+"${hooks[@]}"}; do
   while IFS= read -r n; do
-    fail "$h.sh line $n: a command substitution may only be the whole value of a plain assignment (name=\"\$(…)\"); backticks and <( >( aren't allowed, so a failure inside can't be hidden"
-  done < <(awk '{
-      line = $0; sub(/^[ \t]+/, "", line)
-      if (line ~ /^#/) next
+    fail "$h.sh line $n: a command substitution may only be the whole value of a plain assignment (name=\"\$(…)\", one per line, not nested); backticks and <( >( aren't allowed, so a failure inside can't be hidden"
+  done < <(awk -v header="$HEADER_LINE" '{
+      line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+      if (line ~ /^#/ || line == header) next
       if (index(line, "`") || index(line, "<(") || index(line, ">(")) { print NR; next }
       probe = line; gsub(/\$\(\(/, "", probe)
-      if (index(probe, "$(") && line !~ /^[A-Za-z_][A-Za-z0-9_]*="\$\(.*\)"[ \t]*$/) print NR
+      count = gsub(/\$\(/, "", probe)
+      if (count == 0) next
+      if (count > 1 || line !~ /^[A-Za-z_][A-Za-z0-9_]*="\$\(.*\)"$/) print NR
     }' "$HOOKS_DIR/$h.sh")
 done
 

@@ -565,4 +565,20 @@ test_fails_on_masked_command_substitution_in_a_hook() {
   assert_contains "$OUT" "plain assignment"
 }
 
+test_fails_on_two_or_nested_substitutions_in_a_hook() {
+  local line
+  for line in 'x="$(true)" y="$(true)"' 'x="$(printf %s "$(printf %s "$HR_CMD")")"'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    printf '%s\n' "$line" >>"$H/.claude/hooks/sample-gate.sh"
+    expect_fail "sample-gate.sh line $(wc -l <"$H/.claude/hooks/sample-gate.sh" | tr -d ' '): a command substitution"
+  done
+}
+
+test_standard_header_passes_the_source_check() {
+  mk_conf_harness
+  conform
+  assert_not_contains "$OUT" "a command substitution may only"
+}
+
 run_tests

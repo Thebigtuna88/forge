@@ -15,8 +15,8 @@
 # reads, so even `local x="$(cmd)"` or "$(cmd)" as an argument counts), and an EXIT trap turn a
 # crash, a failed command, a catchable signal, a bare `exit`, `exec` or falling off the end into a
 # deny (fail closed, rule 9). So a hook writes `x="$(cmd || true)"` where a failure is expected.
-# A hook uses $(…) only as the whole value of a plain assignment, `name="$(…)"` (conformance
-# checks its source): then a deny, an unset variable or a signal inside it fails the assignment,
+# A hook uses $(…) only as the whole value of a plain assignment, `name="$(…)"`, one per line
+# and not nested (conformance checks its source): then a deny, an unset variable or a signal inside it fails the assignment,
 # which errexit turns into a deny, where `local x="$(…)"` or an argument would hide it. `bash -p` makes bash ignore exported functions,
 # BASH_ENV, SHELLOPTS and CDPATH; the runtime then clears every environment variable except
 # HOME, USER, LOGNAME, TMPDIR and CLAUDE_PROJECT_DIR (no PERL5OPT, GIT_*, DEVELOPER_DIR, …) and
