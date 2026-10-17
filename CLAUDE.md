@@ -28,8 +28,8 @@ a time**, with a recommendation.
    command output, or `file:line`. The same goes for every claim made to the owner.
 7. **Limits are the owner's.** Paths in `.harness/self-modification-paths.json` (spend limits,
    deploy targets, mode.json, the paths list itself, `.claude/hooks/`, `.claude/settings.json`,
-   `.harness/lib/`, `.github/workflows/`, `.harness/bin/conformance`, `tests/conformance/`)
-   change only by a PR **the owner** merges.
+   `.harness/lib/`, `.github/workflows/`, `.harness/bin/conformance`, `tests/conformance/`,
+   `.harness/gitleaks.toml`) change only by a PR **the owner** merges.
 8. **Test mode until the owner flips it.** Payments run in test mode. Production deploys, App
    Store/TestFlight submissions, DNS changes and anything that charges a card are owner-run
    scripts, never agent actions.

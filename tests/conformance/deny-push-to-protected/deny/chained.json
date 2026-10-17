@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git push origin feature/FRG-3-a && ls"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "one plain command"
+}

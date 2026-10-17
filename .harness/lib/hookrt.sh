@@ -84,6 +84,7 @@ for _hr_v in $(compgen -e); do
 done
 unset _hr_v
 _HR_TMPD="$(mktemp -d "${TMPDIR:-/tmp}/forge-hook.XXXXXX")"
+HR_TMP="$_HR_TMPD" # a private scratch folder for the hook, removed when it exits
 
 # Replacing the shell would skip the EXIT trap, so a hook may not do it in any form: the builtin
 # is switched off (so `builtin exec` and `command exec` fail) and plain `exec` explains why.
@@ -110,8 +111,13 @@ _HR_LOADED="" _HR_TOOLS=() _HR_GIT_CMDS="" _HR_SUBI=-1 _HR_UNKNOWABLE=0 _HR_CDS=
 # Guarded actions (spec 5.2), as words that must appear in this order (hyphens split words, so
 # send-pack is "send pack"). Deploy tools come from
 # .harness/deploy-targets.json ("tools") on top of this floor, so a missing file can't open them.
-_HR_GUARDED_SEQS=("git push" "git commit" "git send pack" "git http push" "gh pr merge" "gh api" "gh repo"
+_HR_GUARDED_SEQS=("git push" "git commit" "git send pack" "git http push" "git rebase" "git filter branch"
+  "git filter repo" "git replace" "git update ref" "git am" "git cherry pick" "git revert"
+  "git checkout" "git switch" "git branch" "git worktree" "gh pr merge" "gh api" "gh repo"
   "gh workflow run")
+# The git subcommands those name; an alias for any of them is refused (hr_require_simple).
+_HR_GIT_GUARDED_SUBS=" push commit send-pack http-push rebase filter-branch filter-repo replace "
+_HR_GIT_GUARDED_SUBS+="update-ref commit-tree am cherry-pick revert checkout switch branch worktree "
 _HR_DEPLOY_FLOOR=("vercel" "fastlane" "eas" "xcrun altool")
 # With `$` or a backtick the shell can build words the hook never sees, so any of these words
 # in such a command makes it guarded.
@@ -128,6 +134,10 @@ _HR_GH_CMDS=" agent-task alias api attestation auth browse cache codespace compl
   discussion extension gist gpg-key help issue label licenses org pr preview project release repo
   ruleset run search secret skill ssh-key status variable workflow accessibility actions
   environment exit-codes formatting mintty reference telemetry "
+# The word lists above are matched as " word "; a line break must count as a space too.
+_HR_GH_CMDS="${_HR_GH_CMDS//$'\n'/ }"
+_HR_WRAPPERS="${_HR_WRAPPERS//$'\n'/ }"
+_HR_GIT_GUARDED_SUBS="${_HR_GIT_GUARDED_SUBS//$'\n'/ }"
 # Characters a guarded command may not contain (spec 5.2), plus glob, brace, comment and tilde
 # characters, which make the shell run words the hook never saw.
 _HR_FORBIDDEN=('&' '|' ';' '<' '>' '(' ')' '$' '`' '#' '*' '?' '[' ']' '{' '}' '~' $'\n' $'\r')
@@ -497,12 +507,8 @@ hr_require_simple() { # deny unless a guarded command is one plain command; fill
       if [[ "$HR_GIT_SUB" == "?" ]]; then
         hr_deny "can't tell what this git command runs (unknown global option, alias.*/include.* config, or a command that isn't git's own)"
       fi
-      if [[ "$HR_GIT_VIA_ALIAS" == 1 ]]; then
-        case "$HR_GIT_SUB" in
-          push | commit | send-pack | http-push)
-            hr_deny "git alias for a guarded command ($HR_GIT_SUB); use the command itself"
-            ;;
-        esac
+      if [[ "$HR_GIT_VIA_ALIAS" == 1 && "$_HR_GIT_GUARDED_SUBS" == *" $HR_GIT_SUB "* ]]; then
+        hr_deny "git alias for a guarded command ($HR_GIT_SUB); use the command itself"
       fi
       return 0
       ;;

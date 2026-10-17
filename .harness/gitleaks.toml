@@ -1,0 +1,6 @@
+# FORGE secret-scan rules (owner-only: docs/decisions/2026-10-17-owner-only-gitleaks-config.md).
+# The secret-scan gate always uses this file, never a .gitleaks.toml in the scanned repository.
+title = "FORGE secret scan: gitleaks default rules"
+
+[extend]
+useDefault = true

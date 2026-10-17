@@ -335,7 +335,10 @@ test_guarded_detection() {
     'find . -exec /tmp/bin/??? {} \;' '/Library/Developer/CommandLineTools/usr/libexec/git-core/git-push origin main' \
     'git-commit -F m' 'git send-pack origin main' 'git http-push origin main' \
     'gh pr m???e 16 --squash' 'gh workflow r?n build.yml' 'gh pr $X 16' 'gh pr {merge,view} 16' \
-    'ls; gh pr m*e 16' 'vercel dep[l]oy --pr?d'; do
+    'ls; gh pr m*e 16' 'vercel dep[l]oy --pr?d' 'cd /x && git rebase dev' \
+    'git checkout -b feature/FRG-3-a && ls' 'git branch -f x; ls' 'git update-ref -d refs/heads/main | cat' \
+    'git cherry-pick abc && ls' 'git commit-tree abc' 'git worktree add -b x /y && ls' 'git switch -c x; ls' \
+    'git filter-branch' 'git replace a b' 'git revert HEAD' 'git am p.patch'; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done
@@ -363,7 +366,8 @@ test_simple_guarded_commands_pass() {
     'git commit -F /tmp/msg.txt' 'git log --grep commit' 'gh pr merge 3 --squash' \
     'gh api repos/Thebigtuna88/forge/pulls' 'vercel deploy' \
     'git --no-pager -c color.ui=never push origin feature/FRG-2-a' \
-    'git -c core.quotepath=false -c advice.detachedHead=false push origin feature/FRG-2-a'; do
+    'git -c core.quotepath=false -c advice.detachedHead=false push origin feature/FRG-2-a' \
+    'gh repo view Thebigtuna88/forge' 'gh actions' 'gh copilot explain x' 'gh repo list'; do
     expect_allow "$c"
   done
 }
@@ -465,6 +469,9 @@ test_git_alias_to_guarded_command_denies() {
   git -C "$H" config alias.sh '!git push origin main'
   git -C "$H" config alias.sp send-pack
   git -C "$H" config alias.hp http-push
+  git -C "$H" config alias.rb rebase
+  git -C "$H" config alias.co checkout
+  git -C "$H" config alias.ur update-ref
   expect_deny 'git p origin feature/FRG-2-a' "$H"
   assert_contains "$ERR" "alias"
   expect_deny 'git ci' "$H"
@@ -472,6 +479,11 @@ test_git_alias_to_guarded_command_denies() {
   assert_contains "$ERR" "alias"
   expect_deny 'git hp origin main' "$H"
   assert_contains "$ERR" "alias"
+  local a
+  for a in 'git rb dev' 'git co -b x' 'git ur -d refs/heads/main'; do
+    expect_deny "$a" "$H"
+    assert_contains "$ERR" "alias" "alias for: $a"
+  done
   expect_deny 'git sh' "$H"
   expect_deny 'git st && ls' "$H"
 }

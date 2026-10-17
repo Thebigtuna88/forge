@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git checkout -b feature/XYZ-3-x"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "branch names must be feature/"
+}

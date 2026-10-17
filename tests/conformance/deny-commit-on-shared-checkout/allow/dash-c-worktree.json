@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git -C @WORKTREES@/FRG-9-demo commit -F m"
+  },
+  "cwd": "@ROOT@"
+}
