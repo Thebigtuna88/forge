@@ -815,4 +815,26 @@ EOF
   [[ ! -e "$T_TMP/leak.txt" ]] || _t_fail "a git program from setup wrote outside the sandbox"
 }
 
+test_command_names_must_be_plain_and_allowed() {
+  local pair line want
+  for pair in "e\"va\"l \"hr_allow\"|plain word" "\"eval\" \"\$HR_CMD\"|plain word" \
+    "sour\\ce \"\$HR_FILE\"|plain word" "command eval \"\$HR_CMD\"|may not run" \
+    "builtin source \"\$HR_FILE\"|may not run" "set +e|may not run" "trap - ERR|may not run" \
+    "FOO=1 eval x|may not run" ">/dev/null eval x|may not run" "bash -c true|may not run" \
+    "unset _HR_TMPD|may not run" \
+    "x=\"\$(b\"as\"h -c 'false; true')\"|inside of a command substitution" \
+    "x=\"\$(FOO=1 bash -c 'false; true')\"|inside of a command substitution" \
+    "x=\"\$(\"bash\" -c 'false; true')\"|inside of a command substitution" \
+    "x=\"\$(>/dev/null bash -c 'false; true')\"|inside of a command substitution" \
+    "x=\"\$(/usr/bin/arch /bin/bash -c 'false; true')\"|inside of a command substitution"; do
+    line="${pair%|*}"
+    want="${pair##*|}"
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    printf '%s\n' "$line" >>"$H/.claude/hooks/sample-gate.sh"
+    expect_fail "sample-gate.sh line"
+    assert_contains "$OUT" "$want" "for: $line"
+  done
+}
+
 run_tests

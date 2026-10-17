@@ -212,8 +212,8 @@ fi
 # shellcheck disable=SC2016 # Python source; its $ signs are for Python, not the shell
 SOURCE_CHECK_PY='
 import re, shlex, sys
-header = sys.argv[2]
-header_source = sys.argv[3]  # the header line that loads the runtime: the one allowed source
+# The standard header lines are the only place a hook may use $(dirname …), unset or source.
+headers = {sys.argv[2], sys.argv[3], "unset HOOKRT_LOADED"}
 raw_lines = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read().split("\n")
 assign = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\"\$\(.*\)\"$")
 LIST_OPS = ("&&", "||", "|", "|&", "!")
@@ -221,7 +221,8 @@ LIST_OPS = ("&&", "||", "|", "|&", "!")
 
 def shell_code(raw):
     # The line as the shell parses it, with every quoted part and backslash escape replaced by
-    # "x" and any comment dropped, so a quoted "(" or "if" is never taken for syntax.
+    # the mark \x01 and any comment dropped, so a quoted "(" or "if" is never taken for syntax,
+    # and a word holding the mark is known to contain quoting.
     # Returns (code, quote still open at the end of the line, where a comment starts (or the
     # length of the line), whether the line ends in a continuing backslash outside quotes and
     # comments).
@@ -231,7 +232,7 @@ def shell_code(raw):
         if quote == "\x27":
             if c == "\x27":
                 quote = None
-                out.append("x")
+                out.append("\x01")
             i += 1
             continue
         if quote == "\x22":
@@ -240,13 +241,13 @@ def shell_code(raw):
                 continue
             if c == "\x22":
                 quote = None
-                out.append("x")
+                out.append("\x01")
             i += 1
             continue
         if c == "\\":
             if i == len(raw) - 1:
                 joins = True
-            out.append("x")
+            out.append("\x01")
             i += 2
             word_start = False
             continue
@@ -274,24 +275,53 @@ def simple_body(body):
     lex.whitespace_split = True
     lex.commenters = ""
     words = list(lex)
-    start = True
-    for w in words:
-        if set(w) <= set("();<>|&!"):
-            if w not in ("|", "<", ">", ">>", ">&", "<&", ">|", "<>"):
-                return False
-            start = w == "|"
+    start, target = True, False
+    for k, w in enumerate(words):
+        if target:
+            target = False  # the file of a redirection
             continue
-        if w in ("{", "}", "!") or (start and (w in RESERVED or w.rsplit("/", 1)[-1] in RUNNERS)):
+        if set(w) <= set("();<>|&!"):
+            if w not in ("|",) + REDIRS:
+                return False
+            if w == "|":
+                start = True
+            else:
+                target = True
+            continue
+        if w in ("{", "}", "!"):
             return False
-        start = False
+        if start:
+            nxt = words[k + 1] if k + 1 < len(words) else ""
+            if (w.isdigit() and nxt in REDIRS) or ASSIGNMENT.match(w):
+                continue  # a file descriptor or an assignment before the command
+            if w in RESERVED or name_problem(w, BODY_FORBIDDEN):
+                return False
+            start = False
     return bool(words)
+
+
+def name_problem(w, forbidden):
+    # "N" if a command name is not a plain word, "E" if it names a forbidden command, else "".
+    if w not in ("[[", "[") and not PLAIN.match(w):
+        return "N"
+    if w.rsplit("/", 1)[-1] in forbidden:
+        return "E"
+    return ""
 
 
 RESERVED = ("if", "then", "elif", "else", "fi", "while", "until", "do", "done", "case", "esac",
             "for", "select", "function", "coproc", "time", "[[", "]]")
-# Commands that run other shell code from their arguments, where a failure would be out of view.
-RUNNERS = ("eval", "source", ".", "sh", "bash", "zsh", "dash", "ksh", "fish", "env", "xargs",
-           "exec", "command", "builtin", "nohup", "trap", "nice", "timeout")
+PLAIN = re.compile(r"^[A-Za-z0-9_./:+@%-]+$")
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+REDIRS = ("<", ">", ">>", ">&", "<&", ">|", "<>", "&>", "&>>", "<<<")
+# Commands a hook may not run: they run code from a string or file the check cannot read, or
+# switch off the safety net (set +e, trap, unset of the runtime state, a fresh shell).
+TOP_FORBIDDEN = ("eval", "source", ".", "command", "builtin", "exec", "env", "trap", "set",
+                 "shopt", "enable", "unset", "sh", "bash", "zsh", "dash", "ksh", "fish")
+# Inside $(…) also no wrapper that runs another command, whose failures would be out of view.
+BODY_FORBIDDEN = TOP_FORBIDDEN + ("xargs", "nohup", "nice", "timeout", "arch", "xcrun", "sudo",
+                                  "doas", "script", "caffeinate", "stdbuf", "taskpolicy",
+                                  "sandbox-exec", "chroot", "su", "launchctl", "time")
 
 # 1. Logical lines: a backslash at the end of a line (outside quotes) joins the next line, as the
 #    shell does, so a word split across lines is still one word.
@@ -312,10 +342,12 @@ stack = []     # open groups: [kind, line]; kind is "{", "(" or "$(" (a substitu
 blocks = []
 lost = False   # the block structure stopped adding up: treat everything after as a condition
 cont = False   # the previous line ended in && || | ! , so this line is part of a list
+case_in = False  # inside "case WORD", waiting for "in"
+pattern = False  # at a case pattern (up to its ")"), whose words are not commands
 bad = []
 for n, raw in logical:
     line = raw.strip()
-    if not line or line.startswith("#") or line == header:
+    if not line or line.startswith("#") or line in headers:
         continue
     code, open_quote, cut, _ = shell_code(raw)
     line = raw[:cut].strip()  # the line without its comment, quoting kept
@@ -346,16 +378,53 @@ for n, raw in logical:
     prev = ""
     start = True  # a command (and so a reserved word) may start here
     timing = False  # after `time`: its options (-p) still come before the command
+    target = False  # the next word is the file of a redirection
+    testing = False  # inside [[ … ]], whose words (and && ||) are a test, not commands
     for k, w in enumerate(words):
+        nxt = words[k + 1] if k + 1 < len(words) else ""
+        if target:
+            target = False
+            prev = w
+            continue
+        if testing:
+            if w == "]]":
+                testing = False
+            prev = w
+            continue
+        if start and w == "[[":
+            testing = True
+            start = False
+            prev = w
+            continue
+        if case_in and w == "in":
+            case_in, pattern = False, True  # case WORD in: patterns follow
+            prev = w
+            continue
+        if pattern and w != "esac":
+            if w == ")" or w.endswith(")"):
+                pattern = False
+                start = True
+            prev = w
+            continue
+        if start and w in REDIRS:
+            target = True
+            prev = w
+            continue
+        if start and ((w.isdigit() and nxt in REDIRS) or ASSIGNMENT.match(w)):
+            prev = w
+            continue  # a file descriptor or an assignment before the command
+        if start and w not in RESERVED and w not in ("{", "}", "(", ")", "!") and not set(w) <= set("();<>|&!"):
+            problem = name_problem(w, TOP_FORBIDDEN)
+            if problem:
+                bad.append("%s%d" % (problem, n))
         tested = cont if k == 0 else prev in LIST_OPS
-        if start and w in ("eval", "source", ".") and line != header_source:
-            bad.append("E%d" % n)  # runs code from a string or file the check cannot read
         if start and w in ("if", "while", "until"):
             blocks.append({"kind": "cond", "tested": tested, "subs": []})
         elif start and w in ("for", "select"):
             blocks.append({"kind": "for", "tested": tested, "subs": []})
         elif start and w == "case":
             blocks.append({"kind": "case", "tested": tested, "subs": []})
+            case_in = True
         elif start and w == "elif":
             if blocks and blocks[-1]["kind"] == "body":
                 blocks[-1]["kind"] = "cond"
@@ -372,6 +441,7 @@ for n, raw in logical:
         elif start and w in ("fi", "done", "esac"):
             want = "case" if w == "esac" else "body"
             if blocks and blocks[-1]["kind"] == want:
+                pattern = False
                 b = blocks.pop()
                 # Tested if a && || | ! follows before the command ends (past any redirections).
                 rest = []
@@ -408,8 +478,8 @@ for n, raw in logical:
         start = (set(w) <= set("();<>|&!{}")
                  or w in ("if", "elif", "while", "until", "then", "do", "else", "time")
                  or (start and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w) is not None))
-        if blocks and blocks[-1]["kind"] == "case" and w.endswith(")"):
-            start = True  # a case pattern: its commands follow
+        if w in (";;", ";&", ";;&") and blocks and blocks[-1]["kind"] == "case":
+            pattern = True  # the next case pattern follows
     if any(kind in ("{", "(") for kind, opened in stack):
         bad.append("G%d" % n)  # a group still open at the end of the line
         stack = [g for g in stack if g[0] == "$("]
@@ -424,7 +494,11 @@ HEADER_SOURCE='source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt fai
 for h in ${hooks[@]+"${hooks[@]}"}; do
   while IFS= read -r n; do
     if [[ "$n" == E* ]]; then
-      fail "$h.sh line ${n#E}: a hook may not use eval, source or . (they run code the source check can't read)"
+      fail "$h.sh line ${n#E}: a hook may not run eval, source, ., command, builtin, exec, env, trap, set, shopt, enable, unset or a shell (they run or change code the source check can't see)"
+      continue
+    fi
+    if [[ "$n" == N* ]]; then
+      fail "$h.sh line ${n#N}: a command name must be a plain word (no quotes, escapes, \$ or globs), so the source check reads it as bash does"
       continue
     fi
     if [[ "$n" == S* ]]; then
