@@ -204,27 +204,35 @@ fi
 # value of one plain assignment; the only exception is the standard header line. Bash also stops
 # checking for errors inside a function or a { } / ( ) group used as a condition, so a hook
 # defines no functions, and every group closes on the line it opens (a line with a $(…) can't
-# hold a group). Groups are found in real shell words (shlex: quoting and comments understood),
-# not by matching text. Prints "G<line>" for a function or group, "<line>" for a substitution.
+# hold a group), and no $(…) may sit in a condition (if/elif/while/until … then/do) or a
+# && || | list. Groups and conditions are found in real shell words (shlex: quoting and comments
+# understood), not by matching text. Prints "G<line>" for a function or group, "C<line>" for a
+# substitution in a condition, "<line>" for any other substitution problem.
 # shellcheck disable=SC2016 # Python source; its $ signs are for Python, not the shell
 SOURCE_CHECK_PY='
-import shlex, sys
+import re, shlex, sys
 header = sys.argv[2]
 lines = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read().split("\n")
-assign = __import__("re").compile(r"^[A-Za-z_][A-Za-z0-9_]*=\"\$\(.*\)\"$")
-stack = []  # open groups: [kind, line]; kind is "{", "(" or "$(" (a substitution)
+assign = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\"\$\(.*\)\"$")
+stack = []        # open groups: [kind, line]; kind is "{", "(" or "$(" (a substitution)
+cond = False      # inside if/elif/while/until … then/do: bash ignores errors there
+cont = False      # the previous line ended in && || | ! or \, so this line is part of a list
 bad = []
 for n, raw in enumerate(lines, 1):
     line = raw.strip()
     if not line or line.startswith("#") or line == header:
         continue
+    in_list = cond or cont
     if "`" in line or "<(" in line or ">(" in line:
         bad.append(str(n))
     probe = line.replace("$((", "")
     count = probe.count("$(")
     if count and (count > 1 or not assign.match(line)):
         bad.append(str(n))
-    lex = shlex.shlex(raw, posix=True, punctuation_chars=True)
+    elif count and in_list:
+        bad.append("C%d" % n)
+    # Non-POSIX shlex keeps the quotes on a word, so a quoted "(" or "{" is not taken for syntax.
+    lex = shlex.shlex(raw, posix=False, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = "#"
     try:
@@ -236,13 +244,17 @@ for n, raw in enumerate(lines, 1):
         bad.append("G%d" % n)
     prev = ""
     for w in words:
-        if w == "{":
+        if w in ("if", "elif", "while", "until"):
+            cond = True
+        elif w in ("then", "do"):
+            cond = False
+        elif w == "{":
             stack.append(["{", n])
         elif w == "}":
             if stack and stack[-1][0] == "{":
                 if stack.pop()[1] != n:
                     bad.append("G%d" % n)
-        elif set(w) <= set("();<>|&"):
+        elif set(w) <= set("();<>|&!"):
             if "()" in w:
                 bad.append("G%d" % n)  # name() — a function definition
             for i, c in enumerate(w):
@@ -255,6 +267,7 @@ for n, raw in enumerate(lines, 1):
     if any(kind in ("{", "(") for kind, opened in stack):
         bad.append("G%d" % n)  # a group still open at the end of the line
         stack = [g for g in stack if g[0] == "$("]
+    cont = raw.rstrip().endswith("\\") or (bool(words) and words[-1] in ("&&", "||", "|", "!", "|&"))
 for b in dict.fromkeys(bad):
     print(b)
 '
@@ -262,6 +275,10 @@ for b in dict.fromkeys(bad):
 HEADER_LINE='here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
 for h in ${hooks[@]+"${hooks[@]}"}; do
   while IFS= read -r n; do
+    if [[ "$n" == C* ]]; then
+      fail "$h.sh line ${n#C}: a command substitution may not be part of a condition (if/elif/while/until … then/do) or of a && || | list (bash ignores errors there)"
+      continue
+    fi
     if [[ "$n" == G* ]]; then
       fail "$h.sh line ${n#G}: a hook may not define functions or open { } or ( ) groups that span lines (bash stops checking for errors inside them when they are used as a condition)"
       continue

@@ -621,4 +621,24 @@ test_fails_on_group_hidden_behind_a_comment() {
   done
 }
 
+test_fails_on_substitution_inside_a_condition() {
+  local body
+  for body in $'if\nx="$(printf %s "$HR_CMD")"\nthen\n  :\nfi' $'while\nx="$(printf %s "$HR_CMD")"\ndo\n  break\ndone' \
+    $'true &&\nx="$(printf %s "$HR_CMD")"' $'false ||\nx="$(printf %s "$HR_CMD")"' \
+    $'printf x | \\\nx="$(printf %s "$HR_CMD")"'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    printf '%s\n' "$body" >>"$H/.claude/hooks/sample-gate.sh"
+    expect_fail "part of a condition"
+  done
+}
+
+test_quoted_punctuation_is_not_a_group() {
+  mk_conf_harness
+  # Appended after hr_allow (never runs): only the source check reads these lines.
+  printf '%s\n' "printf '%s\\n' '('" "echo '{'" 'echo "}" ")"' >>"$H/.claude/hooks/sample-gate.sh"
+  conform
+  assert_not_contains "$OUT" "may not define functions or open"
+}
+
 run_tests
