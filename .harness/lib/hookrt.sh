@@ -116,7 +116,7 @@ _HR_DYNAMIC_WORDS=" push commit merge api repo workflow "
 # Words after which the next word is still a command name.
 _HR_KEYWORDS=" if then else elif do while until ! { coproc "
 _HR_WRAPPERS=" env command exec nohup nice sudo doas xargs builtin eval time timeout caffeinate stdbuf
-  arch xcrun script taskpolicy sandbox-exec su chroot launchctl "
+  arch xcrun script taskpolicy sandbox-exec su chroot launchctl find "
 # Git global options that don't change which repository or program git uses. Anything else
 # before the subcommand makes it "?".
 _HR_GIT_FLAGS=" --no-pager -p -P --paginate --no-optional-locks --literal-pathspecs --no-replace-objects "
@@ -384,6 +384,12 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     done
     return 1
   fi
+  # A guarded verb in the text makes any glob suspect, even one without letters (/tmp/bin/???),
+  # since some program the runtime doesn't know may run it.
+  local verbs=0
+  for w in "${words[@]}"; do
+    if [[ "$_HR_DYNAMIC_WORDS" == *" $w "* ]]; then verbs=1; fi
+  done
   local i n=${#HR_TOK[@]} t u base rc=1 cmdpos=1 wrapped=0 skip=0 op='^[;&|()<>]+$'
   for ((i = 0; i < n; i++)); do
     t="${HR_TOK[$i]}"
@@ -429,6 +435,9 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
       rc=0
       break
     elif _hr_glob_could_be_tool "$u"; then
+      rc=0
+      break
+    elif [[ $verbs == 1 && "$u" == *[*?[]* ]]; then
       rc=0
       break
     fi

@@ -695,4 +695,16 @@ test_tested_blocks_and_split_keywords_are_tracked() {
   done
 }
 
+test_redirection_or_time_cannot_hide_a_tested_block() {
+  local body
+  for body in $'if true; then\nx="$(printf %s "$HR_CMD")"\nfi >/dev/null || true' \
+    $'while true; do\nx="$(printf %s "$HR_CMD")"\nbreak\ndone 2>&1 </dev/null | cat' \
+    $'time -p case x in\n  x)\n    x="$(printf %s "$HR_CMD")"\n    ;;\nesac || true'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    printf '%s\n' "$body" >>"$H/.claude/hooks/sample-gate.sh"
+    expect_fail "part of a condition"
+  done
+}
+
 run_tests

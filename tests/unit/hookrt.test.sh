@@ -330,7 +330,9 @@ test_guarded_detection() {
     'diff <(/usr/bin/g[i]t push origin main) /dev/null' 'tee >(g?t push) </dev/null' \
     "bash -c \$'git\\x20push\\x20origin\\x20main'" "sh -c \$'\\147it push'" \
     'arch -arm64 /usr/bin/g[i]t push origin main' 'xcrun g?t push' 'frobnicate -x /usr/bin/g[i]t push' \
-    'frobnicate /usr/bin/{g,}it push' 'frobnicate /usr/bin/[g][i][t] push'; do
+    'frobnicate /usr/bin/{g,}it push' 'frobnicate /usr/bin/[g][i][t] push' \
+    'find . -maxdepth 0 -exec /tmp/bin/??? push origin main \;' 'frobnicate /tmp/bin/??? push origin main' \
+    'find . -exec /tmp/bin/??? {} \;'; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done
@@ -343,7 +345,7 @@ test_plain_detection() {
     'gh pr view 3 | head' 'gh issue list' 'echo hi > f.txt' 'git -C /x diff | wc -l' \
     'cat README.md' 'git merge dev' 'for f in *.sh; do echo "$f"; done' '' \
     'ls *.sh | wc -l' 'rm -rf build/* && ls' 'for f in a b; do bash "$f"; done' 'ls * | head' \
-    'ls work/*/manual | head'; do
+    'ls work/*/manual | head' 'find work -type f | head'; do
     probe guarded "$c"
     assert_eq "$OUT" PLAIN "plain: $c"
   done

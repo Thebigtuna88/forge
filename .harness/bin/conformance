@@ -306,8 +306,8 @@ for n, raw in logical:
         bad.append("G%d" % n)
     prev = ""
     start = True  # a command (and so a reserved word) may start here
+    timing = False  # after `time`: its options (-p) still come before the command
     for k, w in enumerate(words):
-        nxt = words[k + 1] if k + 1 < len(words) else ""
         tested = cont if k == 0 else prev in LIST_OPS
         if start and w in ("if", "while", "until"):
             blocks.append({"kind": "cond", "tested": tested, "subs": []})
@@ -332,7 +332,13 @@ for n, raw in logical:
             want = "case" if w == "esac" else "body"
             if blocks and blocks[-1]["kind"] == want:
                 b = blocks.pop()
-                if b["tested"] or nxt in LIST_OPS:
+                # Tested if a && || | ! follows before the command ends (past any redirections).
+                rest = []
+                for r in words[k + 1:]:
+                    if r in (";", "&", ";;", ";&", ";;&"):
+                        break
+                    rest.append(r)
+                if b["tested"] or any(r in LIST_OPS for r in rest):
                     bad.extend("C%d" % s for s in b["subs"])
                 elif blocks:
                     blocks[-1]["subs"].extend(b["subs"])
@@ -354,6 +360,9 @@ for n, raw in logical:
                     if stack.pop()[1] != n:
                         bad.append("G%d" % n)
         prev = w
+        if timing and w.startswith("-"):
+            continue  # still before the command
+        timing = start and w == "time"
         # The next word starts a command after an operator, a reserved word or an assignment.
         start = (set(w) <= set("();<>|&!{}")
                  or w in ("if", "elif", "while", "until", "then", "do", "else", "time")
