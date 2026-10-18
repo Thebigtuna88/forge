@@ -1005,7 +1005,7 @@ test_fails_on_unknown_matcher_group_keys() {
   mk_conf_harness
   jq '.hooks.PreToolUse[0].extra = true' "$H/.claude/settings.json" >"$T_TMP/s.json"
   mv "$T_TMP/s.json" "$H/.claude/settings.json"
-  expect_fail "registration has keys FORGE doesn't allow (group extra)"
+  expect_fail "registration has keys FORGE doesn't allow (group \"extra\")"
 }
 
 test_inherited_ci_variables_do_not_skip_version_tests() {
@@ -1026,17 +1026,70 @@ test_fails_when_claude_version_hangs() {
 }
 
 test_version_check_cannot_write_files() {
-  # SEC-3: the claude whose version is read runs in a sandbox that can't write files.
+  # SEC-3: the claude whose version is read runs in a sandbox that can't write files. It reports
+  # an old version, so the result also proves it ran and was read (round 2, C4).
   mk_conf_harness
   mkdir -p "$T_TMP/bin"
-  printf '#!/bin/bash\necho changed >>%q\necho made >%q\nprintf "2.1.302 (Claude Code)\\n"\n' \
+  printf '#!/bin/bash\necho changed >>%q\necho made >%q\nprintf "2.1.294 (Claude Code)\\n"\n' \
     "$H/.harness/lib/hookrt.sh" "$T_TMP/made-by-claude" >"$T_TMP/bin/claude"
   chmod 755 "$T_TMP/bin/claude"
   local before
   before="$(shasum -a 256 "$H/.harness/lib/hookrt.sh")"
-  conform
+  expect_fail "Claude Code 2.1.294 is older than 2.1.295"
   assert_eq "$(shasum -a 256 "$H/.harness/lib/hookrt.sh")" "$before" "the version check changed hookrt.sh"
   [[ ! -e "$T_TMP/made-by-claude" ]] || _t_fail "the version check could write a file"
+}
+
+# --- FRG-20 review round 2 ---------------------------------------------------------------------
+
+test_fails_on_an_empty_key_in_a_registration() {
+  # C2: a key named "" is still a key FORGE doesn't allow.
+  mk_conf_harness
+  set_hook_field '.[""] = true'
+  expect_fail "registration has keys FORGE doesn't allow"
+}
+
+test_fails_on_a_matcher_or_hooks_that_is_not_the_right_type() {
+  # C3, SEC-1: false must not be read as a missing (match-all) matcher, or as no hooks at all.
+  local change
+  for change in '.hooks.PreToolUse[0].matcher = false' '.hooks.PreToolUse[0].matcher = null' \
+    '.hooks.PreToolUse[0].matcher = 0' '.hooks = false' '.hooks = null'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    jq "$change" "$H/.claude/settings.json" >"$T_TMP/s.json"
+    mv "$T_TMP/s.json" "$H/.claude/settings.json"
+    expect_fail ".claude/settings.json is missing or malformed"
+  done
+}
+
+test_version_timeout_ends_the_probes_children() {
+  # C1: a claude that hangs in a child process; after the time limit nothing it started survives.
+  mk_conf_harness
+  mkdir -p "$T_TMP/bin"
+  printf '#!/bin/bash\n/bin/sleep 6017 &\nwait\n' >"$T_TMP/bin/claude"
+  chmod 755 "$T_TMP/bin/claude"
+  expect_fail "did not answer"
+  sleep 1
+  if pgrep -f "sleep 6017" >/dev/null; then
+    pkill -f "sleep 6017"
+    _t_fail "the probe's child process was left running"
+  fi
+}
+
+test_version_probe_leaves_no_children_behind() {
+  # C1: a claude that answers at once but leaves a child running.
+  mk_conf_harness
+  mkdir -p "$T_TMP/bin"
+  printf '#!/bin/bash\n/bin/sleep 6018 >/dev/null 2>&1 &\nprintf "2.1.302 (Claude Code)\\n"\n' \
+    >"$T_TMP/bin/claude"
+  chmod 755 "$T_TMP/bin/claude"
+  conform
+  assert_exit 0 "$RC" "$OUT"
+  sleep 1
+  if pgrep -f "sleep 6018" >/dev/null; then
+    pkill -f "sleep 6018"
+    _t_fail "the probe's child process was left running"
+  fi
 }
 
 test_fails_when_any_installed_claude_is_too_old() {

@@ -153,16 +153,22 @@ registered=() regs=()
 no_onfailure_events=(Stop SubagentStop TaskCompleted TeammateIdle)
 # shellcheck disable=SC2016 # the literal text "$CLAUDE_PROJECT_DIR" that settings.json must contain
 reg_re='^"\$CLAUDE_PROJECT_DIR"/\.claude/hooks/([A-Za-z0-9._-]+)\.sh$'
+# A value is checked as it is, never through a default (`// ""` would turn false into a missing,
+# match-all matcher), and extra keys are counted, so a key named "" still counts.
 if reg="$(jq -r '
-    (.hooks // {}) | if type == "object" then . else error("hooks is not an object") end
+    if type == "object" then . else error("settings is not an object") end
+    | (if has("hooks") then .hooks else {} end)
+    | if type == "object" then . else error("hooks is not an object") end
     | to_entries[] | .key as $event
     | .value | if type == "array" then .[] else error("event is not a list") end
     | if type == "object" then . else error("matcher group is not an object") end
-    | (keys - ["matcher", "hooks"] | map("group " + .)) as $gx
-    | (.matcher // "") as $m | if ($m | type) == "string" then . else error("matcher is not a string") end
+    | (keys - ["matcher", "hooks"] | map("group " + tojson)) as $gx
+    | (if has("matcher") then .matcher else "" end) as $m
+    | if ($m | type) == "string" then . else error("matcher is not a string") end
     | .hooks | if type == "array" then .[] else error("matcher has no hooks list") end
     | if type == "object" and .type == "command" and (.command | type) == "string"
-      then [$event, $m, ($gx + (keys - ["type", "command", "onFailure", "timeout"]) | join(",")),
+      then ($gx + (keys - ["type", "command", "onFailure", "timeout"] | map(tojson))) as $x
+        | [$event, $m, (($x | length | tostring) + " " + ($x | join(","))),
           (.onFailure | tojson),
           (.timeout | if type == "number" and . == floor and . >= 1 and . <= 120 then "ok"
             else tojson end), .command]
@@ -174,10 +180,10 @@ if reg="$(jq -r '
     if [[ "$cmd" =~ $reg_re ]]; then
       h="${BASH_REMATCH[1]}"
       registered+=("$h")
-      if [[ -z "$extra" ]]; then
+      if [[ "$extra" == "0 " ]]; then
         regs+=("$h"$'\x1f'"$event"$'\x1f'"$matcher")
       else
-        fail "$h.sh ($event) registration has keys FORGE doesn't allow ($extra): only type, command, onFailure and timeout, in a group of matcher and hooks (async, asyncRewake or if can keep a gate from running or from blocking)"
+        fail "$h.sh ($event) registration has keys FORGE doesn't allow (${extra#* }): only type, command, onFailure and timeout, in a group of matcher and hooks (async, asyncRewake or if can keep a gate from running or from blocking)"
       fi
       # Without onFailure, a hook that can't start, times out or is killed lets the call through.
       if ! in_list "$event" "${no_onfailure_events[@]}"; then
@@ -228,26 +234,34 @@ VERSION_PROFILE='(version 1) (allow default) (deny file-write*)
   (allow file-write* (literal "/dev/null") (literal "/dev/tty"))
   (deny signal)'
 check_claude() { # <path>: fail unless it reports a version of 2.1.295 or later
-  local c="$1" out="$TMP/claude-version" pid i first ver older=0
+  local c="$1" out="$TMP/claude-version" err="$TMP/claude-version.err" pid i first ver older=0 rc
   if [[ ! -f "$c" || ! -x "$c" ]]; then
     fail "Claude Code is not installed at $c (not an executable file), so its version can't be checked; 2.1.295 or later is needed for \"onFailure\": \"block\""
     return
   fi
-  sandbox-exec -p "$VERSION_PROFILE" "$c" --version >"$out" 2>&1 </dev/null &
+  # Job control puts the probe in a process group of its own (its id is the probe's pid), so
+  # whatever it starts is ended with it, whether it answered or not. The version is read from
+  # standard output only; standard error is kept for the message.
+  set -m
+  sandbox-exec -p "$VERSION_PROFILE" "$c" --version >"$out" 2>"$err" </dev/null &
   pid=$!
+  set +m
   for ((i = 0; i < claude_timeout * 10; i++)); do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
   done
   if kill -0 "$pid" 2>/dev/null; then
-    kill -9 "$pid" 2>/dev/null
+    kill -9 -- "-$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
     fail "$c did not answer 'claude --version' within $claude_timeout seconds, so its version can't be checked; 2.1.295 or later is needed for \"onFailure\": \"block\""
     return
   fi
+  wait "$pid"
+  rc=$?
+  kill -9 -- "-$pid" 2>/dev/null
   first="$(head -n 1 "$out")"
-  if ! wait "$pid" || ! [[ "$first" =~ ^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(\ |$) ]]; then
-    fail "can't read Claude Code's version from '$c --version' (got: $(head -c 80 "$out" | tr '\n' ' ')); 2.1.295 or later is needed for \"onFailure\": \"block\""
+  if [[ $rc != 0 ]] || ! [[ "$first" =~ ^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(\ |$) ]]; then
+    fail "can't read Claude Code's version from '$c --version' (status $rc, got: $(cat "$out" "$err" | head -c 80 | tr '\n' ' ')); 2.1.295 or later is needed for \"onFailure\": \"block\""
     return
   fi
   ver=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")
