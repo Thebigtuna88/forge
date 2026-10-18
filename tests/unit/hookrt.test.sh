@@ -598,6 +598,28 @@ test_inherited_git_exec_path_is_ignored() {
   assert_exit 2 "$RC" "git-launch is not one of git's own commands"
 }
 
+test_inherited_git_variables_deny_guarded_git_commands() {
+  mk_hook_harness
+  local v
+  for v in GIT_INDEX_FILE="$T_TMP/other-index" GIT_AUTHOR_NAME=x GIT_DIR="$T_TMP/x" \
+    GIT_CONFIG_COUNT=1 GIT_EDITOR=vim; do
+    run_hook sample-gate "$(bash_input 'git commit -F /tmp/msg' "$H")" "$v"
+    assert_exit 2 "$RC" "guarded git command with $v"
+    assert_contains "$ERR" "the environment sets ${v%%=*}" "reason with $v"
+  done
+  run_hook sample-gate "$(bash_input 'git commit -F /tmp/msg' "$H")" GIT_EDITOR=true
+  assert_exit 0 "$RC" "Claude Code's own GIT_EDITOR=true"
+  run_hook sample-gate "$(bash_input 'git status' "$H")" GIT_INDEX_FILE="$T_TMP/other-index"
+  assert_exit 0 "$RC" "a command that isn't guarded"
+}
+
+test_alias_expanded_git_paths_deny() {
+  mk_hook_harness
+  git -C "$H" config alias.rollback 'log -1 --format=%H --output=/r/.git/refs/heads/dev HEAD~1'
+  expect_deny 'git rollback'
+  assert_contains "$ERR" "git's own files"
+}
+
 test_checksum_of_missing_file_denies() {
   mk_hook_harness
   run_hook probe "$(jq -n --arg f "$T_TMP/nope" '{tool_name: "Read", tool_input: {file_path: $f}}')" PROBE=sums

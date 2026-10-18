@@ -20,7 +20,10 @@
 #   is set. Merge and pull are refused while merge.autoStash or pull.autoStash is on (an automatic
 #   stash is a commit of the working files, made without the scan).
 # - The author and committer git writes into a commit or merge commit (user.name, user.email) are
-#   scanned too.
+#   scanned too. Commit and merge are refused while i18n.commitEncoding names anything but UTF-8
+#   (git copies it into the commit) or commit.gpgSign is on (a signing program's output goes in).
+# - Guarded git commands are refused while the environment sets GIT_* variables (hookrt.sh), so
+#   the index and identity scanned here are the ones git uses.
 # - git commit-tree, am, cherry-pick, revert and fast-import skip the scan, so they're refused.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset HOOKRT_LOADED
@@ -134,6 +137,19 @@ fi
 type -P gitleaks >/dev/null || hr_deny "gitleaks is not installed, so the commit can't be scanned for secrets"
 rules="$HR_ROOT/.harness/gitleaks.toml"
 mkdir "$HR_TMP/no-ignore" "$HR_TMP/identity"
+
+# Other configuration git copies into the commit object.
+git -C "$HR_GIT_DIR" config --get i18n.commitEncoding >"$HR_TMP/encoding" 2>/dev/null || true
+encoding="$(cat "$HR_TMP/encoding")"
+low="$(_hr_lower "$encoding")"
+case "$low" in
+  "" | utf-8 | utf8) ;;
+  *) hr_deny "i18n.commitEncoding is set ($encoding): git copies it into the commit unscanned; remove it first" ;;
+esac
+git -C "$HR_GIT_DIR" config --type=bool --get commit.gpgSign >"$HR_TMP/gpgsign" 2>/dev/null || true
+gpgsign="$(cat "$HR_TMP/gpgsign")"
+[[ "$gpgsign" != true ]] ||
+  hr_deny "commit.gpgSign is on: the signing program's output goes into the commit unscanned; remove it first"
 
 # The author and committer git writes into the commit (user.name / user.email, or what git works
 # out without them).

@@ -13,6 +13,8 @@
 #   git remote with any option before the subcommand but -v/--verbose, git remote update and
 #   prune (use git fetch / git fetch --prune), and git remote add with any option but
 #   -t/-m/--tags/--no-tags (it could fetch past the mapping check; use git fetch);
+#   git fetch or pull in a repository with submodules (git fetches into them too, with their own
+#   mappings);
 #   git submodule other than status/summary/init/sync/absorbgitdirs/deinit, and submodule update
 #   without --checkout (before any --) or with other options (unchecked commits or rebases in
 #   submodules);
@@ -191,6 +193,13 @@ if [[ "$HR_GIT_SUB" == fetch || "$HR_GIT_SUB" == pull ]]; then
   find "$common/remotes" "$common/branches" -mindepth 1 -print -quit >"$HR_TMP/legacy" 2>/dev/null || true
   [[ ! -s "$HR_TMP/legacy" ]] ||
     hr_deny "old-style remote definitions ($common/remotes or $common/branches) can map fetches into local branches; remove them first"
+  # git also fetches populated submodules (on demand, or always with fetch.recurseSubmodules),
+  # each with its own mappings, which this gate doesn't check: no fetch where submodules exist.
+  find "$common/modules" -mindepth 1 -print -quit >"$HR_TMP/modules" 2>/dev/null || true
+  git -C "$HR_GIT_DIR" ls-files --stage -- ':(top)' >"$HR_TMP/index"
+  if [[ -s "$HR_TMP/modules" ]] || grep -q '^160000 ' "$HR_TMP/index"; then
+    hr_deny "this repository has submodules, and git $HR_GIT_SUB would fetch into them with mappings FORGE doesn't check; FORGE repositories don't use submodules"
+  fi
 fi
 
 moves="git reset moves the branch; to unstage, use git reset -- <path> (or git reset HEAD <path>)"

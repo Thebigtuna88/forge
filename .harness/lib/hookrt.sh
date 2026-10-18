@@ -76,9 +76,24 @@ export LC_ALL=C
 # System tools first: jq, python3, git, shasum and md5 come from root-owned /usr/bin and /sbin.
 PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
 export PATH
+# The command Claude Code runs inherits the same environment. GIT_* variables would make it use
+# another repository, index, identity or settings than the ones the gates inspect, so their names
+# are kept in _HR_GIT_ENV and hr_require_simple refuses guarded git commands while any is set.
+# Claude Code's own GIT_EDITOR=true (an editor that changes nothing) is the only exception.
+# EMAIL and XDG_CONFIG_HOME stay, so git reads the same identity and global settings here.
+unset _HR_GIT_ENV
+_HR_GIT_ENV=""
 for _hr_v in $(compgen -e); do
   case "$_hr_v" in
-    HOME | USER | LOGNAME | TMPDIR | CLAUDE_PROJECT_DIR | PATH | LC_ALL) ;;
+    HOME | USER | LOGNAME | TMPDIR | CLAUDE_PROJECT_DIR | PATH | LC_ALL | EMAIL | XDG_CONFIG_HOME) ;;
+    GIT_EDITOR)
+      if [[ "${GIT_EDITOR:-}" != true ]]; then _HR_GIT_ENV+=" $_hr_v"; fi
+      unset "$_hr_v" 2>/dev/null || true
+      ;;
+    GIT_*)
+      _HR_GIT_ENV+=" $_hr_v"
+      unset "$_hr_v" 2>/dev/null || true
+      ;;
     *) unset "$_hr_v" 2>/dev/null || true ;;
   esac
 done
@@ -582,6 +597,8 @@ hr_require_simple() { # deny unless a guarded command is one plain command; fill
   first="${HR_TOK[0]:-}"
   case "$first" in
     git)
+      [[ -z "$_HR_GIT_ENV" ]] ||
+        hr_deny "the environment sets${_HR_GIT_ENV}, so git would use another repository, index, identity or settings than the ones FORGE checks; start Claude Code without it"
       hr_git_sub
       if [[ "$HR_GIT_SUB" == "?" ]]; then
         hr_deny "can't tell what this git command runs (unknown global option, alias.*/include.* config, or a command that isn't git's own)"
@@ -596,6 +613,11 @@ hr_require_simple() { # deny unless a guarded command is one plain command; fill
       local -a whole=("${HR_TOK[@]}") check=("${HR_TOK[@]:1:$((_HR_SUBI - 1))}" ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"})
       local a
       for a in ${check[@]+"${check[@]}"}; do
+        case "$(_hr_lower "$a")" in
+          .git | .git/* | */.git | */.git/* | *=.git | *=.git/*)
+            hr_deny "commands may not touch git's own files ($a) directly; use git commands"
+            ;;
+        esac
         if _hr_git_runs_program "$HR_GIT_SUB" "$a"; then
           hr_deny "git $HR_GIT_SUB $a runs another program, which no FORGE gate can check; leave the option out"
         fi
