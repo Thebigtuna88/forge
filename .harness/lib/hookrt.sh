@@ -330,6 +330,39 @@ _hr_glob_could_be_tool() {
   return 1
 }
 
+# _hr_word_guarded <one shell word>: 0 if the word, read as a command, mentions a guarded action,
+# or if it is an option whose attached value does (--exec='git tag …', -O'git tag …'): git runs
+# some option values as programs, and stores others (git config) to run later.
+_hr_word_guarded() {
+  local w="$1" low v=""
+  if hr_guarded "$w"; then return 0; fi
+  case "$w" in
+    --*=*) v="${w#*=}" ;;
+    -[!-]*)
+      low="$(_hr_lower "$w")"
+      if [[ "$low" == *git* ]]; then
+        v="git${low#*git}"
+      elif [[ "$low" == *gh* ]]; then
+        v="gh${low#*gh}"
+      fi
+      ;;
+  esac
+  [[ -n "$v" ]] && hr_guarded "$v"
+}
+
+# _hr_git_runs_program <git subcommand> <argument>: 0 if the argument is an option that makes this
+# otherwise read-only git command run another program (any abbreviation git accepts):
+# git archive --exec/--remote, git ls-remote --upload-pack/-u, git grep -O/--open-files-in-pager.
+_hr_git_runs_program() {
+  case "$1:$2" in
+    archive:--e* | archive:--r* | ls-remote:--u* | ls-remote:-u* | ls-remote:-[!-]*u* | \
+      grep:-O* | grep:-[!-]*O* | grep:--op*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 # _hr_git_globals <index of "git" in HR_TOK>: sets _HR_SUBI to the index of git's subcommand
 # after global options, or -1 if there is none. _HR_UNKNOWABLE=1 when an option makes it
 # unknowable (unknown option, -c other than color.*/core.quotepath/advice.*, missing argument). --version and --help just
@@ -483,7 +516,7 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     fi
     if [[ "$u" == *[[:space:]]* ]]; then
       local -a inner=("${HR_TOK[@]}")
-      if hr_guarded "$u"; then rc=0; fi
+      if _hr_word_guarded "$u"; then rc=0; fi
       HR_TOK=("${inner[@]}")
       if [[ $rc == 0 ]]; then break; fi
     elif [[ "$base" == git ]]; then
@@ -494,6 +527,15 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
       elif [[ $_HR_SUBI -ge 0 && "$_HR_GIT_SAFE_SUBS" != *" ${HR_TOK[$_HR_SUBI]} "* ]]; then
         rc=0 # an alias, an unknown command, or a git command that may write: guarded
         break
+      elif [[ $_HR_SUBI -ge 0 ]]; then
+        # A safe command with an option that runs another program (git archive --remote=stash
+        # --exec=git runs git stash) is guarded too.
+        local j sub="${HR_TOK[$_HR_SUBI]}"
+        for ((j = _HR_SUBI + 1; j < n; j++)); do
+          if [[ "${HR_TOK[$j]}" =~ $op ]]; then break; fi
+          if _hr_git_runs_program "$sub" "${HR_TOK[$j]}"; then rc=0; fi
+        done
+        if [[ $rc == 0 ]]; then break; fi
       fi
     elif [[ "$base" == gh && $((i + 1)) -lt $n && "$_HR_GH_CMDS" != *" ${HR_TOK[$((i + 1))]} "* ]]; then
       rc=0
@@ -532,6 +574,21 @@ hr_require_simple() { # deny unless a guarded command is one plain command; fill
       if [[ "$HR_GIT_VIA_ALIAS" == 1 && "$_HR_GIT_GUARDED_SUBS" == *" $HR_GIT_SUB "* ]]; then
         hr_deny "git alias for a guarded command ($HR_GIT_SUB); use the command itself"
       fi
+      # The guarded action must be the command itself, never inside one of its arguments, and the
+      # command may not run another program: the gates judge only the outer git command.
+      local -a whole=("${HR_TOK[@]}")
+      local i subi=$_HR_SUBI
+      for ((i = 1; i < ${#whole[@]}; i++)); do
+        if [[ $i == "$subi" ]]; then continue; fi
+        if _hr_git_runs_program "$HR_GIT_SUB" "${whole[$i]}"; then
+          hr_deny "git $HR_GIT_SUB ${whole[$i]} runs another program, which no FORGE gate can check; leave the option out"
+        fi
+        if _hr_word_guarded "${whole[$i]}"; then
+          hr_deny "an argument of git $HR_GIT_SUB names a guarded action ('${whole[$i]}'); a guarded action runs only as its own git command"
+        fi
+        HR_TOK=("${whole[@]}")
+      done
+      HR_TOK=("${whole[@]}")
       return 0
       ;;
     gh)

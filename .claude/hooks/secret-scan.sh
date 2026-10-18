@@ -10,7 +10,9 @@
 #   (.harness/gitleaks.toml), never the repository's .gitleaks.toml, .gitleaksignore or
 #   gitleaks:allow comments; a missing gitleaks blocks.
 # - git merge only as `git merge [--no-edit] [--no-ff | --ff-only] [--squash] [-q] <branch>` or
-#   `git merge --abort`: it brings in commits that were scanned. A merge stopped by a conflict is
+#   `git merge --abort`: it brings in commits that were scanned. <branch> is dev, main or a ticket
+#   branch (or origin/ and one of those) and must be a branch, not a tag: git writes the name, and
+#   an annotated tag's message, into the merge commit's message. A merge stopped by a conflict is
 #   concluded with git commit -F (scanned), not git merge --continue. Refused while a
 #   branch.*.mergeOptions setting could add options (such as -F) behind the command's back, or
 #   merge.branchdesc / a branch.*.description could put unscanned text into the merge message.
@@ -49,17 +51,41 @@ if [[ "$HR_GIT_SUB" == merge || "$HR_GIT_SUB" == pull ]]; then
 fi
 
 if [[ "$HR_GIT_SUB" == merge ]]; then
+  target=""
   for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
     case "$a" in
       --continue)
         hr_deny "conclude a merge with git commit -F <message file> (scanned), not git merge --continue"
         ;;
-      --abort | --no-edit | --no-ff | --ff-only | --squash | -q | --quiet) ;;
+      --abort)
+        [[ ${#HR_GIT_ARGS[@]} == 1 ]] || hr_deny "abort a merge with git merge --abort alone"
+        hr_allow
+        ;;
+      --no-edit | --no-ff | --ff-only | --squash | -q | --quiet) ;;
       -*)
         hr_deny "merge only as: git merge [--no-edit] [--no-ff | --ff-only] [--squash] <branch>, or git merge --abort (not $a)"
         ;;
+      *)
+        [[ -z "$target" ]] || hr_deny "merge one branch at a time"
+        target="$a"
+        ;;
     esac
   done
+  # The branch name goes into the merge message, so it must be one whose text is known.
+  [[ -n "$target" ]] || hr_deny "name the branch to merge: git merge dev"
+  named='^(origin/)?(dev|main|feature/FRG-[0-9]+-[a-z0-9]+(-[a-z0-9]+)*)$'
+  [[ "$target" =~ $named ]] ||
+    hr_deny "merge only dev, main or a ticket branch (or origin/ and one of those), not '$target'"
+  # Every ref git could take the name for, in git's own order; it must be a branch and nothing else.
+  found=""
+  for ref in "refs/$target" "refs/tags/$target" "refs/heads/$target" "refs/remotes/$target" "refs/remotes/$target/HEAD"; do
+    if git -C "$HR_GIT_DIR" show-ref --verify --quiet "$ref"; then
+      [[ -z "$found" ]] || hr_deny "'$target' names more than one ref ($found and $ref); merge a name that is only a branch"
+      found="$ref"
+    fi
+  done
+  [[ "$found" == "refs/heads/$target" || "$found" == "refs/remotes/$target" ]] ||
+    hr_deny "'$target' is not a branch (it is ${found:-no ref at all}); a tag's name and message would go into the merge message unscanned"
   hr_allow
 fi
 

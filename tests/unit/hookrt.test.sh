@@ -432,6 +432,36 @@ test_git_internal_files_and_dashed_programs_deny() {
   expect_deny '/Library/Developer/CommandLineTools/usr/libexec/git-core/git-notes add -m x'
 }
 
+test_git_options_that_run_programs_deny() {
+  mk_hook_harness
+  local c
+  for c in "git archive --remote=dev --exec='git push origin' HEAD" 'git archive --remote=stash --exec=git HEAD' \
+    'git archive --rem=stash --ex=git HEAD' "git ls-remote --upload-pack='git commit' origin" \
+    "git ls-remote -qu 'git commit' origin" "git grep '-Ogit tag -m x v1' -e y" \
+    "git grep --open-files-in-pager='git commit' -e y" "git ls-remote -u 'git commit' origin" \
+    "git grep -iO'git commit' -e y"; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+    expect_deny "$c"
+    assert_contains "$ERR" "runs another program" "reason for: $c"
+  done
+}
+
+test_guarded_action_inside_an_argument_denies() {
+  mk_hook_harness
+  local c
+  for c in "git config core.pager 'git push origin dev:main'" "git config core.pager 'git tag -m x v1'" \
+    "git config core.pager 'GIT stash'" "git commit -F m --cleanup='git branch -D dev'"; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+    expect_deny "$c"
+    assert_contains "$ERR" "names a guarded action" "reason for: $c"
+  done
+  expect_allow 'git log --grep commit'
+  expect_allow 'git push -u origin feature/FRG-3-git-gates'
+  expect_allow 'git -C /x/forge-worktrees/FRG-3-git-gates merge --no-edit dev'
+}
+
 test_gh_alias_or_extension_denies() {
   mk_hook_harness
   expect_deny 'gh co 3 && gh pr merge 3'
