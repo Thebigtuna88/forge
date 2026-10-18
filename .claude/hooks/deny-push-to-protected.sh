@@ -2,7 +2,10 @@
 # deny-push-to-protected (spec 5.3, FRG-3). A push is allowed only as
 #   git push [-u | --set-upstream] origin feature/<KEY>-<n>-<slug>
 # so nothing reaches main or dev (they change only through pull requests), nothing is forced or
-# deleted, and nothing goes to another remote. git send-pack and git http-push are refused.
+# deleted, and nothing goes to another remote. git send-pack and git http-push are refused. Git
+# configuration can redirect even that form (remote.origin.push maps a branch to another
+# destination, remote.origin.mirror pushes everything, old-style .git/remotes or .git/branches
+# files can map pushes), so the push is refused while any of those is set.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset HOOKRT_LOADED
 # shellcheck source=.harness/lib/hookrt.sh
@@ -46,4 +49,16 @@ done
 ticket='^feature/FRG-[0-9]+-[a-z0-9]+(-[a-z0-9]+)*$'
 [[ "$branch" =~ $ticket ]] ||
   hr_deny "push only a ticket branch (feature/<KEY>-<n>-<slug>), not '$branch'; main and dev change only through pull requests"
+
+[[ -n "$HR_GIT_DIR" && -d "$HR_GIT_DIR" ]] ||
+  hr_deny "can't tell which repository this push runs in, so can't check where git would send it"
+git -C "$HR_GIT_DIR" config --get-regexp '^remote\.origin\.(push|mirror)$' >"$HR_TMP/pushcfg" 2>/dev/null || true
+while read -r key value; do
+  hr_deny "$key is set ($value), so git could push somewhere other than the named branch; remove it first"
+done <"$HR_TMP/pushcfg"
+git -C "$HR_GIT_DIR" rev-parse --path-format=absolute --git-common-dir >"$HR_TMP/common"
+common="$(cat "$HR_TMP/common")"
+find "$common/remotes" "$common/branches" -mindepth 1 -print -quit >"$HR_TMP/legacy" 2>/dev/null || true
+[[ ! -s "$HR_TMP/legacy" ]] ||
+  hr_deny "old-style remote definitions ($common/remotes or $common/branches) can redirect pushes; remove them first"
 hr_allow

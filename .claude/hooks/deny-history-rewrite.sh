@@ -58,11 +58,18 @@ case "$HR_GIT_SUB" in
     ;;
   commit | branch | checkout | switch | worktree | reset | fetch | pull) ;;
   remote)
-    case "${HR_GIT_ARGS[0]:-}" in
+    # git remote [-v | --verbose] <subcommand> …
+    first=0
+    while [[ $first -lt ${#HR_GIT_ARGS[@]} && ("${HR_GIT_ARGS[$first]}" == -v || "${HR_GIT_ARGS[$first]}" == --verbose) ]]; do
+      ((first += 1))
+    done
+    case "${HR_GIT_ARGS[$first]:-}" in
       update) hr_deny "git remote update fetches past FORGE's fetch checks; use git fetch" ;;
       add)
         skip=0
-        for a in "${HR_GIT_ARGS[@]:1}"; do
+        start=$first
+        ((start += 1))
+        for a in "${HR_GIT_ARGS[@]:start}"; do
           if [[ $skip == 1 ]]; then
             skip=0
             continue
@@ -152,17 +159,27 @@ case "$HR_GIT_SUB" in
 esac
 
 if [[ "$HR_GIT_SUB" == fetch || "$HR_GIT_SUB" == pull ]]; then
-  # A configured mapping (git config remote.<name>.fetch) applies to every fetch: each one must
-  # write only under refs/remotes/ (or be a negative ^refspec).
+  # A configured mapping (git config remote.<name>.fetch) applies to every fetch: each must have
+  # the standard shape, refs/heads/<x>:refs/remotes/<name>/<x> (or a negative ^refspec), so it
+  # never writes a local branch. Old-style .git/remotes and .git/branches files map fetches too.
   [[ -n "$HR_GIT_DIR" && -d "$HR_GIT_DIR" ]] ||
     hr_deny "can't tell which repository this runs in, so can't check its fetch mappings"
   git -C "$HR_GIT_DIR" config --get-regexp '^remote\..*\.fetch$' >"$HR_TMP/mappings" 2>/dev/null || true
-  while read -r _ mapping; do
-    case "$mapping" in
-      ^* | *:refs/remotes/*) ;;
-      *) hr_deny "a configured fetch mapping ($mapping) maps fetched branches into local branches; fix remote.*.fetch first" ;;
-    esac
+  while read -r key mapping; do
+    name="${key#remote.}"
+    name="${name%.fetch}"
+    src="${mapping#+}"
+    src="${src%%:*}"
+    dst="${mapping#*:}"
+    if [[ "$mapping" != ^* && ("$src" != refs/heads/* || "$dst" != "refs/remotes/$name/${src#refs/heads/}") ]]; then
+      hr_deny "a configured fetch mapping ($mapping) maps fetched branches into local branches or outside refs/remotes/$name/; fix remote.$name.fetch first"
+    fi
   done <"$HR_TMP/mappings"
+  git -C "$HR_GIT_DIR" rev-parse --path-format=absolute --git-common-dir >"$HR_TMP/common"
+  common="$(cat "$HR_TMP/common")"
+  find "$common/remotes" "$common/branches" -mindepth 1 -print -quit >"$HR_TMP/legacy" 2>/dev/null || true
+  [[ ! -s "$HR_TMP/legacy" ]] ||
+    hr_deny "old-style remote definitions ($common/remotes or $common/branches) can map fetches into local branches; remove them first"
 fi
 
 moves="git reset moves the branch; to unstage, use git reset -- <path> (or git reset HEAD <path>)"

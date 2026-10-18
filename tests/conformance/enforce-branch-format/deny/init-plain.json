@@ -4,5 +4,6 @@
   "tool_input": {
     "command": "git init @TMP@/x"
   },
-  "cwd": "@ROOT@"
+  "cwd": "@ROOT@",
+  "forge_reason": "name the initial branch"
 }

@@ -33,6 +33,7 @@ listing=0   # git branch lists or deletes: its names are not new branches
 track=0     # --track / -t without an explicit name: the name comes from the remote branch
 detach=0    # --detach: no branch at all
 paths=0     # after --: no more options (and for checkout, paths rather than branches)
+guess=""    # a name git may turn into a new branch from a remote branch
 names=()    # plain words after the subcommand (and after "add" for worktree)
 first=1
 for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
@@ -123,16 +124,11 @@ case "$HR_GIT_SUB" in
     fi
     ;;
   checkout | switch)
+    # --track without a name, or a name git would create from a remote branch: the name git
+    # infers depends on the remote's configured mapping, so the gate wants it spelled out.
     if [[ -z "$new" && $detach == 0 && $count -gt 0 ]]; then
-      if [[ $track == 1 ]]; then
-        new="${names[0]#*/}"
-      elif [[ -z "$HR_GIT_DIR" || ! -d "$HR_GIT_DIR" ]]; then
-        hr_deny "can't tell which repository this runs in, so can't tell whether git would create a branch"
-      elif ! git -C "$HR_GIT_DIR" rev-parse --verify --quiet "refs/heads/${names[0]}" >/dev/null; then
-        # Not a local branch: git creates one when the name matches a remote branch.
-        git -C "$HR_GIT_DIR" for-each-ref --format='%(refname)' "refs/remotes/*/${names[0]}" >"$HR_TMP/remote"
-        if [[ -s "$HR_TMP/remote" ]]; then new="${names[0]}"; fi
-      fi
+      [[ $track == 0 ]] || hr_deny "create the branch explicitly with -b / -c feature/<KEY>-<n>-<slug>: git would infer its name from a remote branch"
+      guess="${names[0]}"
     fi
     ;;
   worktree)
@@ -140,22 +136,29 @@ case "$HR_GIT_SUB" in
       folder="${names[0]}"
       while [[ "$folder" == */ ]]; do folder="${folder%/}"; done
       new="${folder##*/}" # git worktree add <path>: a branch named after the folder (no trailing /)
-    elif [[ -z "$new" && $detach == 0 && $count -ge 2 && $track == 1 ]]; then
-      new="${names[1]#*/}"
     elif [[ -z "$new" && $detach == 0 && $count -ge 2 ]]; then
-      [[ -n "$HR_GIT_DIR" && -d "$HR_GIT_DIR" ]] ||
-        hr_deny "can't tell which repository this runs in, so can't tell whether git would create a branch"
-      if ! git -C "$HR_GIT_DIR" rev-parse --verify --quiet "refs/heads/${names[1]}" >/dev/null; then
-        git -C "$HR_GIT_DIR" for-each-ref --format='%(refname)' "refs/remotes/*/${names[1]}" >"$HR_TMP/remote"
-        if [[ -s "$HR_TMP/remote" ]]; then new="${names[1]}"; fi
-      fi
+      [[ $track == 0 ]] || hr_deny "create the branch explicitly with -b / -c feature/<KEY>-<n>-<slug>: git would infer its name from a remote branch"
+      guess="${names[1]}"
     fi
     ;;
 esac
+if [[ -n "$guess" ]]; then
+  # Not a local branch, but a remote-tracking branch of that name exists (at any depth): git
+  # would create a local branch from it, named by the remote's mapping.
+  [[ -n "$HR_GIT_DIR" && -d "$HR_GIT_DIR" ]] ||
+    hr_deny "can't tell which repository this runs in, so can't tell whether git would create a branch"
+  if ! git -C "$HR_GIT_DIR" rev-parse --verify --quiet "refs/heads/$guess" >/dev/null; then
+    git -C "$HR_GIT_DIR" for-each-ref --format='%(refname)' refs/remotes/ >"$HR_TMP/remotes"
+    while IFS= read -r ref; do
+      [[ "$ref" != */"$guess" ]] || hr_deny "create the branch explicitly with -b / -c feature/<KEY>-<n>-<slug>: git would infer its name from a remote branch"
+    done <"$HR_TMP/remotes"
+  fi
+fi
 if [[ "$HR_GIT_SUB" == init || "$HR_GIT_SUB" == clone ]]; then
-  # A new repository or clone starts on dev or main (or git's default for init / the remote's
-  # default branch for clone), never on a name of its own.
-  [[ -z "$new" || "$new" == dev || "$new" == main ]] ||
+  # A new repository or clone starts on dev or main, named explicitly.
+  [[ -n "$new" ]] ||
+    hr_deny "name the initial branch: git $HR_GIT_SUB -b dev (or -b main); otherwise git picks it from configuration or the remote"
+  [[ "$new" == dev || "$new" == main ]] ||
     hr_deny "git $HR_GIT_SUB may start only on dev or main as its initial branch, not '$new'"
   hr_allow
 fi

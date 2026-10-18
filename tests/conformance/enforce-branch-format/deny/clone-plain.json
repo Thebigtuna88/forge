@@ -4,5 +4,6 @@
   "tool_input": {
     "command": "git clone /x @TMP@/y"
   },
-  "cwd": "@ROOT@"
+  "cwd": "@ROOT@",
+  "forge_reason": "name the initial branch"
 }
