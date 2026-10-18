@@ -620,6 +620,19 @@ test_alias_expanded_git_paths_deny() {
   assert_contains "$ERR" "git's own files"
 }
 
+test_attached_option_git_paths_deny() {
+  mk_hook_harness
+  local c
+  for c in 'sort -o.git/refs/heads/dev /tmp/sha' 'tar -C.git -xf x.tar' 'cp -t.GIT/hooks x' \
+    'sort -uo.git/packed-refs x' 'git log -1 --format=%H -- -o.git/x'; do
+    expect_deny "$c"
+    assert_contains "$ERR" "git's own files"
+  done
+  for c in 'ls -d /tmp/remote.git' 'cat .gitignore' 'git -C /x log -1 -- .git-blame-ignore-revs'; do
+    expect_allow "$c"
+  done
+}
+
 test_checksum_of_missing_file_denies() {
   mk_hook_harness
   run_hook probe "$(jq -n --arg f "$T_TMP/nope" '{tool_name: "Read", tool_input: {file_path: $f}}')" PROBE=sums

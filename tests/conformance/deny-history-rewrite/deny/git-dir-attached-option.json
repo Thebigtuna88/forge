@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "sort -o.git/refs/heads/dev @TMP@/sha"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "git's own files"
+}

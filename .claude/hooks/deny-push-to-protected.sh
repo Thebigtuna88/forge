@@ -5,8 +5,9 @@
 # deleted, and nothing goes to another remote. git send-pack and git http-push are refused. Git
 # configuration can redirect even that form (remote.origin.push maps a branch to another
 # destination, remote.origin.mirror pushes everything, old-style .git/remotes or .git/branches
-# files can map pushes), so the push is refused while any of those is set. The name must be a
-# local branch and nothing else: git reads a bare name as a tag (or another ref) first.
+# files can map pushes), so the push is refused while any of those is set, and in a repository
+# with submodules (git can push inside them too). The name must be a local branch and nothing
+# else: git reads a bare name as a tag (or another ref) first.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset HOOKRT_LOADED
 # shellcheck source=.harness/lib/hookrt.sh
@@ -62,6 +63,13 @@ common="$(cat "$HR_TMP/common")"
 find "$common/remotes" "$common/branches" -mindepth 1 -print -quit >"$HR_TMP/legacy" 2>/dev/null || true
 [[ ! -s "$HR_TMP/legacy" ]] ||
   hr_deny "old-style remote definitions ($common/remotes or $common/branches) can redirect pushes; remove them first"
+# git can also push inside submodules first (push.recurseSubmodules, --recurse-submodules=on-demand),
+# to destinations this gate doesn't check: no push where submodules exist.
+find "$common/modules" -mindepth 1 -print -quit >"$HR_TMP/modules" 2>/dev/null || true
+git -C "$HR_GIT_DIR" ls-files --stage -- ':(top)' >"$HR_TMP/index"
+if [[ -s "$HR_TMP/modules" ]] || grep -q '^160000 ' "$HR_TMP/index"; then
+  hr_deny "this repository has submodules, and git push could push inside them to destinations FORGE doesn't check; FORGE repositories don't use submodules"
+fi
 # Every ref git could take the name for, in git's own order; only refs/heads/<name> may exist.
 found=""
 for ref in "refs/$branch" "refs/tags/$branch" "refs/heads/$branch" "refs/remotes/$branch" "refs/remotes/$branch/HEAD"; do

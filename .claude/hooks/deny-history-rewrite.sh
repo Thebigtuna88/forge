@@ -168,10 +168,10 @@ case "$HR_GIT_SUB" in
       case "$a" in
         --no-sign) nosign=1 ;;
         -l | --list | -d | --delete | -v | --verify) notcreating=1 ;;
-        -i | --ignore-case | \
-          --contains | --no-contains | --merged | --no-merged | --points-at | --contains=* | \
-          --no-contains=* | --merged=* | --no-merged=* | --points-at=* | --sort=* | --format=* | \
-          --column | --column=* | --no-column | -n | -n[0-9]*) ;;
+        # git lists tags when any of these is given, so the names after them are filters.
+        --contains | --no-contains | --merged | --no-merged | --points-at | --contains=* | \
+          --no-contains=* | --merged=* | --no-merged=* | --points-at=* | -n | -n[0-9]*) notcreating=1 ;;
+        -i | --ignore-case | --sort=* | --format=* | --column | --column=* | --no-column) ;;
         -a | --annotate | -s | --sign | -u | -m | -F | -e | --edit)
           hr_deny "a tag with a message (git tag $a) puts unscanned text into git; use a plain tag (git tag <name>)"
           ;;

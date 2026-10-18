@@ -380,6 +380,14 @@ _hr_word_guarded() {
   [[ -n "$v" ]] && _hr_word_guarded "$v"
 }
 
+# _hr_git_path <text>: 0 if the text names a .git path component anywhere: alone, after / = : or
+# a space, or attached to an option (-o.git/x, -xC.git, --opt.git). foo.git and .gitignore don't.
+_hr_git_path() {
+  local low re='(^|[^a-z0-9_.-])(-+[a-z0-9]*)?[.]git($|[^a-z0-9_.-])'
+  low="$(_hr_lower "$1")"
+  [[ "$low" =~ $re ]]
+}
+
 # _hr_git_runs_program <git subcommand> <argument>: 0 if the argument is an option that makes this
 # otherwise read-only git command run another program (any abbreviation git accepts):
 # git archive --exec/--remote, git ls-remote --upload-pack/-u, git grep -O/--open-files-in-pager.
@@ -451,9 +459,7 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   [[ ${#words[@]} -gt 0 ]] || return 1
   # A path into git's own files (.git/refs, .git/config, …) can move a branch with no git
   # command at all, so naming one makes a command guarded (and hr_require_simple refuses it).
-  for w in "${words[@]}"; do
-    if [[ "$w" == .git ]]; then return 0; fi
-  done
+  if _hr_git_path "${cmd//[\'\"\\]/}"; then return 0; fi
   for seq in "${_HR_GUARDED_SEQS[@]}" "${_HR_TOOLS[@]}"; do
     if _hr_seq_in "$seq" "${words[@]}"; then return 0; fi
   done
@@ -588,11 +594,9 @@ hr_require_simple() { # deny unless a guarded command is one plain command; fill
   done
   hr_tokens "$HR_CMD" || hr_deny "guarded command's quoting does not parse"
   for c in "${HR_TOK[@]}"; do
-    case "$(_hr_lower "$c")" in
-      .git | .git/* | */.git | */.git/* | *=.git | *=.git/*)
-        hr_deny "commands may not touch git's own files ($c) directly; use git commands"
-        ;;
-    esac
+    if _hr_git_path "$c"; then
+      hr_deny "commands may not touch git's own files ($c) directly; use git commands"
+    fi
   done
   first="${HR_TOK[0]:-}"
   case "$first" in
@@ -613,11 +617,9 @@ hr_require_simple() { # deny unless a guarded command is one plain command; fill
       local -a whole=("${HR_TOK[@]}") check=("${HR_TOK[@]:1:$((_HR_SUBI - 1))}" ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"})
       local a
       for a in ${check[@]+"${check[@]}"}; do
-        case "$(_hr_lower "$a")" in
-          .git | .git/* | */.git | */.git/* | *=.git | *=.git/*)
-            hr_deny "commands may not touch git's own files ($a) directly; use git commands"
-            ;;
-        esac
+        if _hr_git_path "$a"; then
+          hr_deny "commands may not touch git's own files ($a) directly; use git commands"
+        fi
         if _hr_git_runs_program "$HR_GIT_SUB" "$a"; then
           hr_deny "git $HR_GIT_SUB $a runs another program, which no FORGE gate can check; leave the option out"
         fi
