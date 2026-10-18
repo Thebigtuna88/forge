@@ -2,7 +2,7 @@
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
   "tool_input": {
-    "command": "git merge --no-edit feature/FRG-3-a"
+    "command": "git merge --no-commit feature/FRG-3-a"
   },
   "cwd": "@ROOT@"
 }

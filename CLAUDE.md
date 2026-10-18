@@ -61,7 +61,8 @@ web-UI click), **write a script, never instructions**:
   simple commands**: one per Bash call, no `&&` `||` `;` `|` `&`, no `$( )`, backticks or
   redirection. Use `git -C <dir>` instead of `cd … &&`.
 - Push with an explicit target: `git push -u origin feature/<KEY>-<n>-<slug>`.
-- Update a branch with `git merge dev` in its worktree. Never rebase, amend or force-push.
+- Update a branch in its worktree with `git merge --no-commit dev`, then `git commit -F <file>`
+  (the merged result is scanned). Never rebase, amend or force-push.
 - Update a main checkout with `git -C /Users/atl/code/forge pull --ff-only origin dev` (an
   absolute path: the gates refuse `~` in guarded commands). It may only fast-forward and never gets
   a commit of its own.

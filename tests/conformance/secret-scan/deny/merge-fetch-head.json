@@ -2,7 +2,7 @@
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
   "tool_input": {
-    "command": "git merge FETCH_HEAD"
+    "command": "git merge --no-commit FETCH_HEAD"
   },
   "cwd": "@ROOT@",
   "forge_reason": "merge only dev, main or a ticket branch"

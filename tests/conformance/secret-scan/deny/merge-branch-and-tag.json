@@ -2,7 +2,7 @@
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
   "tool_input": {
-    "command": "git merge --no-edit dev"
+    "command": "git merge --no-commit dev"
   },
   "cwd": "@ROOT@",
   "forge_reason": "names more than one ref"

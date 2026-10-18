@@ -2,7 +2,7 @@
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
   "tool_input": {
-    "command": "git merge --no-edit"
+    "command": "git merge --no-commit"
   },
   "cwd": "@ROOT@",
   "forge_reason": "name the branch to merge"

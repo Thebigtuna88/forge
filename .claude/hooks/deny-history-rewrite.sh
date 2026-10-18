@@ -25,7 +25,8 @@
 #   set (both put unscanned text into git, which push.followTags could carry with a branch);
 #   any git command that is neither on the runtime's safe list nor checked by a FORGE gate
 #   (git history, git replay, and whatever a newer git adds).
-# A forced push is refused by deny-push-to-protected. A branch is updated with `git merge dev`.
+# A forced push is refused by deny-push-to-protected. A branch is updated with
+# `git merge --no-commit dev` and `git commit -F <file>`.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset HOOKRT_LOADED
 # shellcheck source=.harness/lib/hookrt.sh
@@ -39,7 +40,7 @@ hr_require_simple
 
 case "$HR_GIT_SUB" in
   rebase | filter-branch | filter-repo | replace | update-ref)
-    hr_deny "git $HR_GIT_SUB rewrites history; update a branch with git merge dev instead"
+    hr_deny "git $HR_GIT_SUB rewrites history; update a branch with git merge --no-commit dev and git commit -F <file> instead"
     ;;
   fast-import)
     hr_deny "git fast-import writes refs directly (and makes unscanned commits)"

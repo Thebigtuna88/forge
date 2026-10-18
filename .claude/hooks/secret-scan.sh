@@ -9,8 +9,10 @@
 #   The message file must be a regular file (not a link). gitleaks always uses FORGE's own rules
 #   (.harness/gitleaks.toml), never the repository's .gitleaks.toml, .gitleaksignore or
 #   gitleaks:allow comments; a missing gitleaks blocks.
-# - git merge only as `git merge [--no-edit] [--no-ff | --ff-only] [--squash] [-q] <branch>` or
-#   `git merge --abort`: it brings in commits that were scanned. <branch> is dev, main or a ticket
+# - git merge only as `git merge --no-commit [--no-edit] [--no-ff] [-q] <branch>`, `--ff-only`,
+#   `--squash` or `git merge --abort`: git never makes the merge commit itself, since a merge driver
+#   or filter can write new content into the result; `git commit -F` then scans the whole merged
+#   result (a fast-forward makes no new content). <branch> is dev, main or a ticket
 #   branch (or origin/ and one of those) and must be a branch, not a tag: git writes the name, and
 #   an annotated tag's message, into the merge commit's message. A merge stopped by a conflict is
 #   concluded with git commit -F (scanned), not git merge --continue. Refused while a
@@ -66,6 +68,7 @@ fi
 
 if [[ "$HR_GIT_SUB" == merge ]]; then
   target=""
+  nocommit=0
   for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
     case "$a" in
       --continue)
@@ -75,9 +78,10 @@ if [[ "$HR_GIT_SUB" == merge ]]; then
         [[ ${#HR_GIT_ARGS[@]} == 1 ]] || hr_deny "abort a merge with git merge --abort alone"
         hr_allow
         ;;
-      --no-edit | --no-ff | --ff-only | --squash | -q | --quiet) ;;
+      --no-commit | --ff-only | --squash) nocommit=1 ;;
+      --no-edit | --no-ff | -q | --quiet) ;;
       -*)
-        hr_deny "merge only as: git merge [--no-edit] [--no-ff | --ff-only] [--squash] <branch>, or git merge --abort (not $a)"
+        hr_deny "merge only as: git merge --no-commit [--no-ff] <branch> (or --ff-only, --squash), or git merge --abort (not $a)"
         ;;
       *)
         [[ -z "$target" ]] || hr_deny "merge one branch at a time"
@@ -85,8 +89,11 @@ if [[ "$HR_GIT_SUB" == merge ]]; then
         ;;
     esac
   done
+  # A merge commit made by git itself skips the scan of its result, so git must stop first.
+  [[ $nocommit == 1 ]] ||
+    hr_deny "merge as git merge --no-commit <branch>, then commit the result with git commit -F <message file>, which scans it (a fast-forward needs no commit)"
   # The branch name goes into the merge message, so it must be one whose text is known.
-  [[ -n "$target" ]] || hr_deny "name the branch to merge: git merge dev"
+  [[ -n "$target" ]] || hr_deny "name the branch to merge: git merge --no-commit dev"
   named='^(origin/)?(dev|main|feature/FRG-[0-9]+-[a-z0-9]+(-[a-z0-9]+)*)$'
   [[ "$target" =~ $named ]] ||
     hr_deny "merge only dev, main or a ticket branch (or origin/ and one of those), not '$target'"
@@ -130,6 +137,9 @@ if [[ "$HR_GIT_SUB" == commit ]]; then
     hr_deny "commit only as: git commit -F <message file> (no -m, -a, --amend, --no-verify or other options)"
   [[ -n "$HR_GIT_DIR" && -d "$HR_GIT_DIR" ]] ||
     hr_deny "can't tell which repository this commit is in, so it can't be scanned for secrets"
+  # git reads "-" as standard input, never as a file of that name.
+  [[ "$message" != - ]] ||
+    hr_deny "the message must come from a message file, not standard input (git commit -F -)"
   [[ "$message" == /* ]] || message="$HR_GIT_DIR/$message"
   [[ -f "$message" && -r "$message" && ! -L "$message" ]] ||
     hr_deny "the message file must be a regular file you can read (not a link), so it can be scanned too: $message"
