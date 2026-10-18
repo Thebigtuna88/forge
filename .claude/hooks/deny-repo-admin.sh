@@ -13,7 +13,8 @@
 #   gh pr merge in the one form HR_MERGE_FORM (gate-merge-on-review and gate-self-modification
 #     judge the rest)
 # Text goes to GitHub only as --title <text> and --body-file <file> (no -b/--body, --fill, editor
-# or web modes): the whole command and every body file are scanned by gitleaks with FORGE's rules
+# or web modes): the whole command, each of its words as gh receives them, and every body file are
+# scanned by gitleaks with FORGE's rules
 # before anything is sent, since the repository is public (rule 10). Everything else is refused:
 # repo create/edit/delete/rename/archive/fork/sync/set-default/clone, rulesets, secrets,
 # variables, auth login/logout/refresh/token/setup-git, config, alias, extension, gist, release
@@ -160,6 +161,9 @@ fi
 
 mkdir "$HR_TMP/text"
 printf '%s\n' "$HR_CMD" >"$HR_TMP/text/command"
+# Quotes and backslashes can split a secret in the command's text ('ghp_'"…") while gh gets it
+# whole, so each word as the shell passes it is scanned too, one per line (review round 1).
+printf '%s\n' "${HR_TOK[@]}" >"$HR_TMP/text/words"
 k=0
 for b in ${bodies[@]+"${bodies[@]}"}; do
   [[ "$b" != - ]] || hr_deny "the text must come from a file, not standard input (--body-file -)"

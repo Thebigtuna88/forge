@@ -484,6 +484,30 @@ test_fails_when_a_hook_changes_its_sandbox_copy() {
   expect_fail "toucher allow/touch.json: the sandbox copy of .claude/hooks/toucher.sh differs from the live file"
 }
 
+# FRG-4 review round 1 (C3): the test stubs copied into a sandbox (the fake gh the hooks run there)
+# are guarded like the copied hooks: a setup can't write them, and a hook that changes one fails.
+test_setup_cannot_change_a_stub() {
+  local how
+  for how in 'printf "#!/bin/bash\nexit 0\n" >"$TMP/stubs/gh"' 'rm "$TMP/stubs/gh"' \
+    'mv "$TMP/stubs" "$TMP/stubs.old"'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    mkdir -p "$H/tests/stubs"
+    cp "$FORGE_SRC/tests/stubs/gh" "$H/tests/stubs/gh"
+    printf '%s\n' "$how" >"$H/tests/conformance/sample-gate/allow/push-feature.setup.sh"
+    expect_fail "setup failed"
+  done
+}
+
+test_fails_when_a_hook_changes_a_stub() {
+  mk_conf_harness sample-gate toucher
+  mkdir -p "$H/tests/stubs"
+  cp "$FORGE_SRC/tests/stubs/gh" "$H/tests/stubs/gh"
+  case_json toucher deny main 'git push origin main'
+  touch_case '@TMP@/stubs/gh'
+  expect_fail "toucher allow/touch.json: the sandbox copy of tests/stubs/gh differs from the live file"
+}
+
 test_bad_mode_runs_check_the_mode_variant_survives() {
   mk_conf_harness sample-gate toucher
   mkdir -p "$H/tests/conformance/toucher/deny"

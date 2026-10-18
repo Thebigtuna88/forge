@@ -20,7 +20,8 @@
 #    included) at <tmp>/code/forge, a git repo on dev with a bare "origin", next to an empty
 #    <tmp>/code/forge-worktrees, with its own HOME, and FORGE's test stubs (tests/stubs) in
 #    <tmp>/stubs: there the runtime's hr_gh runs the fake gh, which answers from <tmp>/gh/ and
-#    never reaches GitHub (FRG-4). The hook must be registered for the case's
+#    never reaches GitHub (FRG-4). A setup may not write <tmp>/stubs, and the stubs, like the
+#    copied hooks, must still match the live files afterwards. The hook must be registered for the case's
 #    hook_event_name and tool_name. In a case, @ROOT@, @WORKTREES@ and @TMP@ become those paths,
 #    @SHA@ the commit id the setup wrote to <tmp>/case.sha (a case that names it needs one),
 #    an optional "forge_mode_key" names the mode.json key it runs under (default: the hook's
@@ -693,6 +694,7 @@ SETUP_PROFILE='(version 1) (allow default) (deny file-write*)
   (allow file-write* (subpath (param "BASE")) (literal "/dev/null") (literal "/dev/tty"))
   (deny file-write* (subpath (string-append (param "SBX") "/.claude"))
     (subpath (string-append (param "SBX") "/.harness")) (literal (param "SBX"))
+    (subpath (string-append (param "BASE") "/stubs"))
     (literal (string-append (param "BASE") "/code")) (literal (param "BASE")))
   (deny signal)'
 if [[ ${#hooks[@]} -gt 0 ]] && ! command -v sandbox-exec >/dev/null 2>&1; then
@@ -720,7 +722,9 @@ mk_sandbox() {
     git -C "$SBX" remote add origin "$BASE/remote.git"
 }
 
-# differs [skip]: print the first copied path whose sandbox copy no longer matches the live file.
+# differs [skip]: print the first copied path whose sandbox copy no longer matches the live file:
+# the hooks, runtime and config in SBX, and the test stubs in BASE/stubs (the fake gh the hooks run
+# there), which must also still be regular files, not links.
 differs() {
   local rel
   for rel in ${COPIED[@]+"${COPIED[@]}"}; do
@@ -729,6 +733,13 @@ differs() {
       echo "$rel"
       return 0
     }
+  done
+  for rel in ${STUBS[@]+"${STUBS[@]}"}; do
+    if [[ -L "$BASE/stubs/${rel##*/}" || ! -f "$BASE/stubs/${rel##*/}" ]] ||
+      ! cmp -s "$ROOT/$rel" "$BASE/stubs/${rel##*/}"; then
+      echo "$rel"
+      return 0
+    fi
   done
   return 1
 }

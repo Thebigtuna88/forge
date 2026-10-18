@@ -761,9 +761,13 @@ hr_gh() {
     GH_SPINNER_DISABLED=1 GH_PAGER=cat NO_COLOR=1 "$gh" "$@"
 }
 
+# The fake is chosen only when the runtime sits in a sandbox-shaped folder *and* the project folder
+# the hook was started for is exactly that folder, as conformance starts it. A live checkout moved
+# into such a folder, with a link left where Claude Code was started, doesn't qualify: Claude
+# Code's CLAUDE_PROJECT_DIR still names the folder it was started in (FRG-4 review round 1).
 _hr_gh_path() { # the gh hr_gh runs: the sandbox's fake inside a conformance sandbox, else gh on PATH
   local sandbox='^/.+/forge-conformance\.[A-Za-z0-9]{6}/s[0-9]+/code/forge$'
-  if [[ "$HR_ROOT" =~ $sandbox ]]; then
+  if [[ "$HR_ROOT" =~ $sandbox && "${CLAUDE_PROJECT_DIR:-}" == "$HR_ROOT" ]]; then
     printf '%s\n' "${HR_ROOT%/code/forge}/stubs/gh"
   else
     type -P gh || true
@@ -814,9 +818,12 @@ hr_merge_prepare() {
     err="$(head -c 200 "$HR_TMP/gh.err" | tr '\n' ' ')"
     hr_deny "can't read PR #$HR_PR from GitHub ($err); check gh auth status and try again"
   fi
-  got="$(jq -er 'if type == "object" then [.state, .baseRefName, .headRefName, .headRefOid,
-      .isCrossRepository, (.headRepositoryOwner | if type == "object" then .login else null end)]
-      | map(tostring) | join("\u001f") else error("not an object") end' "$pr" 2>/dev/null)" ||
+  # Every answer must be exactly one JSON object: jq reads a stream, and would judge only part of
+  # it otherwise (FRG-4 review round 1).
+  got="$(jq -ser 'if length == 1 and (.[0] | type) == "object" then .[0] | [.state, .baseRefName,
+      .headRefName, .headRefOid, .isCrossRepository,
+      (.headRepositoryOwner | if type == "object" then .login else null end)]
+      | map(tostring) | join("\u001f") else error("not one object") end' "$pr" 2>/dev/null)" ||
     hr_deny "GitHub's answer about PR #$HR_PR can't be read; try again"
   IFS=$'\x1f' read -r state base branch head cross owner <<<"$got"
   [[ "$state" == OPEN ]] || hr_deny "PR #$HR_PR is $state, not open"
@@ -833,12 +840,28 @@ hr_merge_prepare() {
     err="$(head -c 200 "$HR_TMP/gh.err" | tr '\n' ' ')"
     hr_deny "can't read dev...$HR_PR_HEAD from GitHub ($err); try again"
   fi
-  got="$(jq -er 'if type == "object" then [.base_commit.sha, .merge_base_commit.sha] | map(tostring)
-      | join(" ") else error("not an object") end' "$cmp" 2>/dev/null)" ||
+  got="$(jq -ser 'if length == 1 and (.[0] | type) == "object" then .[0]
+      | [.base_commit.sha, .merge_base_commit.sha] | map(tostring) | join(" ")
+      else error("not one object") end' "$cmp" 2>/dev/null)" ||
     hr_deny "GitHub's comparison of dev and PR #$HR_PR can't be read; try again"
   read -r HR_PR_DEV ghmb <<<"$got"
   [[ "$HR_PR_DEV" =~ $sha && "$ghmb" =~ $sha ]] ||
     hr_deny "GitHub's comparison of dev and PR #$HR_PR has no commit ids; try again"
+
+  # Where dev requires a merge queue, gh pr merge may turn on auto-merge or queue the PR (and the
+  # queue picks the merge method) instead of squash-merging it now, so the gate stops there.
+  local owner_name="${HR_FORGE_REPO%%/*}" repo_name="${HR_FORGE_REPO#*/}" mq="$HR_TMP/merge-queue.json"
+  if ! hr_gh api graphql -f "query=query { repository(owner: \"$owner_name\", name: \"$repo_name\") { mergeQueue(branch: \"dev\") { id } } }" \
+    >"$mq" 2>"$HR_TMP/gh.err"; then
+    err="$(head -c 200 "$HR_TMP/gh.err" | tr '\n' ' ')"
+    hr_deny "can't tell whether dev requires a merge queue ($err); try again"
+  fi
+  got="$(jq -ser 'if length == 1 and (.[0].data.repository | type) == "object"
+      and (.[0].data.repository | has("mergeQueue"))
+      then (.[0].data.repository.mergeQueue == null | tostring) else error("unreadable") end' "$mq" 2>/dev/null)" ||
+    hr_deny "can't tell whether dev requires a merge queue (GitHub's answer can't be read); try again"
+  [[ "$got" == true ]] ||
+    hr_deny "dev requires a merge queue, where gh pr merge can turn on auto-merge or queue the PR instead of squash-merging it now; the owner merges"
 
   HR_PR_DIR="$HR_TMP/review"
   mkdir "$HR_PR_DIR"

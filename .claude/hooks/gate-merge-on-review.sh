@@ -37,9 +37,11 @@ review="$work/review.md"
   hr_deny "no review for $HR_PR_BRANCH: work/$ticket/review.md is missing (review the PR first, until every required lens is CLEAN)"
 hr_review_json "$review" "$HR_TMP/review.json" ||
   hr_deny "work/$ticket/review.md must hold exactly one json forge-review block with the review's facts (spec 6.6)"
-jq -e 'type == "object" and .forge_review == 1 and (.repo | type) == "string" and (.branch | type) == "string" and (.pr | type) == "number" and (.head | type) == "string" and (.merge_base | type) == "string" and (.diff_md5 | type) == "string" and (.diff_bytes | type) == "number" and (.lenses | type) == "array" and (.deferred | type) == "array" and (.lenses | all(type == "object" and (.lens | type) == "string" and (.mechanism | type) == "string" and (.model | type) == "string" and (.model | length) > 0 and (.rounds | type) == "number" and .rounds >= 1 and .rounds == (.rounds | floor) and (.verdict | type) == "string" and (.reply | type) == "string" and (.reply_sha256 | type) == "string")) and (.deferred | all(type == "object" and (.finding | type) == "string" and (.issue | type) == "number" and .issue >= 1 and .issue == (.issue | floor)))' \
+jq -se 'length == 1 and (.[0] | type == "object" and .forge_review == 1 and (.repo | type) == "string" and (.branch | type) == "string" and (.pr | type) == "number" and (.head | type) == "string" and (.merge_base | type) == "string" and (.diff_md5 | type) == "string" and (.diff_bytes | type) == "number" and (.lenses | type) == "array" and (.deferred | type) == "array" and (.lenses | all(type == "object" and (.lens | type) == "string" and (.mechanism | type) == "string" and (.model | type) == "string" and (.model | length) > 0 and (.rounds | type) == "number" and .rounds >= 1 and .rounds == (.rounds | floor) and (.verdict | type) == "string" and (.reply | type) == "string" and (.reply_sha256 | type) == "string")) and (.deferred | all(type == "object" and (.finding | type) == "string" and (.issue | type) == "number" and .issue >= 1 and .issue == (.issue | floor))))' \
   "$HR_TMP/review.json" >/dev/null 2>&1 ||
-  hr_deny "work/$ticket/review.md's forge-review block is malformed (spec 6.6: forge_review 1, repo, branch, pr, head, merge_base, diff_md5, diff_bytes, lenses and deferred)"
+  hr_deny "work/$ticket/review.md's forge-review block is malformed (spec 6.6: one JSON object with forge_review 1, repo, branch, pr, head, merge_base, diff_md5, diff_bytes, lenses and deferred)"
+jq -s '.[0]' "$HR_TMP/review.json" >"$HR_TMP/review.one"
+mv "$HR_TMP/review.one" "$HR_TMP/review.json"
 
 bound="$(jq -r '[.repo, .branch, (.pr | tostring), .head, .merge_base, .diff_md5, (.diff_bytes | tostring)] | join("\u001f")' "$HR_TMP/review.json")"
 IFS=$'\x1f' read -r r_repo r_branch r_pr r_head r_mb r_md5 r_bytes <<<"$bound"
@@ -81,8 +83,8 @@ while IFS=$'\x1f' read -r lens mech verdict reply rsha; do
   got="$(hr_sha256 "$rfile")"
   [[ "$got" == "$rsha" ]] ||
     hr_deny "the $lens lens's reply work/$ticket/$reply changed after the review (its sha256 is $got; review.md records $rsha)"
-  jq -e --arg l "$lens" --arg m "$md5" --argjson b "$bytes" 'type == "object" and .lens == $l and .verdict == "CLEAN" and .findings == [] and .diff_md5 == $m and .diff_bytes == $b' "$rfile" >/dev/null 2>&1 ||
-    hr_deny "the $lens lens's reply work/$ticket/$reply is not a CLEAN reply for this diff: it must name the $lens lens, list no findings, and report the diff's md5 $md5 and $bytes bytes as the reviewer computed them (read-proof, rule 4)"
+  jq -se --arg l "$lens" --arg m "$md5" --argjson b "$bytes" 'length == 1 and (.[0] | type == "object" and .lens == $l and .verdict == "CLEAN" and .findings == [] and .diff_md5 == $m and .diff_bytes == $b)' "$rfile" >/dev/null 2>&1 ||
+    hr_deny "the $lens lens's reply work/$ticket/$reply is not a CLEAN reply for this diff: it must be one JSON object that names the $lens lens, lists no findings, and reports the diff's md5 $md5 and $bytes bytes as the reviewer computed them (read-proof, rule 4)"
 done <"$HR_TMP/lenses"
 for lens in code security; do
   [[ "$seen" == *" $lens "* ]] || hr_deny "work/$ticket/review.md has no $lens lens; code and security are required for every PR (rule 3)"
@@ -92,17 +94,22 @@ jq -r '.deferred[] | [.finding, (.issue | tostring)] | join("\u001f")' "$HR_TMP/
 while IFS=$'\x1f' read -r finding issue; do
   hr_gh issue view "$issue" --repo "$HR_FORGE_REPO" --json state </dev/null >"$HR_TMP/issue.json" 2>/dev/null ||
     hr_deny "can't read issue #$issue (deferred finding $finding) from GitHub; try again"
-  jq -r 'if type == "object" then .state | tostring else error("not an object") end' "$HR_TMP/issue.json" >"$HR_TMP/issue.state" 2>/dev/null ||
+  jq -sr 'if length == 1 and (.[0] | type) == "object" then .[0].state | tostring else error("not one object") end' "$HR_TMP/issue.json" >"$HR_TMP/issue.state" 2>/dev/null ||
     hr_deny "GitHub's answer about issue #$issue (deferred finding $finding) can't be read; try again"
   istate="$(cat "$HR_TMP/issue.state")"
   [[ "$istate" == OPEN ]] ||
     hr_deny "deferred finding $finding cites issue #$issue, which is $istate; every deferred finding needs an open issue (rule 5)"
 done <"$HR_TMP/deferred"
 
+# Everything the squash commit may hold must be there in the expected shape, so nothing is skipped
+# by being missing or malformed (FRG-4 review round 1); a co-author's name or email may be null.
+jq -se 'length == 1 and (.[0] | (.title | type) == "string" and (.body | type) == "string" and (.commits | type) == "array" and (.commits | length) > 0 and (.commits | all(type == "object" and (.messageHeadline | type) == "string" and (.messageBody | type) == "string" and (.authors | type) == "array" and (.authors | all(type == "object" and ((.name | type) == "string" or .name == null) and ((.email | type) == "string" or .email == null))))))' \
+  "$HR_TMP/pr.json" >/dev/null 2>&1 ||
+  hr_deny "GitHub's answer about PR #$HR_PR's title, body or commits is incomplete, so what the squash commit would hold can't be scanned; try again"
 mkdir "$HR_TMP/squash"
-jq -r '.title // "" | tostring' "$HR_TMP/pr.json" >"$HR_TMP/squash/title"
-jq -r '.body // "" | tostring' "$HR_TMP/pr.json" >"$HR_TMP/squash/body"
-jq -r '.commits | if type == "array" then .[] else empty end | .messageHeadline, .messageBody, (.authors | if type == "array" then .[] else empty end | .name, .email) | tostring' "$HR_TMP/pr.json" >"$HR_TMP/squash/commits"
+jq -r '.title' "$HR_TMP/pr.json" >"$HR_TMP/squash/title"
+jq -r '.body' "$HR_TMP/pr.json" >"$HR_TMP/squash/body"
+jq -r '.commits[] | .messageHeadline, .messageBody, (.authors[] | .name // empty, .email // empty)' "$HR_TMP/pr.json" >"$HR_TMP/squash/commits"
 if ! hr_scan_text "$HR_TMP/squash"; then
   hr_deny "gitleaks found a possible secret in what the squash commit would hold (PR #$HR_PR's title, body or commit messages), or could not scan it: $HR_SCAN"
 fi

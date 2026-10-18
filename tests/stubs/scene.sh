@@ -142,6 +142,7 @@ scene_github() { # the fake gh's answers about the PR and dev...head, and the ca
         authors: [{name: "Scene", email: "scene@example.com"}]}]}' >"$SC_GH/pr-view-$SC_PR.out"
   jq -n --arg d "$SC_DEV" --arg m "$SC_MB" '{base_commit: {sha: $d}, merge_base_commit: {sha: $m}}' \
     >"$SC_GH/api-repos_Thebigtuna88_forge_compare_dev...$SC_HEAD.out"
+  printf '%s\n' '{"data": {"repository": {"mergeQueue": null}}}' >"$SC_GH/api-graphql.out"
   printf '%s\n' "$SC_HEAD" >"$TMP/case.sha"
 }
 

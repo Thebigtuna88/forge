@@ -396,21 +396,50 @@ test_inherited_gh_variables_deny_guarded_gh_commands() {
   assert_exit 0 "$RC" "a gh read isn't guarded"
 }
 
+# ghpath <project dir or ""> : which gh hr_gh would run, as Claude Code (or conformance) would
+# start the hook, with CLAUDE_PROJECT_DIR set to <project dir> (unset when empty).
+ghpath() {
+  if [[ -n "$1" ]]; then
+    run_hook probe "$(bash_input true)" PROBE=ghpath CLAUDE_PROJECT_DIR="$1"
+  else
+    run_hook probe "$(bash_input true)" PROBE=ghpath
+  fi
+}
+
 test_fake_gh_only_inside_a_conformance_sandbox() {
   mk_hook_harness
   mkdir -p "$T_TMP/stubs"
-  probe ghpath 'true'
+  ghpath "$H"
   assert_not_contains "$OUT" "$T_TMP" "outside a sandbox, gh comes from PATH"
-  mk_hook_harness "$T_TMP/forge-conformance.Ab3dE9/s12"
-  probe ghpath 'true'
-  assert_eq "$OUT" "gh=$T_TMP/forge-conformance.Ab3dE9/s12/stubs/gh" "inside a sandbox, its fake gh"
+  local sbx="$T_TMP/forge-conformance.Ab3dE9/s12"
+  mk_hook_harness "$sbx"
+  ghpath "$H"
+  assert_eq "$OUT" "gh=$sbx/stubs/gh" "inside a sandbox, started there: its fake gh"
   local base
   for base in "$T_TMP/forge-conformance.Ab3dE/s1" "$T_TMP/forge-conformance.Ab3dE9/x1" \
     "$T_TMP/conformance.Ab3dE9/s1" "$T_TMP/forge-conformance.Ab3dE9/s1/extra"; do
     mk_hook_harness "$base"
-    probe ghpath 'true'
+    ghpath "$H"
     assert_not_contains "$OUT" "/stubs/gh" "not a sandbox: $base"
   done
+}
+
+# Review round 1 (SEC-4): a checkout moved into a sandbox-shaped path, with a link left at the
+# folder Claude Code was started in, must not switch to the fake gh. The project folder Claude Code
+# gives the hook has to be exactly the runtime's own folder.
+test_fake_gh_needs_the_project_folder_to_be_the_sandbox() {
+  local sbx="$T_TMP/forge-conformance.Ab3dE9/s12"
+  mk_hook_harness "$sbx"
+  mkdir -p "$T_TMP/code"
+  ln -s "$H" "$T_TMP/code/forge"
+  ghpath "$T_TMP/code/forge"
+  assert_not_contains "$OUT" "/stubs/gh" "started through a link to the sandbox"
+  ghpath ""
+  assert_not_contains "$OUT" "/stubs/gh" "no project folder"
+  ghpath "$T_TMP/elsewhere"
+  assert_not_contains "$OUT" "/stubs/gh" "another project folder"
+  ghpath "$H/"
+  assert_not_contains "$OUT" "/stubs/gh" "the same folder spelled differently"
 }
 
 test_plain_detection() {

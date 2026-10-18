@@ -153,7 +153,8 @@ mk_gate() { # H: a harness holding the real deny-repo-admin, the runtime and FOR
   printf 'A clean body.\n' >"$T_TMP/body.md"
 }
 
-secret() { printf '%s%s' "ghp_" "4Vq9TzLm2Rk8XwPn6YbJc3HdF7GsA1KeUoNi"; } # built at run time
+token_tail() { printf '%s%s' "4Vq9TzLm2Rk8XwPn6Yb" "Jc3HdF7GsA1KeUoNi"; } # after ghp_: a fake token
+secret() { printf '%s%s' "ghp_" "$(token_tail)"; }                         # built at run time
 
 test_secret_in_title_refused() {
   mk_gate
@@ -164,6 +165,21 @@ test_secret_in_title_refused() {
   assert_exit 2 "$RC" "a secret in a PR's new title"
   run_hook deny-repo-admin "$(bash_input "gh issue create --title x --body-file $T_TMP/body.md --label $(secret)" "$T_TMP")"
   assert_exit 2 "$RC" "a secret in a label"
+}
+
+# Review round 1 (SEC-2): quotes and backslashes can split a secret in the command's text while gh
+# gets it whole, so the words as the shell passes them are scanned too.
+test_secret_split_by_quoting_refused() {
+  mk_gate
+  local tail
+  tail="$(token_tail)"
+  run_hook deny-repo-admin "$(bash_input "gh issue create --title 'ghp_'\"$tail\" --body-file $T_TMP/body.md" "$T_TMP")"
+  assert_exit 2 "$RC" "a secret split by adjacent quotes"
+  assert_contains "$ERR" "possible secret in the text this gh command would send"
+  run_hook deny-repo-admin "$(bash_input "gh issue create --title ghp_\\${tail} --body-file $T_TMP/body.md" "$T_TMP")"
+  assert_exit 2 "$RC" "a secret split by a backslash"
+  run_hook deny-repo-admin "$(bash_input "gh pr edit 5 --add-label 'gh'p_$tail" "$T_TMP")"
+  assert_exit 2 "$RC" "a secret split inside a label"
 }
 
 test_clean_title_allowed() {
