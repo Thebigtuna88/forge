@@ -97,12 +97,11 @@ done
 count=${#names[@]}
 case "$HR_GIT_SUB" in
   branch)
-    if [[ $count -gt 0 && $listing == 0 ]]; then
-      if [[ $rename == 1 ]]; then
-        new="${names[$count - 1]}"
-      else
-        new="${names[0]}"
-      fi
+    # -m / -c win over any listing option given with them (git branch -m --sort=… old new).
+    if [[ $count -gt 0 && $rename == 1 ]]; then
+      new="${names[$count - 1]}"
+    elif [[ $count -gt 0 && $listing == 0 ]]; then
+      new="${names[0]}"
     fi
     ;;
   push)

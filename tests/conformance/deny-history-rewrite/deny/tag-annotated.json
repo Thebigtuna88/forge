@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git tag -a v1 -m msg"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "a tag with a message"
+}

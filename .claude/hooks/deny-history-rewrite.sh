@@ -9,6 +9,9 @@
 #   names, and git pull with a refspec (":" or "+" moves local branches); git fetch or pull while a
 #   configured remote.*.fetch mapping writes outside refs/remotes/; git pull --rebase;
 #   git stash other than push/save/pop/apply/drop/clear/list/show (stash branch, export, …);
+#   git remote update and remote add -f (they fetch past the mapping check; use git fetch);
+#   git submodule foreach, and submodule update --merge/--rebase (unchecked commands in submodules);
+#   writing git notes, and a git tag with a message (-a/-s/-u/-m/-F): unscanned text in git;
 #   any git command that is neither on the runtime's safe list nor checked by a FORGE gate
 #   (git history, git replay, and whatever a newer git adds).
 # A forced push is refused by deny-push-to-protected. A branch is updated with `git merge dev`.
@@ -50,8 +53,47 @@ case "$HR_GIT_SUB" in
     esac
     ;;
   commit | branch | checkout | switch | worktree | reset | fetch | pull) ;;
-  push | send-pack | http-push | merge | commit-tree | am | cherry-pick | revert | config | notes | \
-    submodule | reflog | bundle)
+  remote)
+    for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
+      case "$a" in
+        update | -f | --fetch) hr_deny "git remote ${HR_GIT_ARGS[0]:-} with $a fetches past FORGE's fetch checks; use git fetch" ;;
+      esac
+    done
+    hr_allow
+    ;;
+  submodule)
+    case "${HR_GIT_ARGS[0]:-status}" in
+      status | summary | init | sync | absorbgitdirs | deinit) hr_allow ;;
+      update)
+        for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
+          case "$a" in
+            --merge | --rebase) hr_deny "git submodule update $a makes unchecked commits inside submodules" ;;
+          esac
+        done
+        hr_allow
+        ;;
+      *) hr_deny "git submodule ${HR_GIT_ARGS[0]} runs or changes things FORGE can't check inside submodules" ;;
+    esac
+    ;;
+  notes)
+    case "${HR_GIT_ARGS[0]:-list}" in
+      list | show) hr_allow ;;
+      *) hr_deny "git notes ${HR_GIT_ARGS[0]} writes a notes commit without the secret scan; notes may only be read" ;;
+    esac
+    ;;
+  tag)
+    for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
+      case "$a" in
+        -a | --annotate | -s | --sign | -u | --local-user* | -m | --message* | -F | --file* | -e | --edit | \
+          -[!-]*[asumFe]*)
+          hr_deny "a tag with a message (git tag $a) puts unscanned text into git; use a plain tag (git tag <name>)"
+          ;;
+      esac
+    done
+    hr_allow
+    ;;
+  push | send-pack | http-push | merge | commit-tree | am | cherry-pick | revert | config | \
+    reflog | bundle)
     hr_allow # checked by another FORGE gate, or understood and harmless to history
     ;;
   *)

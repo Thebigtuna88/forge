@@ -340,7 +340,8 @@ test_guarded_detection() {
     'git cherry-pick abc && ls' 'git commit-tree abc' 'git worktree add -b x /y && ls' 'git switch -c x; ls' \
     'git filter-branch' 'git replace a b' 'git revert HEAD' 'git am p.patch' 'git merge dev && ls' \
     'cd /x; git reset --hard HEAD' 'git pull origin dev | cat' 'git fetch origin main:main && ls' \
-    'git stash push && ls' 'git history split HEAD; ls' 'git replay x | cat' 'git config alias.x y && ls'; do
+    'git stash push && ls' 'git history split HEAD; ls' 'git replay x | cat' 'git config alias.x y && ls' \
+    'git remote update && ls' 'git tag -a v1 -m x; ls'; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done
@@ -354,7 +355,7 @@ test_plain_detection() {
     'cat README.md' 'for f in *.sh; do echo "$f"; done' '' \
     'ls *.sh | wc -l' 'rm -rf build/* && ls' 'for f in a b; do bash "$f"; done' 'ls * | head' \
     'ls work/*/manual | head' 'find work -type f | head' 'for d in a b; do git -C "$d" status; done' \
-    'git remote -v | head' 'git tag | head' 'git ls-files | wc -l' 'git diff --stat && git log -1'; do
+    'git ls-files | wc -l' 'git diff --stat && git log -1'; do
     probe guarded "$c"
     assert_eq "$OUT" PLAIN "plain: $c"
   done

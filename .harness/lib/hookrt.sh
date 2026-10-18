@@ -142,7 +142,7 @@ _HR_GIT_SAFE_SUBS=" status log show diff add rm mv restore grep blame ls-files l
 _HR_GIT_SAFE_SUBS+="rev-parse rev-list cat-file describe shortlog help version var for-each-ref show-ref "
 _HR_GIT_SAFE_SUBS+="name-rev merge-base cherry whatchanged count-objects fsck check-ignore check-attr "
 _HR_GIT_SAFE_SUBS+="check-ref-format check-mailmap diff-tree diff-index diff-files range-diff format-patch "
-_HR_GIT_SAFE_SUBS+="archive remote tag clean gc prune repack maintenance init clone sparse-checkout "
+_HR_GIT_SAFE_SUBS+="archive clean gc prune repack maintenance init clone sparse-checkout "
 # The word lists above are matched as " word "; a line break must count as a space too.
 _HR_GH_CMDS="${_HR_GH_CMDS//$'\n'/ }"
 _HR_WRAPPERS="${_HR_WRAPPERS//$'\n'/ }"
