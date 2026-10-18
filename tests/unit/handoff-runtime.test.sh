@@ -260,10 +260,32 @@ test_overlapping_secrets_are_redacted_whole() {
   mk_script "$ID" "ho_secret_to_file short A $H/.env" "ho_secret_to_file long B $H/.env" \
     "ho_info reveal /usr/bin/sort $H/.env"
   pty_run --answer 'abc' --answer 'abcdef' -- bash "$SCRIPT"
-  local result
+  local result body="" line i=0 re hex='[0-9a-f]{64}'
   result="$(cat "$H/work/owner/$ID/RESULT.txt")"
   assert_contains "$result" "check reveal: INFO B=[REDACTED]"
-  assert_not_contains "$result" "def"
+  # The header holds two hex checksums, and the script's is random (the script names this test's
+  # random folder), so either can contain "abc" or "def" by chance (FRG-23). The header lines
+  # must have exactly their expected shape, so nothing can hide in them; every other line, with
+  # the random folder masked, may hold no piece of either secret: not "abc", and not the "def"
+  # left over if the short secret were redacted inside the long one.
+  while IFS= read -r line; do
+    i=$((i + 1))
+    case $i in
+      1) re='^----- HANDOFF-RESULT BEGIN -----$' ;;
+      2) re="^id: $ID\$" ;;
+      3) re="^script-sha256: $hex\$" ;;
+      4) re="^runtime-sha256: $hex\$" ;;
+      5) re='^at: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' ;;
+      *)
+        body+="${line//"$T_TMP"/<tmp>}"$'\n'
+        continue
+        ;;
+    esac
+    [[ "$line" =~ $re ]] || _t_fail "RESULT.txt header line $i has an unexpected shape: $line"
+  done <<<"$result"
+  assert_contains "$body" "check long: PASS stored B in <tmp>/h/.env (mode 600)"
+  assert_not_contains "$body" "abc"
+  assert_not_contains "$body" "def"
 }
 
 test_refuses_shell_tracing() {
