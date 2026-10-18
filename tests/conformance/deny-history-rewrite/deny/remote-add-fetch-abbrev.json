@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git remote add --fet --mirror=fetch upstream /x"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "git remote add option --fet"
+}

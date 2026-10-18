@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git commit -F @TMP@/msg"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "gitleaks found a possible secret in the staged changes"
+}

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git merge feature/FRG-9-demo"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "only --ff-only"
+}

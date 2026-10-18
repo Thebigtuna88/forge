@@ -845,4 +845,22 @@ test_redirection_targets_are_not_command_names() {
   assert_not_contains "$OUT" "plain word"
 }
 
+test_array_assignments_pass_the_source_check() {
+  mk_conf_harness
+  printf '%s\n' 'names=()' 'names+=("$HR_CMD")' 'more=(a "b c")' 'last="${names[${#names[@]} - 1]}"' \
+    >>"$H/.claude/hooks/sample-gate.sh"
+  conform
+  assert_not_contains "$OUT" "may not define functions or open"
+  assert_not_contains "$OUT" "plain word"
+}
+
+test_harness_toml_files_reach_the_sandbox() {
+  mk_conf_harness sample-gate rules-gate
+  printf 'title = "rules"\n' >"$H/.harness/rules.toml"
+  case_json rules-gate deny main 'git push origin main'
+  case_json rules-gate allow other 'ls'
+  conform
+  assert_exit 0 "$RC" "$OUT"
+}
+
 run_tests

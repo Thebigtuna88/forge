@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git config --add include.path /x"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "may set only"
+}

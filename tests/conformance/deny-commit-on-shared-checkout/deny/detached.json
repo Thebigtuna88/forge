@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git commit -F m"
+  },
+  "cwd": "@WORKTREES@/FRG-9-detached",
+  "forge_reason": "not on a branch"
+}

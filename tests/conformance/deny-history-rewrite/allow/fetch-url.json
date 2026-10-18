@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git fetch https://github.com/Thebigtuna88/forge.git dev"
+  },
+  "cwd": "@ROOT@"
+}

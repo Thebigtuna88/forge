@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git switch feature/FRG-9-remote"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "create the branch explicitly"
+}

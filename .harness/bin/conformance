@@ -114,7 +114,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 for p in "$ROOT/.claude" "$HOOKS_DIR" "$SETTINGS" "$ROOT/.harness" "$ROOT/.harness/lib" \
   "$ROOT/.harness/bin" "$ROOT/.harness/bin/conformance" "$ROOT/tests" "$CASES_DIR" \
-  "$ROOT"/.harness/lib/* "$ROOT"/.harness/*.json; do
+  "$ROOT"/.harness/lib/* "$ROOT"/.harness/*.json "$ROOT"/.harness/*.toml; do
   [[ -L "$p" ]] && fail "${p#"$ROOT"/} is a symlink (the hooks, runtime and config must be real files)"
 done
 
@@ -312,7 +312,7 @@ def name_problem(w, forbidden):
 RESERVED = ("if", "then", "elif", "else", "fi", "while", "until", "do", "done", "case", "esac",
             "for", "select", "function", "coproc", "time", "[[", "]]")
 PLAIN = re.compile(r"^[A-Za-z0-9_./:+@%-]+$")
-ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 REDIRS = ("<", ">", ">>", ">&", "<&", ">|", "<>", "&>", "&>>", "<<<")
 # Commands a hook may not run: they run code from a string or file the check cannot read, or
 # switch off the safety net (set +e, trap, unset of the runtime state, a fresh shell).
@@ -380,6 +380,7 @@ for n, raw in logical:
     timing = False  # after `time`: its options (-p) still come before the command
     target = False  # the next word is the file of a redirection
     testing = False  # inside [[ … ]], whose words (and && ||) are a test, not commands
+    array = False  # inside name=( … ), whose words are values, not commands
     for k, w in enumerate(words):
         nxt = words[k + 1] if k + 1 < len(words) else ""
         if target:
@@ -389,6 +390,15 @@ for n, raw in logical:
         if testing:
             if w == "]]":
                 testing = False
+            prev = w
+            continue
+        if array:
+            if ")" in w:
+                array = False
+            prev = w
+            continue
+        if w in ("(", "()") and ASSIGNMENT.match(prev) and prev.endswith("="):
+            array = w == "("  # name=( … ) or name=(): an array, not a group or a function
             prev = w
             continue
         if start and w == "[[":
@@ -551,7 +561,7 @@ fi
 # --- sandboxes -----------------------------------------------------------------------------------
 
 COPIED=() # paths relative to ROOT, copied byte for byte into every sandbox
-for f in "$SETTINGS" "$HOOKS_DIR"/*.sh "$ROOT"/.harness/lib/* "$ROOT"/.harness/*.json; do
+for f in "$SETTINGS" "$HOOKS_DIR"/*.sh "$ROOT"/.harness/lib/* "$ROOT"/.harness/*.json "$ROOT"/.harness/*.toml; do
   [[ -f "$f" && ! -L "$f" ]] && COPIED+=("${f#"$ROOT"/}")
 done
 BEFORE="$(snapshot)"

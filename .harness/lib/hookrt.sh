@@ -76,14 +76,30 @@ export LC_ALL=C
 # System tools first: jq, python3, git, shasum and md5 come from root-owned /usr/bin and /sbin.
 PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
 export PATH
+# The command Claude Code runs inherits the same environment. GIT_* variables would make it use
+# another repository, index, identity or settings than the ones the gates inspect, so their names
+# are kept in _HR_GIT_ENV and hr_require_simple refuses guarded git commands while any is set.
+# Claude Code's own GIT_EDITOR=true (an editor that changes nothing) is the only exception.
+# EMAIL and XDG_CONFIG_HOME stay, so git reads the same identity and global settings here.
+unset _HR_GIT_ENV
+_HR_GIT_ENV=""
 for _hr_v in $(compgen -e); do
   case "$_hr_v" in
-    HOME | USER | LOGNAME | TMPDIR | CLAUDE_PROJECT_DIR | PATH | LC_ALL) ;;
+    HOME | USER | LOGNAME | TMPDIR | CLAUDE_PROJECT_DIR | PATH | LC_ALL | EMAIL | XDG_CONFIG_HOME) ;;
+    GIT_EDITOR)
+      if [[ "${GIT_EDITOR:-}" != true ]]; then _HR_GIT_ENV+=" $_hr_v"; fi
+      unset "$_hr_v" 2>/dev/null || true
+      ;;
+    GIT_*)
+      _HR_GIT_ENV+=" $_hr_v"
+      unset "$_hr_v" 2>/dev/null || true
+      ;;
     *) unset "$_hr_v" 2>/dev/null || true ;;
   esac
 done
 unset _hr_v
 _HR_TMPD="$(mktemp -d "${TMPDIR:-/tmp}/forge-hook.XXXXXX")"
+HR_TMP="$_HR_TMPD" # a private scratch folder for the hook, removed when it exits
 
 # Replacing the shell would skip the EXIT trap, so a hook may not do it in any form: the builtin
 # is switched off (so `builtin exec` and `command exec` fail) and plain `exec` explains why.
@@ -110,8 +126,15 @@ _HR_LOADED="" _HR_TOOLS=() _HR_GIT_CMDS="" _HR_SUBI=-1 _HR_UNKNOWABLE=0 _HR_CDS=
 # Guarded actions (spec 5.2), as words that must appear in this order (hyphens split words, so
 # send-pack is "send pack"). Deploy tools come from
 # .harness/deploy-targets.json ("tools") on top of this floor, so a missing file can't open them.
-_HR_GUARDED_SEQS=("git push" "git commit" "git send pack" "git http push" "gh pr merge" "gh api" "gh repo"
-  "gh workflow run")
+_HR_GUARDED_SEQS=("git push" "git commit" "git send pack" "git http push" "git rebase" "git filter branch"
+  "git filter repo" "git replace" "git update ref" "git am" "git cherry pick" "git revert"
+  "git checkout" "git switch" "git branch" "git worktree" "git reset" "git merge" "git pull" "git fetch"
+  "git fast import" "git symbolic ref"
+  "gh pr merge" "gh api" "gh repo" "gh workflow run")
+# The git subcommands those name; an alias for any of them is refused (hr_require_simple).
+_HR_GIT_GUARDED_SUBS=" push commit send-pack http-push rebase filter-branch filter-repo replace "
+_HR_GIT_GUARDED_SUBS+="update-ref commit-tree am cherry-pick revert checkout switch branch worktree "
+_HR_GIT_GUARDED_SUBS+="reset merge pull fetch fast-import symbolic-ref "
 _HR_DEPLOY_FLOOR=("vercel" "fastlane" "eas" "xcrun altool")
 # With `$` or a backtick the shell can build words the hook never sees, so any of these words
 # in such a command makes it guarded.
@@ -128,6 +151,17 @@ _HR_GH_CMDS=" agent-task alias api attestation auth browse cache codespace compl
   discussion extension gist gpg-key help issue label licenses org pr preview project release repo
   ruleset run search secret skill ssh-key status variable workflow accessibility actions
   environment exit-codes formatting mintty reference telemetry "
+# git commands that never create a commit or move a branch. Any other git command (including ones
+# a newer git adds) counts as guarded, so it must be one plain command and a gate decides on it.
+_HR_GIT_SAFE_SUBS=" status log show diff add rm mv restore grep blame ls-files ls-tree ls-remote "
+_HR_GIT_SAFE_SUBS+="rev-parse rev-list cat-file describe shortlog help version var for-each-ref show-ref "
+_HR_GIT_SAFE_SUBS+="name-rev merge-base cherry whatchanged count-objects fsck check-ignore check-attr "
+_HR_GIT_SAFE_SUBS+="check-ref-format check-mailmap diff-tree diff-index diff-files range-diff format-patch "
+_HR_GIT_SAFE_SUBS+="archive clean gc prune repack maintenance sparse-checkout "
+# The word lists above are matched as " word "; a line break must count as a space too.
+_HR_GH_CMDS="${_HR_GH_CMDS//$'\n'/ }"
+_HR_WRAPPERS="${_HR_WRAPPERS//$'\n'/ }"
+_HR_GIT_GUARDED_SUBS="${_HR_GIT_GUARDED_SUBS//$'\n'/ }"
 # Characters a guarded command may not contain (spec 5.2), plus glob, brace, comment and tilde
 # characters, which make the shell run words the hook never saw.
 _HR_FORBIDDEN=('&' '|' ';' '<' '>' '(' ')' '$' '`' '#' '*' '?' '[' ']' '{' '}' '~' $'\n' $'\r')
@@ -311,6 +345,62 @@ _hr_glob_could_be_tool() {
   return 1
 }
 
+# _hr_word_guarded <one argument>: 0 if the argument is a command that mentions a guarded action
+# (it has spaces: 'git tag -m x v1'), names one of git's own programs (…/git-stash), or is an
+# option whose attached value is one of those (--exec='git tag …', -O'git tag …'): git runs some
+# option values as programs, and stores others (git config) to run later. A single word is not
+# read as a command otherwise, so a file such as git-message.txt is just a file.
+_hr_word_guarded() {
+  local w="$1" low v="" base
+  case "$w" in
+    *[[:space:]]*)
+      if hr_guarded "$w"; then return 0; fi
+      ;;
+    *)
+      _hr_load
+      base="$(_hr_lower "${w##*/}")"
+      if [[ "$base" == git-* ]] && _hr_git_builtin "${base#git-}"; then return 0; fi
+      for v in "${_HR_TOOLS[@]}"; do
+        if [[ "$base" == "$v" ]]; then return 0; fi
+      done
+      v=""
+      ;;
+  esac
+  case "$w" in
+    --*=*) v="${w#*=}" ;;
+    -[!-]*)
+      low="$(_hr_lower "$w")"
+      if [[ "$low" == *git* ]]; then
+        v="git${low#*git}"
+      elif [[ "$low" == *gh* ]]; then
+        v="gh${low#*gh}"
+      fi
+      ;;
+  esac
+  [[ -n "$v" ]] && _hr_word_guarded "$v"
+}
+
+# _hr_git_path <text>: 0 if the text names a .git path component anywhere: alone, after / = : or
+# a space, or attached to an option (-o.git/x, -xC.git, --opt.git). foo.git and .gitignore don't.
+_hr_git_path() {
+  local low re='(^|[^a-z0-9_.-])(-+[a-z0-9]*)?[.]git($|[^a-z0-9_.-])'
+  low="$(_hr_lower "$1")"
+  [[ "$low" =~ $re ]]
+}
+
+# _hr_git_runs_program <git subcommand> <argument>: 0 if the argument is an option that makes this
+# otherwise read-only git command run another program (any abbreviation git accepts):
+# git archive --exec/--remote, git ls-remote --upload-pack/-u, git grep -O/--open-files-in-pager.
+_hr_git_runs_program() {
+  case "$1:$2" in
+    archive:--e* | archive:--r* | ls-remote:--u* | ls-remote:-u* | ls-remote:-[!-]*u* | \
+      grep:-O* | grep:-[!-]*O* | grep:--op*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 # _hr_git_globals <index of "git" in HR_TOK>: sets _HR_SUBI to the index of git's subcommand
 # after global options, or -1 if there is none. _HR_UNKNOWABLE=1 when an option makes it
 # unknowable (unknown option, -c other than color.*/core.quotepath/advice.*, missing argument). --version and --help just
@@ -367,6 +457,9 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   # Hyphens split words too, so git's own git-push and git-commit programs read as git push.
   read -r -a words <<<"$(printf '%s' "${cmd//[\'\"\\]/}" | LC_ALL=C tr -c 'A-Za-z0-9_.' ' ' | LC_ALL=C tr '[:upper:]' '[:lower:]')"
   [[ ${#words[@]} -gt 0 ]] || return 1
+  # A path into git's own files (.git/refs, .git/config, …) can move a branch with no git
+  # command at all, so naming one makes a command guarded (and hr_require_simple refuses it).
+  if _hr_git_path "${cmd//[\'\"\\]/}"; then return 0; fi
   for seq in "${_HR_GUARDED_SEQS[@]}" "${_HR_TOOLS[@]}"; do
     if _hr_seq_in "$seq" "${words[@]}"; then return 0; fi
   done
@@ -442,11 +535,12 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
         continue
       fi
       cmdpos=0
-      if _hr_could_be_tool "$u"; then
+      # git's own programs (git-tag, git-remote, …) run git commands under another name.
+      if _hr_could_be_tool "$u" || [[ "$base" == git-* ]]; then
         rc=0
         break
       fi
-    elif [[ $wrapped == 1 ]] && _hr_could_be_tool "$u"; then
+    elif [[ $wrapped == 1 ]] && { _hr_could_be_tool "$u" || [[ "$base" == git-* ]]; }; then
       rc=0
       break
     elif _hr_glob_could_be_tool "$u"; then
@@ -458,7 +552,7 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     fi
     if [[ "$u" == *[[:space:]]* ]]; then
       local -a inner=("${HR_TOK[@]}")
-      if hr_guarded "$u"; then rc=0; fi
+      if _hr_word_guarded "$u"; then rc=0; fi
       HR_TOK=("${inner[@]}")
       if [[ $rc == 0 ]]; then break; fi
     elif [[ "$base" == git ]]; then
@@ -466,9 +560,18 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
       if [[ $_HR_UNKNOWABLE == 1 ]]; then
         rc=0
         break
-      elif [[ $_HR_SUBI -ge 0 ]] && ! _hr_git_builtin "${HR_TOK[$_HR_SUBI]}"; then
-        rc=0
+      elif [[ $_HR_SUBI -ge 0 && "$_HR_GIT_SAFE_SUBS" != *" ${HR_TOK[$_HR_SUBI]} "* ]]; then
+        rc=0 # an alias, an unknown command, or a git command that may write: guarded
         break
+      elif [[ $_HR_SUBI -ge 0 ]]; then
+        # A safe command with an option that runs another program (git archive --remote=stash
+        # --exec=git runs git stash) is guarded too.
+        local j sub="${HR_TOK[$_HR_SUBI]}"
+        for ((j = _HR_SUBI + 1; j < n; j++)); do
+          if [[ "${HR_TOK[$j]}" =~ $op ]]; then break; fi
+          if _hr_git_runs_program "$sub" "${HR_TOK[$j]}"; then rc=0; fi
+        done
+        if [[ $rc == 0 ]]; then break; fi
       fi
     elif [[ "$base" == gh && $((i + 1)) -lt $n && "$_HR_GH_CMDS" != *" ${HR_TOK[$((i + 1))]} "* ]]; then
       rc=0
@@ -490,20 +593,42 @@ hr_require_simple() { # deny unless a guarded command is one plain command; fill
     fi
   done
   hr_tokens "$HR_CMD" || hr_deny "guarded command's quoting does not parse"
+  for c in "${HR_TOK[@]}"; do
+    if _hr_git_path "$c"; then
+      hr_deny "commands may not touch git's own files ($c) directly; use git commands"
+    fi
+  done
   first="${HR_TOK[0]:-}"
   case "$first" in
     git)
+      [[ -z "$_HR_GIT_ENV" ]] ||
+        hr_deny "the environment sets${_HR_GIT_ENV}, so git would use another repository, index, identity or settings than the ones FORGE checks; start Claude Code without it"
       hr_git_sub
       if [[ "$HR_GIT_SUB" == "?" ]]; then
         hr_deny "can't tell what this git command runs (unknown global option, alias.*/include.* config, or a command that isn't git's own)"
       fi
-      if [[ "$HR_GIT_VIA_ALIAS" == 1 ]]; then
-        case "$HR_GIT_SUB" in
-          push | commit | send-pack | http-push)
-            hr_deny "git alias for a guarded command ($HR_GIT_SUB); use the command itself"
-            ;;
-        esac
+      if [[ "$HR_GIT_VIA_ALIAS" == 1 && "$_HR_GIT_GUARDED_SUBS" == *" $HR_GIT_SUB "* ]]; then
+        hr_deny "git alias for a guarded command ($HR_GIT_SUB); use the command itself"
       fi
+      # The guarded action must be the command itself, never inside one of its arguments, and the
+      # command may not run another program: the gates judge only the outer git command. The
+      # arguments checked are git's global options and the subcommand's arguments as an alias
+      # expands them.
+      local -a whole=("${HR_TOK[@]}") check=("${HR_TOK[@]:1:$((_HR_SUBI - 1))}" ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"})
+      local a
+      for a in ${check[@]+"${check[@]}"}; do
+        if _hr_git_path "$a"; then
+          hr_deny "commands may not touch git's own files ($a) directly; use git commands"
+        fi
+        if _hr_git_runs_program "$HR_GIT_SUB" "$a"; then
+          hr_deny "git $HR_GIT_SUB $a runs another program, which no FORGE gate can check; leave the option out"
+        fi
+        if _hr_word_guarded "$a"; then
+          hr_deny "an argument of git $HR_GIT_SUB names a guarded action ('$a'); a guarded action runs only as its own git command"
+        fi
+        HR_TOK=("${whole[@]}")
+      done
+      HR_TOK=("${whole[@]}")
       return 0
       ;;
     gh)

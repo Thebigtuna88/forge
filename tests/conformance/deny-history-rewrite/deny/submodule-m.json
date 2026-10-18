@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git submodule update -m"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "git submodule update"
+}

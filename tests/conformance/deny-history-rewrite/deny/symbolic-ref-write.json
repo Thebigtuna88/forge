@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git symbolic-ref refs/heads/feature/FRG-3-topic refs/heads/dev"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "writes refs directly"
+}

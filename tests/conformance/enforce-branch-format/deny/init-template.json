@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git init -b dev --template=@TMP@/t @TMP@/x"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "not an option this gate knows"
+}

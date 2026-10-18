@@ -10,6 +10,7 @@
     ".harness/lib/",
     ".github/workflows/",
     ".harness/bin/conformance",
-    "tests/conformance/"
+    "tests/conformance/",
+    ".harness/gitleaks.toml"
   ]
 }

@@ -28,8 +28,8 @@ a time**, with a recommendation.
    command output, or `file:line`. The same goes for every claim made to the owner.
 7. **Limits are the owner's.** Paths in `.harness/self-modification-paths.json` (spend limits,
    deploy targets, mode.json, the paths list itself, `.claude/hooks/`, `.claude/settings.json`,
-   `.harness/lib/`, `.github/workflows/`, `.harness/bin/conformance`, `tests/conformance/`)
-   change only by a PR **the owner** merges.
+   `.harness/lib/`, `.github/workflows/`, `.harness/bin/conformance`, `tests/conformance/`,
+   `.harness/gitleaks.toml`) change only by a PR **the owner** merges.
 8. **Test mode until the owner flips it.** Payments run in test mode. Production deploys, App
    Store/TestFlight submissions, DNS changes and anything that charges a card are owner-run
    scripts, never agent actions.
@@ -61,7 +61,11 @@ web-UI click), **write a script, never instructions**:
   simple commands**: one per Bash call, no `&&` `||` `;` `|` `&`, no `$( )`, backticks or
   redirection. Use `git -C <dir>` instead of `cd … &&`.
 - Push with an explicit target: `git push -u origin feature/<KEY>-<n>-<slug>`.
-- Update a branch with `git merge dev` in its worktree. Never rebase, amend or force-push.
+- Update a branch in its worktree with `git merge --no-commit dev`, then `git commit -F <file>`
+  (the merged result is scanned). Never rebase, amend or force-push.
+- Update a main checkout with `git -C /Users/atl/code/forge pull --ff-only origin dev` (an
+  absolute path: the gates refuse `~` in guarded commands). It may only fast-forward and never gets
+  a commit of its own.
 - Merge: `gh pr merge <n> --squash --match-head-commit <sha>`, only into `dev`, only after review.
 - No git aliases for guarded commands.
 

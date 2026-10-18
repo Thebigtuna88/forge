@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git switch --force-create feature/FRG-3-old abc"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "resets an existing branch"
+}

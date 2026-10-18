@@ -335,7 +335,16 @@ test_guarded_detection() {
     'find . -exec /tmp/bin/??? {} \;' '/Library/Developer/CommandLineTools/usr/libexec/git-core/git-push origin main' \
     'git-commit -F m' 'git send-pack origin main' 'git http-push origin main' \
     'gh pr m???e 16 --squash' 'gh workflow r?n build.yml' 'gh pr $X 16' 'gh pr {merge,view} 16' \
-    'ls; gh pr m*e 16' 'vercel dep[l]oy --pr?d'; do
+    'ls; gh pr m*e 16' 'vercel dep[l]oy --pr?d' 'cd /x && git rebase dev' \
+    'git checkout -b feature/FRG-3-a && ls' 'git branch -f x; ls' 'git update-ref -d refs/heads/main | cat' \
+    'git cherry-pick abc && ls' 'git commit-tree abc' 'git worktree add -b x /y && ls' 'git switch -c x; ls' \
+    'git filter-branch' 'git replace a b' 'git revert HEAD' 'git am p.patch' 'git merge dev && ls' \
+    'cd /x; git reset --hard HEAD' 'git pull origin dev | cat' 'git fetch origin main:main && ls' \
+    'git stash push && ls' 'git history split HEAD; ls' 'git replay x | cat' 'git config alias.x y && ls' \
+    'git remote update && ls' 'git tag -a v1 -m x; ls' 'git init -b bad /tmp/x && ls' 'git clone -b x /y /z; ls' \
+    '/Library/Developer/CommandLineTools/usr/libexec/git-core/git-remote update' 'git-tag -a v1 -m x' \
+    'git-notes add -m x' 'echo x > .git/refs/heads/dev' 'cat .git/config' 'cd .git && ls' \
+    'git log -1 --format=%H --output=/r/.git/refs/heads/dev HEAD~1' 'cp a /r/.git/packed-refs'; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done
@@ -346,9 +355,10 @@ test_plain_detection() {
   local c
   for c in 'ls -la' 'git status && git log --oneline -5' 'git log --grep fix | head' \
     'gh pr view 3 | head' 'gh issue list' 'echo hi > f.txt' 'git -C /x diff | wc -l' \
-    'cat README.md' 'git merge dev' 'for f in *.sh; do echo "$f"; done' '' \
+    'cat README.md' 'for f in *.sh; do echo "$f"; done' '' \
     'ls *.sh | wc -l' 'rm -rf build/* && ls' 'for f in a b; do bash "$f"; done' 'ls * | head' \
-    'ls work/*/manual | head' 'find work -type f | head' 'for d in a b; do git -C "$d" status; done'; do
+    'ls work/*/manual | head' 'find work -type f | head' 'for d in a b; do git -C "$d" status; done' \
+    'git ls-files | wc -l' 'git diff --stat && git log -1' 'ls .github | head' 'cat .gitignore | head'; do
     probe guarded "$c"
     assert_eq "$OUT" PLAIN "plain: $c"
   done
@@ -363,7 +373,9 @@ test_simple_guarded_commands_pass() {
     'git commit -F /tmp/msg.txt' 'git log --grep commit' 'gh pr merge 3 --squash' \
     'gh api repos/Thebigtuna88/forge/pulls' 'vercel deploy' \
     'git --no-pager -c color.ui=never push origin feature/FRG-2-a' \
-    'git -c core.quotepath=false -c advice.detachedHead=false push origin feature/FRG-2-a'; do
+    'git -c core.quotepath=false -c advice.detachedHead=false push origin feature/FRG-2-a' \
+    'gh repo view Thebigtuna88/forge' 'gh actions' 'gh copilot explain x' 'gh repo list' 'git merge dev' \
+    'git pull --ff-only origin dev'; do
     expect_allow "$c"
   done
 }
@@ -409,6 +421,64 @@ test_git_unknown_global_option_denies() {
     '-c core.sshCommand=evil push origin feature/FRG-2-a' '-c x.y=1 push origin feature/FRG-2-a'; do
     expect_deny "git $c"
   done
+}
+
+test_git_internal_files_and_dashed_programs_deny() {
+  mk_hook_harness
+  expect_deny 'git log -1 --format=%H --output=/r/.git/refs/heads/dev HEAD'
+  assert_contains "$ERR" "git's own files"
+  expect_deny 'cat .git/config'
+  expect_deny 'git-tag -a v1 -m x'
+  expect_deny '/Library/Developer/CommandLineTools/usr/libexec/git-core/git-notes add -m x'
+}
+
+test_git_options_that_run_programs_deny() {
+  mk_hook_harness
+  local c
+  for c in "git archive --remote=dev --exec='git push origin' HEAD" 'git archive --remote=stash --exec=git HEAD' \
+    'git archive --rem=stash --ex=git HEAD' "git ls-remote --upload-pack='git commit' origin" \
+    "git ls-remote -qu 'git commit' origin" "git grep '-Ogit tag -m x v1' -e y" \
+    "git grep --open-files-in-pager='git commit' -e y" "git ls-remote -u 'git commit' origin" \
+    "git grep -iO'git commit' -e y"; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+    expect_deny "$c"
+    assert_contains "$ERR" "runs another program" "reason for: $c"
+  done
+}
+
+test_guarded_action_inside_an_argument_denies() {
+  mk_hook_harness
+  local c
+  for c in "git config core.pager 'git push origin dev:main'" "git config core.pager 'git tag -m x v1'" \
+    "git config core.pager 'GIT stash'" "git commit -F m --cleanup='git branch -D dev'"; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+    expect_deny "$c"
+    assert_contains "$ERR" "names a guarded action" "reason for: $c"
+  done
+  expect_allow 'git log --grep commit'
+  expect_allow 'git push -u origin feature/FRG-3-git-gates'
+  expect_allow 'git -C /x/forge-worktrees/FRG-3-git-gates merge --no-edit dev'
+  expect_allow 'git commit -F /tmp/git-message.txt'
+  expect_allow 'git commit --file=/tmp/git-notes.txt'
+  expect_deny 'git config core.pager /Library/Developer/CommandLineTools/usr/libexec/git-core/git-stash'
+  assert_contains "$ERR" "names a guarded action"
+  expect_deny 'git config core.pager vercel'
+  assert_contains "$ERR" "names a guarded action"
+}
+
+test_alias_expanded_arguments_are_checked() {
+  mk_hook_harness
+  git -C "$H" config alias.ag 'grep -Ogit -e marker'
+  git -C "$H" config alias.ar 'archive --remote=stash'
+  git -C "$H" config alias.cp "config core.pager 'git push origin dev:main'"
+  expect_deny 'git ag'
+  assert_contains "$ERR" "runs another program"
+  expect_deny 'git ar --exec=git HEAD'
+  assert_contains "$ERR" "runs another program"
+  expect_deny 'git cp'
+  assert_contains "$ERR" "names a guarded action"
 }
 
 test_gh_alias_or_extension_denies() {
@@ -465,6 +535,9 @@ test_git_alias_to_guarded_command_denies() {
   git -C "$H" config alias.sh '!git push origin main'
   git -C "$H" config alias.sp send-pack
   git -C "$H" config alias.hp http-push
+  git -C "$H" config alias.rb rebase
+  git -C "$H" config alias.co checkout
+  git -C "$H" config alias.ur update-ref
   expect_deny 'git p origin feature/FRG-2-a' "$H"
   assert_contains "$ERR" "alias"
   expect_deny 'git ci' "$H"
@@ -472,6 +545,11 @@ test_git_alias_to_guarded_command_denies() {
   assert_contains "$ERR" "alias"
   expect_deny 'git hp origin main' "$H"
   assert_contains "$ERR" "alias"
+  local a
+  for a in 'git rb dev' 'git co -b x' 'git ur -d refs/heads/main'; do
+    expect_deny "$a" "$H"
+    assert_contains "$ERR" "alias" "alias for: $a"
+  done
   expect_deny 'git sh' "$H"
   expect_deny 'git st && ls' "$H"
 }
@@ -518,6 +596,41 @@ test_inherited_git_exec_path_is_ignored() {
   chmod 755 "$T_TMP/gx/git-launch"
   run_hook sample-gate "$(bash_input 'git launch' "$H")" GIT_EXEC_PATH="$T_TMP/gx"
   assert_exit 2 "$RC" "git-launch is not one of git's own commands"
+}
+
+test_inherited_git_variables_deny_guarded_git_commands() {
+  mk_hook_harness
+  local v
+  for v in GIT_INDEX_FILE="$T_TMP/other-index" GIT_AUTHOR_NAME=x GIT_DIR="$T_TMP/x" \
+    GIT_CONFIG_COUNT=1 GIT_EDITOR=vim; do
+    run_hook sample-gate "$(bash_input 'git commit -F /tmp/msg' "$H")" "$v"
+    assert_exit 2 "$RC" "guarded git command with $v"
+    assert_contains "$ERR" "the environment sets ${v%%=*}" "reason with $v"
+  done
+  run_hook sample-gate "$(bash_input 'git commit -F /tmp/msg' "$H")" GIT_EDITOR=true
+  assert_exit 0 "$RC" "Claude Code's own GIT_EDITOR=true"
+  run_hook sample-gate "$(bash_input 'git status' "$H")" GIT_INDEX_FILE="$T_TMP/other-index"
+  assert_exit 0 "$RC" "a command that isn't guarded"
+}
+
+test_alias_expanded_git_paths_deny() {
+  mk_hook_harness
+  git -C "$H" config alias.rollback 'log -1 --format=%H --output=/r/.git/refs/heads/dev HEAD~1'
+  expect_deny 'git rollback'
+  assert_contains "$ERR" "git's own files"
+}
+
+test_attached_option_git_paths_deny() {
+  mk_hook_harness
+  local c
+  for c in 'sort -o.git/refs/heads/dev /tmp/sha' 'tar -C.git -xf x.tar' 'cp -t.GIT/hooks x' \
+    'sort -uo.git/packed-refs x' 'git log -1 --format=%H -- -o.git/x'; do
+    expect_deny "$c"
+    assert_contains "$ERR" "git's own files"
+  done
+  for c in 'ls -d /tmp/remote.git' 'cat .gitignore' 'git -C /x log -1 -- .git-blame-ignore-revs'; do
+    expect_allow "$c"
+  done
 }
 
 test_checksum_of_missing_file_denies() {

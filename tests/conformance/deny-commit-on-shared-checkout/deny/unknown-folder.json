@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git -C relative/dir commit -F m"
+  },
+  "forge_reason": "can't tell which folder"
+}

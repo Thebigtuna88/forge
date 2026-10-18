@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git tag v1"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "tag.gpgSign"
+}

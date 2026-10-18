@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git checkout -b feature/FRG-3-git-gates"
+  },
+  "cwd": "@ROOT@"
+}

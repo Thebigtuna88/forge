@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git pull --ff-only origin dev"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "pull.autostash is set"
+}

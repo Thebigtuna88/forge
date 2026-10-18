@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git notes add -F /tmp/x HEAD"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "git notes add"
+}

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git clone --branch dev /x @TMP@/y"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "init.templateDir"
+}
