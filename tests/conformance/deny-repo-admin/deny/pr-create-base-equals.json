@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh pr create --base=main --head feature/FRG-9-sample --title FRG-9 --body-file @TMP@/body.md"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "'--base=main' is not allowed"
+}

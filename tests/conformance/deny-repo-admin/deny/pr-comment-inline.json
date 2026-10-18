@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh pr comment 5 --body x"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "'--body' is not allowed"
+}

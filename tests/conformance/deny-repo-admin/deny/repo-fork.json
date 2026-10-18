@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh repo fork Thebigtuna88/forge"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "is not on FORGE's list of allowed gh commands"
+}

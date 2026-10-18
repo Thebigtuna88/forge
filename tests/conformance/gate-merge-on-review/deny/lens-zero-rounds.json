@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh pr merge 22 --repo Thebigtuna88/forge --squash --match-head-commit @SHA@"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "forge-review block is malformed"
+}

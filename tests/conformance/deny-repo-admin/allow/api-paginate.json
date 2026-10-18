@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh api --paginate repos/Thebigtuna88/forge/issues --jq length"
+  },
+  "cwd": "@TMP@"
+}

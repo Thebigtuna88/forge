@@ -33,6 +33,24 @@
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/deny-history-rewrite.sh",
             "onFailure": "block",
             "timeout": 120
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/gate-merge-on-review.sh",
+            "onFailure": "block",
+            "timeout": 120
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/gate-self-modification.sh",
+            "onFailure": "block",
+            "timeout": 120
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/deny-repo-admin.sh",
+            "onFailure": "block",
+            "timeout": 120
           }
         ]
       }

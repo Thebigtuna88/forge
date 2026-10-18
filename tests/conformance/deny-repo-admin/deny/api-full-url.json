@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh api https://example.com/repos"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "must be a plain path"
+}

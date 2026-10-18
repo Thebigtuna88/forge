@@ -101,6 +101,7 @@ cloned under `projects/`, and is governed by FORGE's rules, hooks and review run
     bin/                            commands: status ticket worktree handoff review-lens
                                     conformance new-project
     lib/                            shared code: hookrt.sh handoff.sh review.sh pr.sh
+                                    review-diff.sh (the one review diff, FRG-4)
     lenses/                         review checklists: code security frontend ios spend (.md)
     mode.json                       per-hook enforce|observe (missing/malformed = enforce)
     spend-limits.json               monthly $ cap per paid API              [owner-only]
@@ -155,7 +156,10 @@ Worktrees live **outside** the repo:
   owner-only itself, so the list can't be shortened without the owner:
   `.harness/spend-limits.json`, `.harness/deploy-targets.json`, `.harness/mode.json`,
   `.harness/self-modification-paths.json`, `.claude/hooks/`, `.claude/settings.json`,
-  `.harness/lib/`, `.github/workflows/`.
+  `.harness/lib/`, `.github/workflows/`, `.harness/bin/conformance`, `tests/conformance/`
+  (FRG-2), `.harness/gitleaks.toml` (FRG-3), `CLAUDE.md`, `.harness/bin/handoff`,
+  `docs/specs/` and `tests/stubs/` (FRG-4). `gate-self-modification` reads both this list and the one at a PR's
+  merge base.
 
 ---
 
@@ -483,10 +487,21 @@ It provides:
 - `hr_tokens`: splits a command into words with `python3 -c 'import shlex…'` (correct quote
   handling, from the macOS Command Line Tools), never with ad-hoc regex.
 - `hr_require_simple`: if a command mentions a guarded verb anywhere (`git push`, `git commit`,
-  `gh pr merge`, `gh api`, `gh repo`, any deploy tool), it must be a **single simple command**:
-  no `&&` `||` `;` `|` `&` `$(` backticks `>` `<` or newlines, and the first word must be the
-  tool itself, not `env`, `command`, `sh -c`, `bash -c`, `xargs` or `eval`. Otherwise it's
+  any `gh` command that isn't read-only, any deploy tool), it must be a **single simple
+  command**: no `&&` `||` `;` `|` `&` `$(` backticks `>` `<` or newlines, and the first word must
+  be the tool itself, not `env`, `command`, `sh -c`, `bash -c`, `xargs` or `eval`. Otherwise it's
   denied. So `echo "git push"` is denied too. That false positive is accepted: fail closed.
+  `gh` is judged by its real command (FRG-4): only `gh <command> <subcommand>` written out and on
+  the read-only list (`issue list/view`, `pr list/view/diff/checks/status`, `run
+  list/view/watch`, `workflow list/view`, `repo view`, `release list/view`, `label list`,
+  `search`, `status`, `browse`) leaves a command unguarded, so such a read may sit in a pipeline
+  and `--repo` doesn't count as `gh repo`. Any other `gh` invocation, wherever `gh` may run
+  (after a wrapper such as `xargs`, or with words after it), is guarded. A guarded `gh` command
+  is refused while the environment sets a `GH_*` or `GITHUB_*` variable, as git's are for
+  `GIT_*`.
+- `hr_gh`: runs `gh` for a gate with prompts, pager and update checks off. Inside a conformance
+  sandbox, and only there (the runtime itself sits at
+  `<tmp>/forge-conformance.XXXXXX/s<n>/code/forge`), it runs the sandbox's fake `gh`.
 - `hr_git_sub`: finds the git subcommand after global options (`-C <dir>`, `-c k=v`). **A git
   alias is denied** if it would expand to a guarded subcommand, because the hook can't see
   what an alias does.
@@ -497,10 +512,10 @@ It provides:
 |---|---|---|---|
 | `deny-push-to-protected` | Pre / Bash | `git push` to `main` or `dev` (any refspec form: `main`, `HEAD:main`, `refs/heads/dev`, `:main`); any `--force`, `-f`, `--force-with-lease`, `+refspec`; `--delete`/`-d`, `--mirror`, `--all`; a **bare** `git push` (target must be explicit: `git push origin <branch>`) | enforce |
 | `secret-scan` | Pre / Bash | `git commit` if `gitleaks git --staged` finds a secret, or gitleaks is missing; also any `git commit` using `-m`, `-a`, `--no-verify` or without `-F <file>` | enforce |
-| `gate-merge-on-review` | Pre / Bash | `gh pr merge` unless all hold: explicit PR number; base is `dev` (looked up with `gh pr view`); `--match-head-commit <sha>` equals the PR's current head; `work/<KEY>-<n>-<slug>/review.md` is bound to that branch **and** sha, lists every required lens as CLEAN, and its read-proof re-verifies now (the hook recomputes, it doesn't trust review.md's text); every deferred finding cites an open issue. Also denies `--auto`, `--admin`, `--delete-branch`, and any merge done through the API (`gh api` on `pulls/<n>/merge` or `merges`) | enforce |
-| `gate-self-modification` | Pre / Bash | `gh pr merge` when the PR touches any path in `self-modification-paths.json` (or a project's own owner-only list in `projects.json`) → "owner must merge this" | enforce |
+| `gate-merge-on-review` | Pre / Bash | `gh pr merge` in any form but `gh pr merge <n> --repo Thebigtuna88/forge --squash --match-head-commit <40-character sha>` (so no `--auto`, `--admin`, `--delete-branch`, `--rebase`, `--merge`, `--subject`, `--body`), and that form unless all hold (FRG-4): GitHub says the PR is open, its base is `dev`, its head is a ticket branch of this repository (not a fork) at exactly that sha, and its merge base with `dev` is the one recomputed locally; `work/<KEY>-<n>-<slug>/review.md` (6.6) is bound to that repository, branch, PR, head **and** merge base, and the diff recomputed now has its md5 and byte count; every lens listed is CLEAN, run by `codex` or `subagent` (`code` only by `codex`; `author`, `inline`, `self` refused), and its reply file still has the recorded sha256 and is itself a CLEAN reply for this lens and this diff's md5 and bytes; `code` and `security` are present; every deferred finding cites an issue open now; and gitleaks finds no secret in what the squash commit would hold (the PR's title, body, commit messages and authors). The hook recomputes everything; it trusts none of review.md's text. Merges through the API are refused by `deny-repo-admin` | enforce |
+| `gate-self-modification` | Pre / Bash | `gh pr merge` when the PR touches any path in `self-modification-paths.json`, the live list or the one at the PR's merge base (or a project's own owner-only list in `projects.json`) → "owner must merge this". The changed paths come from the recomputed diff, not GitHub's file list (which stops at 100); names are compared case-folded and Unicode-normalised, a rename counts as both paths, and any symlink or submodule in the diff counts as owner-only. A missing or malformed list refuses | enforce |
 | `guard-live-checkout` (added) | Pre / Edit, Write, MultiEdit, NotebookEdit **and** Bash | Edits inside the main checkout `~/code/forge` or `~/code/forge/projects/<name>` other than gitignored scratch areas (`work/`, `.harness/state/`); any write to `.claude/settings.local.json` or `~/.claude/settings*.json` (these could switch hooks off). For Bash, a best-effort check for write operators (`>`, `tee`, `sed -i`, `cp`, `mv`, `rm`) aimed at those paths | enforce (Edit/Write); **observe** (Bash part) |
-| `deny-repo-admin` (added) | Pre / Bash | `gh repo edit`/`delete`/`rename`/`archive`; `gh api` with a non-GET method on `branches/*/protection`, `rulesets`, `git/refs`, repo settings or default branch; `gh auth refresh` adding scopes; `git config` writes to `alias.*` or `core.hooksPath` | enforce |
+| `deny-repo-admin` (added) | Pre / Bash | Every `gh` command not on its allowlist (FRG-4): the read-only commands; `gh auth status` (no `--show-token`); `gh api <path>` as a GET only (no `-X`/`--method` but GET, no `-f`/`-F`/`--field`/`--raw-field`/`--input`, no `-H`, `--hostname` or `graphql`); `gh issue create/edit/comment/close/reopen` and `gh pr create/edit/comment/close/ready` with listed options only (a PR only into `dev` from a ticket branch, its base never edited); and the one merge form. So `gh repo edit`/`delete`/`rename`/`archive`/…, rulesets, secrets, variables, `gh auth login/logout/refresh/token/setup-git`, `gh config`, `gh alias`, `gh extension`, `gh workflow run` and anything a newer `gh` adds are refused. Text reaches GitHub only through `--title` and `--body-file`, and the whole command and every body file are scanned by gitleaks first. (`git config` writes to `alias.*` or `core.hooksPath` are refused by `deny-history-rewrite`, FRG-3) | enforce |
 | `deny-history-rewrite` (added) | Pre / Bash | `git rebase`, `git commit --amend`, `git filter-branch`, `git filter-repo`, `git replace`, `git update-ref -d`, `git push` of rewritten history (already caught by the force rules) | enforce |
 | `gate-deploy-target` | Pre / Bash | Any command that matches a **production** pattern in `deploy-targets.json` (`vercel --prod`, `vercel deploy --prod`, `vercel promote`, `vercel alias`, `vercel domains`, `vercel dns`, `xcrun altool --upload*`, `fastlane` upload lanes, `eas submit`, `gh workflow run <production workflow>`); **any deploy tool command matching neither list** (fail closed). Preview patterns are allowed | enforce |
 | `gate-spend` | Pre / Bash | Commands that mention a paid-API host (`api.openai.com`, `fal.run`, `api.replicate.com`, the Higgsfield API host, `api.stripe.com`, …) or a provider key variable (`FAL_KEY`, `REPLICATE_API_TOKEN`, …) unless the command is the project's budget wrapper. The hosts and variables are listed in `spend-limits.json`, so they're owner-only. Also any `sk_live_` Stripe key in a command | enforce |
@@ -515,13 +530,16 @@ owner can merge.
 
 - **Commits:** write the message to a file, then run `git commit -F <file>`. Never `-m`, `-a`,
   `--amend` or `--no-verify`. Stage with an explicit `git add <paths>`.
-- **Single simple commands** for `git push`, `git commit`, `gh pr merge`, `gh api`, `gh repo`
-  and every deploy command: one command per Bash call, no chaining, piping, substitution or
-  redirection. Use `-C <dir>` instead of `cd … &&`.
+- **Single simple commands** for `git push`, `git commit`, every `gh` command that isn't
+  read-only, and every deploy command: one command per Bash call, no chaining, piping,
+  substitution or redirection. Use `-C <dir>` instead of `cd … &&`.
+- **Text to GitHub:** only `--title <text>` and `--body-file <file>`, both scanned for secrets
+  first; never `--body`, `-b`, `--fill` or an editor. A PR: `gh pr create --base dev --head
+  feature/<KEY>-<n>-<slug> --title <text> --body-file <file>`.
 - **Push:** `git push -u origin feature/<KEY>-<n>-<slug>` (always explicit).
 - **Update a branch:** `git merge dev` inside the worktree. Never rebase, amend or force-push.
-- **Merge:** `gh pr merge <n> --squash --match-head-commit <sha>`. Squashing keeps one commit
-  per ticket on `dev`. Feature branches are cleaned up by the repo setting "automatically
+- **Merge:** `gh pr merge <n> --repo Thebigtuna88/forge --squash --match-head-commit <sha>`.
+  Squashing keeps one commit per ticket on `dev`. Feature branches are cleaned up by the repo setting "automatically
   delete head branches", which the owner sets in the repo-creation handoff, not by the agent.
 - **No git aliases** for guarded commands.
 
@@ -661,8 +679,30 @@ per lens: mechanism, model, rounds, verdict, sha256 of the reply file; deferred 
 issue numbers) and posts a short summary as a PR comment.
 
 `gate-merge-on-review` does **not** trust `review.md`'s text. It recomputes the diff from the
-recorded merge-base to the PR head, rechecks each reply's md5/bytes and file sha256, and checks
-that the merge-base still equals `git merge-base origin/dev <head>`.
+merge base to the PR head, rechecks each reply's md5/bytes and file sha256, and checks that the
+recorded merge base is still the merge base of GitHub's `dev` and the head.
+
+**The diff** (FRG-4) is made by one command, `.harness/lib/review-diff.sh <repo> <dev sha>
+<head sha> <out>`, which the runner uses to freeze `diff.patch` and the gate uses to recompute
+it. It runs git in a fresh scratch repository that borrows the objects and nothing else: no
+repository, global or system settings, no attributes, no replace refs, no commit-graph. So no
+setting (external diff tools, text conversion, prefixes, context, rename detection, diff
+drivers) can change its bytes. It shows every file as text (`--text`, so nothing hides as
+"Binary files differ"), and it re-hashes every object both snapshots are made of, so a planted
+object file can't show the reviewer one content while GitHub merges another.
+
+**What the gate reads in `review.md`** (FRG-4): the file is for people, with the facts in
+exactly one block fenced by a line ` ```json forge-review ` and a line ` ``` `:
+
+```json
+{ "forge_review": 1, "repo": "Thebigtuna88/forge", "branch": "feature/FRG-4-github-gates",
+  "pr": 22, "head": "<40 hex>", "merge_base": "<40 hex>", "diff_md5": "<32 hex>", "diff_bytes": 1234,
+  "lenses": [ { "lens": "code", "mechanism": "codex", "model": "…", "rounds": 3, "verdict": "CLEAN",
+                "reply": "rounds/3/reply-code.json", "reply_sha256": "<64 hex>" } ],
+  "deferred": [ { "finding": "S4", "issue": 31 } ] }
+```
+
+`reply` is relative to `work/<KEY>-<n>-<slug>/` and must be `rounds/<r>/reply-<lens>.json`.
 
 ### 6.7 Lens checklists (`.harness/lenses/*.md`)
 
@@ -988,7 +1028,10 @@ or 1.
   repo standing in for GitHub. No test touches the network or the real repos.
 - **`gh` and `codex` are replaced by stubs** (`tests/stubs/`) put first on `PATH` *inside the
   test only*. The stubs record how they were called and return canned replies, for example a
-  codex reply with a wrong md5.
+  codex reply with a wrong md5. The hooks set their own `PATH`, so for them conformance copies
+  the stubs into each sandbox, and the runtime's `hr_gh` runs the fake `gh` there and only
+  there (FRG-4). Its answers come from files the case's setup wrote (`tests/stubs/scene.sh`
+  builds a PR, its review and GitHub's answers about it).
 - **Handoff tests need a terminal**, so they run the script in a pseudo-terminal
   (`tests/lib/ptyrun.py`, which also types the answers) with all four agent markers removed.
   That the test suite can do this is exactly why section 4.8 calls the TTY check a speed bump.
@@ -1012,6 +1055,7 @@ unprivileged containment or race-free signalling for either (FRG-15). The tests 
 | each hook | deny and allow fixtures (conformance), including quoting tricks, `-C`, aliases, chained commands |
 | `review-lens` | read-proof mismatch means INVALID; CLEAN with findings is rejected; refused mechanisms; findings-hash normalisation; stall after two identical rounds; required-lens computation; a new commit invalidates CLEAN; finalize refuses an incomplete set |
 | `gate-merge-on-review` | edited `review.md` text, a stale sha, a moved merge-base or `--auto` all deny |
+| `review-diff.sh` | the same bytes whatever the repository, global or environment settings; binary files shown as text; a missing commit, two merge bases or a forged object refused |
 | `status` | a failing `gh` prints `UNKNOWN`, never an empty list |
 | budget wrapper (Vitest, in the template) | refuses over cap, on a missing or malformed limits file, on a disabled provider; two concurrent calls can't both pass a cap that allows one; ledger entries are complete |
 

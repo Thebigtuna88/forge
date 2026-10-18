@@ -18,8 +18,11 @@
 # 2. Each case tests/conformance/<hook>/{deny,allow}/<case>.json is fed on stdin to the hook in a
 #    fresh sandbox: a byte-identical copy of the hooks, runtime and config (live mode.json
 #    included) at <tmp>/code/forge, a git repo on dev with a bare "origin", next to an empty
-#    <tmp>/code/forge-worktrees, with its own HOME. The hook must be registered for the case's
+#    <tmp>/code/forge-worktrees, with its own HOME, and FORGE's test stubs (tests/stubs) in
+#    <tmp>/stubs: there the runtime's hr_gh runs the fake gh, which answers from <tmp>/gh/ and
+#    never reaches GitHub (FRG-4). The hook must be registered for the case's
 #    hook_event_name and tool_name. In a case, @ROOT@, @WORKTREES@ and @TMP@ become those paths,
+#    @SHA@ the commit id the setup wrote to <tmp>/case.sha (a case that names it needs one),
 #    an optional "forge_mode_key" names the mode.json key it runs under (default: the hook's
 #    name), and an optional <case>.setup.sh runs first: copied into the sandbox and run by bash
 #    under macOS sandbox-exec, with only PATH, HOME, ROOT, WORKTREES and TMP set. It (and anything
@@ -673,6 +676,10 @@ COPIED=() # paths relative to ROOT, copied byte for byte into every sandbox
 for f in "$SETTINGS" "$HOOKS_DIR"/*.sh "$ROOT"/.harness/lib/* "$ROOT"/.harness/*.json "$ROOT"/.harness/*.toml; do
   [[ -f "$f" && ! -L "$f" ]] && COPIED+=("${f#"$ROOT"/}")
 done
+STUBS=() # tests/stubs/*, copied into every sandbox's stubs/ (the fake gh and the scene helper)
+for f in "$ROOT"/tests/stubs/*; do
+  [[ -f "$f" && ! -L "$f" ]] && STUBS+=("${f#"$ROOT"/}")
+done
 
 # The hook under test runs sandboxed too: it (and any program git starts for it, say a
 # core.fsmonitor a setup configured) may write only inside its sandbox, and may not send signals.
@@ -702,9 +709,12 @@ mk_sandbox() {
   BASE="$TMP/s$n_sbx"
   RUN="$TMP/r$n_sbx"
   SBX="$BASE/code/forge"
-  mkdir -p "$SBX" "$BASE/code/forge-worktrees" "$BASE/home" "$BASE/tmp" "$RUN" || return 1
+  mkdir -p "$SBX" "$BASE/code/forge-worktrees" "$BASE/home" "$BASE/tmp" "$BASE/stubs" "$BASE/gh" "$RUN" || return 1
   for rel in ${COPIED[@]+"${COPIED[@]}"}; do
     mkdir -p "$SBX/$(dirname "$rel")" && cp -p "$ROOT/$rel" "$SBX/$rel" || return 1
+  done
+  for rel in ${STUBS[@]+"${STUBS[@]}"}; do
+    cp -p "$ROOT/$rel" "$BASE/stubs/${rel##*/}" || return 1
   done
   git init -q -b dev "$SBX" && git init -q --bare "$BASE/remote.git" &&
     git -C "$SBX" remote add origin "$BASE/remote.git"
@@ -804,9 +814,19 @@ run_case() {
     skip=.harness/mode.json
     [[ "$variant" == missing ]] || cp "$SBX/.harness/mode.json" "$RUN/mode.variant"
   fi
-  jq --arg r "$SBX" --arg w "$BASE/code/forge-worktrees" --arg t "$BASE" \
+  # @SHA@: a commit id only the setup knows (scene.sh writes the PR head it built).
+  local sha=""
+  if [[ -f "$BASE/case.sha" && ! -L "$BASE/case.sha" ]]; then sha="$(head -n 1 "$BASE/case.sha")"; fi
+  if grep -qF '@SHA@' "$json"; then
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || {
+      CASE_ERR="the case names @SHA@, but its setup wrote no commit id to case.sha"
+      return 0
+    }
+  fi
+  jq --arg r "$SBX" --arg w "$BASE/code/forge-worktrees" --arg t "$BASE" --arg s "$sha" \
     'walk(if type == "string"
       then split("@ROOT@") | join($r) | split("@WORKTREES@") | join($w) | split("@TMP@") | join($t)
+        | split("@SHA@") | join($s)
       else . end)' "$json" >"$RUN/input.json" || {
     CASE_ERR="can't fill in the placeholders"
     return 0

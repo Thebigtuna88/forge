@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh repo edit Thebigtuna88/forge --visibility private --accept-visibility-change-consequences"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "is not on FORGE's list of allowed gh commands"
+}

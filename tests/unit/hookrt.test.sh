@@ -316,7 +316,7 @@ test_guarded_detection() {
   mk_hook_harness
   local c
   for c in 'git push origin x' 'git commit -F m' 'gh pr merge 3' 'gh api repos/a/b' \
-    'gh repo view' 'gh workflow run deploy.yml' 'vercel deploy' 'xcrun altool --upload-app' \
+    'gh repo edit' 'gh workflow run deploy.yml' 'vercel deploy' 'xcrun altool --upload-app' \
     'echo "git push"' 'g"i"t p\ush origin x' 'GIT PUSH' 'cd x && git -C /y push' \
     $'git status\ngit push origin x' 'bash -c "git commit -F m"' '`git push`' \
     'x=$(printf pu)sh; git $x' 'git p origin main' 'git --exec-path=/x status' \
@@ -350,6 +350,69 @@ test_guarded_detection() {
   done
 }
 
+# FRG-4: gh is judged by its real command. Only the read-only commands, with the two words after
+# gh written out, are plain; any other gh invocation, wherever gh may run, is guarded.
+test_gh_guarded_detection() {
+  mk_hook_harness
+  local c
+  for c in 'gh issue create --repo a/b --title x --body-file f' 'gh secret set X' 'gh auth status' \
+    'gh auth token' 'gh pr comment 5 --body-file f' 'gh' 'gh pr' 'gh pr view5' 'gh co 5' \
+    'echo repo delete a/b | xargs gh' 'xargs gh < args.txt' 'nice gh repo delete a/b' \
+    'ssh host gh pr merge 5' 'gh pr view 5 && gh pr merge 5' 'gh pr view 5 | gh pr merge 5' \
+    'frobnicate /tmp/bin/?? repo delete a/b' 'gh $X view 5' 'gh pr "$X" 5' 'GH repo delete a/b' \
+    '/opt/homebrew/bin/gh repo delete a/b' 'which gh | cat' 'gh search' 'gh pr -R a/b merge 5' \
+    'gh issue --repo a/b view 5' "sh -c 'gh pr merge 5'" 'gh run rerun 5' 'gh workflow run x' \
+    'gh repo view && gh repo delete a/b' 'gh label create x' 'gh release create v1'; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+}
+
+test_gh_reads_are_plain() {
+  mk_hook_harness
+  local c
+  for c in 'gh pr view 5 --repo a/b | head' "gh pr view 5 --repo a/b --json files | jq '.files[].path'" \
+    'gh issue list --repo a/b --state open' 'gh repo view a/b' 'gh pr diff 5 --repo a/b | wc -l' \
+    'gh pr checks 5' 'gh pr status' 'gh run list --limit 3' 'gh run view 1 --log | tail -5' \
+    'gh run watch 1' 'gh workflow list' 'gh workflow view ci.yml' 'gh release list' \
+    'gh release view v1' 'gh label list' 'gh search issues x --repo a/b' 'gh status' 'gh browse' \
+    "gh pr view 5 --json title --jq '.title | ascii_downcase'" 'which gh' 'brew upgrade gh' \
+    'ls /opt/homebrew/bin/gh' 'gh issue view 5 --comments | grep -i repo'; do
+    probe guarded "$c"
+    assert_eq "$OUT" PLAIN "plain: $c"
+  done
+}
+
+test_inherited_gh_variables_deny_guarded_gh_commands() {
+  mk_hook_harness
+  local v
+  for v in GH_TOKEN=x GH_REPO=a/b GH_HOST=example.com GH_CONFIG_DIR="$T_TMP/x" GITHUB_TOKEN=x \
+    GH_ENTERPRISE_TOKEN=x GITHUB_API_URL=https://example.com; do
+    run_hook sample-gate "$(bash_input 'gh issue create --title x --body-file f' "$H")" "$v"
+    assert_exit 2 "$RC" "guarded gh command with $v"
+    assert_contains "$ERR" "the environment sets ${v%%=*}" "reason with $v"
+  done
+  run_hook sample-gate "$(bash_input 'gh pr view 5 --repo a/b' "$H")" GH_REPO=c/d
+  assert_exit 0 "$RC" "a gh read isn't guarded"
+}
+
+test_fake_gh_only_inside_a_conformance_sandbox() {
+  mk_hook_harness
+  mkdir -p "$T_TMP/stubs"
+  probe ghpath 'true'
+  assert_not_contains "$OUT" "$T_TMP" "outside a sandbox, gh comes from PATH"
+  mk_hook_harness "$T_TMP/forge-conformance.Ab3dE9/s12"
+  probe ghpath 'true'
+  assert_eq "$OUT" "gh=$T_TMP/forge-conformance.Ab3dE9/s12/stubs/gh" "inside a sandbox, its fake gh"
+  local base
+  for base in "$T_TMP/forge-conformance.Ab3dE/s1" "$T_TMP/forge-conformance.Ab3dE9/x1" \
+    "$T_TMP/conformance.Ab3dE9/s1" "$T_TMP/forge-conformance.Ab3dE9/s1/extra"; do
+    mk_hook_harness "$base"
+    probe ghpath 'true'
+    assert_not_contains "$OUT" "/stubs/gh" "not a sandbox: $base"
+  done
+}
+
 test_plain_detection() {
   mk_hook_harness
   local c
@@ -374,7 +437,7 @@ test_simple_guarded_commands_pass() {
     'gh api repos/Thebigtuna88/forge/pulls' 'vercel deploy' \
     'git --no-pager -c color.ui=never push origin feature/FRG-2-a' \
     'git -c core.quotepath=false -c advice.detachedHead=false push origin feature/FRG-2-a' \
-    'gh repo view Thebigtuna88/forge' 'gh actions' 'gh copilot explain x' 'gh repo list' 'git merge dev' \
+    'gh repo edit Thebigtuna88/forge' 'gh actions' 'gh copilot explain x' 'gh repo list' 'git merge dev' \
     'git pull --ff-only origin dev'; do
     expect_allow "$c"
   done

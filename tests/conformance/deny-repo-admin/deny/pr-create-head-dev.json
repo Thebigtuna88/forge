@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh pr create --base dev --head main --title FRG-9 --body-file @TMP@/body.md"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "must be a ticket branch"
+}

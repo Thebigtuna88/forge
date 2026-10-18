@@ -1,0 +1,28 @@
+#!/bin/bash
+# Test stub for gh (spec 10.2). Conformance copies it to <sandbox>/stubs/gh, where the hook
+# runtime's hr_gh runs it instead of the real gh (only inside a conformance sandbox). It answers
+# from files a case's setup wrote and never reaches GitHub. A call's answer is picked by its words
+# up to the first option, joined by "-", with "/" as "_" ("pr view 22 --json …" → pr-view-22):
+#   <sandbox>/gh/<key>.out   printed on standard output
+#   <sandbox>/gh/<key>.rc    the exit status (0 if absent)
+# With no .out file it says so on standard error and exits 1, as gh does when GitHub can't be
+# reached. Every call is appended to <sandbox>/gh/calls.log.
+set -u
+dir="$(cd "$(dirname "$0")/../gh" 2>/dev/null && pwd)" || {
+  echo "stub gh: no answer folder next to $0" >&2
+  exit 1
+}
+key=""
+for a in "$@"; do
+  case "$a" in -*) break ;; esac
+  key="${key:+$key-}${a//\//_}"
+done
+printf '%s\n' "$*" >>"$dir/calls.log"
+if [[ ! -f "$dir/$key.out" ]]; then
+  echo "stub gh: no answer for: gh $*" >&2
+  exit 1
+fi
+cat "$dir/$key.out"
+rc=0
+if [[ -f "$dir/$key.rc" ]]; then rc="$(cat "$dir/$key.rc")"; fi
+exit "$rc"

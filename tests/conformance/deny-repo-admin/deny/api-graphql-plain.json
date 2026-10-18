@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh api graphql"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "gh api graphql is refused"
+}

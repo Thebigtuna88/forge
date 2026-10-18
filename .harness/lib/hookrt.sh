@@ -81,8 +81,11 @@ export PATH
 # are kept in _HR_GIT_ENV and hr_require_simple refuses guarded git commands while any is set.
 # Claude Code's own GIT_EDITOR=true (an editor that changes nothing) is the only exception.
 # EMAIL and XDG_CONFIG_HOME stay, so git reads the same identity and global settings here.
-unset _HR_GIT_ENV
+# GH_* and GITHUB_* variables (GH_REPO, GH_HOST, GH_TOKEN, GITHUB_TOKEN, GH_CONFIG_DIR, …) would
+# make gh act on another repository, host or login, so they are kept in _HR_GH_ENV the same way.
+unset _HR_GIT_ENV _HR_GH_ENV
 _HR_GIT_ENV=""
+_HR_GH_ENV=""
 for _hr_v in $(compgen -e); do
   case "$_hr_v" in
     HOME | USER | LOGNAME | TMPDIR | CLAUDE_PROJECT_DIR | PATH | LC_ALL | EMAIL | XDG_CONFIG_HOME) ;;
@@ -92,6 +95,10 @@ for _hr_v in $(compgen -e); do
       ;;
     GIT_*)
       _HR_GIT_ENV+=" $_hr_v"
+      unset "$_hr_v" 2>/dev/null || true
+      ;;
+    GH_* | GITHUB_*)
+      _HR_GH_ENV+=" $_hr_v"
       unset "$_hr_v" 2>/dev/null || true
       ;;
     *) unset "$_hr_v" 2>/dev/null || true ;;
@@ -126,11 +133,12 @@ _HR_LOADED="" _HR_TOOLS=() _HR_GIT_CMDS="" _HR_SUBI=-1 _HR_UNKNOWABLE=0 _HR_CDS=
 # Guarded actions (spec 5.2), as words that must appear in this order (hyphens split words, so
 # send-pack is "send pack"). Deploy tools come from
 # .harness/deploy-targets.json ("tools") on top of this floor, so a missing file can't open them.
+# gh is judged by its real command instead (FRG-4, _hr_gh_reads below), so a word such as --repo
+# in `gh issue create --repo …` doesn't make it count as `gh repo`.
 _HR_GUARDED_SEQS=("git push" "git commit" "git send pack" "git http push" "git rebase" "git filter branch"
   "git filter repo" "git replace" "git update ref" "git am" "git cherry pick" "git revert"
   "git checkout" "git switch" "git branch" "git worktree" "git reset" "git merge" "git pull" "git fetch"
-  "git fast import" "git symbolic ref"
-  "gh pr merge" "gh api" "gh repo" "gh workflow run")
+  "git fast import" "git symbolic ref")
 # The git subcommands those name; an alias for any of them is refused (hr_require_simple).
 _HR_GIT_GUARDED_SUBS=" push commit send-pack http-push rebase filter-branch filter-repo replace "
 _HR_GIT_GUARDED_SUBS+="update-ref commit-tree am cherry-pick revert checkout switch branch worktree "
@@ -151,6 +159,14 @@ _HR_GH_CMDS=" agent-task alias api attestation auth browse cache codespace compl
   discussion extension gist gpg-key help issue label licenses org pr preview project release repo
   ruleset run search secret skill ssh-key status variable workflow accessibility actions
   environment exit-codes formatting mintty reference telemetry "
+# gh commands that only read, as "<command>:<subcommand>" ("<command>:*" for any subcommand,
+# "<command>" alone when it takes none). A gh invocation that is one of these, with the two words
+# written right after gh, isn't guarded, so it may sit in a pipeline. Every other gh invocation is
+# guarded: one plain command, judged by deny-repo-admin. `gh auth status` isn't here, because its
+# --show-token prints the login token.
+_HR_GH_READS=" issue:list issue:view pr:list pr:view pr:diff pr:checks pr:status run:list run:view
+  run:watch workflow:list workflow:view repo:view release:list release:view label:list search:*
+  status browse "
 # git commands that never create a commit or move a branch. Any other git command (including ones
 # a newer git adds) counts as guarded, so it must be one plain command and a gate decides on it.
 _HR_GIT_SAFE_SUBS=" status log show diff add rm mv restore grep blame ls-files ls-tree ls-remote "
@@ -160,6 +176,7 @@ _HR_GIT_SAFE_SUBS+="check-ref-format check-mailmap diff-tree diff-index diff-fil
 _HR_GIT_SAFE_SUBS+="archive clean gc prune repack maintenance sparse-checkout "
 # The word lists above are matched as " word "; a line break must count as a space too.
 _HR_GH_CMDS="${_HR_GH_CMDS//$'\n'/ }"
+_HR_GH_READS="${_HR_GH_READS//$'\n'/ }"
 _HR_WRAPPERS="${_HR_WRAPPERS//$'\n'/ }"
 _HR_GIT_GUARDED_SUBS="${_HR_GIT_GUARDED_SUBS//$'\n'/ }"
 # Characters a guarded command may not contain (spec 5.2), plus glob, brace, comment and tilde
@@ -445,6 +462,14 @@ _hr_git_globals() {
   _HR_UNKNOWABLE=0 # plain `git` with nothing after it
 }
 
+_hr_gh_reads() { # <index of a gh word in HR_TOK>: 0 if that gh invocation only reads
+  local c1="${HR_TOK[$(($1 + 1))]:-}" c2="${HR_TOK[$(($1 + 2))]:-}"
+  [[ "$c1" =~ ^[a-z]+(-[a-z]+)*$ && "$_HR_GH_CMDS" == *" $c1 "* ]] || return 1
+  if [[ "$_HR_GH_READS" == *" $c1 "* ]]; then return 0; fi
+  [[ "$c2" =~ ^[a-z]+(-[a-z]+)*$ ]] || return 1
+  [[ "$_HR_GH_READS" == *" $c1:$c2 "* || "$_HR_GH_READS" == *" $c1:* "* ]]
+}
+
 hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2)
   local cmd="${1-$HR_CMD}" w seq tool
   local -a words
@@ -473,8 +498,9 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   fi
   # 2. Real shell words (newlines count as command separators):
   #    - a command name the shell builds or globs that could become git, gh or a deploy tool;
-  #    - a git or gh invocation whose command is not one of their own (an alias, an extension or
-  #      something unknowable).
+  #    - a git invocation whose command is not one of git's own (an alias or something
+  #      unknowable), or that may write;
+  #    - a gh invocation that isn't one of the read-only commands (_HR_GH_READS).
   local -a saved=(${HR_TOK[@]+"${HR_TOK[@]}"})
   if ! hr_tokens "${cmd//$'\n'/ ; }" punct; then
     HR_TOK=(${saved[@]+"${saved[@]}"})
@@ -485,11 +511,16 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   fi
   # A guarded verb in the text makes any glob suspect, even one without letters (/tmp/bin/???),
   # since some program the runtime doesn't know may run it.
+  # git's verbs count wherever they appear; gh's only as whole words, so the --repo of a read
+  # such as `gh pr view 5 --repo a/b --json files | jq '.files[]'` isn't one.
   local verbs=0
   for w in "${words[@]}"; do
-    if [[ "$_HR_DYNAMIC_WORDS" == *" $w "* ]]; then verbs=1; fi
+    case "$w" in push | commit | merge) verbs=1 ;; esac
   done
-  local i n=${#HR_TOK[@]} t u base rc=1 cmdpos=1 wrapped=0 skip=0 op='^[;&|()<>]+$' toolargs=0
+  for w in ${HR_TOK[@]+"${HR_TOK[@]}"}; do
+    case "$(_hr_lower "$w")" in api | repo | workflow) verbs=1 ;; esac
+  done
+  local i n=${#HR_TOK[@]} t u base rc=1 cmdpos=1 wrapped=0 skip=0 op='^[;&|()<>]+$'
   for ((i = 0; i < n; i++)); do
     t="${HR_TOK[$i]}"
     if [[ $skip == 1 ]]; then # the target of a redirection
@@ -506,7 +537,6 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
         *)
           cmdpos=1
           wrapped=0
-          toolargs=0
           ;;
       esac
       continue
@@ -514,14 +544,15 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     if [[ "$t" == '`'* ]]; then cmdpos=1; fi
     u="${t//\`/}"
     base="$(_hr_lower "${u##*/}")"
-    # After gh, a word the shell expands could become its guarded subcommand (gh pr m???e →
-    # gh pr merge), so the command counts as guarded. (git's subcommand is checked exactly below,
-    # and any deploy tool already makes a command guarded.)
-    if [[ $toolargs == 1 && "$t" == *[*?[\{\$\`]* ]]; then
+    # gh runs here, or may: in command position, after a wrapper (xargs gh), or with words after
+    # it. Unless the two words after it are written out and name a read-only command, the
+    # command is guarded. So a word the shell expands can't become a guarded subcommand
+    # (gh pr m???e, gh pr $X), and `which gh` (nothing after it) stays plain.
+    if [[ "$base" == gh ]] && [[ $cmdpos == 1 || $wrapped == 1 || $((i + 1)) -lt $n ]] &&
+      ! _hr_gh_reads "$i"; then
       rc=0
       break
     fi
-    if [[ "$base" == gh ]]; then toolargs=1; fi
     if [[ $cmdpos == 1 ]]; then
       if [[ "$u" =~ ^[0-9]+$ && $((i + 1)) -lt $n && "${HR_TOK[$((i + 1))]}" == *[\<\>]* ]]; then
         continue # a file descriptor in front of a redirection (2>f): still before the command
@@ -573,9 +604,6 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
         done
         if [[ $rc == 0 ]]; then break; fi
       fi
-    elif [[ "$base" == gh && $((i + 1)) -lt $n && "$_HR_GH_CMDS" != *" ${HR_TOK[$((i + 1))]} "* ]]; then
-      rc=0
-      break
     fi
   done
   HR_TOK=(${saved[@]+"${saved[@]}"})
@@ -634,6 +662,8 @@ hr_require_simple() { # deny unless a guarded command is one plain command; fill
     gh)
       [[ "$_HR_GH_CMDS" == *" ${HR_TOK[1]:-} "* ]] ||
         hr_deny "gh alias, extension or option before the command ('${HR_TOK[1]:-}'); use gh's own command"
+      [[ -z "$_HR_GH_ENV" ]] ||
+        hr_deny "the environment sets${_HR_GH_ENV}, so gh could act on another repository, host or login than the one FORGE checks; start Claude Code without it"
       return 0
       ;;
   esac
@@ -708,6 +738,217 @@ hr_sha256() { # <file>: its sha256 in hex; fails if the file can't be read
   s="$(shasum -a 256 <"$1" 2>/dev/null || true)"
   [[ -n "$s" ]] || return 1
   printf '%s\n' "${s%% *}"
+}
+
+# --- GitHub (FRG-4) -----------------------------------------------------------------------------
+
+# The only repository a merge may name, until projects.json (FRG-10) adds the projects'.
+HR_FORGE_REPO=Thebigtuna88/forge
+HR_MERGE_FORM="gh pr merge <n> --repo $HR_FORGE_REPO --squash --match-head-commit <40-character sha>"
+HR_TICKET_BRANCH='^feature/FRG-[0-9]+-[a-z0-9]+(-[a-z0-9]+)*$'
+HR_PR="" HR_PR_HEAD="" HR_PR_BRANCH="" HR_PR_DEV="" HR_PR_MB="" HR_PR_DIR="" HR_SCAN=""
+
+# hr_gh <args…>: runs gh with prompts, pager, colour and update checks off. Inside a conformance
+# sandbox (this runtime itself sits at <tmp>/forge-conformance.XXXXXX/s<n>/code/forge) it runs the
+# sandbox's fake gh (<tmp>/…/s<n>/stubs/gh), which answers from files the case wrote and never
+# reaches GitHub. Nothing in the environment or in a real checkout can pick the fake: the runtime
+# Claude Code runs lives in the folder Claude Code was started in.
+hr_gh() {
+  local gh
+  gh="$(_hr_gh_path)"
+  [[ -n "$gh" && -f "$gh" && -x "$gh" ]] || return 127
+  env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 GH_NO_EXTENSION_UPDATE_NOTIFIER=1 \
+    GH_SPINNER_DISABLED=1 GH_PAGER=cat NO_COLOR=1 "$gh" "$@"
+}
+
+_hr_gh_path() { # the gh hr_gh runs: the sandbox's fake inside a conformance sandbox, else gh on PATH
+  local sandbox='^/.+/forge-conformance\.[A-Za-z0-9]{6}/s[0-9]+/code/forge$'
+  if [[ "$HR_ROOT" =~ $sandbox ]]; then
+    printf '%s\n' "${HR_ROOT%/code/forge}/stubs/gh"
+  else
+    type -P gh || true
+  fi
+}
+
+# hr_scan_text <folder>: 0 if gitleaks, with FORGE's rules (never a repository's own config,
+# .gitleaksignore or gitleaks:allow comments), finds nothing in the files of <folder>. Otherwise 1,
+# with gitleaks' last lines in HR_SCAN; a missing gitleaks or a failed scan counts as a finding.
+hr_scan_text() {
+  HR_SCAN="gitleaks is not installed"
+  type -P gitleaks >/dev/null || return 1
+  HR_SCAN="can't make a scratch folder for gitleaks"
+  [[ -d "$HR_TMP/no-ignore" ]] || mkdir "$HR_TMP/no-ignore" || return 1
+  if gitleaks dir --config "$HR_ROOT/.harness/gitleaks.toml" --gitleaks-ignore-path "$HR_TMP/no-ignore" \
+    --ignore-gitleaks-allow --no-banner --no-color --redact --exit-code 1 "$1" >"$HR_TMP/scan.out" 2>&1; then
+    HR_SCAN=""
+    return 0
+  fi
+  HR_SCAN="$(tail -n 3 "$HR_TMP/scan.out" 2>/dev/null || true)"
+  HR_SCAN="${HR_SCAN//$'\n'/ | }"
+  return 1
+}
+
+# hr_merge_form: 0 if HR_TOK is exactly HR_MERGE_FORM, setting HR_PR and HR_PR_HEAD.
+hr_merge_form() {
+  HR_PR="" HR_PR_HEAD=""
+  [[ ${#HR_TOK[@]} -eq 9 && "${HR_TOK[0]}" == gh && "${HR_TOK[1]}" == pr && "${HR_TOK[2]}" == merge ]] || return 1
+  [[ "${HR_TOK[3]}" =~ ^[1-9][0-9]{0,8}$ && "${HR_TOK[4]}" == --repo && "${HR_TOK[5]}" == "$HR_FORGE_REPO" ]] || return 1
+  [[ "${HR_TOK[6]}" == --squash && "${HR_TOK[7]}" == --match-head-commit && "${HR_TOK[8]}" =~ ^[0-9a-f]{40}$ ]] || return 1
+  HR_PR="${HR_TOK[3]}"
+  HR_PR_HEAD="${HR_TOK[8]}"
+}
+
+# hr_merge_prepare: the facts both merge gates judge, read from GitHub and recomputed here, never
+# taken from a file the agent wrote. Call after hr_merge_form. Denies unless the PR is open, merges
+# into dev, comes from a ticket branch of this repository (not a fork) and has exactly HR_PR_HEAD
+# as its head, and unless the merge base GitHub reports for dev...head is the one review-diff.sh
+# recomputes from the local objects. Sets HR_PR_BRANCH, HR_PR_DEV (dev's tip on GitHub), HR_PR_MB
+# and HR_PR_DIR (review-diff.sh's output: diff.patch, raw, iso.git), and leaves GitHub's answer
+# about the PR in "$HR_TMP/pr.json".
+hr_merge_prepare() {
+  local pr="$HR_TMP/pr.json" cmp="$HR_TMP/compare.json" err="" got="" rc=0
+  local state base branch head cross owner ghmb sha='^[0-9a-f]{40}$'
+  if ! hr_gh pr view "$HR_PR" --repo "$HR_FORGE_REPO" \
+    --json state,baseRefName,headRefName,headRefOid,isCrossRepository,headRepositoryOwner,title,body,commits \
+    >"$pr" 2>"$HR_TMP/gh.err"; then
+    err="$(head -c 200 "$HR_TMP/gh.err" | tr '\n' ' ')"
+    hr_deny "can't read PR #$HR_PR from GitHub ($err); check gh auth status and try again"
+  fi
+  got="$(jq -er 'if type == "object" then [.state, .baseRefName, .headRefName, .headRefOid,
+      .isCrossRepository, (.headRepositoryOwner | if type == "object" then .login else null end)]
+      | map(tostring) | join("\u001f") else error("not an object") end' "$pr" 2>/dev/null)" ||
+    hr_deny "GitHub's answer about PR #$HR_PR can't be read; try again"
+  IFS=$'\x1f' read -r state base branch head cross owner <<<"$got"
+  [[ "$state" == OPEN ]] || hr_deny "PR #$HR_PR is $state, not open"
+  [[ "$base" == dev ]] || hr_deny "PR #$HR_PR merges into '$base'; a merge goes only into dev (main is the owner's)"
+  [[ "$cross" == false && "$owner" == "${HR_FORGE_REPO%%/*}" ]] ||
+    hr_deny "PR #$HR_PR comes from a fork or another owner's repository; merge only branches of $HR_FORGE_REPO"
+  [[ "$branch" =~ $HR_TICKET_BRANCH ]] ||
+    hr_deny "PR #$HR_PR's branch '$branch' is not a ticket branch (feature/<KEY>-<n>-<slug>)"
+  [[ "$head" == "$HR_PR_HEAD" ]] ||
+    hr_deny "PR #$HR_PR's head on GitHub is $head, not the --match-head-commit $HR_PR_HEAD; the branch moved, so review its new head"
+  HR_PR_BRANCH="$branch"
+
+  if ! hr_gh api "repos/$HR_FORGE_REPO/compare/dev...$HR_PR_HEAD" >"$cmp" 2>"$HR_TMP/gh.err"; then
+    err="$(head -c 200 "$HR_TMP/gh.err" | tr '\n' ' ')"
+    hr_deny "can't read dev...$HR_PR_HEAD from GitHub ($err); try again"
+  fi
+  got="$(jq -er 'if type == "object" then [.base_commit.sha, .merge_base_commit.sha] | map(tostring)
+      | join(" ") else error("not an object") end' "$cmp" 2>/dev/null)" ||
+    hr_deny "GitHub's comparison of dev and PR #$HR_PR can't be read; try again"
+  read -r HR_PR_DEV ghmb <<<"$got"
+  [[ "$HR_PR_DEV" =~ $sha && "$ghmb" =~ $sha ]] ||
+    hr_deny "GitHub's comparison of dev and PR #$HR_PR has no commit ids; try again"
+
+  HR_PR_DIR="$HR_TMP/review"
+  mkdir "$HR_PR_DIR"
+  if /bin/bash -p "$HR_ROOT/.harness/lib/review-diff.sh" "$HR_ROOT" "$HR_PR_DEV" "$HR_PR_HEAD" "$HR_PR_DIR" \
+    2>"$HR_TMP/review-diff.err"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  err="$(head -c 300 "$HR_TMP/review-diff.err" | tr '\n' ' ')"
+  case "$rc" in
+    0) ;;
+    3) hr_deny "$err (dev is at $HR_PR_DEV on GitHub)" ;;
+    *) hr_deny "can't recompute PR #$HR_PR's diff: $err" ;;
+  esac
+  HR_PR_MB="$(cat "$HR_PR_DIR/merge-base")"
+  [[ "$HR_PR_MB" == "$ghmb" ]] ||
+    hr_deny "GitHub's merge base of dev and PR #$HR_PR ($ghmb) is not the one recomputed here ($HR_PR_MB); run git fetch origin and try again"
+}
+
+# hr_base_blob <path> <out file>: the file at <path> in the merge base, read from review-diff's
+# scratch repository (whose objects review-diff re-hashed). Fails if it isn't a file there.
+hr_base_blob() {
+  [[ "$(git --git-dir="$HR_PR_DIR/iso.git" cat-file -t "$HR_PR_MB:$1" 2>/dev/null || true)" == blob ]] || return 1
+  git --git-dir="$HR_PR_DIR/iso.git" cat-file blob "$HR_PR_MB:$1" >"$2" 2>/dev/null
+}
+
+# Owner-only paths a diff touches. Arguments: review-diff's raw file, then one or more owner-only
+# lists (JSON: {"paths": [...]}, a path ending in / covering everything under it). Each changed path
+# and each list entry is compared as macOS compares names: Unicode-normalised (NFC), case-folded,
+# with invisible format characters (such as zero-width joiners) dropped. A deleted path counts as
+# much as an added one (renames are both), and any symlink or submodule on either side counts as
+# owner-only, since it can point into an owner-only folder. Prints one line per hit; exits 1 if any,
+# 3 if a list is missing or malformed, 0 if none.
+_HR_PY_OWNER='
+import json, sys, unicodedata
+
+def norm(p):
+    p = "".join(c for c in unicodedata.normalize("NFC", p) if unicodedata.category(c) != "Cf")
+    return unicodedata.normalize("NFC", p.casefold())
+
+raw, lists = sys.argv[1], sys.argv[2:]
+entries = []
+for f in lists:
+    try:
+        with open(f, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except Exception:
+        print("owner-only list " + f + " is missing or not JSON")
+        sys.exit(3)
+    paths = doc.get("paths") if isinstance(doc, dict) else None
+    if not isinstance(paths, list) or not paths or not all(isinstance(p, str) and p.strip("/") for p in paths):
+        print("owner-only list " + f + " has no paths list of non-empty strings")
+        sys.exit(3)
+    entries.extend(norm(p) for p in paths)
+parts = open(raw, "rb").read().split(b"\0")
+if parts and parts[-1] == b"":
+    parts.pop()
+if len(parts) % 2:
+    print("diff --raw output is malformed")
+    sys.exit(3)
+hits = []
+for meta, path in zip(parts[0::2], parts[1::2]):
+    fields = meta.decode("ascii", "replace").lstrip(":").split()
+    name = path.decode("utf-8", "surrogateescape")
+    if len(fields) < 2:
+        print("diff --raw output is malformed")
+        sys.exit(3)
+    if {"120000", "160000"} & set(fields[:2]):
+        hits.append("symlink or submodule: " + name)
+        continue
+    n = norm(name)
+    for e in entries:
+        d = e.rstrip("/")
+        if n == d or n.startswith(d + "/"):
+            hits.append(name)
+            break
+for h in hits:
+    print(h)
+sys.exit(1 if hits else 0)
+'
+hr_owner_hits() { # <raw> <list…>: prints the hits into "$HR_TMP/owner.hits"; status as above
+  python3 -I -c "$_HR_PY_OWNER" "$@" >"$HR_TMP/owner.hits" 2>&1
+}
+
+hr_gh_reads() { # <index of gh in HR_TOK>: 0 if that gh invocation is one of the read-only commands
+  _hr_gh_reads "$1"
+}
+
+# review.md (spec 6.6) is for people, with the facts the merge gate reads in exactly one block
+# fenced by a line that is exactly ```json forge-review and a line that is exactly ```.
+_HR_PY_REVIEW='
+import sys
+fence = chr(96) * 3
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+blocks, cur = [], None
+for line in lines:
+    if cur is None and line == fence + "json forge-review":
+        cur = []
+    elif cur is not None and line == fence:
+        blocks.append("\n".join(cur))
+        cur = None
+    elif cur is not None:
+        cur.append(line)
+if cur is not None or len(blocks) != 1:
+    sys.exit(1)
+open(sys.argv[2], "w", encoding="utf-8").write(blocks[0] + "\n")
+'
+hr_review_json() { # <review.md> <out.json>: 0 if review.md holds exactly one forge-review block
+  python3 -I -c "$_HR_PY_REVIEW" "$1" "$2" 2>/dev/null
 }
 
 HOOKRT_LOADED=1

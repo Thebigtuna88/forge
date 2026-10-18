@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh pr create --base dev --head feature/FRG-9-sample --title a --title b --body-file @TMP@/body.md"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "give --title once"
+}

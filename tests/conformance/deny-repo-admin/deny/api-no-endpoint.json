@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh api --paginate"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "needs an endpoint"
+}

@@ -29,7 +29,8 @@ a time**, with a recommendation.
 7. **Limits are the owner's.** Paths in `.harness/self-modification-paths.json` (spend limits,
    deploy targets, mode.json, the paths list itself, `.claude/hooks/`, `.claude/settings.json`,
    `.harness/lib/`, `.github/workflows/`, `.harness/bin/conformance`, `tests/conformance/`,
-   `.harness/gitleaks.toml`) change only by a PR **the owner** merges.
+   `.harness/gitleaks.toml`, this file `CLAUDE.md`, `.harness/bin/handoff`, `docs/specs/`,
+   `tests/stubs/`) change only by a PR **the owner** merges.
 8. **Test mode until the owner flips it.** Payments run in test mode. Production deploys, App
    Store/TestFlight submissions, DNS changes and anything that charges a card are owner-run
    scripts, never agent actions.
@@ -57,16 +58,23 @@ web-UI click), **write a script, never instructions**:
 
 - Commit: write the message to a file, then `git commit -F <file>`. Never `-m`, `-a`, `--amend`
   or `--no-verify`. Stage with explicit `git add <paths>`.
-- `git push`, `git commit`, `gh pr merge`, `gh api`, `gh repo` and deploy commands are **single
-  simple commands**: one per Bash call, no `&&` `||` `;` `|` `&`, no `$( )`, backticks or
-  redirection. Use `git -C <dir>` instead of `cd … &&`.
+- `git push`, `git commit`, every `gh` command except the read-only ones, and deploy commands are
+  **single simple commands**: one per Bash call, no `&&` `||` `;` `|` `&`, no `$( )`, backticks
+  or redirection. Use `git -C <dir>` instead of `cd … &&`. The read-only `gh` commands (`issue
+  list/view`, `pr list/view/diff/checks/status`, `run list/view/watch`, `workflow list/view`,
+  `repo view`, `release list/view`, `label list`, `search`, `status`, `browse`) may use pipes.
+- Text goes to GitHub only as `--title <text>` and `--body-file <file>` (scanned for secrets
+  first); never `--body`, `-b`, `--fill` or an editor. PRs: `gh pr create --base dev --head
+  feature/<KEY>-<n>-<slug> --title <text> --body-file <file>`. `gh api` only reads (GET).
 - Push with an explicit target: `git push -u origin feature/<KEY>-<n>-<slug>`.
 - Update a branch in its worktree with `git merge --no-commit dev`, then `git commit -F <file>`
   (the merged result is scanned). Never rebase, amend or force-push.
 - Update a main checkout with `git -C /Users/atl/code/forge pull --ff-only origin dev` (an
   absolute path: the gates refuse `~` in guarded commands). It may only fast-forward and never gets
   a commit of its own.
-- Merge: `gh pr merge <n> --squash --match-head-commit <sha>`, only into `dev`, only after review.
+- Merge: `gh pr merge <n> --repo Thebigtuna88/forge --squash --match-head-commit <sha>`, only
+  into `dev`, only after review (`work/<KEY>-<n>-<slug>/review.md`, every required lens CLEAN),
+  and never a PR that touches an owner-only path.
 - No git aliases for guarded commands.
 
 ## Where things are remembered

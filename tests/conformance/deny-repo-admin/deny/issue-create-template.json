@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh issue create --title x --template bug.md"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "'--template' is not allowed"
+}
