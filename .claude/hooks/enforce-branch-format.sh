@@ -72,8 +72,7 @@ for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
     init:-q | init:--quiet | \
       init:--shared | init:--shared=* | init:--object-format=* | init:--ref-format=* | \
       clone:-q | clone:--quiet | clone:--depth=* | clone:--single-branch | clone:--no-single-branch | \
-      clone:-n | clone:--no-checkout | clone:--origin=* | clone:--recurse-submodules | \
-      clone:--recurse-submodules=* | clone:--shallow-submodules | clone:--no-tags | clone:--filter=* | \
+      clone:-n | clone:--no-checkout | clone:--origin=* | clone:--no-tags | clone:--filter=* | \
       clone:--sparse) ;;
     checkout:-q | checkout:--quiet | checkout:-f | checkout:--force | checkout:--ours | \
       checkout:--theirs | checkout:-m | checkout:--merge | checkout:--no-track | \

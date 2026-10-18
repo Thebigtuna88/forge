@@ -5,5 +5,5 @@
     "command": "git submodule update -- --checkout"
   },
   "cwd": "@ROOT@",
-  "forge_reason": "--checkout"
+  "forge_reason": "git submodule update"
 }

@@ -15,9 +15,11 @@
 #   -t/-m/--tags/--no-tags (it could fetch past the mapping check; use git fetch);
 #   git fetch or pull in a repository with submodules (git fetches into them too, with their own
 #   mappings);
-#   git submodule other than status/summary/init/sync/absorbgitdirs/deinit, and submodule update
-#   without --checkout (before any --) or with other options (unchecked commits or rebases in
-#   submodules);
+#   git submodule other than status/summary (FORGE repositories don't use submodules, and update
+#   fetches, merges or rebases inside them unchecked);
+#   git config writes other than user.name, user.email, core.quotepath, color.* and advice.*
+#   (other settings name programs git runs later, such as remote.<name>.uploadpack), and
+#   git config rename-section / --edit; reading and removing settings are fine;
 #   writing git notes; git reflog other than show/exists/list (delete --updateref moves a branch);
 #   git tag with any option outside listing/deleting/verifying, or a plain tag while tag.gpgSign is
 #   set (both put unscanned text into git, which push.followTags could carry with a branch);
@@ -95,26 +97,59 @@ case "$HR_GIT_SUB" in
     hr_allow
     ;;
   submodule)
+    # FORGE repositories don't use submodules. Anything beyond looking (update fetches, merges or
+    # rebases inside them with their own, unchecked settings) is refused.
     case "${HR_GIT_ARGS[0]:-status}" in
-      status | summary | init | sync | absorbgitdirs | deinit) hr_allow ;;
-      update)
-        # Only listed options, and --checkout must be said (before any --, after which every
-        # word is a path): it overrides a configured submodule.<name>.update=merge/rebase.
-        checkout=0
-        for a in "${HR_GIT_ARGS[@]:1}"; do
-          case "$a" in
-            --) break ;;
-            --checkout) checkout=1 ;;
-            --init | --recursive | -q | --quiet | --no-fetch | -N) ;;
-            -*) hr_deny "git submodule update option $a is not one FORGE allows (it may merge, rebase or skip checks)" ;;
-          esac
-        done
-        [[ $checkout == 1 ]] ||
-          hr_deny "git submodule update must say --checkout, so configuration can't make it merge or rebase"
-        hr_allow
-        ;;
-      *) hr_deny "git submodule ${HR_GIT_ARGS[0]} runs or changes things FORGE can't check inside submodules" ;;
+      status | summary) hr_allow ;;
+      *) hr_deny "git submodule ${HR_GIT_ARGS[0]} runs or changes things FORGE can't check inside submodules (FORGE repositories don't use submodules)" ;;
     esac
+    ;;
+  config)
+    # Reading settings is fine. Many settings name a program git runs later (core.pager,
+    # core.sshCommand, remote.<name>.uploadpack, diff.external, filter.*, …) or text it copies
+    # into commits, so writing is limited to identity and display settings. Removing a setting is
+    # allowed (the gates ask for that); renaming a section or opening an editor is not.
+    mode=""
+    skip=0
+    cfgnames=()
+    for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
+      if [[ $skip == 1 ]]; then
+        skip=0
+        continue
+      fi
+      case "$a" in
+        --get | --get-all | --get-regexp | --get-urlmatch | --get-color | --get-colorbool | -l | --list) mode="reading" ;;
+        --unset | --unset-all | --remove-section) mode="removing" ;;
+        --add | --replace-all) mode="writing" ;;
+        --local | --global | --system | --worktree | --show-origin | --show-scope | --name-only | -z | \
+          --null | --includes | --no-includes | --bool | --int | --bool-or-int | --path | \
+          --expiry-date | --fixed-value | --type=* | --default=* | --file=* | --blob=*) ;;
+        -f | --file | --blob | -t | --type | --default) skip=1 ;;
+        -*) hr_deny "git config option $a is not one FORGE knows (reading settings, writing identity and display settings, and removing settings are allowed)" ;;
+        *) cfgnames+=("$a") ;;
+      esac
+    done
+    if [[ -z "$mode" ]]; then
+      # git config get|list|set|unset|… <name> (git 2.46 and later), or git config <name> [<value>]
+      case "${cfgnames[0]:-}" in
+        get | list) mode="reading" ;;
+        unset | remove-section) mode="removing" ;;
+        set)
+          mode="writing"
+          cfgnames=("${cfgnames[@]:1}")
+          ;;
+        rename-section | edit | "") hr_deny "git config ${cfgnames[0]:-with no setting} is not allowed (it can move settings into place or open an editor)" ;;
+        *) if [[ ${#cfgnames[@]} -ge 2 ]]; then mode="writing"; else mode="reading"; fi ;;
+      esac
+    fi
+    if [[ "$mode" == writing ]]; then
+      key="$(_hr_lower "${cfgnames[0]:-}")"
+      case "$key" in
+        user.name | user.email | core.quotepath | color.* | advice.*) ;;
+        *) hr_deny "git config may set only user.name, user.email, core.quotepath, color.* and advice.*, not '${cfgnames[0]:-}' (other settings can run programs or change what git writes)" ;;
+      esac
+    fi
+    hr_allow
     ;;
   notes)
     case "${HR_GIT_ARGS[0]:-list}" in
@@ -160,7 +195,7 @@ case "$HR_GIT_SUB" in
       *) hr_deny "git reflog ${HR_GIT_ARGS[0]} can move or drop branch history (delete --updateref); reflog may only be read" ;;
     esac
     ;;
-  push | send-pack | http-push | merge | commit-tree | am | cherry-pick | revert | config | \
+  push | send-pack | http-push | merge | commit-tree | am | cherry-pick | revert | \
     bundle | init | clone)
     hr_allow # checked by another FORGE gate, or understood and harmless to history
     ;;

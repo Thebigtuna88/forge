@@ -5,5 +5,5 @@
     "command": "git submodule update --merge"
   },
   "cwd": "@ROOT@",
-  "forge_reason": "git submodule update option --merge"
+  "forge_reason": "git submodule update"
 }
