@@ -432,7 +432,11 @@ order, and the order is the only exception to "review before merge":
 Claude Code runs each registered hook before the matching tool call (`PreToolUse`) or when the
 agent ends a turn (`Stop`). It passes the call as JSON on stdin (`tool_name`, `tool_input`,
 `cwd`, …). A hook **denies only by exiting 2**, and its stderr is shown to the agent as the
-reason. Any other exit allows.
+reason. Any other exit allows, and so do a hook that can't start (missing, not executable) and
+one that times out, unless it is registered with `"onFailure": "block"` (Claude Code 2.1.295 or
+later). Then any failure blocks, as exit 2 does. **Every FORGE hook is registered that way, with
+a timeout of at most 120 seconds** (FRG-20, `docs/decisions/2026-10-18-failed-hooks-block.md`).
+Claude Code ignores the field on `Stop` hooks, which is why the Stop hook fails open (4.6).
 
 Registration is project-scoped, in the committed `.claude/settings.json` (never `~/.claude`):
 
@@ -441,10 +445,12 @@ Registration is project-scoped, in the committed `.claude/settings.json` (never 
   "hooks": {
     "PreToolUse": [
       { "matcher": "Bash", "hooks": [
-        { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/deny-push-to-protected.sh" }
+        { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/deny-push-to-protected.sh",
+          "onFailure": "block", "timeout": 120 }
       ]},
       { "matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [
-        { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-live-checkout.sh" }
+        { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-live-checkout.sh",
+          "onFailure": "block", "timeout": 120 }
       ]}
     ],
     "Stop": [
@@ -524,6 +530,10 @@ It proves the gates work **as configured right now**:
 
 1. Every hook file in `.claude/hooks/` is executable, registered in `.claude/settings.json`,
    and passes `shellcheck`, and every registered hook exists. Nothing is orphaned or missing.
+   Every registration (except on events where Claude Code ignores it, such as `Stop`) has
+   `"onFailure": "block"` and a timeout of 1 to 120 seconds, and `claude --version` is 2.1.295 or
+   later (FRG-20). The version check prints `SKIP` on GitHub Actions, which doesn't run Claude
+   Code, and `NOTE` when tests point it at a fake `claude`.
 2. For every hook, it feeds fixture JSON (`tests/conformance/<hook>/{deny,allow}/*.json`) on
    stdin under the live `mode.json`:
    - **enforce**: every deny case must exit 2, every allow case must exit 0;

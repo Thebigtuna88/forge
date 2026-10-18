@@ -8,7 +8,11 @@
 #    not nested (no backticks, no <( >( ), and defines no functions or multi-line groups, so bash
 #    can't hide a failure inside it. Nothing else lives in .claude/hooks or
 #    tests/conformance: no hidden or stray files, and no symlinks there or in the hook, runtime and
-#    config paths.
+#    config paths. Every registration blocks when its hook fails: "onFailure": "block" and a
+#    whole-number "timeout" of 1 to 120 seconds (except on events where Claude Code ignores
+#    onFailure), and `claude --version` is 2.1.295 or later, the first to honour it (FRG-20). That
+#    version check prints SKIP on GitHub Actions (CI and GITHUB_ACTIONS both true), which doesn't
+#    run Claude Code, and a NOTE when FORGE_TEST_CLAUDE points it at a test's fake claude.
 # 2. Each case tests/conformance/<hook>/{deny,allow}/<case>.json is fed on stdin to the hook in a
 #    fresh sandbox: a byte-identical copy of the hooks, runtime and config (live mode.json
 #    included) at <tmp>/code/forge, a git repo on dev with a bare "origin", next to an empty
@@ -33,7 +37,8 @@
 # 6. Prints `hook | mode | deny cases | allow cases | result`, then "conformance: PASS" or
 #    "conformance: FAIL (<n>)", and exits 0 or 1.
 # Runs as `bash -p` (no exported functions, no BASH_ENV) with its own PATH and only HOME, USER,
-# LOGNAME, TMPDIR and CLAUDE_CONFIG_DIR kept from the environment, like the hooks.
+# LOGNAME, TMPDIR and CLAUDE_CONFIG_DIR kept from the environment, like the hooks (plus CI,
+# GITHUB_ACTIONS and FORGE_TEST_CLAUDE, which only steer the Claude Code version check).
 # Must run on macOS /bin/bash 3.2.
 set -uo pipefail
 PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
@@ -41,6 +46,7 @@ export PATH LC_ALL=C
 for v in $(compgen -e); do
   case "$v" in
     HOME | USER | LOGNAME | TMPDIR | CLAUDE_CONFIG_DIR | PATH | LC_ALL) ;;
+    CI | GITHUB_ACTIONS | FORGE_TEST_CLAUDE) ;;
     *) unset "$v" 2>/dev/null || true ;;
   esac
 done
@@ -130,9 +136,12 @@ if [[ -d "$HOOKS_DIR" ]]; then
   done < <(entries "$HOOKS_DIR")
 fi
 
-# One line per registered command: <event> US <matcher> US <async> US <command> (US = \x1f, not
-# whitespace, so an empty matcher stays a field of its own).
+# One line per registered command: <event> US <matcher> US <async> US <onFailure> US <timeout>
+# US <command> (US = \x1f, not whitespace, so an empty matcher stays a field of its own). The
+# timeout field is "ok" for a whole number of 1 to 120 seconds, otherwise its JSON text.
 registered=() regs=()
+# Events where Claude Code ignores onFailure (its exit code 2 sends the agent back to work).
+no_onfailure_events=(Stop SubagentStop TaskCompleted TeammateIdle)
 # shellcheck disable=SC2016 # the literal text "$CLAUDE_PROJECT_DIR" that settings.json must contain
 reg_re='^"\$CLAUDE_PROJECT_DIR"/\.claude/hooks/([A-Za-z0-9._-]+)\.sh$'
 if reg="$(jq -r '
@@ -142,11 +151,13 @@ if reg="$(jq -r '
     | (.matcher // "") as $m | if ($m | type) == "string" then . else error("matcher is not a string") end
     | .hooks | if type == "array" then .[] else error("matcher has no hooks list") end
     | if .type == "command" and (.command | type) == "string"
-      then [$event, $m, (.async // false | tostring), .command]
+      then [$event, $m, (.async // false | tostring), (.onFailure | tojson),
+          (.timeout | if type == "number" and . == floor and . >= 1 and . <= 120 then "ok"
+            else tojson end), .command]
         | if any(.[]; explode | any(. < 32)) then error("control character in a registration")
           else join("\u001f") end
       else error("hook entry is not a command") end' "$SETTINGS" 2>&1)"; then
-  while IFS=$'\x1f' read -r event matcher async cmd; do
+  while IFS=$'\x1f' read -r event matcher async onfail timeout cmd; do
     [[ -n "$event" ]] || continue
     if [[ "$cmd" =~ $reg_re ]]; then
       h="${BASH_REMATCH[1]}"
@@ -155,6 +166,13 @@ if reg="$(jq -r '
         regs+=("$h"$'\x1f'"$event"$'\x1f'"$matcher")
       else
         fail "$h.sh is registered with async: an async hook can't block anything"
+      fi
+      # Without onFailure, a hook that can't start, times out or is killed lets the call through.
+      if ! in_list "$event" "${no_onfailure_events[@]}"; then
+        [[ "$onfail" == '"block"' ]] ||
+          fail "$h.sh ($event) lacks \"onFailure\": \"block\" (has $onfail): if it can't start, times out or is killed, Claude Code runs the command anyway"
+        [[ "$timeout" == ok ]] ||
+          fail "$h.sh ($event) needs a \"timeout\" of 1 to 120 seconds, a whole number (has $timeout)"
       fi
     else
       fail "unrecognised hook command in .claude/settings.json: $cmd"
@@ -185,6 +203,37 @@ done
 for h in ${registered[@]+"${registered[@]}"}; do
   in_list "$h" ${hooks[@]+"${hooks[@]}"} || fail "$h.sh is registered but missing from .claude/hooks"
 done
+
+# Claude Code before 2.1.295 ignores onFailure, so there a hook that fails would let the command
+# through. GitHub Actions doesn't run Claude Code; tests use a fake claude. Both say so.
+claude_min=(2 1 295)
+if [[ "${CI:-}" == true && "${GITHUB_ACTIONS:-}" == true ]]; then
+  echo "SKIP Claude Code version: GitHub Actions doesn't run Claude Code (CI and GITHUB_ACTIONS are true)"
+else
+  claude_bin="$(command -v claude 2>/dev/null || true)"
+  if [[ -n "${FORGE_TEST_CLAUDE:-}" ]]; then
+    claude_bin="$FORGE_TEST_CLAUDE"
+    echo "NOTE Claude Code version read from FORGE_TEST_CLAUDE=$claude_bin (a test override, not a real pass)"
+  fi
+  if [[ -z "$claude_bin" || ! -f "$claude_bin" || ! -x "$claude_bin" ]]; then
+    fail "Claude Code is not installed (no claude${claude_bin:+ at $claude_bin}), so its version can't be checked; 2.1.295 or later is needed for \"onFailure\": \"block\""
+  elif ! claude_out="$("$claude_bin" --version 2>&1)" ||
+    ! [[ "${claude_out%%$'\n'*}" =~ ^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(\ |$) ]]; then
+    fail "can't read Claude Code's version from '$claude_bin --version' (got: ${claude_out:0:80}); 2.1.295 or later is needed for \"onFailure\": \"block\""
+  else
+    claude_ver=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")
+    older=0
+    for i in 0 1 2; do
+      if ((10#${claude_ver[i]} > claude_min[i])); then break; fi
+      if ((10#${claude_ver[i]} < claude_min[i])); then
+        older=1
+        break
+      fi
+    done
+    [[ $older == 0 ]] ||
+      fail "Claude Code ${claude_ver[0]}.${claude_ver[1]}.${claude_ver[2]} is older than 2.1.295, which ignores \"onFailure\": \"block\" (a hook that fails would let the command through); update Claude Code"
+  fi
+fi
 
 if [[ ${#hooks[@]} -gt 0 ]]; then
   if command -v shellcheck >/dev/null 2>&1; then
