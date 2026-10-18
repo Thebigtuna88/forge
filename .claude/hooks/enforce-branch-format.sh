@@ -4,9 +4,10 @@
 # --orphan, switch -c/-C/--create/--force-create/--orphan, branch <new>, branch -m/-c, worktree add
 # -b/-B), implicit creation (checkout/switch --track <remote>/<name>, checkout/switch <name> or
 # worktree add <path> <name> that git creates from a remote branch, worktree add <path> alone, which
-# names the branch after the folder) and git push origin <branch>. checkout, switch, branch and
-# worktree add accept only the options listed here, spelled in full: an abbreviation (--creat) or a
-# cluster (-qm) is refused, since git would accept it.
+# names the branch after the folder) and git push origin <branch>. A new repository (git init) or
+# a clone starts only on dev or main (-b / --initial-branch / --branch). checkout, switch, branch,
+# worktree add, init and clone accept only the options listed here, spelled in full: an
+# abbreviation (--creat) or a cluster (-qm) is refused, since git would accept it.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset HOOKRT_LOADED
 # shellcheck source=.harness/lib/hookrt.sh
@@ -18,7 +19,7 @@ hr_guarded || hr_allow
 hr_require_simple
 [[ "${HR_TOK[0]:-}" == git ]] || hr_allow
 case "$HR_GIT_SUB" in
-  checkout | switch | branch | worktree | push) ;;
+  checkout | switch | branch | worktree | push | init | clone) ;;
   *) hr_allow ;;
 esac
 # git worktree: only "add" creates a branch.
@@ -64,6 +65,15 @@ for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
       ;;
     checkout:-t | checkout:--track | switch:-t | switch:--track | worktree:--track) track=1 ;;
     checkout:--detach | switch:-d | switch:--detach | worktree:-d | worktree:--detach) detach=1 ;;
+    init:-b | init:--initial-branch | clone:-b | clone:--branch) take=1 ;;
+    init:--initial-branch=* | clone:--branch=*) new="${a#*=}" ;;
+    clone:--depth | clone:-o | clone:--origin) skip=1 ;;
+    init:-q | init:--quiet | init:--bare | init:--template=* | init:--separate-git-dir=* | \
+      init:--shared | init:--shared=* | init:--object-format=* | init:--ref-format=* | \
+      clone:-q | clone:--quiet | clone:--depth=* | clone:--single-branch | clone:--no-single-branch | \
+      clone:-n | clone:--no-checkout | clone:--origin=* | clone:--recurse-submodules | \
+      clone:--recurse-submodules=* | clone:--shallow-submodules | clone:--no-tags | clone:--filter=* | \
+      clone:--sparse | clone:--bare) ;;
     checkout:-q | checkout:--quiet | checkout:-f | checkout:--force | checkout:--ours | \
       checkout:--theirs | checkout:-m | checkout:--merge | checkout:--no-track | \
       switch:-q | switch:--quiet | switch:-f | switch:--force | switch:--discard-changes | \
@@ -75,7 +85,7 @@ for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
       branch:-r | branch:--remotes | branch:--show-current | branch:--merged | branch:--no-merged | \
       branch:--contains | branch:--no-contains | branch:--points-at | branch:--merged=* | \
       branch:--no-merged=* | branch:--contains=* | branch:--no-contains=* | branch:--points-at=* | \
-      branch:--sort=* | branch:--format=* | branch:--edit-description | branch:--unset-upstream | \
+      branch:--format=* | branch:--edit-description | branch:--unset-upstream | \
       branch:--set-upstream-to=*)
       listing=1
       ;;
@@ -83,7 +93,7 @@ for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
       listing=1
       skip=1
       ;;
-    branch:-v | branch:-vv | branch:--verbose | branch:-q | branch:--quiet | branch:-t | \
+    branch:-v | branch:-vv | branch:--verbose | branch:-q | branch:--quiet | branch:-t | branch:--sort=* | \
       branch:--track | branch:--no-track | branch:-f | branch:--force | branch:--column | \
       branch:--no-column | branch:--color | branch:--no-color) ;;
     push:-*) ;; # deny-push-to-protected rules push options
@@ -142,6 +152,13 @@ case "$HR_GIT_SUB" in
     fi
     ;;
 esac
+if [[ "$HR_GIT_SUB" == init || "$HR_GIT_SUB" == clone ]]; then
+  # A new repository or clone starts on dev or main (or git's default for init / the remote's
+  # default branch for clone), never on a name of its own.
+  [[ -z "$new" || "$new" == dev || "$new" == main ]] ||
+    hr_deny "git $HR_GIT_SUB may start only on dev or main as its initial branch, not '$new'"
+  hr_allow
+fi
 [[ -n "$new" ]] || hr_allow
 # The only known ticket key is FRG until projects.json arrives (FRG-10).
 ticket='^feature/FRG-[0-9]+-[a-z0-9]+(-[a-z0-9]+)*$'

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git tag -mTOPSECRET v1"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "git tag option"
+}

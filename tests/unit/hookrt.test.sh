@@ -341,7 +341,7 @@ test_guarded_detection() {
     'git filter-branch' 'git replace a b' 'git revert HEAD' 'git am p.patch' 'git merge dev && ls' \
     'cd /x; git reset --hard HEAD' 'git pull origin dev | cat' 'git fetch origin main:main && ls' \
     'git stash push && ls' 'git history split HEAD; ls' 'git replay x | cat' 'git config alias.x y && ls' \
-    'git remote update && ls' 'git tag -a v1 -m x; ls'; do
+    'git remote update && ls' 'git tag -a v1 -m x; ls' 'git init -b bad /tmp/x && ls' 'git clone -b x /y /z; ls'; do
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done

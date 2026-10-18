@@ -9,9 +9,13 @@
 #   names, and git pull with a refspec (":" or "+" moves local branches); git fetch or pull while a
 #   configured remote.*.fetch mapping writes outside refs/remotes/; git pull --rebase;
 #   git stash other than push/save/pop/apply/drop/clear/list/show (stash branch, export, …);
-#   git remote update and remote add -f (they fetch past the mapping check; use git fetch);
-#   git submodule foreach, and submodule update --merge/--rebase (unchecked commands in submodules);
-#   writing git notes, and a git tag with a message (-a/-s/-u/-m/-F): unscanned text in git;
+#   git remote update, and git remote add with any option but -t/-m/--tags/--no-tags (it could
+#   fetch past the mapping check; use git fetch);
+#   git submodule other than status/summary/init/sync/absorbgitdirs/deinit, and submodule update
+#   without --checkout or with other options (unchecked commits or rebases in submodules);
+#   writing git notes; git reflog other than show/exists/list (delete --updateref moves a branch);
+#   git tag with any option outside listing/deleting/verifying, or a plain tag while tag.gpgSign is
+#   set (both put unscanned text into git, which push.followTags could carry with a branch);
 #   any git command that is neither on the runtime's safe list nor checked by a FORGE gate
 #   (git history, git replay, and whatever a newer git adds).
 # A forced push is refused by deny-push-to-protected. A branch is updated with `git merge dev`.
@@ -54,22 +58,41 @@ case "$HR_GIT_SUB" in
     ;;
   commit | branch | checkout | switch | worktree | reset | fetch | pull) ;;
   remote)
-    for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
-      case "$a" in
-        update | -f | --fetch) hr_deny "git remote ${HR_GIT_ARGS[0]:-} with $a fetches past FORGE's fetch checks; use git fetch" ;;
-      esac
-    done
+    case "${HR_GIT_ARGS[0]:-}" in
+      update) hr_deny "git remote update fetches past FORGE's fetch checks; use git fetch" ;;
+      add)
+        skip=0
+        for a in "${HR_GIT_ARGS[@]:1}"; do
+          if [[ $skip == 1 ]]; then
+            skip=0
+            continue
+          fi
+          case "$a" in
+            -t | -m) skip=1 ;;
+            --tags | --no-tags) ;;
+            -*) hr_deny "git remote add option $a is not one FORGE allows (only -t, -m, --tags, --no-tags); add the remote, then use git fetch" ;;
+          esac
+        done
+        ;;
+    esac
     hr_allow
     ;;
   submodule)
     case "${HR_GIT_ARGS[0]:-status}" in
       status | summary | init | sync | absorbgitdirs | deinit) hr_allow ;;
       update)
-        for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
+        # Only listed options, and --checkout must be said: it overrides a configured
+        # submodule.<name>.update=merge/rebase.
+        checkout=0
+        for a in "${HR_GIT_ARGS[@]:1}"; do
           case "$a" in
-            --merge | --rebase) hr_deny "git submodule update $a makes unchecked commits inside submodules" ;;
+            --checkout) checkout=1 ;;
+            --init | --recursive | -q | --quiet | --no-fetch | -N | --) ;;
+            -*) hr_deny "git submodule update option $a is not one FORGE allows (it may merge, rebase or skip checks)" ;;
           esac
         done
+        [[ $checkout == 1 ]] ||
+          hr_deny "git submodule update must say --checkout, so configuration can't make it merge or rebase"
         hr_allow
         ;;
       *) hr_deny "git submodule ${HR_GIT_ARGS[0]} runs or changes things FORGE can't check inside submodules" ;;
@@ -82,18 +105,43 @@ case "$HR_GIT_SUB" in
     esac
     ;;
   tag)
+    # Listing, deleting and verifying only (an option outside the list may carry a message, also
+    # abbreviated or attached: --mes=, -mTEXT); a plain tag is refused while tag.gpgSign would make
+    # it a signed tag with a message.
+    names=0
+    nosign=0
     for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
       case "$a" in
-        -a | --annotate | -s | --sign | -u | --local-user* | -m | --message* | -F | --file* | -e | --edit | \
-          -[!-]*[asumFe]*)
+        --no-sign) nosign=1 ;;
+        -l | --list | -d | --delete | -v | --verify | -i | --ignore-case | \
+          --contains | --no-contains | --merged | --no-merged | --points-at | --contains=* | \
+          --no-contains=* | --merged=* | --no-merged=* | --points-at=* | --sort=* | --format=* | \
+          --column | --column=* | --no-column | -n | -n[0-9]*) ;;
+        -a | --annotate | -s | --sign | -u | -m | -F | -e | --edit)
           hr_deny "a tag with a message (git tag $a) puts unscanned text into git; use a plain tag (git tag <name>)"
           ;;
+        -*) hr_deny "git tag option $a is not one FORGE allows (it may carry a message); use a plain tag" ;;
+        *) ((names += 1)) ;;
       esac
     done
+    if [[ $names -gt 0 && $nosign == 0 ]]; then
+      [[ -n "$HR_GIT_DIR" && -d "$HR_GIT_DIR" ]] ||
+        hr_deny "can't tell which repository this runs in, so can't check tag.gpgSign; use git tag --no-sign <name>"
+      git -C "$HR_GIT_DIR" config --type=bool --get tag.gpgSign >"$HR_TMP/gpgsign" 2>/dev/null || true
+      gpgsign="$(cat "$HR_TMP/gpgsign")"
+      [[ "$gpgsign" != true ]] ||
+        hr_deny "tag.gpgSign is set, so a plain tag would be a signed tag with a message; use git tag --no-sign <name>"
+    fi
     hr_allow
     ;;
+  reflog)
+    case "${HR_GIT_ARGS[0]:-show}" in
+      show | exists | list | -*) hr_allow ;;
+      *) hr_deny "git reflog ${HR_GIT_ARGS[0]} can move or drop branch history (delete --updateref); reflog may only be read" ;;
+    esac
+    ;;
   push | send-pack | http-push | merge | commit-tree | am | cherry-pick | revert | config | \
-    reflog | bundle)
+    bundle | init | clone)
     hr_allow # checked by another FORGE gate, or understood and harmless to history
     ;;
   *)
