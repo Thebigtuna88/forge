@@ -530,10 +530,12 @@ It proves the gates work **as configured right now**:
 
 1. Every hook file in `.claude/hooks/` is executable, registered in `.claude/settings.json`,
    and passes `shellcheck`, and every registered hook exists. Nothing is orphaned or missing.
-   Every registration (except on events where Claude Code ignores it, such as `Stop`) has
-   `"onFailure": "block"` and a timeout of 1 to 120 seconds, and `claude --version` is 2.1.295 or
-   later (FRG-20). The version check prints `SKIP` on GitHub Actions, which doesn't run Claude
-   Code, and `NOTE` when tests point it at a fake `claude`.
+   A registration holds only `type`, `command`, `onFailure` and `timeout` (in a group of
+   `matcher` and `hooks`). Every registration, except on events where Claude Code ignores it
+   such as `Stop`, has `"onFailure": "block"` and a timeout of 1 to 120 seconds. Every installed
+   `claude` (on `PATH`, in `~/.local/bin` or `~/.claude/local`) reports 2.1.295 or later, read in
+   a no-write sandbox with a time limit (FRG-20). The version check prints `SKIP` on GitHub
+   Actions, which doesn't run Claude Code, and `NOTE` when tests point it at a fake `claude`.
 2. For every hook, it feeds fixture JSON (`tests/conformance/<hook>/{deny,allow}/*.json`) on
    stdin under the live `mode.json`:
    - **enforce**: every deny case must exit 2, every allow case must exit 0;

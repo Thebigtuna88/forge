@@ -23,8 +23,11 @@ Found while planning FRG-4.
 ## Decision
 
 - Every FORGE hook is registered with `"onFailure": "block"` and `"timeout": 120`.
-- Conformance fails when a registered hook (other than the exempt events) lacks either, or when
-  Claude Code is older than 2.1.295, missing, or its version can't be read.
+- Conformance fails when a registered hook (other than the exempt events) lacks either, when a
+  registration holds any other key (`async`, `asyncRewake`, `if`, …, which change whether a gate
+  runs or blocks), or when any installed Claude Code (on `PATH`, `~/.local/bin`,
+  `~/.claude/local`) is older than 2.1.295, none is found, or a version can't be read. Each
+  `claude --version` runs in a no-write, no-signal sandbox with a 15-second limit (review round 1).
 - A separate small ticket (FRG-20), merged before FRG-4, so the five FRG-3 gates are covered at
   once.
 

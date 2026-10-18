@@ -60,11 +60,13 @@ fake_claude() {
 }
 
 # conform [VAR=value…]: run conformance in H. Claude Code's version comes from a fake claude
-# (2.1.302 unless the test made another), so the result doesn't depend on this machine.
+# (2.1.302 unless the test made another), so the result doesn't depend on this machine. CI and
+# GITHUB_ACTIONS are cleared (a run on GitHub Actions would otherwise skip the version check);
+# a test sets them explicitly when it needs them.
 conform() {
   [[ -x "$T_TMP/bin/claude" ]] || fake_claude "2.1.302 (Claude Code)"
-  OUT="$(cd "$H" && env HOME="$T_TMP/home" FORGE_TEST_CLAUDE="$T_TMP/bin/claude" "$@" \
-    "$H/.harness/bin/conformance" 2>&1)"
+  OUT="$(cd "$H" && env -u CI -u GITHUB_ACTIONS HOME="$T_TMP/home" \
+    FORGE_TEST_CLAUDE="$T_TMP/bin/claude" "$@" "$H/.harness/bin/conformance" 2>&1)"
   RC=$?
 }
 
@@ -982,6 +984,72 @@ test_ci_alone_does_not_skip_the_version_check() {
     conform FORGE_TEST_CLAUDE="$T_TMP/no-such-claude" "$env"
     assert_exit 1 "$RC" "$env alone must not skip: $OUT"
   done
+}
+
+# --- FRG-20 review round 1 ---------------------------------------------------------------------
+
+test_fails_on_keys_that_change_when_or_whether_a_hook_runs() {
+  # asyncRewake runs the hook in the background (onFailure ignored); "if" skips it for commands
+  # that don't match. Only type, command, onFailure and timeout are allowed (C1, SEC-1, SEC-2).
+  local change
+  for change in '.asyncRewake = true' '.if = "Bash(echo *)"' '.statusMessage = "x"' \
+    '.shell = "bash"' '.once = true'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    set_hook_field "$change"
+    expect_fail "registration has keys FORGE doesn't allow"
+  done
+}
+
+test_fails_on_unknown_matcher_group_keys() {
+  mk_conf_harness
+  jq '.hooks.PreToolUse[0].extra = true' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  expect_fail "registration has keys FORGE doesn't allow (group extra)"
+}
+
+test_inherited_ci_variables_do_not_skip_version_tests() {
+  # C2: on GitHub Actions the test process inherits CI and GITHUB_ACTIONS.
+  mk_conf_harness
+  fake_claude "2.1.294 (Claude Code)"
+  export CI=true GITHUB_ACTIONS=true
+  expect_fail "Claude Code 2.1.294 is older than 2.1.295"
+}
+
+test_fails_when_claude_version_hangs() {
+  # C3: a claude that never answers must not stall conformance.
+  mk_conf_harness
+  mkdir -p "$T_TMP/bin"
+  printf '#!/bin/bash\nexec /bin/sleep 30\n' >"$T_TMP/bin/claude"
+  chmod 755 "$T_TMP/bin/claude"
+  expect_fail "did not answer"
+}
+
+test_version_check_cannot_write_files() {
+  # SEC-3: the claude whose version is read runs in a sandbox that can't write files.
+  mk_conf_harness
+  mkdir -p "$T_TMP/bin"
+  printf '#!/bin/bash\necho changed >>%q\necho made >%q\nprintf "2.1.302 (Claude Code)\\n"\n' \
+    "$H/.harness/lib/hookrt.sh" "$T_TMP/made-by-claude" >"$T_TMP/bin/claude"
+  chmod 755 "$T_TMP/bin/claude"
+  local before
+  before="$(shasum -a 256 "$H/.harness/lib/hookrt.sh")"
+  conform
+  assert_eq "$(shasum -a 256 "$H/.harness/lib/hookrt.sh")" "$before" "the version check changed hookrt.sh"
+  [[ ! -e "$T_TMP/made-by-claude" ]] || _t_fail "the version check could write a file"
+}
+
+test_fails_when_any_installed_claude_is_too_old() {
+  # C4, SEC-4: the native install (~/.local/bin) is checked too, and every copy found must be new
+  # enough, whichever one launched the session.
+  mk_conf_harness
+  mkdir -p "$T_TMP/home/.local/bin"
+  printf '#!/bin/bash\nprintf "2.1.294 (Claude Code)\\n"\n' >"$T_TMP/home/.local/bin/claude"
+  chmod 755 "$T_TMP/home/.local/bin/claude"
+  conform FORGE_TEST_CLAUDE=
+  assert_exit 1 "$RC" "an old ~/.local/bin/claude must fail: $OUT"
+  assert_contains "$OUT" "$T_TMP/home/.local/bin/claude"
+  assert_contains "$OUT" "2.1.294 is older than 2.1.295"
 }
 
 test_harness_toml_files_reach_the_sandbox() {
