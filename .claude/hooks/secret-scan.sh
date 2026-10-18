@@ -151,6 +151,17 @@ gpgsign="$(cat "$HR_TMP/gpgsign")"
 [[ "$gpgsign" != true ]] ||
   hr_deny "commit.gpgSign is on: the signing program's output goes into the commit unscanned; remove it first"
 
+# A half-finished cherry-pick, rebase or am keeps the original commit's author, not the identity
+# scanned below, so no commit while one is in progress.
+if [[ "$HR_GIT_SUB" == commit ]]; then
+  git -C "$HR_GIT_DIR" rev-parse --path-format=absolute --git-dir >"$HR_TMP/gitdir"
+  gitdir="$(cat "$HR_TMP/gitdir")"
+  for state in CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply sequencer; do
+    [[ ! -e "$gitdir/$state" ]] ||
+      hr_deny "a cherry-pick, revert, rebase or am is in progress ($state), and git would keep that commit's author, which FORGE can't scan; ask the owner to finish or abort it"
+  done
+fi
+
 # The author and committer git writes into the commit (user.name / user.email, or what git works
 # out without them).
 if ! git -C "$HR_GIT_DIR" var GIT_AUTHOR_IDENT >"$HR_TMP/identity/author" 2>/dev/null; then

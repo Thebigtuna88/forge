@@ -123,7 +123,8 @@ case "$HR_GIT_SUB" in
         --add | --replace-all) mode="writing" ;;
         --local | --global | --system | --worktree | --show-origin | --show-scope | --name-only | -z | \
           --null | --includes | --no-includes | --bool | --int | --bool-or-int | --path | \
-          --expiry-date | --fixed-value | --type=* | --default=* | --file=* | --blob=*) ;;
+          --expiry-date | --fixed-value | --type=* | --default=* | --file=* | --blob=* | \
+          --all | --regexp | --show-names | --value=* | --url=*) ;; # also git config get/unset (2.46)
         -f | --file | --blob | -t | --type | --default) skip=1 ;;
         -*) hr_deny "git config option $a is not one FORGE knows (reading settings, writing identity and display settings, and removing settings are allowed)" ;;
         *) cfgnames+=("$a") ;;
