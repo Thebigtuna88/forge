@@ -69,7 +69,7 @@ for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
     init:-b | init:--initial-branch | clone:-b | clone:--branch) take=1 ;;
     init:--initial-branch=* | clone:--branch=*) new="${a#*=}" ;;
     clone:--depth | clone:-o | clone:--origin) skip=1 ;;
-    init:-q | init:--quiet | init:--bare | init:--separate-git-dir=* | \
+    init:-q | init:--quiet | init:--bare | \
       init:--shared | init:--shared=* | init:--object-format=* | init:--ref-format=* | \
       clone:-q | clone:--quiet | clone:--depth=* | clone:--single-branch | clone:--no-single-branch | \
       clone:-n | clone:--no-checkout | clone:--origin=* | clone:--recurse-submodules | \
@@ -157,7 +157,10 @@ fi
 if [[ "$HR_GIT_SUB" == init || "$HR_GIT_SUB" == clone ]]; then
   # A new repository or clone starts on dev or main, named explicitly, and without a template
   # directory (templates can carry refs of their own).
-  git config --get init.templateDir >"$HR_TMP/template" 2>/dev/null || true
+  # The configuration that applies is the one where the command runs (git -C <dir>).
+  [[ -n "$HR_GIT_DIR" && -d "$HR_GIT_DIR" ]] ||
+    hr_deny "can't tell which folder git $HR_GIT_SUB runs in, so can't check init.templateDir"
+  git -C "$HR_GIT_DIR" config --get init.templateDir >"$HR_TMP/template" 2>/dev/null || true
   [[ ! -s "$HR_TMP/template" ]] ||
     hr_deny "init.templateDir is set: a template can install branches of its own; remove it first"
   [[ -n "$new" ]] ||

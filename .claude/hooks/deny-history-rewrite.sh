@@ -8,11 +8,14 @@
 #   git fetch other than `git fetch [-q] [--prune] [<repository> [<branch>…]]` with plain branch
 #   names, and git pull with a refspec (":" or "+" moves local branches); git fetch or pull while a
 #   configured remote.*.fetch mapping writes outside refs/remotes/; git pull --rebase;
-#   git stash other than push/save/pop/apply/drop/clear/list/show (stash branch, export, …);
-#   git remote update, and git remote add with any option but -t/-m/--tags/--no-tags (it could
-#   fetch past the mapping check; use git fetch);
+#   git stash other than pop/apply/drop/clear/list/show (a stash is a commit made without the
+#   secret scan; stash branch and export write refs);
+#   git remote with any option before the subcommand but -v/--verbose, git remote update and
+#   prune (use git fetch / git fetch --prune), and git remote add with any option but
+#   -t/-m/--tags/--no-tags (it could fetch past the mapping check; use git fetch);
 #   git submodule other than status/summary/init/sync/absorbgitdirs/deinit, and submodule update
-#   without --checkout or with other options (unchecked commits or rebases in submodules);
+#   without --checkout (before any --) or with other options (unchecked commits or rebases in
+#   submodules);
 #   writing git notes; git reflog other than show/exists/list (delete --updateref moves a branch);
 #   git tag with any option outside listing/deleting/verifying, or a plain tag while tag.gpgSign is
 #   set (both put unscanned text into git, which push.followTags could carry with a branch);
@@ -51,9 +54,12 @@ case "$HR_GIT_SUB" in
     hr_allow
     ;;
   stash)
+    # Saving a stash (git stash, push, save, or an option such as -u) makes a commit that the
+    # secret scan never sees; restoring, listing and dropping stashes is fine.
     case "${HR_GIT_ARGS[0]:-push}" in
-      push | save | pop | apply | drop | clear | list | show | -*) hr_allow ;;
-      *) hr_deny "git stash ${HR_GIT_ARGS[0]} creates or writes branches or refs; use stash push/pop/apply/drop/list/show" ;;
+      pop | apply | drop | clear | list | show) hr_allow ;;
+      push | save | -*) hr_deny "git stash ${HR_GIT_ARGS[*]:-push} creates a commit without the secret scan; commit the work on the ticket branch instead" ;;
+      *) hr_deny "git stash ${HR_GIT_ARGS[0]} creates or writes branches or refs; use stash pop/apply/drop/list/show" ;;
     esac
     ;;
   commit | branch | checkout | switch | worktree | reset | fetch | pull) ;;
@@ -64,7 +70,9 @@ case "$HR_GIT_SUB" in
       ((first += 1))
     done
     case "${HR_GIT_ARGS[$first]:-}" in
+      -*) hr_deny "git remote option ${HR_GIT_ARGS[$first]} before the subcommand is not one FORGE knows (only -v / --verbose)" ;;
       update) hr_deny "git remote update fetches past FORGE's fetch checks; use git fetch" ;;
+      prune) hr_deny "git remote prune deletes remote-tracking refs without FORGE's fetch checks; use git fetch --prune" ;;
       add)
         skip=0
         start=$first
@@ -88,13 +96,14 @@ case "$HR_GIT_SUB" in
     case "${HR_GIT_ARGS[0]:-status}" in
       status | summary | init | sync | absorbgitdirs | deinit) hr_allow ;;
       update)
-        # Only listed options, and --checkout must be said: it overrides a configured
-        # submodule.<name>.update=merge/rebase.
+        # Only listed options, and --checkout must be said (before any --, after which every
+        # word is a path): it overrides a configured submodule.<name>.update=merge/rebase.
         checkout=0
         for a in "${HR_GIT_ARGS[@]:1}"; do
           case "$a" in
+            --) break ;;
             --checkout) checkout=1 ;;
-            --init | --recursive | -q | --quiet | --no-fetch | -N | --) ;;
+            --init | --recursive | -q | --quiet | --no-fetch | -N) ;;
             -*) hr_deny "git submodule update option $a is not one FORGE allows (it may merge, rebase or skip checks)" ;;
           esac
         done
