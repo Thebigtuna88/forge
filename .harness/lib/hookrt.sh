@@ -136,6 +136,13 @@ _HR_GH_CMDS=" agent-task alias api attestation auth browse cache codespace compl
   discussion extension gist gpg-key help issue label licenses org pr preview project release repo
   ruleset run search secret skill ssh-key status variable workflow accessibility actions
   environment exit-codes formatting mintty reference telemetry "
+# git commands that never create a commit or move a branch. Any other git command (including ones
+# a newer git adds) counts as guarded, so it must be one plain command and a gate decides on it.
+_HR_GIT_SAFE_SUBS=" status log show diff add rm mv restore grep blame ls-files ls-tree ls-remote "
+_HR_GIT_SAFE_SUBS+="rev-parse rev-list cat-file describe shortlog help version var for-each-ref show-ref "
+_HR_GIT_SAFE_SUBS+="name-rev merge-base cherry whatchanged count-objects fsck check-ignore check-attr "
+_HR_GIT_SAFE_SUBS+="check-ref-format check-mailmap diff-tree diff-index diff-files range-diff format-patch "
+_HR_GIT_SAFE_SUBS+="archive remote tag clean gc prune repack maintenance init clone sparse-checkout "
 # The word lists above are matched as " word "; a line break must count as a space too.
 _HR_GH_CMDS="${_HR_GH_CMDS//$'\n'/ }"
 _HR_WRAPPERS="${_HR_WRAPPERS//$'\n'/ }"
@@ -478,8 +485,8 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
       if [[ $_HR_UNKNOWABLE == 1 ]]; then
         rc=0
         break
-      elif [[ $_HR_SUBI -ge 0 ]] && ! _hr_git_builtin "${HR_TOK[$_HR_SUBI]}"; then
-        rc=0
+      elif [[ $_HR_SUBI -ge 0 && "$_HR_GIT_SAFE_SUBS" != *" ${HR_TOK[$_HR_SUBI]} "* ]]; then
+        rc=0 # an alias, an unknown command, or a git command that may write: guarded
         break
       fi
     elif [[ "$base" == gh && $((i + 1)) -lt $n && "$_HR_GH_CMDS" != *" ${HR_TOK[$((i + 1))]} "* ]]; then

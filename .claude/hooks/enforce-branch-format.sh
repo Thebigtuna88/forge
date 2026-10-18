@@ -128,7 +128,9 @@ case "$HR_GIT_SUB" in
     ;;
   worktree)
     if [[ -z "$new" && $detach == 0 && $count -eq 1 ]]; then
-      new="${names[0]##*/}" # git worktree add <path>: a branch named after the folder
+      folder="${names[0]}"
+      while [[ "$folder" == */ ]]; do folder="${folder%/}"; done
+      new="${folder##*/}" # git worktree add <path>: a branch named after the folder (no trailing /)
     elif [[ -z "$new" && $detach == 0 && $count -ge 2 && $track == 1 ]]; then
       new="${names[1]#*/}"
     elif [[ -z "$new" && $detach == 0 && $count -ge 2 ]]; then
