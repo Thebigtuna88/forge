@@ -6,23 +6,33 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/deny-push-to-protected.sh"
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/deny-push-to-protected.sh",
+            "onFailure": "block",
+            "timeout": 120
           },
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/secret-scan.sh"
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/secret-scan.sh",
+            "onFailure": "block",
+            "timeout": 120
           },
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/enforce-branch-format.sh"
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/enforce-branch-format.sh",
+            "onFailure": "block",
+            "timeout": 120
           },
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/deny-commit-on-shared-checkout.sh"
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/deny-commit-on-shared-checkout.sh",
+            "onFailure": "block",
+            "timeout": 120
           },
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/deny-history-rewrite.sh"
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/deny-history-rewrite.sh",
+            "onFailure": "block",
+            "timeout": 120
           }
         ]
       }

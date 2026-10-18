@@ -52,7 +52,8 @@ done
 # --- 3. conformance (spec 5.5) -----------------------------------------------------------------
 stage conformance
 if [[ -x .harness/bin/conformance ]]; then
-  if .harness/bin/conformance; then echo "ok conformance"; else
+  # The real run checks the real Claude Code: no test override of its version (FRG-20).
+  if env -u FORGE_TEST_CLAUDE .harness/bin/conformance; then echo "ok conformance"; else
     echo "not ok conformance"
     failures=$((failures + 1))
   fi

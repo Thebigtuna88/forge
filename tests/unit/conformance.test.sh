@@ -29,11 +29,13 @@ mk_conf_harness() {
   case_json sample-gate allow push-feature 'git push origin feature/FRG-2-a'
 }
 
-# register [hook…]: write settings.json registering exactly these hooks for Bash.
+# register [hook…]: write settings.json registering exactly these hooks for Bash, each blocking
+# on failure with a 120-second timeout.
 register() {
   local h list=()
   for h in "$@"; do
-    list+=("$(jq -n --arg c "\"\$CLAUDE_PROJECT_DIR\"/.claude/hooks/$h.sh" '{type: "command", command: $c}')")
+    list+=("$(jq -n --arg c "\"\$CLAUDE_PROJECT_DIR\"/.claude/hooks/$h.sh" \
+      '{type: "command", command: $c, onFailure: "block", timeout: 120}')")
   done
   if [[ ${#list[@]} -eq 0 ]]; then
     printf '{"hooks": {}}\n' >"$H/.claude/settings.json"
@@ -50,8 +52,21 @@ case_json() {
     >"$H/tests/conformance/$1/$2/$3.json"
 }
 
+# fake_claude <output of claude --version>: a stand-in claude at $T_TMP/bin/claude.
+fake_claude() {
+  mkdir -p "$T_TMP/bin"
+  printf '#!/bin/bash\nprintf "%%s\\n" %q\n' "$1" >"$T_TMP/bin/claude"
+  chmod 755 "$T_TMP/bin/claude"
+}
+
+# conform [VAR=value…]: run conformance in H. Claude Code's version comes from a fake claude
+# (2.1.302 unless the test made another), so the result doesn't depend on this machine. CI and
+# GITHUB_ACTIONS are cleared (a run on GitHub Actions would otherwise skip the version check);
+# a test sets them explicitly when it needs them.
 conform() {
-  OUT="$(cd "$H" && env HOME="$T_TMP/home" "$H/.harness/bin/conformance" 2>&1)"
+  [[ -x "$T_TMP/bin/claude" ]] || fake_claude "2.1.302 (Claude Code)"
+  OUT="$(cd "$H" && env -u CI -u GITHUB_ACTIONS HOME="$T_TMP/home" \
+    FORGE_TEST_CLAUDE="$T_TMP/bin/claude" "$@" "$H/.harness/bin/conformance" 2>&1)"
   RC=$?
 }
 
@@ -852,6 +867,282 @@ test_array_assignments_pass_the_source_check() {
   conform
   assert_not_contains "$OUT" "may not define functions or open"
   assert_not_contains "$OUT" "plain word"
+}
+
+# --- FRG-20: a hook that fails blocks the command -----------------------------------------------
+
+# set_hook_field <jq assignment>: change sample-gate's registration, e.g. '.timeout = 600'.
+set_hook_field() {
+  jq ".hooks.PreToolUse[0].hooks[0] |= ($1)" "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+}
+
+test_fails_when_a_hook_does_not_block_on_failure() {
+  mk_conf_harness
+  set_hook_field 'del(.onFailure)'
+  expect_fail 'sample-gate.sh (PreToolUse) lacks "onFailure": "block"'
+}
+
+test_fails_when_a_hook_continues_on_failure() {
+  mk_conf_harness
+  set_hook_field '.onFailure = "continue"'
+  expect_fail 'lacks "onFailure": "block"'
+}
+
+test_fails_when_a_hook_has_no_timeout() {
+  mk_conf_harness
+  set_hook_field 'del(.timeout)'
+  expect_fail 'sample-gate.sh (PreToolUse) needs a "timeout" of 1 to 120 seconds'
+}
+
+test_fails_on_a_timeout_outside_1_to_120_seconds() {
+  local t
+  for t in 600 121 0 -5 1.5 '"60"' null; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    set_hook_field ".timeout = $t"
+    expect_fail 'needs a "timeout" of 1 to 120 seconds'
+  done
+}
+
+test_timeouts_of_1_and_120_seconds_pass() {
+  local t
+  for t in 1 120; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    set_hook_field ".timeout = $t"
+    conform
+    assert_exit 0 "$RC" "timeout $t: $OUT"
+  done
+}
+
+test_stop_hooks_need_no_onfailure() {
+  # Claude Code ignores onFailure on Stop hooks (spec 4.6: the Stop hook fails open by design).
+  mk_conf_harness
+  jq --arg c "\"\$CLAUDE_PROJECT_DIR\"/.claude/hooks/sample-gate.sh" \
+    '.hooks.Stop = [{hooks: [{type: "command", command: $c}]}]' \
+    "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  conform
+  assert_exit 0 "$RC" "$OUT"
+  assert_not_contains "$OUT" "onFailure"
+}
+
+test_fails_when_claude_code_is_too_old() {
+  mk_conf_harness
+  fake_claude "2.1.294 (Claude Code)"
+  expect_fail "Claude Code 2.1.294 is older than 2.1.295"
+}
+
+test_newer_claude_code_versions_pass() {
+  local v
+  for v in "2.1.295 (Claude Code)" "2.1.1000 (Claude Code)" "2.2.0 (Claude Code)" "3.0.0 (Claude Code)"; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home" "${T_TMP:?}/bin"
+    mk_conf_harness
+    fake_claude "$v"
+    conform
+    assert_exit 0 "$RC" "version $v: $OUT"
+  done
+}
+
+test_fails_when_claude_code_version_is_unreadable() {
+  local v
+  for v in "Claude Code" "" "2.1 (Claude Code)" "v2.1.302"; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home" "${T_TMP:?}/bin"
+    mk_conf_harness
+    fake_claude "$v"
+    expect_fail "can't read Claude Code's version"
+  done
+}
+
+test_fails_when_claude_is_missing() {
+  mk_conf_harness
+  conform FORGE_TEST_CLAUDE="$T_TMP/no-such-claude"
+  assert_exit 1 "$RC" "conformance should fail"
+  assert_contains "$OUT" "Claude Code is not installed"
+}
+
+test_test_override_is_reported() {
+  mk_conf_harness
+  conform
+  assert_exit 0 "$RC" "$OUT"
+  assert_contains "$OUT" "NOTE Claude Code version read from FORGE_TEST_CLAUDE="
+}
+
+test_github_actions_skips_the_version_check() {
+  mk_conf_harness
+  conform FORGE_TEST_CLAUDE="$T_TMP/no-such-claude" CI=true GITHUB_ACTIONS=true
+  assert_exit 0 "$RC" "$OUT"
+  assert_contains "$OUT" "SKIP Claude Code version: GitHub Actions doesn't run Claude Code"
+}
+
+test_ci_alone_does_not_skip_the_version_check() {
+  local env
+  for env in CI=true GITHUB_ACTIONS=true; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    conform FORGE_TEST_CLAUDE="$T_TMP/no-such-claude" "$env"
+    assert_exit 1 "$RC" "$env alone must not skip: $OUT"
+  done
+}
+
+# --- FRG-20 review round 1 ---------------------------------------------------------------------
+
+test_fails_on_keys_that_change_when_or_whether_a_hook_runs() {
+  # asyncRewake runs the hook in the background (onFailure ignored); "if" skips it for commands
+  # that don't match. Only type, command, onFailure and timeout are allowed (C1, SEC-1, SEC-2).
+  local change
+  for change in '.asyncRewake = true' '.if = "Bash(echo *)"' '.statusMessage = "x"' \
+    '.shell = "bash"' '.once = true'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    set_hook_field "$change"
+    expect_fail "registration has keys FORGE does not allow"
+  done
+}
+
+test_fails_on_unknown_matcher_group_keys() {
+  mk_conf_harness
+  jq '.hooks.PreToolUse[0].extra = true' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  expect_fail "registration has keys FORGE does not allow (group \"extra\")"
+}
+
+test_inherited_ci_variables_do_not_skip_version_tests() {
+  # C2: on GitHub Actions the test process inherits CI and GITHUB_ACTIONS.
+  mk_conf_harness
+  fake_claude "2.1.294 (Claude Code)"
+  export CI=true GITHUB_ACTIONS=true
+  expect_fail "Claude Code 2.1.294 is older than 2.1.295"
+}
+
+test_fails_when_claude_version_hangs() {
+  # C3: a claude that never answers must not stall conformance.
+  mk_conf_harness
+  mkdir -p "$T_TMP/bin"
+  printf '#!/bin/bash\nexec /bin/sleep 30\n' >"$T_TMP/bin/claude"
+  chmod 755 "$T_TMP/bin/claude"
+  expect_fail "did not answer"
+}
+
+test_version_check_cannot_write_files() {
+  # SEC-3: the claude whose version is read runs in a sandbox that can't write files. It reports
+  # an old version, so the result also proves it ran and was read (round 2, C4).
+  mk_conf_harness
+  mkdir -p "$T_TMP/bin"
+  printf '#!/bin/bash\necho changed >>%q\necho made >%q\nprintf "2.1.294 (Claude Code)\\n"\n' \
+    "$H/.harness/lib/hookrt.sh" "$T_TMP/made-by-claude" >"$T_TMP/bin/claude"
+  chmod 755 "$T_TMP/bin/claude"
+  local before
+  before="$(shasum -a 256 "$H/.harness/lib/hookrt.sh")"
+  expect_fail "Claude Code 2.1.294 is older than 2.1.295"
+  assert_eq "$(shasum -a 256 "$H/.harness/lib/hookrt.sh")" "$before" "the version check changed hookrt.sh"
+  [[ ! -e "$T_TMP/made-by-claude" ]] || _t_fail "the version check could write a file"
+}
+
+# --- FRG-20 review round 2 ---------------------------------------------------------------------
+
+test_fails_on_an_empty_key_in_a_registration() {
+  # C2: a key named "" is still a key FORGE doesn't allow.
+  mk_conf_harness
+  set_hook_field '.[""] = true'
+  expect_fail "registration has keys FORGE does not allow"
+}
+
+test_fails_on_a_matcher_or_hooks_that_is_not_the_right_type() {
+  # C3, SEC-1: false must not be read as a missing (match-all) matcher, or as no hooks at all.
+  local change
+  for change in '.hooks.PreToolUse[0].matcher = false' '.hooks.PreToolUse[0].matcher = null' \
+    '.hooks.PreToolUse[0].matcher = 0' '.hooks = false' '.hooks = null'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    jq "$change" "$H/.claude/settings.json" >"$T_TMP/s.json"
+    mv "$T_TMP/s.json" "$H/.claude/settings.json"
+    expect_fail ".claude/settings.json is missing or malformed"
+  done
+}
+
+# probe_sleep: a link to /bin/sleep named inside this test's own folder ($S), so a process found
+# by its path belongs to this test and no other run.
+probe_sleep() {
+  mkdir -p "$T_TMP/bin"
+  S="$T_TMP/bin/probe-sleep"
+  ln -sf /bin/sleep "$S"
+}
+
+# no_probe_processes: fail (and clean up) if any process of this test's probe-sleep is running.
+no_probe_processes() {
+  sleep 1
+  if pgrep -f "$S" >/dev/null; then
+    pkill -9 -f "$S"
+    _t_fail "a process the probe started was left running: $1"
+  fi
+}
+
+test_version_timeout_ends_the_probe() {
+  # Round 2 C1: a claude that never answers is ended at the time limit.
+  mk_conf_harness
+  probe_sleep
+  printf '#!/bin/bash\nexec %q 30\n' "$S" >"$T_TMP/bin/claude"
+  chmod 755 "$T_TMP/bin/claude"
+  expect_fail "did not answer"
+  no_probe_processes "after the time limit"
+}
+
+test_version_probe_cannot_start_processes() {
+  # Round 2 C1, round 3 C1/SEC-1: the probe may not start any process, so none can outlive it:
+  # not a plain child, not one in its own process group, not one in a new session. Refused a
+  # process, the fake's bash stops before printing its version, so the check fails closed. (The
+  # real claude starts no process for --version.)
+  local body
+  probe_sleep
+  for body in \
+    "$(printf '%q 600 >/dev/null 2>&1 &' "$S")" \
+    "$(printf 'set -m; %q 600 >/dev/null 2>&1 &' "$S")" \
+    "$(printf '/usr/bin/perl -MPOSIX -e %q 2>/dev/null' \
+      "if (!fork) { POSIX::setsid(); exec '$S', 600 }")"; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    printf '#!/bin/bash\n%s\nprintf "2.1.302 (Claude Code)\\n"\n' "$body" >"$T_TMP/bin/claude"
+    chmod 755 "$T_TMP/bin/claude"
+    expect_fail "can't read Claude Code's version"
+    no_probe_processes "$body"
+  done
+}
+
+test_fails_on_an_empty_or_odd_event_name() {
+  # Round 3 C2: an event named "" (or anything but a plain word) is malformed, not skipped.
+  local name
+  for name in '""' '"Pre Tool"' '"PreToolUse\u0000"'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    jq --arg c "\"\$CLAUDE_PROJECT_DIR\"/.claude/hooks/sample-gate.sh" \
+      ".hooks[$name] = [{hooks: [{type: \"command\", command: \$c}]}]" \
+      "$H/.claude/settings.json" >"$T_TMP/s.json"
+    mv "$T_TMP/s.json" "$H/.claude/settings.json"
+    expect_fail ".claude/settings.json is missing or malformed"
+  done
+}
+
+test_fails_on_extra_keys_in_an_empty_matcher_group() {
+  # Round 3 C3: a group's keys are checked even when its hooks list is empty.
+  mk_conf_harness
+  jq '.hooks.Stop = [{hooks: [], extra: true}]' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  expect_fail "registration has keys FORGE does not allow (group \"extra\")"
+}
+
+test_fails_when_any_installed_claude_is_too_old() {
+  # C4, SEC-4: the native install (~/.local/bin) is checked too, and every copy found must be new
+  # enough, whichever one launched the session.
+  mk_conf_harness
+  mkdir -p "$T_TMP/home/.local/bin"
+  printf '#!/bin/bash\nprintf "2.1.294 (Claude Code)\\n"\n' >"$T_TMP/home/.local/bin/claude"
+  chmod 755 "$T_TMP/home/.local/bin/claude"
+  conform FORGE_TEST_CLAUDE=
+  assert_exit 1 "$RC" "an old ~/.local/bin/claude must fail: $OUT"
+  assert_contains "$OUT" "$T_TMP/home/.local/bin/claude"
+  assert_contains "$OUT" "2.1.294 is older than 2.1.295"
 }
 
 test_harness_toml_files_reach_the_sandbox() {

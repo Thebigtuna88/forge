@@ -8,7 +8,13 @@
 #    not nested (no backticks, no <( >( ), and defines no functions or multi-line groups, so bash
 #    can't hide a failure inside it. Nothing else lives in .claude/hooks or
 #    tests/conformance: no hidden or stray files, and no symlinks there or in the hook, runtime and
-#    config paths.
+#    config paths. A registration holds only type, command, onFailure and timeout (in a group of
+#    matcher and hooks), and blocks when its hook fails: "onFailure": "block" and a whole-number
+#    "timeout" of 1 to 120 seconds (except on events where Claude Code ignores onFailure). Every
+#    installed claude (PATH, ~/.local/bin, ~/.claude/local) reports 2.1.295 or later, the first to
+#    honour it, read in a no-write sandbox with a time limit (FRG-20). That version check prints
+#    SKIP on GitHub Actions (CI and GITHUB_ACTIONS both true), which doesn't run Claude Code, and
+#    a NOTE when FORGE_TEST_CLAUDE points it at a test's fake claude.
 # 2. Each case tests/conformance/<hook>/{deny,allow}/<case>.json is fed on stdin to the hook in a
 #    fresh sandbox: a byte-identical copy of the hooks, runtime and config (live mode.json
 #    included) at <tmp>/code/forge, a git repo on dev with a bare "origin", next to an empty
@@ -33,7 +39,8 @@
 # 6. Prints `hook | mode | deny cases | allow cases | result`, then "conformance: PASS" or
 #    "conformance: FAIL (<n>)", and exits 0 or 1.
 # Runs as `bash -p` (no exported functions, no BASH_ENV) with its own PATH and only HOME, USER,
-# LOGNAME, TMPDIR and CLAUDE_CONFIG_DIR kept from the environment, like the hooks.
+# LOGNAME, TMPDIR and CLAUDE_CONFIG_DIR kept from the environment, like the hooks (plus CI,
+# GITHUB_ACTIONS and FORGE_TEST_CLAUDE, which only steer the Claude Code version check).
 # Must run on macOS /bin/bash 3.2.
 set -uo pipefail
 PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
@@ -41,6 +48,7 @@ export PATH LC_ALL=C
 for v in $(compgen -e); do
   case "$v" in
     HOME | USER | LOGNAME | TMPDIR | CLAUDE_CONFIG_DIR | PATH | LC_ALL) ;;
+    CI | GITHUB_ACTIONS | FORGE_TEST_CLAUDE) ;;
     *) unset "$v" 2>/dev/null || true ;;
   esac
 done
@@ -109,6 +117,9 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/forge-conformance.XXXXXX")" && TMP="$(cd "$TMP
   finish
 }
 trap 'rm -rf "$TMP"' EXIT
+# Taken before conformance runs anything (claude --version included), so no program it starts
+# can change a live file and have that change become the baseline.
+BEFORE="$(snapshot)"
 
 # --- 1. hooks, registration, shellcheck, case layout --------------------------------------------
 
@@ -130,31 +141,60 @@ if [[ -d "$HOOKS_DIR" ]]; then
   done < <(entries "$HOOKS_DIR")
 fi
 
-# One line per registered command: <event> US <matcher> US <async> US <command> (US = \x1f, not
-# whitespace, so an empty matcher stays a field of its own).
+# One line per registered command: <event> US <matcher> US <extra keys> US <onFailure> US
+# <timeout> US <command> (US = \x1f, not whitespace, so an empty field stays a field of its own).
+# A registration may hold only the keys FORGE knows: any other (async, asyncRewake, if, shell,
+# once, …) could change when or whether Claude Code runs the hook, or whether its failure blocks,
+# in ways the cases (which run the hook directly) can't see. A handler's extra keys are listed in
+# its row. Everything that produces no row of its own (the event name, the matcher group's keys)
+# is checked where it stands, so an empty event name or an empty hooks list can't hide anything.
+# The timeout field is "ok" for a whole number of 1 to 120 seconds, otherwise its JSON text.
 registered=() regs=()
+# Events where Claude Code ignores onFailure (its exit code 2 sends the agent back to work).
+no_onfailure_events=(Stop SubagentStop TaskCompleted TeammateIdle)
 # shellcheck disable=SC2016 # the literal text "$CLAUDE_PROJECT_DIR" that settings.json must contain
 reg_re='^"\$CLAUDE_PROJECT_DIR"/\.claude/hooks/([A-Za-z0-9._-]+)\.sh$'
+# A value is checked as it is, never through a default (`// ""` would turn false into a missing,
+# match-all matcher), and extra keys are counted, so a key named "" still counts.
 if reg="$(jq -r '
-    (.hooks // {}) | if type == "object" then . else error("hooks is not an object") end
+    if type == "object" then . else error("settings is not an object") end
+    | (if has("hooks") then .hooks else {} end)
+    | if type == "object" then . else error("hooks is not an object") end
     | to_entries[] | .key as $event
+    | if ($event | test("^[A-Za-z]+$")) then . else error("event name \($event | tojson) is not a plain word") end
     | .value | if type == "array" then .[] else error("event is not a list") end
-    | (.matcher // "") as $m | if ($m | type) == "string" then . else error("matcher is not a string") end
+    | if type == "object" then . else error("matcher group is not an object") end
+    | (keys - ["matcher", "hooks"]) as $gx
+    | if ($gx | length) == 0 then . else
+        error("registration has keys FORGE does not allow (group \($gx | map(tojson) | join(","))) in \($event): a matcher group holds only matcher and hooks") end
+    | (if has("matcher") then .matcher else "" end) as $m
+    | if ($m | type) == "string" then . else error("matcher is not a string") end
     | .hooks | if type == "array" then .[] else error("matcher has no hooks list") end
-    | if .type == "command" and (.command | type) == "string"
-      then [$event, $m, (.async // false | tostring), .command]
+    | if type == "object" and .type == "command" and (.command | type) == "string"
+      then (keys - ["type", "command", "onFailure", "timeout"] | map(tojson)) as $x
+        | [$event, $m, (($x | length | tostring) + " " + ($x | join(","))),
+          (.onFailure | tojson),
+          (.timeout | if type == "number" and . == floor and . >= 1 and . <= 120 then "ok"
+            else tojson end), .command]
         | if any(.[]; explode | any(. < 32)) then error("control character in a registration")
           else join("\u001f") end
       else error("hook entry is not a command") end' "$SETTINGS" 2>&1)"; then
-  while IFS=$'\x1f' read -r event matcher async cmd; do
+  while IFS=$'\x1f' read -r event matcher extra onfail timeout cmd; do
     [[ -n "$event" ]] || continue
     if [[ "$cmd" =~ $reg_re ]]; then
       h="${BASH_REMATCH[1]}"
       registered+=("$h")
-      if [[ "$async" == false ]]; then
+      if [[ "$extra" == "0 " ]]; then
         regs+=("$h"$'\x1f'"$event"$'\x1f'"$matcher")
       else
-        fail "$h.sh is registered with async: an async hook can't block anything"
+        fail "$h.sh ($event) registration has keys FORGE does not allow (${extra#* }): only type, command, onFailure and timeout, in a group of matcher and hooks (async, asyncRewake or if can keep a gate from running or from blocking)"
+      fi
+      # Without onFailure, a hook that can't start, times out or is killed lets the call through.
+      if ! in_list "$event" "${no_onfailure_events[@]}"; then
+        [[ "$onfail" == '"block"' ]] ||
+          fail "$h.sh ($event) lacks \"onFailure\": \"block\" (has $onfail): if it can't start, times out or is killed, Claude Code runs the command anyway"
+        [[ "$timeout" == ok ]] ||
+          fail "$h.sh ($event) needs a \"timeout\" of 1 to 120 seconds, a whole number (has $timeout)"
       fi
     else
       fail "unrecognised hook command in .claude/settings.json: $cmd"
@@ -185,6 +225,75 @@ done
 for h in ${registered[@]+"${registered[@]}"}; do
   in_list "$h" ${hooks[@]+"${hooks[@]}"} || fail "$h.sh is registered but missing from .claude/hooks"
 done
+
+# Claude Code before 2.1.295 ignores onFailure, so there a hook that fails would let the command
+# through. Any installed copy may be the one that launches a session, so every claude in the
+# usual places (conformance's PATH, the native ~/.local/bin, the old ~/.claude/local) must be new
+# enough, and at least one must exist. Each runs under a sandbox that can't write files, send
+# signals or start processes (no fork, no posix_spawn), so nothing it does outlives it, with a
+# time limit. GitHub Actions doesn't run Claude Code; tests use a fake claude. Both say so.
+claude_min=(2 1 295)
+claude_timeout=15 # seconds
+VERSION_PROFILE='(version 1) (allow default) (deny file-write*)
+  (allow file-write* (literal "/dev/null") (literal "/dev/tty"))
+  (deny signal) (deny process-fork)'
+check_claude() { # <path>: fail unless it reports a version of 2.1.295 or later
+  local c="$1" out="$TMP/claude-version" err="$TMP/claude-version.err" pid i first ver older=0 rc
+  if [[ ! -f "$c" || ! -x "$c" ]]; then
+    fail "Claude Code is not installed at $c (not an executable file), so its version can't be checked; 2.1.295 or later is needed for \"onFailure\": \"block\""
+    return
+  fi
+  # The sandbox lets the probe start no process, so it is the only one to end. The version is
+  # read from standard output only; standard error is kept for the message.
+  sandbox-exec -p "$VERSION_PROFILE" "$c" --version >"$out" 2>"$err" </dev/null &
+  pid=$!
+  for ((i = 0; i < claude_timeout * 10; i++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    fail "$c did not answer 'claude --version' within $claude_timeout seconds, so its version can't be checked; 2.1.295 or later is needed for \"onFailure\": \"block\""
+    return
+  fi
+  wait "$pid"
+  rc=$?
+  first="$(head -n 1 "$out")"
+  if [[ $rc != 0 ]] || ! [[ "$first" =~ ^([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(\ |$) ]]; then
+    fail "can't read Claude Code's version from '$c --version' (status $rc, got: $(cat "$out" "$err" | head -c 80 | tr '\n' ' ')); 2.1.295 or later is needed for \"onFailure\": \"block\""
+    return
+  fi
+  ver=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")
+  for i in 0 1 2; do
+    if ((10#${ver[i]} > claude_min[i])); then break; fi
+    if ((10#${ver[i]} < claude_min[i])); then
+      older=1
+      break
+    fi
+  done
+  [[ $older == 0 ]] ||
+    fail "Claude Code ${ver[0]}.${ver[1]}.${ver[2]} is older than 2.1.295 ($c), which ignores \"onFailure\": \"block\" (a hook that fails would let the command through); update or remove it"
+}
+if [[ "${CI:-}" == true && "${GITHUB_ACTIONS:-}" == true ]]; then
+  echo "SKIP Claude Code version: GitHub Actions doesn't run Claude Code (CI and GITHUB_ACTIONS are true)"
+elif ! command -v sandbox-exec >/dev/null 2>&1; then
+  fail "sandbox-exec is missing, so claude --version can't be run confined"
+else
+  claudes=()
+  if [[ -n "${FORGE_TEST_CLAUDE:-}" ]]; then
+    claudes=("$FORGE_TEST_CLAUDE")
+    echo "NOTE Claude Code version read from FORGE_TEST_CLAUDE=$FORGE_TEST_CLAUDE (a test override, not a real pass)"
+  else
+    for d in ${PATH//:/ } "$HOME/.local/bin" "$HOME/.claude/local"; do
+      [[ -e "$d/claude" || -L "$d/claude" ]] && claudes+=("$d/claude")
+    done
+  fi
+  if [[ ${#claudes[@]} -eq 0 ]]; then
+    fail "Claude Code is not installed (no claude in ${PATH//:/, }, ~/.local/bin or ~/.claude/local), so its version can't be checked; 2.1.295 or later is needed for \"onFailure\": \"block\""
+  fi
+  for c in ${claudes[@]+"${claudes[@]}"}; do check_claude "$c"; done
+fi
 
 if [[ ${#hooks[@]} -gt 0 ]]; then
   if command -v shellcheck >/dev/null 2>&1; then
@@ -564,7 +673,6 @@ COPIED=() # paths relative to ROOT, copied byte for byte into every sandbox
 for f in "$SETTINGS" "$HOOKS_DIR"/*.sh "$ROOT"/.harness/lib/* "$ROOT"/.harness/*.json "$ROOT"/.harness/*.toml; do
   [[ -f "$f" && ! -L "$f" ]] && COPIED+=("${f#"$ROOT"/}")
 done
-BEFORE="$(snapshot)"
 
 # The hook under test runs sandboxed too: it (and any program git starts for it, say a
 # core.fsmonitor a setup configured) may write only inside its sandbox, and may not send signals.
