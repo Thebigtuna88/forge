@@ -17,7 +17,10 @@
 #   branch.*.mergeOptions setting could add options (such as -F) behind the command's back, or
 #   merge.branchdesc / a branch.*.description could put unscanned text into the merge message.
 # - git pull only with --ff-only (no merge commit), and not while pull.rebase or branch.*.rebase
-#   is set.
+#   is set. Merge and pull are refused while merge.autoStash or pull.autoStash is on (an automatic
+#   stash is a commit of the working files, made without the scan).
+# - The author and committer git writes into a commit or merge commit (user.name, user.email) are
+#   scanned too.
 # - git commit-tree, am, cherry-pick, revert and fast-import skip the scan, so they're refused.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset HOOKRT_LOADED
@@ -48,6 +51,14 @@ if [[ "$HR_GIT_SUB" == merge || "$HR_GIT_SUB" == pull ]]; then
   while read -r key _; do
     hr_deny "$key is set: a branch description can go into the merge message unscanned; remove it first"
   done <"$HR_TMP/desccfg"
+  git -C "$HR_GIT_DIR" config --get-regexp '^(merge|pull)\.autostash$' >"$HR_TMP/stashcfg" 2>/dev/null || true
+  while read -r key value; do
+    low="$(_hr_lower "$value")"
+    case "$low" in
+      false | no | off | 0) ;;
+      *) hr_deny "$key is set ($value): an automatic stash commits the working files without the secret scan; remove it first" ;;
+    esac
+  done <"$HR_TMP/stashcfg"
 fi
 
 if [[ "$HR_GIT_SUB" == merge ]]; then
@@ -86,7 +97,6 @@ if [[ "$HR_GIT_SUB" == merge ]]; then
   done
   [[ "$found" == "refs/heads/$target" || "$found" == "refs/remotes/$target" ]] ||
     hr_deny "'$target' is not a branch (it is ${found:-no ref at all}); a tag's name and message would go into the merge message unscanned"
-  hr_allow
 fi
 
 if [[ "$HR_GIT_SUB" == pull ]]; then
@@ -107,23 +117,42 @@ if [[ "$HR_GIT_SUB" == pull ]]; then
 fi
 
 message=""
-if [[ ${#HR_GIT_ARGS[@]} -eq 2 && ("${HR_GIT_ARGS[0]}" == -F || "${HR_GIT_ARGS[0]}" == --file) ]]; then
-  message="${HR_GIT_ARGS[1]}"
-elif [[ ${#HR_GIT_ARGS[@]} -eq 1 && "${HR_GIT_ARGS[0]}" == --file=* ]]; then
-  message="${HR_GIT_ARGS[0]#--file=}"
+if [[ "$HR_GIT_SUB" == commit ]]; then
+  if [[ ${#HR_GIT_ARGS[@]} -eq 2 && ("${HR_GIT_ARGS[0]}" == -F || "${HR_GIT_ARGS[0]}" == --file) ]]; then
+    message="${HR_GIT_ARGS[1]}"
+  elif [[ ${#HR_GIT_ARGS[@]} -eq 1 && "${HR_GIT_ARGS[0]}" == --file=* ]]; then
+    message="${HR_GIT_ARGS[0]#--file=}"
+  fi
+  [[ -n "$message" ]] ||
+    hr_deny "commit only as: git commit -F <message file> (no -m, -a, --amend, --no-verify or other options)"
+  [[ -n "$HR_GIT_DIR" && -d "$HR_GIT_DIR" ]] ||
+    hr_deny "can't tell which repository this commit is in, so it can't be scanned for secrets"
+  [[ "$message" == /* ]] || message="$HR_GIT_DIR/$message"
+  [[ -f "$message" && -r "$message" && ! -L "$message" ]] ||
+    hr_deny "the message file must be a regular file you can read (not a link), so it can be scanned too: $message"
 fi
-[[ -n "$message" ]] ||
-  hr_deny "commit only as: git commit -F <message file> (no -m, -a, --amend, --no-verify or other options)"
-[[ -n "$HR_GIT_DIR" && -d "$HR_GIT_DIR" ]] ||
-  hr_deny "can't tell which repository this commit is in, so it can't be scanned for secrets"
-[[ "$message" == /* ]] || message="$HR_GIT_DIR/$message"
-[[ -f "$message" && -r "$message" && ! -L "$message" ]] ||
-  hr_deny "the message file must be a regular file you can read (not a link), so it can be scanned too: $message"
 type -P gitleaks >/dev/null || hr_deny "gitleaks is not installed, so the commit can't be scanned for secrets"
+rules="$HR_ROOT/.harness/gitleaks.toml"
+mkdir "$HR_TMP/no-ignore" "$HR_TMP/identity"
+
+# The author and committer git writes into the commit (user.name / user.email, or what git works
+# out without them).
+if ! git -C "$HR_GIT_DIR" var GIT_AUTHOR_IDENT >"$HR_TMP/identity/author" 2>/dev/null; then
+  hr_deny "can't tell who the commit's author would be (git var GIT_AUTHOR_IDENT failed); set user.name and user.email"
+fi
+if ! git -C "$HR_GIT_DIR" var GIT_COMMITTER_IDENT >"$HR_TMP/identity/committer" 2>/dev/null; then
+  hr_deny "can't tell who the commit's committer would be (git var GIT_COMMITTER_IDENT failed); set user.name and user.email"
+fi
+if ! gitleaks dir --config "$rules" --gitleaks-ignore-path "$HR_TMP/no-ignore" --ignore-gitleaks-allow \
+  --no-banner --no-color --redact --exit-code 1 "$HR_TMP/identity" >"$HR_TMP/identity.out" 2>&1; then
+  summary="$(tail -n 3 "$HR_TMP/identity.out")"
+  hr_deny "gitleaks found a possible secret in the commit's author or committer (user.name / user.email), or could not scan them: ${summary//$'\n'/ | }"
+fi
+[[ "$HR_GIT_SUB" == commit ]] || hr_allow
 
 # The staged files as raw blobs, read by their exact object ids, under their own paths. The whole
 # index is listed (--no-relative), whatever folder the commit runs from.
-mkdir "$HR_TMP/staged" "$HR_TMP/neutral" "$HR_TMP/no-ignore" "$HR_TMP/message"
+mkdir "$HR_TMP/staged" "$HR_TMP/neutral" "$HR_TMP/message"
 n=0
 git -C "$HR_GIT_DIR" diff --cached --raw -z --no-abbrev --no-renames --no-relative \
   --ignore-submodules=none --diff-filter=ACMRT >"$HR_TMP/staged.list"
@@ -139,7 +168,6 @@ while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
 done <"$HR_TMP/staged.list"
 cp "$message" "$HR_TMP/message/commit-message"
 
-rules="$HR_ROOT/.harness/gitleaks.toml"
 for scan in staged neutral message; do
   if ! gitleaks dir --config "$rules" --gitleaks-ignore-path "$HR_TMP/no-ignore" --ignore-gitleaks-allow \
     --no-banner --no-color --redact --exit-code 1 "$HR_TMP/$scan" >"$HR_TMP/$scan.out" 2>&1; then

@@ -460,6 +460,25 @@ test_guarded_action_inside_an_argument_denies() {
   expect_allow 'git log --grep commit'
   expect_allow 'git push -u origin feature/FRG-3-git-gates'
   expect_allow 'git -C /x/forge-worktrees/FRG-3-git-gates merge --no-edit dev'
+  expect_allow 'git commit -F /tmp/git-message.txt'
+  expect_allow 'git commit --file=/tmp/git-notes.txt'
+  expect_deny 'git config core.pager /Library/Developer/CommandLineTools/usr/libexec/git-core/git-stash'
+  assert_contains "$ERR" "names a guarded action"
+  expect_deny 'git config core.pager vercel'
+  assert_contains "$ERR" "names a guarded action"
+}
+
+test_alias_expanded_arguments_are_checked() {
+  mk_hook_harness
+  git -C "$H" config alias.ag 'grep -Ogit -e marker'
+  git -C "$H" config alias.ar 'archive --remote=stash'
+  git -C "$H" config alias.cp "config core.pager 'git push origin dev:main'"
+  expect_deny 'git ag'
+  assert_contains "$ERR" "runs another program"
+  expect_deny 'git ar --exec=git HEAD'
+  assert_contains "$ERR" "runs another program"
+  expect_deny 'git cp'
+  assert_contains "$ERR" "names a guarded action"
 }
 
 test_gh_alias_or_extension_denies() {

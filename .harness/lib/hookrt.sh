@@ -330,12 +330,27 @@ _hr_glob_could_be_tool() {
   return 1
 }
 
-# _hr_word_guarded <one shell word>: 0 if the word, read as a command, mentions a guarded action,
-# or if it is an option whose attached value does (--exec='git tag …', -O'git tag …'): git runs
-# some option values as programs, and stores others (git config) to run later.
+# _hr_word_guarded <one argument>: 0 if the argument is a command that mentions a guarded action
+# (it has spaces: 'git tag -m x v1'), names one of git's own programs (…/git-stash), or is an
+# option whose attached value is one of those (--exec='git tag …', -O'git tag …'): git runs some
+# option values as programs, and stores others (git config) to run later. A single word is not
+# read as a command otherwise, so a file such as git-message.txt is just a file.
 _hr_word_guarded() {
-  local w="$1" low v=""
-  if hr_guarded "$w"; then return 0; fi
+  local w="$1" low v="" base
+  case "$w" in
+    *[[:space:]]*)
+      if hr_guarded "$w"; then return 0; fi
+      ;;
+    *)
+      _hr_load
+      base="$(_hr_lower "${w##*/}")"
+      if [[ "$base" == git-* ]] && _hr_git_builtin "${base#git-}"; then return 0; fi
+      for v in "${_HR_TOOLS[@]}"; do
+        if [[ "$base" == "$v" ]]; then return 0; fi
+      done
+      v=""
+      ;;
+  esac
   case "$w" in
     --*=*) v="${w#*=}" ;;
     -[!-]*)
@@ -347,7 +362,7 @@ _hr_word_guarded() {
       fi
       ;;
   esac
-  [[ -n "$v" ]] && hr_guarded "$v"
+  [[ -n "$v" ]] && _hr_word_guarded "$v"
 }
 
 # _hr_git_runs_program <git subcommand> <argument>: 0 if the argument is an option that makes this
@@ -575,16 +590,17 @@ hr_require_simple() { # deny unless a guarded command is one plain command; fill
         hr_deny "git alias for a guarded command ($HR_GIT_SUB); use the command itself"
       fi
       # The guarded action must be the command itself, never inside one of its arguments, and the
-      # command may not run another program: the gates judge only the outer git command.
-      local -a whole=("${HR_TOK[@]}")
-      local i subi=$_HR_SUBI
-      for ((i = 1; i < ${#whole[@]}; i++)); do
-        if [[ $i == "$subi" ]]; then continue; fi
-        if _hr_git_runs_program "$HR_GIT_SUB" "${whole[$i]}"; then
-          hr_deny "git $HR_GIT_SUB ${whole[$i]} runs another program, which no FORGE gate can check; leave the option out"
+      # command may not run another program: the gates judge only the outer git command. The
+      # arguments checked are git's global options and the subcommand's arguments as an alias
+      # expands them.
+      local -a whole=("${HR_TOK[@]}") check=("${HR_TOK[@]:1:$((_HR_SUBI - 1))}" ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"})
+      local a
+      for a in ${check[@]+"${check[@]}"}; do
+        if _hr_git_runs_program "$HR_GIT_SUB" "$a"; then
+          hr_deny "git $HR_GIT_SUB $a runs another program, which no FORGE gate can check; leave the option out"
         fi
-        if _hr_word_guarded "${whole[$i]}"; then
-          hr_deny "an argument of git $HR_GIT_SUB names a guarded action ('${whole[$i]}'); a guarded action runs only as its own git command"
+        if _hr_word_guarded "$a"; then
+          hr_deny "an argument of git $HR_GIT_SUB names a guarded action ('$a'); a guarded action runs only as its own git command"
         fi
         HR_TOK=("${whole[@]}")
       done
