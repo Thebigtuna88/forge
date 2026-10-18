@@ -27,7 +27,8 @@ Found while planning FRG-4.
   registration holds any other key (`async`, `asyncRewake`, `if`, …, which change whether a gate
   runs or blocks), or when any installed Claude Code (on `PATH`, `~/.local/bin`,
   `~/.claude/local`) is older than 2.1.295, none is found, or a version can't be read. Each
-  `claude --version` runs in a no-write, no-signal sandbox with a 15-second limit (review round 1).
+  `claude --version` runs in a sandbox that can't write files, send signals or start processes,
+  with a 15-second limit (review rounds 1 and 3).
 - A separate small ticket (FRG-20), merged before FRG-4, so the five FRG-3 gates are covered at
   once.
 

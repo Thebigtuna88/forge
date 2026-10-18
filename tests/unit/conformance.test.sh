@@ -997,7 +997,7 @@ test_fails_on_keys_that_change_when_or_whether_a_hook_runs() {
     rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
     mk_conf_harness
     set_hook_field "$change"
-    expect_fail "registration has keys FORGE doesn't allow"
+    expect_fail "registration has keys FORGE does not allow"
   done
 }
 
@@ -1005,7 +1005,7 @@ test_fails_on_unknown_matcher_group_keys() {
   mk_conf_harness
   jq '.hooks.PreToolUse[0].extra = true' "$H/.claude/settings.json" >"$T_TMP/s.json"
   mv "$T_TMP/s.json" "$H/.claude/settings.json"
-  expect_fail "registration has keys FORGE doesn't allow (group \"extra\")"
+  expect_fail "registration has keys FORGE does not allow (group \"extra\")"
 }
 
 test_inherited_ci_variables_do_not_skip_version_tests() {
@@ -1046,7 +1046,7 @@ test_fails_on_an_empty_key_in_a_registration() {
   # C2: a key named "" is still a key FORGE doesn't allow.
   mk_conf_harness
   set_hook_field '.[""] = true'
-  expect_fail "registration has keys FORGE doesn't allow"
+  expect_fail "registration has keys FORGE does not allow"
 }
 
 test_fails_on_a_matcher_or_hooks_that_is_not_the_right_type() {
@@ -1062,34 +1062,74 @@ test_fails_on_a_matcher_or_hooks_that_is_not_the_right_type() {
   done
 }
 
-test_version_timeout_ends_the_probes_children() {
-  # C1: a claude that hangs in a child process; after the time limit nothing it started survives.
-  mk_conf_harness
+# probe_sleep: a link to /bin/sleep named inside this test's own folder ($S), so a process found
+# by its path belongs to this test and no other run.
+probe_sleep() {
   mkdir -p "$T_TMP/bin"
-  printf '#!/bin/bash\n/bin/sleep 6017 &\nwait\n' >"$T_TMP/bin/claude"
-  chmod 755 "$T_TMP/bin/claude"
-  expect_fail "did not answer"
+  S="$T_TMP/bin/probe-sleep"
+  ln -sf /bin/sleep "$S"
+}
+
+# no_probe_processes: fail (and clean up) if any process of this test's probe-sleep is running.
+no_probe_processes() {
   sleep 1
-  if pgrep -f "sleep 6017" >/dev/null; then
-    pkill -f "sleep 6017"
-    _t_fail "the probe's child process was left running"
+  if pgrep -f "$S" >/dev/null; then
+    pkill -9 -f "$S"
+    _t_fail "a process the probe started was left running: $1"
   fi
 }
 
-test_version_probe_leaves_no_children_behind() {
-  # C1: a claude that answers at once but leaves a child running.
+test_version_timeout_ends_the_probe() {
+  # Round 2 C1: a claude that never answers is ended at the time limit.
   mk_conf_harness
-  mkdir -p "$T_TMP/bin"
-  printf '#!/bin/bash\n/bin/sleep 6018 >/dev/null 2>&1 &\nprintf "2.1.302 (Claude Code)\\n"\n' \
-    >"$T_TMP/bin/claude"
+  probe_sleep
+  printf '#!/bin/bash\nexec %q 30\n' "$S" >"$T_TMP/bin/claude"
   chmod 755 "$T_TMP/bin/claude"
-  conform
-  assert_exit 0 "$RC" "$OUT"
-  sleep 1
-  if pgrep -f "sleep 6018" >/dev/null; then
-    pkill -f "sleep 6018"
-    _t_fail "the probe's child process was left running"
-  fi
+  expect_fail "did not answer"
+  no_probe_processes "after the time limit"
+}
+
+test_version_probe_cannot_start_processes() {
+  # Round 2 C1, round 3 C1/SEC-1: the probe may not start any process, so none can outlive it:
+  # not a plain child, not one in its own process group, not one in a new session. Refused a
+  # process, the fake's bash stops before printing its version, so the check fails closed. (The
+  # real claude starts no process for --version.)
+  local body
+  probe_sleep
+  for body in \
+    "$(printf '%q 600 >/dev/null 2>&1 &' "$S")" \
+    "$(printf 'set -m; %q 600 >/dev/null 2>&1 &' "$S")" \
+    "$(printf '/usr/bin/perl -MPOSIX -e %q 2>/dev/null' \
+      "if (!fork) { POSIX::setsid(); exec '$S', 600 }")"; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    printf '#!/bin/bash\n%s\nprintf "2.1.302 (Claude Code)\\n"\n' "$body" >"$T_TMP/bin/claude"
+    chmod 755 "$T_TMP/bin/claude"
+    expect_fail "can't read Claude Code's version"
+    no_probe_processes "$body"
+  done
+}
+
+test_fails_on_an_empty_or_odd_event_name() {
+  # Round 3 C2: an event named "" (or anything but a plain word) is malformed, not skipped.
+  local name
+  for name in '""' '"Pre Tool"' '"PreToolUse\u0000"'; do
+    rm -rf "${T_TMP:?}/code" "${T_TMP:?}/home"
+    mk_conf_harness
+    jq --arg c "\"\$CLAUDE_PROJECT_DIR\"/.claude/hooks/sample-gate.sh" \
+      ".hooks[$name] = [{hooks: [{type: \"command\", command: \$c}]}]" \
+      "$H/.claude/settings.json" >"$T_TMP/s.json"
+    mv "$T_TMP/s.json" "$H/.claude/settings.json"
+    expect_fail ".claude/settings.json is missing or malformed"
+  done
+}
+
+test_fails_on_extra_keys_in_an_empty_matcher_group() {
+  # Round 3 C3: a group's keys are checked even when its hooks list is empty.
+  mk_conf_harness
+  jq '.hooks.Stop = [{hooks: [], extra: true}]' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  expect_fail "registration has keys FORGE does not allow (group \"extra\")"
 }
 
 test_fails_when_any_installed_claude_is_too_old() {

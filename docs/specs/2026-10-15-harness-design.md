@@ -435,8 +435,9 @@ agent ends a turn (`Stop`). It passes the call as JSON on stdin (`tool_name`, `t
 reason. Any other exit allows, and so do a hook that can't start (missing, not executable) and
 one that times out, unless it is registered with `"onFailure": "block"` (Claude Code 2.1.295 or
 later). Then any failure blocks, as exit 2 does. **Every FORGE hook is registered that way, with
-a timeout of at most 120 seconds** (FRG-20, `docs/decisions/2026-10-18-failed-hooks-block.md`).
-Claude Code ignores the field on `Stop` hooks, which is why the Stop hook fails open (4.6).
+a timeout of at most 120 seconds**, except on the events where Claude Code ignores the field
+(`Stop`, `SubagentStop`, `TaskCompleted`, `TeammateIdle`), which is why the Stop hook below has
+neither and fails open (4.6) (FRG-20, `docs/decisions/2026-10-18-failed-hooks-block.md`).
 
 Registration is project-scoped, in the committed `.claude/settings.json` (never `~/.claude`):
 
