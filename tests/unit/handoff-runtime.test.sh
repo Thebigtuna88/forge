@@ -259,11 +259,18 @@ test_overlapping_secrets_are_redacted_whole() {
   mk_harness
   mk_script "$ID" "ho_secret_to_file short A $H/.env" "ho_secret_to_file long B $H/.env" \
     "ho_info reveal /usr/bin/sort $H/.env"
-  pty_run --answer 'abc' --answer 'abcdef' -- bash "$SCRIPT"
+  # The secrets are made only of characters (% @ , +) that RESULT.txt never holds otherwise: not
+  # in its hex checksums, its timestamp, the test folder's path or its wording. So the whole file
+  # can be searched with no exemptions, and any piece of either secret shows up: the short one,
+  # the long one, or the ",+," a short-first redaction would leave of the long one. (With letters,
+  # a random checksum could hold them by chance, FRG-23.)
+  [[ "$T_TMP" != *[%@,+]* ]] || _t_fail "the test folder's path ($T_TMP) holds % @ , or +; this test can't tell it from a leak"
+  pty_run --answer '%@%' --answer '%@%,+,' -- bash "$SCRIPT"
   local result
   result="$(cat "$H/work/owner/$ID/RESULT.txt")"
+  assert_contains "$result" "check long: PASS stored B in $H/.env (mode 600)"
   assert_contains "$result" "check reveal: INFO B=[REDACTED]"
-  assert_not_contains "$result" "def"
+  [[ "$result" != *[%@,+]* ]] || _t_fail "RESULT.txt holds a piece of a secret (% @ , or +): $result"
 }
 
 test_refuses_shell_tracing() {
