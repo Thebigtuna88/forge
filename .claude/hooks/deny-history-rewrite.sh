@@ -117,10 +117,12 @@ case "$HR_GIT_SUB" in
     # it a signed tag with a message.
     names=0
     nosign=0
+    notcreating=0  # listing, deleting or verifying: no tag is made
     for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
       case "$a" in
         --no-sign) nosign=1 ;;
-        -l | --list | -d | --delete | -v | --verify | -i | --ignore-case | \
+        -l | --list | -d | --delete | -v | --verify) notcreating=1 ;;
+        -i | --ignore-case | \
           --contains | --no-contains | --merged | --no-merged | --points-at | --contains=* | \
           --no-contains=* | --merged=* | --no-merged=* | --points-at=* | --sort=* | --format=* | \
           --column | --column=* | --no-column | -n | -n[0-9]*) ;;
@@ -131,7 +133,7 @@ case "$HR_GIT_SUB" in
         *) ((names += 1)) ;;
       esac
     done
-    if [[ $names -gt 0 && $nosign == 0 ]]; then
+    if [[ $names -gt 0 && $nosign == 0 && $notcreating == 0 ]]; then
       [[ -n "$HR_GIT_DIR" && -d "$HR_GIT_DIR" ]] ||
         hr_deny "can't tell which repository this runs in, so can't check tag.gpgSign; use git tag --no-sign <name>"
       git -C "$HR_GIT_DIR" config --type=bool --get tag.gpgSign >"$HR_TMP/gpgsign" 2>/dev/null || true

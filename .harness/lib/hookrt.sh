@@ -386,6 +386,11 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   # Hyphens split words too, so git's own git-push and git-commit programs read as git push.
   read -r -a words <<<"$(printf '%s' "${cmd//[\'\"\\]/}" | LC_ALL=C tr -c 'A-Za-z0-9_.' ' ' | LC_ALL=C tr '[:upper:]' '[:lower:]')"
   [[ ${#words[@]} -gt 0 ]] || return 1
+  # A path into git's own files (.git/refs, .git/config, …) can move a branch with no git
+  # command at all, so naming one makes a command guarded (and hr_require_simple refuses it).
+  for w in "${words[@]}"; do
+    if [[ "$w" == .git ]]; then return 0; fi
+  done
   for seq in "${_HR_GUARDED_SEQS[@]}" "${_HR_TOOLS[@]}"; do
     if _hr_seq_in "$seq" "${words[@]}"; then return 0; fi
   done
@@ -461,11 +466,12 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
         continue
       fi
       cmdpos=0
-      if _hr_could_be_tool "$u"; then
+      # git's own programs (git-tag, git-remote, …) run git commands under another name.
+      if _hr_could_be_tool "$u" || [[ "$base" == git-* ]]; then
         rc=0
         break
       fi
-    elif [[ $wrapped == 1 ]] && _hr_could_be_tool "$u"; then
+    elif [[ $wrapped == 1 ]] && { _hr_could_be_tool "$u" || [[ "$base" == git-* ]]; }; then
       rc=0
       break
     elif _hr_glob_could_be_tool "$u"; then
@@ -509,6 +515,13 @@ hr_require_simple() { # deny unless a guarded command is one plain command; fill
     fi
   done
   hr_tokens "$HR_CMD" || hr_deny "guarded command's quoting does not parse"
+  for c in "${HR_TOK[@]}"; do
+    case "$(_hr_lower "$c")" in
+      .git | .git/* | */.git | */.git/* | *=.git | *=.git/*)
+        hr_deny "commands may not touch git's own files ($c) directly; use git commands"
+        ;;
+    esac
+  done
   first="${HR_TOK[0]:-}"
   case "$first" in
     git)

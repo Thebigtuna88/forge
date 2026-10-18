@@ -12,7 +12,8 @@
 # - git merge only as `git merge [--no-edit] [--no-ff | --ff-only] [--squash] [-q] <branch>` or
 #   `git merge --abort`: it brings in commits that were scanned. A merge stopped by a conflict is
 #   concluded with git commit -F (scanned), not git merge --continue. Refused while a
-#   branch.*.mergeOptions setting could add options (such as -F) behind the command's back.
+#   branch.*.mergeOptions setting could add options (such as -F) behind the command's back, or
+#   merge.branchdesc / a branch.*.description could put unscanned text into the merge message.
 # - git pull only with --ff-only (no merge commit), and not while pull.rebase or branch.*.rebase
 #   is set.
 # - git commit-tree, am, cherry-pick, revert and fast-import skip the scan, so they're refused.
@@ -41,6 +42,10 @@ if [[ "$HR_GIT_SUB" == merge || "$HR_GIT_SUB" == pull ]]; then
   while read -r key value; do
     hr_deny "$key is set ($value): mergeOptions can add options (such as -F <file>) the gate doesn't see; remove it first"
   done <"$HR_TMP/mergecfg"
+  git -C "$HR_GIT_DIR" config --get-regexp '^(merge\.branchdesc|branch\..*\.description)$' >"$HR_TMP/desccfg" 2>/dev/null || true
+  while read -r key _; do
+    hr_deny "$key is set: a branch description can go into the merge message unscanned; remove it first"
+  done <"$HR_TMP/desccfg"
 fi
 
 if [[ "$HR_GIT_SUB" == merge ]]; then
