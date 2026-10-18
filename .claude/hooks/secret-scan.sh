@@ -69,6 +69,8 @@ fi
 if [[ "$HR_GIT_SUB" == merge ]]; then
   target=""
   nocommit=0
+  ffonly=0
+  noff=0
   for a in ${HR_GIT_ARGS[@]+"${HR_GIT_ARGS[@]}"}; do
     case "$a" in
       --continue)
@@ -78,8 +80,10 @@ if [[ "$HR_GIT_SUB" == merge ]]; then
         [[ ${#HR_GIT_ARGS[@]} == 1 ]] || hr_deny "abort a merge with git merge --abort alone"
         hr_allow
         ;;
-      --no-commit | --ff-only | --squash) nocommit=1 ;;
-      --no-edit | --no-ff | -q | --quiet) ;;
+      --no-commit | --squash) nocommit=1 ;;
+      --ff-only) ffonly=1 ;;
+      --no-ff) noff=1 ;;
+      --no-edit | -q | --quiet) ;;
       -*)
         hr_deny "merge only as: git merge --no-commit [--no-ff] <branch> (or --ff-only, --squash), or git merge --abort (not $a)"
         ;;
@@ -90,6 +94,8 @@ if [[ "$HR_GIT_SUB" == merge ]]; then
     esac
   done
   # A merge commit made by git itself skips the scan of its result, so git must stop first.
+  # --ff-only counts only without --no-ff (the later of the two wins in git).
+  if [[ $ffonly == 1 && $noff == 0 ]]; then nocommit=1; fi
   [[ $nocommit == 1 ]] ||
     hr_deny "merge as git merge --no-commit <branch>, then commit the result with git commit -F <message file>, which scans it (a fast-forward needs no commit)"
   # The branch name goes into the merge message, so it must be one whose text is known.
