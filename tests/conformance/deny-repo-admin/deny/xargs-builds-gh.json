@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "printf h | xargs -I X gX repo delete Thebigtuna88/forge --yes"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "must be one plain command"
+}

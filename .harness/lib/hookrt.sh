@@ -540,7 +540,7 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   for w in ${HR_TOK[@]+"${HR_TOK[@]}"}; do
     case "$(_hr_lower "$w")" in api | repo | workflow) verbs=1 ;; esac
   done
-  local i n=${#HR_TOK[@]} t u base rc=1 cmdpos=1 wrapped=0 skip=0 op='^[;&|()<>]+$'
+  local i n=${#HR_TOK[@]} t u base xa xj rc=1 cmdpos=1 wrapped=0 skip=0 op='^[;&|()<>]+$'
   for ((i = 0; i < n; i++)); do
     t="${HR_TOK[$i]}"
     if [[ $skip == 1 ]]; then # the target of a redirection
@@ -574,8 +574,8 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     # with words after it counts as gh too, since its value may become a command's name (zsh's
     # hash g=…, an alias; round 8).
     if [[ "$u" == *=* && $((i + 1)) -lt $n ]]; then
-      t="${u#*=}"
-      if [[ "$(_hr_lower "${t##*/}")" == gh ]]; then
+      xa="${u#*=}"
+      if [[ "$(_hr_lower "${xa##*/}")" == gh ]]; then
         rc=0
         break
       fi
@@ -583,6 +583,30 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     if [[ "$base" == gh ]] && [[ $cmdpos == 1 || $wrapped == 1 || $((i + 1)) -lt $n ]]; then
       rc=0
       break
+    fi
+    # A program that builds its command line from its input can turn input into a command's
+    # name: printf h | xargs -I X gX … runs gh (review round 9), and parallel puts its input in
+    # {}. So xargs with a replacement (-I, -J, -i, --replace) or with an option FORGE doesn't
+    # know, and parallel, make a command guarded; xargs that only appends words to a command
+    # written out stays plain. (find -exec {} is caught below: {} could be any program.)
+    if [[ "$base" == parallel ]]; then
+      rc=0
+      break
+    fi
+    if [[ "$base" == xargs ]]; then
+      for ((xj = i + 1; xj < n; xj++)); do
+        xa="${HR_TOK[$xj]}"
+        [[ "$xa" == -* ]] || break # the command xargs runs
+        case "$xa" in
+          -0 | -o | -p | -r | -t | -x | --null | --no-run-if-empty | --verbose | --exit | --open-tty) ;;
+          -E | -L | -n | -P | -R | -S | -s | -a | -d) xj=$((xj + 1)) ;; # its value is the next word
+          -[ELnPRSsad]?*) ;;                                           # its value attached
+          *)
+            rc=0
+            break 2
+            ;;
+        esac
+      done
     fi
     if [[ $cmdpos == 1 ]]; then
       if [[ "$u" =~ ^[0-9]+$ && $((i + 1)) -lt $n && "${HR_TOK[$((i + 1))]}" == *[\<\>]* ]]; then

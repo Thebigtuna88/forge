@@ -90,13 +90,15 @@ while IFS=$'\x1f' read -r lens mech verdict reply rsha rounds; do
   # digit (review round 4).
   [[ "$rounds" =~ ^[1-9][0-9]*$ ]] ||
     hr_deny "review.md records '$rounds' rounds for the $lens lens, not a whole number written out"
+  # A link counts as there even when it points nowhere (-L): a broken or unreadable later round is
+  # still a later round (review round 9).
   for later in "$work"/rounds/*/reply-"$lens".json; do
     k="${later%/reply-*}"
     k="${k##*/}"
-    if [[ -e "$later" && ! "$k" =~ ^[1-9][0-9]*$ ]]; then
+    if [[ (-e "$later" || -L "$later") && ! "$k" =~ ^[1-9][0-9]*$ ]]; then
       hr_deny "work/$ticket/rounds/$k/ is not a round number, so the $lens lens's rounds can't be checked"
     fi
-    if [[ -e "$later" && (${#k} -gt ${#rounds} || (${#k} -eq ${#rounds} && "$k" > "$rounds")) ]]; then
+    if [[ (-e "$later" || -L "$later") && (${#k} -gt ${#rounds} || (${#k} -eq ${#rounds} && "$k" > "$rounds")) ]]; then
       hr_deny "work/$ticket has a later round ($k) for the $lens lens than review.md records ($rounds); review.md is stale, so finish the review and rewrite it"
     fi
   done

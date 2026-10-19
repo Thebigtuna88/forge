@@ -508,6 +508,29 @@ test_gh_after_a_comment_is_guarded() {
   assert_exit 2 "$RC" "a read with a comment (a guarded command is one plain command)"
 }
 
+# Review round 9 (SEC-1): a program that builds its command line from its input can turn input
+# into a command's name (printf h | xargs -I X gX repo delete … runs gh), so xargs with a
+# replacement (or an option FORGE doesn't know), find with -exec/-execdir/-ok/-okdir, and parallel
+# make a command guarded. xargs that only appends words to a command written out stays plain.
+test_wrapper_that_substitutes_is_guarded() {
+  mk_hook_harness
+  local c
+  for c in 'printf h | xargs -I X gX repo delete a/b --yes' 'printf h | xargs -IX gX repo delete a/b' \
+    'printf h | xargs -J X gX repo delete a/b' 'printf h | xargs -0 -I X gX pr list' \
+    'printf %s%s g h | xargs -I X X pr merge 5' 'printf h | xargs --replace=X gX pr list' \
+    'printf h | xargs -iX gX pr list' 'printf h | xargs -0IX gX pr list' 'printf h | xargs -q gX' \
+    'parallel echo ::: a' "find /opt -name x -exec {} repo delete a/b ';'" 'find . -execdir true {} +' \
+    "find . -ok rm {} ';'"; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+  for c in 'find . -name x | xargs wc -l' 'ls | xargs -n 1 echo' 'ls | xargs -n1 -0 echo' \
+    'printf a | xargs -0 echo' 'find . -name x -print'; do
+    probe guarded "$c"
+    assert_eq "$OUT" PLAIN "plain: $c"
+  done
+}
+
 # Review round 8 (SEC-1): an alias defined in the command runs gh under another name (zsh, which
 # Claude Code's Bash uses here, expands aliases without being asked; bash after shopt -s
 # expand_aliases), so a command that defines one is guarded, and so is a NAME=gh word with words
