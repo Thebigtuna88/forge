@@ -40,6 +40,8 @@ hr_review_json "$review" "$HR_TMP/review.json" ||
 jq -se 'length == 1 and (.[0] | type == "object" and .forge_review == 1 and (.repo | type) == "string" and (.branch | type) == "string" and (.pr | type) == "number" and (.head | type) == "string" and (.merge_base | type) == "string" and (.diff_md5 | type) == "string" and (.diff_bytes | type) == "number" and (.lenses | type) == "array" and (.deferred | type) == "array" and (.lenses | all(type == "object" and (.lens | type) == "string" and (.mechanism | type) == "string" and (.model | type) == "string" and (.model | length) > 0 and (.rounds | type) == "number" and .rounds >= 1 and .rounds == (.rounds | floor) and (.verdict | type) == "string" and (.reply | type) == "string" and (.reply_sha256 | type) == "string")) and (.deferred | all(type == "object" and (.finding | type) == "string" and (.issue | type) == "number" and .issue >= 1 and .issue == (.issue | floor))))' \
   "$HR_TMP/review.json" >/dev/null 2>&1 ||
   hr_deny "work/$ticket/review.md's forge-review block is malformed (spec 6.6: one JSON object with forge_review 1, repo, branch, pr, head, merge_base, diff_md5, diff_bytes, lenses and deferred)"
+hr_plain_numbers "$HR_TMP/review.json" ||
+  hr_deny "work/$ticket/review.md's forge-review block writes a number that is not plain digits (spec 6.6: no fraction or exponent, as in rounds 1e0)"
 jq -s '.[0]' "$HR_TMP/review.json" >"$HR_TMP/review.one"
 mv "$HR_TMP/review.one" "$HR_TMP/review.json"
 

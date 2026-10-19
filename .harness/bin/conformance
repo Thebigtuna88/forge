@@ -724,7 +724,8 @@ mk_sandbox() {
 
 # differs [skip]: print the first copied path whose sandbox copy no longer matches the live file:
 # the hooks, runtime and config in SBX, and the test stubs in BASE/stubs (the fake gh the hooks run
-# there), which must also still be regular files, not links.
+# there), which must also still be regular files, not links, in a stubs folder that is itself not
+# a link (review round 11).
 differs() {
   local rel
   for rel in ${COPIED[@]+"${COPIED[@]}"}; do
@@ -734,6 +735,10 @@ differs() {
       return 0
     }
   done
+  if [[ ${#STUBS[@]} -gt 0 && (-L "$BASE/stubs" || ! -d "$BASE/stubs") ]]; then
+    echo "tests/stubs"
+    return 0
+  fi
   for rel in ${STUBS[@]+"${STUBS[@]}"}; do
     if [[ -L "$BASE/stubs/${rel##*/}" || ! -f "$BASE/stubs/${rel##*/}" ]] ||
       ! cmp -s "$ROOT/$rel" "$BASE/stubs/${rel##*/}"; then

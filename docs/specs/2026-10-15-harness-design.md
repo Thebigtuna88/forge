@@ -716,6 +716,8 @@ exactly one block fenced by a line ` ```json forge-review ` and a line ` ``` `:
 ```
 
 `reply` is relative to `work/<KEY>-<n>-<slug>/` and must be `rounds/<r>/reply-<lens>.json`.
+Every number in the block is written as plain digits, with no fraction or exponent (`1`, not
+`1e0` or `1.0`).
 
 ### 6.7 Lens checklists (`.harness/lenses/*.md`)
 

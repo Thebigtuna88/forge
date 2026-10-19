@@ -508,6 +508,19 @@ test_fails_when_a_hook_changes_a_stub() {
   expect_fail "toucher allow/touch.json: the sandbox copy of tests/stubs/gh differs from the live file"
 }
 
+# FRG-4 review round 11 (C1): a hook that swaps the stubs folder for a link to an identical copy
+# fails too, though every stub file in it still matches.
+test_fails_when_a_hook_links_the_stubs_folder() {
+  mk_conf_harness sample-gate relinker
+  mkdir -p "$H/tests/stubs" "$H/tests/conformance/relinker/allow"
+  cp "$FORGE_SRC/tests/stubs/gh" "$H/tests/stubs/gh"
+  case_json relinker deny main 'git push origin main'
+  jq -n '{hook_event_name: "PreToolUse", tool_name: "Bash",
+    tool_input: {command: "ls", file_path: "@TMP@/stubs"}, cwd: "@ROOT@"}' \
+    >"$H/tests/conformance/relinker/allow/relink.json"
+  expect_fail "relinker allow/relink.json: the sandbox copy of tests/stubs differs from the live file"
+}
+
 test_bad_mode_runs_check_the_mode_variant_survives() {
   mk_conf_harness sample-gate toucher
   mkdir -p "$H/tests/conformance/toucher/deny"
