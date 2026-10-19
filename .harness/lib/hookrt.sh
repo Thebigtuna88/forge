@@ -1069,13 +1069,18 @@ hr_review_json() { # <review.md> <out.json>: 0 if review.md holds exactly one fo
 }
 
 # jq reads 1e0 or 1.0 as 1 before anyone sees the spelling, so whole numbers are checked as written:
-# Python's json calls parse_float for any number with a fraction or an exponent, and
-# parse_constant for NaN and Infinity (review round 11).
+# Python's json calls parse_float for any number with a fraction or an exponent, parse_constant
+# for NaN and Infinity (review round 11), and parse_int for the rest, which must be digits only,
+# with no minus sign (round 12).
 _HR_PY_PLAIN_NUMBERS='
 import json, sys
 def refuse(text):
     raise ValueError(text)
-json.load(open(sys.argv[1], encoding="utf-8"), parse_float=refuse, parse_constant=refuse)
+def digits(text):
+    if not (text.isascii() and text.isdigit()):
+        refuse(text)
+    return int(text)
+json.load(open(sys.argv[1], encoding="utf-8"), parse_float=refuse, parse_constant=refuse, parse_int=digits)
 '
 hr_plain_numbers() { # <file.json>: 0 if every number in it is written as plain digits
   python3 -I -c "$_HR_PY_PLAIN_NUMBERS" "$1" 2>/dev/null
