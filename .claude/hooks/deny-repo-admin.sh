@@ -1,9 +1,9 @@
 #!/bin/bash -p
 # deny-repo-admin (spec 5.3, FRG-4): the gh allowlist. A gh command that only reads (hookrt's
-# _HR_GH_READS, with no $ or ` in the command) isn't guarded, so it may sit in a pipeline and
-# reaches here only when something else makes the command guarded; it is allowed. Every other gh
-# command must be one plain command (hr_require_simple, which also refuses while a GH_* or
-# GITHUB_* variable is set) and one of:
+# _HR_GH_READS, with no $, ` or unquoted glob in the command) isn't guarded, so it may sit in a
+# pipeline and reaches here only when something else makes the command guarded; it is allowed.
+# Every other gh command must be one plain command (hr_require_simple, which also refuses while a
+# GH_* or GITHUB_* variable is set) and one of:
 #   gh auth status [--active]
 #   gh api <endpoint> as a GET only: no -X/--method but GET, no -f/-F/--field/--raw-field/--input
 #     (any of them turns it into a write), no -H, --hostname or graphql; options --paginate,
@@ -30,11 +30,15 @@ source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&
 
 hr_init deny-repo-admin
 # A read sends its words to GitHub too (a search query, --search), so any command that names gh is
-# scanned first, as written and word by word, whether or not it is guarded (review round 2).
+# scanned first, as written and word by word, whether or not it is guarded (review round 2). The
+# shell joins a line that ends in a backslash to the next one, so a secret split that way is
+# scanned joined too, and the words are the joined text's (review round 4).
 if hr_mentions_gh; then
   mkdir "$HR_TMP/read"
+  joined="${HR_CMD//\\$'\n'/}"
   printf '%s\n' "$HR_CMD" >"$HR_TMP/read/command"
-  if hr_tokens "$HR_CMD" punct; then printf '%s\n' "${HR_TOK[@]}" >"$HR_TMP/read/words"; fi
+  printf '%s\n' "$joined" >"$HR_TMP/read/joined"
+  if hr_tokens "$joined" punct; then printf '%s\n' "${HR_TOK[@]}" >"$HR_TMP/read/words"; fi
   if ! hr_scan_text "$HR_TMP/read"; then
     hr_deny "gitleaks found a possible secret in the text this gh command would send to GitHub, or could not scan it: $HR_SCAN"
   fi

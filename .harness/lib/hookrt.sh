@@ -161,7 +161,8 @@ _HR_GH_CMDS=" agent-task alias api attestation auth browse cache codespace compl
   environment exit-codes formatting mintty reference telemetry "
 # gh commands that only read, as "<command>:<subcommand>" ("<command>:*" for any subcommand,
 # "<command>" alone when it takes none). A gh invocation that is one of these, with the two words
-# written right after gh and no $ or ` in the command, isn't guarded, so it may sit in a pipeline.
+# written right after gh and no $, ` or unquoted glob in the command, isn't guarded, so it may sit
+# in a pipeline.
 # Every other gh invocation is guarded: one plain command, judged by deny-repo-admin.
 # `gh auth status` isn't here, because its --show-token prints the login token.
 _HR_GH_READS=" issue:list issue:view pr:list pr:view pr:diff pr:checks pr:status run:list run:view
@@ -199,6 +200,29 @@ except ValueError:
     sys.exit(3)
 out = str(len(words)).encode() + b"\0" + b"".join(os.fsencode(w) + b"\0" for w in words)
 sys.stdout.buffer.write(out)
+'
+
+# Exits 0 if the text has a * ? or [ the shell would expand as a glob: outside quotes and not
+# escaped by a backslash. Broken quoting counts as a glob (exit 0); none found exits 1.
+_HR_PY_GLOB='
+import sys
+text, q, i = sys.argv[1], None, 0
+while i < len(text):
+    c = text[i]
+    if q == "\x27":
+        if c == "\x27":
+            q = None
+    elif c == "\\":
+        i += 1
+    elif q == "\"":
+        if c == "\"":
+            q = None
+    elif c in "\x27\"":
+        q = c
+    elif c in "*?[":
+        sys.exit(0)
+    i += 1
+sys.exit(0 if q else 1)
 '
 
 # --- decisions ---------------------------------------------------------------------------------
@@ -470,6 +494,12 @@ _hr_gh_reads() { # <index of a gh word in HR_TOK>: 0 if that gh invocation only 
   [[ "$_HR_GH_READS" == *" $c1:$c2 "* || "$_HR_GH_READS" == *" $c1:* "* ]]
 }
 
+_hr_unquoted_glob() { # <text>: 0 if the shell would expand a glob in it (or python can't tell)
+  [[ "$1" == *[\*\?\[]* ]] || return 1
+  python3 -I -c "$_HR_PY_GLOB" "$1" 2>/dev/null
+  [[ $? != 1 ]]
+}
+
 hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2)
   local cmd="${1-$HR_CMD}" w seq tool
   local -a words
@@ -551,9 +581,10 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     # (xargs -I view gh repo view … runs gh repo delete; FRG-4 review round 2); and `which gh`
     # (nothing after it) stays plain. A read sends its words to GitHub, and the secret scan sees
     # them only as written, so a $ or ` anywhere in the command makes even a read guarded
-    # (gh search code "$S" would send a value nobody scanned; round 3).
+    # (gh search code "$S" would send a value nobody scanned; round 3), and so does a glob outside
+    # quotes (gh search code ghp_* would send a file's name; round 4).
     if [[ "$base" == gh ]] && [[ $cmdpos == 1 || $wrapped == 1 || $((i + 1)) -lt $n ]]; then
-      if [[ $cmdpos != 1 || "$cmd" == *[\$\`]* ]] || ! _hr_gh_reads "$i"; then
+      if [[ $cmdpos != 1 || "$cmd" == *[\$\`]* ]] || _hr_unquoted_glob "$cmd" || ! _hr_gh_reads "$i"; then
         rc=0
         break
       fi
@@ -823,8 +854,9 @@ hr_scan_text() {
 }
 
 hr_mentions_gh() { # 0 if gh is one of the command's words (quotes and backslashes removed)
-  local low
-  low="$(printf '%s' "${HR_CMD//[\'\"\\]/}" | LC_ALL=C tr -c 'A-Za-z0-9_.' ' ' | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  # Line continuations go first, as the shell removes them: g\<newline>h is gh (review round 4).
+  local low cmd="${HR_CMD//\\$'\n'/}"
+  low="$(printf '%s' "${cmd//[\'\"\\]/}" | LC_ALL=C tr -c 'A-Za-z0-9_.' ' ' | LC_ALL=C tr '[:upper:]' '[:lower:]')"
   [[ " $low " == *" gh "* ]]
 }
 

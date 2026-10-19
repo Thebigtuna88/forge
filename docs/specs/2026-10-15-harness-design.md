@@ -498,7 +498,11 @@ It provides:
   `search`, `status`, `browse`) leaves a command unguarded, so such a read may sit in a pipeline
   and `--repo` doesn't count as `gh repo`. A read sends its words to GitHub, and the secret scan
   sees them only as written, so a `$` or backtick anywhere in the command makes even a read
-  guarded (`gh search code "$S"` would send an unscanned value; FRG-4 review round 3). Any other `gh` invocation, wherever `gh` may run
+  guarded (`gh search code "$S"` would send an unscanned value; FRG-4 review round 3), and so
+  does a `*`, `?` or `[` outside quotes (`gh search code ghp_*` would send a file's name; round
+  4). A quoted one doesn't expand, so `jq '.files[]'` in a read's pipeline stays plain. Lines
+  joined by a trailing backslash are joined before `gh` is looked for and before the scan.
+  Any other `gh` invocation, wherever `gh` may run
   (after a wrapper such as `xargs`, or with words after it), is guarded. A guarded `gh` command
   is refused while the environment sets a `GH_*` or `GITHUB_*` variable, as git's are for
   `GIT_*`.

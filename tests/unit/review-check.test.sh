@@ -195,6 +195,20 @@ test_secret_in_a_read_refused() {
   assert_exit 0 "$RC" "a clean read in a pipeline: $ERR"
 }
 
+# Review round 4 (SEC-2): bash joins a line that ends in a backslash to the next one, so g\
+# h is gh, and a secret split the same way is whole when gh receives it.
+test_secret_across_a_line_continuation_refused() {
+  mk_gate
+  local s nl=$'\n'
+  s="$(secret)"
+  run_hook deny-repo-admin "$(bash_input "g\\${nl}h search code $s" "$T_TMP")"
+  assert_exit 2 "$RC" "gh spelt across a line continuation"
+  assert_contains "$ERR" "possible secret in the text this gh command would send"
+  run_hook deny-repo-admin "$(bash_input "gh search code ${s:0:12}\\${nl}${s:12}" "$T_TMP")"
+  assert_exit 2 "$RC" "a secret split by a line continuation"
+  assert_contains "$ERR" "possible secret in the text this gh command would send"
+}
+
 # Review round 2 (C1): gitleaks silently skips what it takes for a binary format (a file that
 # starts like a PDF), and reports success. Text that gitleaks wouldn't really read is refused.
 test_text_gitleaks_would_skip_refused() {

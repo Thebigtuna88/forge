@@ -400,6 +400,26 @@ test_gh_read_with_an_expansion_is_guarded() {
   done
 }
 
+# Review round 4 (C1, SEC-1): an unquoted glob becomes file names before gh runs, so a file named
+# like a token would be sent unscanned (gh search code ghp_*). A quoted or escaped one doesn't
+# expand, so a jq filter in quotes stays plain.
+test_gh_read_with_a_glob_is_guarded() {
+  mk_hook_harness
+  local c
+  for c in 'gh search code ghp_*' 'gh search code *' 'gh issue list --search ghp_?bc' \
+    'gh pr list --search [g]hp_x' 'gh pr view 5 | head; gh search code x*' 'gh search code "a"*' \
+    "gh search code 'a'b*"; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+  for c in "gh pr view 5 --json files --jq '.files[].path'" 'gh search code "ghp_*"' \
+    'gh search code ghp_\*' "gh pr view 5 --json files | jq '.files[] | .path'" \
+    'gh search issues "is it? [yes]" --repo a/b'; do
+    probe guarded "$c"
+    assert_eq "$OUT" PLAIN "plain: $c"
+  done
+}
+
 test_gh_reads_are_plain() {
   mk_hook_harness
   local c

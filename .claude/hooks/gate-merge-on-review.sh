@@ -78,13 +78,18 @@ while IFS=$'\x1f' read -r lens mech verdict reply rsha rounds; do
   # by a newer round (perhaps with findings) is stale (review round 2).
   [[ "$reply" == "rounds/$rounds/reply-$lens.json" ]] ||
     hr_deny "the $lens lens's reply file '$reply' must be rounds/$rounds/reply-$lens.json in work/$ticket, its last round (review.md records $rounds rounds)"
+  # Rounds are uncapped (rule 5), so they compare as decimal text of any length, never in bash's
+  # 64-bit arithmetic: a longer number is later, and one of the same length compares digit by
+  # digit (review round 4).
+  [[ "$rounds" =~ ^[1-9][0-9]*$ ]] ||
+    hr_deny "review.md records '$rounds' rounds for the $lens lens, not a whole number written out"
   for later in "$work"/rounds/*/reply-"$lens".json; do
     k="${later%/reply-*}"
     k="${k##*/}"
-    if [[ -e "$later" && ! "$k" =~ ^[1-9][0-9]{0,5}$ ]]; then
+    if [[ -e "$later" && ! "$k" =~ ^[1-9][0-9]*$ ]]; then
       hr_deny "work/$ticket/rounds/$k/ is not a round number, so the $lens lens's rounds can't be checked"
     fi
-    if [[ -e "$later" ]] && ((k > rounds)); then
+    if [[ -e "$later" && (${#k} -gt ${#rounds} || (${#k} -eq ${#rounds} && "$k" > "$rounds")) ]]; then
       hr_deny "work/$ticket has a later round ($k) for the $lens lens than review.md records ($rounds); review.md is stale, so finish the review and rewrite it"
     fi
   done
