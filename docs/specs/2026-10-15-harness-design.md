@@ -491,8 +491,9 @@ It provides:
   command**: no `&&` `||` `;` `|` `&` `$(` backticks `>` `<` or newlines, and the first word must
   be the tool itself, not `env`, `command`, `sh -c`, `bash -c`, `xargs` or `eval`. Otherwise it's
   denied. So `echo "git push"` is denied too. That false positive is accepted: fail closed.
-  `gh` is judged by its real command (FRG-4): only `gh <command> <subcommand>` written out and on
-  the read-only list (`issue list/view`, `pr list/view/diff/checks/status`, `run
+  `gh` is judged by its real command (FRG-4): only `gh <command> <subcommand>` written out, with
+  `gh` itself as the command (not run by `xargs`, `find`, `env` or another program, which could
+  rewrite its words), and on the read-only list (`issue list/view`, `pr list/view/diff/checks/status`, `run
   list/view/watch`, `workflow list/view`, `repo view`, `release list/view`, `label list`,
   `search`, `status`, `browse`) leaves a command unguarded, so such a read may sit in a pipeline
   and `--repo` doesn't count as `gh repo`. Any other `gh` invocation, wherever `gh` may run

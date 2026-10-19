@@ -182,6 +182,33 @@ test_secret_split_by_quoting_refused() {
   assert_exit 2 "$RC" "a secret split inside a label"
 }
 
+# Review round 2 (SEC-2): a read sends its words to GitHub too (a search query), so a gh read is
+# scanned like a write, and stays allowed in a pipeline when clean.
+test_secret_in_a_read_refused() {
+  mk_gate
+  run_hook deny-repo-admin "$(bash_input "gh search code $(secret)" "$T_TMP")"
+  assert_exit 2 "$RC" "a secret in a search query"
+  assert_contains "$ERR" "possible secret in the text this gh command would send"
+  run_hook deny-repo-admin "$(bash_input "gh issue list --search $(secret) | head -5" "$T_TMP")"
+  assert_exit 2 "$RC" "a secret in a read inside a pipeline"
+  run_hook deny-repo-admin "$(bash_input "gh issue list --repo Thebigtuna88/forge --state open | head -5" "$T_TMP")"
+  assert_exit 0 "$RC" "a clean read in a pipeline: $ERR"
+}
+
+# Review round 2 (C1): gitleaks silently skips what it takes for a binary format (a file that
+# starts like a PDF), and reports success. Text that gitleaks wouldn't really read is refused.
+test_text_gitleaks_would_skip_refused() {
+  mk_gate
+  { printf '%%PDF-1.7\n'; printf 'token = "%s"\n' "$(secret)"; } >"$T_TMP/pdf-secret.md"
+  run_hook deny-repo-admin "$(bash_input "gh issue create --title x --body-file $T_TMP/pdf-secret.md" "$T_TMP")"
+  assert_exit 2 "$RC" "a secret behind a PDF header"
+  assert_contains "$ERR" "could not scan it"
+  printf '%%PDF-1.7\nhello\n' >"$T_TMP/pdf-clean.md"
+  run_hook deny-repo-admin "$(bash_input "gh issue create --title x --body-file $T_TMP/pdf-clean.md" "$T_TMP")"
+  assert_exit 2 "$RC" "a body gitleaks would skip, even without a secret"
+  assert_contains "$ERR" "skipped"
+}
+
 test_clean_title_allowed() {
   mk_gate
   run_hook deny-repo-admin "$(bash_input "gh issue create --title 'FRG-30: a ticket' --body-file $T_TMP/body.md" "$T_TMP")"

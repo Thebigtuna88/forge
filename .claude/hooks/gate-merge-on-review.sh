@@ -56,9 +56,9 @@ bytes="$(wc -c <"$HR_PR_DIR/diff.patch" | tr -d ' ')"
 [[ "$r_md5" == "$md5" && "$r_bytes" == "$bytes" ]] ||
   hr_deny "the diff recomputed now (md5 $md5, $bytes bytes) is not the one work/$ticket/review.md records (md5 $r_md5, $r_bytes bytes)"
 
-jq -r '.lenses[] | [.lens, .mechanism, .verdict, .reply, .reply_sha256] | join("\u001f")' "$HR_TMP/review.json" >"$HR_TMP/lenses"
+jq -r '.lenses[] | [.lens, .mechanism, .verdict, .reply, .reply_sha256, (.rounds | tostring)] | join("\u001f")' "$HR_TMP/review.json" >"$HR_TMP/lenses"
 seen=" "
-while IFS=$'\x1f' read -r lens mech verdict reply rsha; do
+while IFS=$'\x1f' read -r lens mech verdict reply rsha rounds; do
   case "$lens" in
     code | security | frontend | ios | spend) ;;
     *) hr_deny "work/$ticket/review.md lists an unknown lens '$lens' (code, security, frontend, ios, spend)" ;;
@@ -74,8 +74,20 @@ while IFS=$'\x1f' read -r lens mech verdict reply rsha; do
   esac
   [[ "$lens" != code || "$mech" == codex ]] || hr_deny "the code lens must be run by codex (rule 3), not $mech"
   [[ "$verdict" == CLEAN ]] || hr_deny "the $lens lens is $verdict, not CLEAN; fix and review again until it is"
-  [[ "$reply" =~ ^rounds/[1-9][0-9]*/reply-[a-z]+\.json$ && "$reply" == */reply-"$lens".json ]] ||
-    hr_deny "the $lens lens's reply file '$reply' must be rounds/<r>/reply-$lens.json in work/$ticket"
+  # The reply is the last round's, and no later round exists for the lens: a summary left behind
+  # by a newer round (perhaps with findings) is stale (review round 2).
+  [[ "$reply" == "rounds/$rounds/reply-$lens.json" ]] ||
+    hr_deny "the $lens lens's reply file '$reply' must be rounds/$rounds/reply-$lens.json in work/$ticket, its last round (review.md records $rounds rounds)"
+  for later in "$work"/rounds/*/reply-"$lens".json; do
+    k="${later%/reply-*}"
+    k="${k##*/}"
+    if [[ -e "$later" && ! "$k" =~ ^[1-9][0-9]{0,5}$ ]]; then
+      hr_deny "work/$ticket/rounds/$k/ is not a round number, so the $lens lens's rounds can't be checked"
+    fi
+    if [[ -e "$later" ]] && ((k > rounds)); then
+      hr_deny "work/$ticket has a later round ($k) for the $lens lens than review.md records ($rounds); review.md is stale, so finish the review and rewrite it"
+    fi
+  done
   rdir="$work/${reply%/*}"
   rfile="$work/$reply"
   [[ ! -L "$work/rounds" && ! -L "$rdir" && -f "$rfile" && ! -L "$rfile" ]] ||
@@ -106,6 +118,10 @@ done <"$HR_TMP/deferred"
 jq -se 'length == 1 and (.[0] | (.title | type) == "string" and (.body | type) == "string" and (.commits | type) == "array" and (.commits | length) > 0 and (.commits | all(type == "object" and (.messageHeadline | type) == "string" and (.messageBody | type) == "string" and (.authors | type) == "array" and (.authors | all(type == "object" and ((.name | type) == "string" or .name == null) and ((.email | type) == "string" or .email == null))))))' \
   "$HR_TMP/pr.json" >/dev/null 2>&1 ||
   hr_deny "GitHub's answer about PR #$HR_PR's title, body or commits is incomplete, so what the squash commit would hold can't be scanned; try again"
+# gh lists only the first 100 commits of a PR, and 100 authors of each, without saying whether
+# there are more, so a list that long may be cut off (review round 2).
+jq -e '(.commits | length) < 100 and all(.commits[]; (.authors | length) < 100)' "$HR_TMP/pr.json" >/dev/null 2>&1 ||
+  hr_deny "PR #$HR_PR has 100 or more commits (or a commit with 100 or more authors), and GitHub lists only the first 100, so the squash text can't all be scanned; the owner merges this one"
 mkdir "$HR_TMP/squash"
 jq -r '.title' "$HR_TMP/pr.json" >"$HR_TMP/squash/title"
 jq -r '.body' "$HR_TMP/pr.json" >"$HR_TMP/squash/body"

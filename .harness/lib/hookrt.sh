@@ -545,13 +545,16 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     u="${t//\`/}"
     base="$(_hr_lower "${u##*/}")"
     # gh runs here, or may: in command position, after a wrapper (xargs gh), or with words after
-    # it. Unless the two words after it are written out and name a read-only command, the
-    # command is guarded. So a word the shell expands can't become a guarded subcommand
-    # (gh pr m???e, gh pr $X), and `which gh` (nothing after it) stays plain.
-    if [[ "$base" == gh ]] && [[ $cmdpos == 1 || $wrapped == 1 || $((i + 1)) -lt $n ]] &&
-      ! _hr_gh_reads "$i"; then
-      rc=0
-      break
+    # it. Unless gh itself is the command and the two words after it are written out and name a
+    # read-only command, the command is guarded. So a word the shell expands can't become a
+    # guarded subcommand (gh pr m???e, gh pr $X); a program that runs gh can't rewrite its words
+    # (xargs -I view gh repo view … runs gh repo delete; FRG-4 review round 2); and `which gh`
+    # (nothing after it) stays plain.
+    if [[ "$base" == gh ]] && [[ $cmdpos == 1 || $wrapped == 1 || $((i + 1)) -lt $n ]]; then
+      if [[ $cmdpos != 1 ]] || ! _hr_gh_reads "$i"; then
+        rc=0
+        break
+      fi
     fi
     if [[ $cmdpos == 1 ]]; then
       if [[ "$u" =~ ^[0-9]+$ && $((i + 1)) -lt $n && "${HR_TOK[$((i + 1))]}" == *[\<\>]* ]]; then
@@ -775,21 +778,52 @@ _hr_gh_path() { # the gh hr_gh runs: the sandbox's fake inside a conformance san
 }
 
 # hr_scan_text <folder>: 0 if gitleaks, with FORGE's rules (never a repository's own config,
-# .gitleaksignore or gitleaks:allow comments), finds nothing in the files of <folder>. Otherwise 1,
-# with gitleaks' last lines in HR_SCAN; a missing gitleaks or a failed scan counts as a finding.
+# .gitleaksignore or gitleaks:allow comments), finds nothing in the files of <folder> and really
+# read each of them. Otherwise 1, with the reason in HR_SCAN; a missing gitleaks or a failed scan
+# counts as a finding. gitleaks silently skips what it takes for a binary or archive format (a
+# file that starts like a PDF) and still reports success, so each file is scanned again with a
+# fake token (built here, at run time) added at its end: if gitleaks doesn't find that, it didn't
+# read the file, and the file can't be sent (FRG-4 review round 2).
 hr_scan_text() {
+  local f k=0 rc canary dir
   HR_SCAN="gitleaks is not installed"
   type -P gitleaks >/dev/null || return 1
   HR_SCAN="can't make a scratch folder for gitleaks"
   [[ -d "$HR_TMP/no-ignore" ]] || mkdir "$HR_TMP/no-ignore" || return 1
-  if gitleaks dir --config "$HR_ROOT/.harness/gitleaks.toml" --gitleaks-ignore-path "$HR_TMP/no-ignore" \
+  if ! gitleaks dir --config "$HR_ROOT/.harness/gitleaks.toml" --gitleaks-ignore-path "$HR_TMP/no-ignore" \
     --ignore-gitleaks-allow --no-banner --no-color --redact --exit-code 1 "$1" >"$HR_TMP/scan.out" 2>&1; then
-    HR_SCAN=""
-    return 0
+    HR_SCAN="$(tail -n 3 "$HR_TMP/scan.out" 2>/dev/null || true)"
+    HR_SCAN="${HR_SCAN//$'\n'/ | }"
+    return 1
   fi
-  HR_SCAN="$(tail -n 3 "$HR_TMP/scan.out" 2>/dev/null || true)"
-  HR_SCAN="${HR_SCAN//$'\n'/ | }"
-  return 1
+  canary="$(printf '%s%s%s' 'ghp_' 'Zq7Lw2Xn9Rb4Tk6Vm1Pc' '8Hd3Jf5Gs0Ay2QeU')"
+  for f in "$1"/*; do
+    [[ -f "$f" ]] || continue
+    k=$((k + 1))
+    HR_SCAN="can't make a scratch folder for gitleaks"
+    # A fresh folder for every file of every call: a hook may scan more than once.
+    dir="$(mktemp -d "$HR_TMP/canary.XXXXXX")" || return 1
+    { cat "$f" && printf '\ntoken = "%s"\n' "$canary"; } >"$dir/check" || return 1
+    if gitleaks dir --config "$HR_ROOT/.harness/gitleaks.toml" --gitleaks-ignore-path "$HR_TMP/no-ignore" \
+      --ignore-gitleaks-allow --no-banner --no-color --redact --exit-code 1 "$dir" \
+      >"$dir.out" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [[ $rc != 1 ]]; then
+      HR_SCAN="gitleaks skipped ${f##*/} (it takes it for a binary or archive format, or failed), so it can't be checked for secrets"
+      return 1
+    fi
+  done
+  HR_SCAN=""
+  return 0
+}
+
+hr_mentions_gh() { # 0 if gh is one of the command's words (quotes and backslashes removed)
+  local low
+  low="$(printf '%s' "${HR_CMD//[\'\"\\]/}" | LC_ALL=C tr -c 'A-Za-z0-9_.' ' ' | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  [[ " $low " == *" gh "* ]]
 }
 
 # hr_merge_form: 0 if HR_TOK is exactly HR_MERGE_FORM, setting HR_PR and HR_PR_HEAD.
@@ -820,11 +854,16 @@ hr_merge_prepare() {
   fi
   # Every answer must be exactly one JSON object: jq reads a stream, and would judge only part of
   # it otherwise (FRG-4 review round 1).
-  got="$(jq -ser 'if length == 1 and (.[0] | type) == "object" then .[0] | [.state, .baseRefName,
-      .headRefName, .headRefOid, .isCrossRepository,
-      (.headRepositoryOwner | if type == "object" then .login else null end)]
-      | map(tostring) | join("\u001f") else error("not one object") end' "$pr" 2>/dev/null)" ||
-    hr_deny "GitHub's answer about PR #$HR_PR can't be read; try again"
+  # Types are checked before anything is turned into text, so "false" (a string) can't pass for
+  # false (review round 2).
+  got="$(jq -ser 'if length == 1 and (.[0] | type == "object" and (.state | type) == "string"
+      and (.baseRefName | type) == "string" and (.headRefName | type) == "string"
+      and (.headRefOid | type) == "string" and (.isCrossRepository | type) == "boolean"
+      and (.headRepositoryOwner | type) == "object" and (.headRepositoryOwner.login | type) == "string")
+      then .[0] | [.state, .baseRefName, .headRefName, .headRefOid, (.isCrossRepository | tostring),
+        .headRepositoryOwner.login] | join("\u001f")
+      else error("not one object of the expected shape") end' "$pr" 2>/dev/null)" ||
+    hr_deny "GitHub's answer about PR #$HR_PR can't be read (not one object of the expected shape); try again"
   IFS=$'\x1f' read -r state base branch head cross owner <<<"$got"
   [[ "$state" == OPEN ]] || hr_deny "PR #$HR_PR is $state, not open"
   [[ "$base" == dev ]] || hr_deny "PR #$HR_PR merges into '$base'; a merge goes only into dev (main is the owner's)"
@@ -840,9 +879,10 @@ hr_merge_prepare() {
     err="$(head -c 200 "$HR_TMP/gh.err" | tr '\n' ' ')"
     hr_deny "can't read dev...$HR_PR_HEAD from GitHub ($err); try again"
   fi
-  got="$(jq -ser 'if length == 1 and (.[0] | type) == "object" then .[0]
-      | [.base_commit.sha, .merge_base_commit.sha] | map(tostring) | join(" ")
-      else error("not one object") end' "$cmp" 2>/dev/null)" ||
+  got="$(jq -ser 'if length == 1 and (.[0] | type == "object" and (.base_commit.sha | type) == "string"
+      and (.merge_base_commit.sha | type) == "string")
+      then .[0] | [.base_commit.sha, .merge_base_commit.sha] | join(" ")
+      else error("not one object of the expected shape") end' "$cmp" 2>/dev/null)" ||
     hr_deny "GitHub's comparison of dev and PR #$HR_PR can't be read; try again"
   read -r HR_PR_DEV ghmb <<<"$got"
   [[ "$HR_PR_DEV" =~ $sha && "$ghmb" =~ $sha ]] ||

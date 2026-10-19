@@ -368,6 +368,21 @@ test_gh_guarded_detection() {
   done
 }
 
+# Review round 2 (SEC-1): a program that runs gh can rewrite its words (xargs -I view … turns
+# `gh repo view` into `gh repo delete`), so a read counts as a read only when gh itself is the
+# command; gh run by anything else, with words after it, is guarded.
+test_gh_run_by_another_program_is_guarded() {
+  mk_hook_harness
+  local c
+  for c in 'printf delete | xargs -I view gh repo view a/b --yes' 'xargs -I view gh pr view 5' \
+    'printf merge | xargs -I view gh pr view 25 --repo a/b --squash' "find . -exec gh pr view {} ';'" \
+    'parallel gh pr view ::: 5' 'env gh pr view 5' 'ssh host gh issue list' 'nice gh pr view 5' \
+    'time gh pr view 5' 'command gh pr view 5' 'sudo gh pr view 5'; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+}
+
 test_gh_reads_are_plain() {
   mk_hook_harness
   local c

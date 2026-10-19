@@ -28,6 +28,16 @@ source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&
 [ "${HOOKRT_LOADED:-}" = 1 ] || { echo "hookrt not loaded" >&2; exit 2; }
 
 hr_init deny-repo-admin
+# A read sends its words to GitHub too (a search query, --search), so any command that names gh is
+# scanned first, as written and word by word, whether or not it is guarded (review round 2).
+if hr_mentions_gh; then
+  mkdir "$HR_TMP/read"
+  printf '%s\n' "$HR_CMD" >"$HR_TMP/read/command"
+  if hr_tokens "$HR_CMD" punct; then printf '%s\n' "${HR_TOK[@]}" >"$HR_TMP/read/words"; fi
+  if ! hr_scan_text "$HR_TMP/read"; then
+    hr_deny "gitleaks found a possible secret in the text this gh command would send to GitHub, or could not scan it: $HR_SCAN"
+  fi
+fi
 hr_guarded || hr_allow
 hr_require_simple
 [[ "${HR_TOK[0]:-}" == gh ]] || hr_allow

@@ -5,5 +5,5 @@
     "command": "gh pr merge 22 --repo Thebigtuna88/forge --squash --match-head-commit @SHA@"
   },
   "cwd": "@ROOT@",
-  "forge_reason": "has no commit ids"
+  "forge_reason": "GitHub's comparison of dev and PR #22 can't be read"
 }
