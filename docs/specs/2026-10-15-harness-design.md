@@ -42,7 +42,8 @@ cloned under `projects/`, and is governed by FORGE's rules, hooks and review run
 
 - **Not a product.** Product code never goes in the FORGE repo itself.
 - **Not a security sandbox.** The hooks stop the agent from making *mistakes* and from taking
-  shortcuts through the normal commands. They cannot stop a determined program that has a shell.
+  shortcuts through the normal commands. They cannot stop a determined program that has a shell,
+  including a command deliberately disguised from them (L13).
   Section 11 lists the gaps honestly. The real backstops are GitHub server-side branch
   protection, the owner-only `main` branch, and the owner's own review of self-modification PRs.
 
@@ -491,7 +492,7 @@ It provides:
   `|` `&` `$(` backticks `>` `<`, newlines, `~`, globs or `#`, and the first word must be the
   tool itself, not `NAME=value`, `env`, `command`, `sh -c`, `bash -c`, `xargs` or `eval`.
   Otherwise it's denied. So `echo "git push"` is denied too. That false positive is accepted:
-  fail closed. Every `gh` invocation wherever `gh` may run (in command position, after a
+  fail closed. Every `gh` invocation the runtime recognises (in command position, after a
   wrapper such as `xargs`, or with words after it) is guarded, reads included, and
   `deny-repo-admin` then judges it by its real command (FRG-4), so `--repo` doesn't count as
   `gh repo`. Reads were exempt at first, so they could sit in a pipeline; FRG-4 review rounds
@@ -508,6 +509,9 @@ It provides:
   `GITHUB_*`, `BROWSER` or `PAGER` variable, as git's are for `GIT_*`. A `#` doesn't hide the
   rest of a line from the gates: its words are judged like any others, and a line ending in a
   backslash is joined to the next before `gh` is looked for and before the secret scan.
+  These checks recognise ordinary commands and mistakes. A command deliberately built to hide
+  `gh` or `git` may not be recognised: review rounds 6-10 kept finding new spellings, and the
+  owner accepted that as known limit L13 (11) rather than patching each one.
 - `hr_gh`: runs `gh` for a gate with prompts, pager and update checks off. Inside a conformance
   sandbox, and only there (the runtime itself sits at
   `<tmp>/forge-conformance.XXXXXX/s<n>/code/forge`), it runs the sandbox's fake `gh`.
@@ -1082,6 +1086,10 @@ fix round → finalize → gated merge to `dev` → owner merges `dev`→`main` 
 production deploy handoff** verified. Every problem found becomes a FRG ticket and is fixed
 before 5:00 starts.
 
+A pass proves the workflow, and the gates against ordinary commands and mistakes. It doesn't
+prove the agent couldn't get around them on purpose (L1, L12, L13): that rests on what its
+credentials and macOS user can't do (FRG-26).
+
 ---
 
 ## 11. Known limits (what FORGE does not protect against)
@@ -1097,6 +1105,7 @@ its mitigation and, where one exists, a stronger option the owner can adopt late
 | L4 | **The paste file is written by the agent** (until FRG-5). The agent saves the owner's pasted text to disk; a dishonest agent could write something else, with a matching `RESULT.txt` (FRG-1 review S1). | Claude Code has no "owner-signed" input. | The paste is visible in the chat transcript; verify cross-checks `RESULT.txt`; charter. **Decided 2026-10-16:** FRG-5 adds a UserPromptSubmit hook that captures the paste and a guard on evidence files. | Agent runs as a separate macOS user. |
 | L11 | **Handoff steps run arbitrary programs.** The grammar limits shell syntax, but an allowed step (`python3 -c …`) can do anything the owner can: forge evidence, or print a collected secret to the screen before redaction (FRG-1 review S15, C3, S18). | The agent writes the scripts the owner runs. | Allowlist grammar; secret-file rule; redaction of evidence and logs; owner sees each step's command on screen. | FRG-14: reject inline interpreters, live redaction. |
 | L12 | **Evidence the agent writes can be forged or swapped by the agent** (FRG-4 review round 1). The merge gate re-checks `review.md` and the reply files (binding, recomputed diff, hashes, read-proof), which proves which code they describe, not that a reviewer wrote them: the agent could write CLEAN replies and a matching `review.md` itself. Likewise a second command running at the same moment could replace a `--body-file` between the scan and `gh` sending it. | Agent, reviewer runner and files share one macOS user; nothing on disk is beyond the agent's reach. | The gates stop mistakes and shortcuts, not a deliberately dishonest agent (as L1, L4); every PR touching an owner-only path is merged by the owner; review summaries are posted on the PR; charter rules 3, 6 and 9. **Decided 2026-10-18** (owner): accepted as a known limit. | Agent (and codex) run as separate macOS users, or a GitHub machine account whose merges need the owner's approval (L2). |
+| L13 | **Commands deliberately disguised from the gates** (FRG-4 review rounds 6-10). A command built to hide that it runs `gh`, `git` or a deploy tool (its name or words spelled so the text check doesn't recognise them) may not be judged as that tool. Accepted risk, not fixed: round 10's SEC-1, deferred to FRG-26. | The hooks read a command's text; what the shell makes of it can't be fully predicted, and each patch was followed by a new spelling. | The gates recognise ordinary commands and mistakes (conformance proves each listed case); the round 2-9 checks stay; charter rule 9; GitHub branch protection on `main` and `dev`. Against a deliberate attempt, nothing technical holds while the agent uses the owner's admin login (L2). **Decided 2026-10-19** (owner): `docs/decisions/2026-10-19-disguised-commands-known-limit.md`. | FRG-26: define what the agent's own GitHub credentials and macOS user must be unable to do, and test each restriction. A separate account alone isn't enough. |
 | L5 | **Read-proof proves access, not diligence.** A reviewer can hash the diff and still review it badly. | — | Adversarial prompt, structured findings, multiple lenses, stall rule, owner merges `main`. | Owner skims `review.md` for risky PRs. |
 | L6 | **Heuristic hooks.** The Stop hook and the Bash part of `guard-live-checkout` guess from text. | Natural language and shell are open-ended. | They start in observe; the owner promotes them by PR after reviewing `observed.log`. | — |
 | L7 | **Local-only evidence.** `work/` and the spend ledger live on one Mac. | Gitignored by design (may hold logs/screens). | PR comment summary of every review; prepaid wallets as the real spend cap; deleting the ledger doesn't remove a provider's own limits. | Back up `work/` with Time Machine. |
