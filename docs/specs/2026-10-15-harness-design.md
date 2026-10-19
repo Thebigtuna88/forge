@@ -500,12 +500,12 @@ It provides:
   sees them only as written, so a `$` or backtick anywhere in the command makes even a read
   guarded (`gh search code "$S"` would send an unscanned value; FRG-4 review round 3), and so
   does a `*`, `?` or `[` outside quotes (`gh search code ghp_*` would send a file's name; round
-  4). A quoted one doesn't expand, so `jq '.files[]'` in a read's pipeline stays plain. Lines
-  joined by a trailing backslash are joined before `gh` is looked for and before the scan.
+  4). A quoted one doesn't expand, so `jq '.files[]'` in a read's pipeline stays plain. A line
+  ending in a backslash is joined to the next before `gh` is looked for and before the scan.
   Any other `gh` invocation, wherever `gh` may run
-  (after a wrapper such as `xargs`, or with words after it), is guarded. A guarded `gh` command
-  is refused while the environment sets a `GH_*` or `GITHUB_*` variable, as git's are for
-  `GIT_*`.
+  (after a wrapper such as `xargs`, or with words after it), is guarded. While the environment
+  sets a `GH_*` or `GITHUB_*` variable, a read is guarded too (`GH_PAGER` can make it run a
+  program; round 5), and every guarded `gh` command is refused, as git's are for `GIT_*`.
 - `hr_gh`: runs `gh` for a gate with prompts, pager and update checks off. Inside a conformance
   sandbox, and only there (the runtime itself sits at
   `<tmp>/forge-conformance.XXXXXX/s<n>/code/forge`), it runs the sandbox's fake `gh`.

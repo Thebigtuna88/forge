@@ -43,7 +43,12 @@ jq -se 'length == 1 and (.[0] | type == "object" and .forge_review == 1 and (.re
 jq -s '.[0]' "$HR_TMP/review.json" >"$HR_TMP/review.one"
 mv "$HR_TMP/review.one" "$HR_TMP/review.json"
 
-bound="$(jq -r '[.repo, .branch, (.pr | tostring), .head, .merge_base, .diff_md5, (.diff_bytes | tostring)] | join("\u001f")' "$HR_TMP/review.json")"
+# Each row is one line of fields; a field with a line break can't be judged by its first line or
+# split a row in two (review round 5).
+jq -r "$HR_JQ_FIELDS"'[.repo, .branch, (.pr | tostring), .head, .merge_base, .diff_md5, (.diff_bytes | tostring)] | fields' \
+  "$HR_TMP/review.json" >"$HR_TMP/bound" 2>/dev/null ||
+  hr_deny "work/$ticket/review.md's forge-review block is malformed (a field holds a line break)"
+bound="$(cat "$HR_TMP/bound")"
 IFS=$'\x1f' read -r r_repo r_branch r_pr r_head r_mb r_md5 r_bytes <<<"$bound"
 [[ "$r_repo" == "$HR_FORGE_REPO" && "$r_branch" == "$HR_PR_BRANCH" && "$r_pr" == "$HR_PR" ]] ||
   hr_deny "work/$ticket/review.md is a review of PR #$r_pr on $r_branch ($r_repo), not of PR #$HR_PR on $HR_PR_BRANCH"
@@ -56,7 +61,9 @@ bytes="$(wc -c <"$HR_PR_DIR/diff.patch" | tr -d ' ')"
 [[ "$r_md5" == "$md5" && "$r_bytes" == "$bytes" ]] ||
   hr_deny "the diff recomputed now (md5 $md5, $bytes bytes) is not the one work/$ticket/review.md records (md5 $r_md5, $r_bytes bytes)"
 
-jq -r '.lenses[] | [.lens, .mechanism, .verdict, .reply, .reply_sha256, (.rounds | tostring)] | join("\u001f")' "$HR_TMP/review.json" >"$HR_TMP/lenses"
+jq -r "$HR_JQ_FIELDS"'.lenses[] | [.lens, .mechanism, .verdict, .reply, .reply_sha256, (.rounds | tostring)] | fields' \
+  "$HR_TMP/review.json" >"$HR_TMP/lenses" 2>/dev/null ||
+  hr_deny "work/$ticket/review.md's forge-review block is malformed (a lens's field holds a line break)"
 seen=" "
 while IFS=$'\x1f' read -r lens mech verdict reply rsha rounds; do
   case "$lens" in
@@ -107,7 +114,9 @@ for lens in code security; do
   [[ "$seen" == *" $lens "* ]] || hr_deny "work/$ticket/review.md has no $lens lens; code and security are required for every PR (rule 3)"
 done
 
-jq -r '.deferred[] | [.finding, (.issue | tostring)] | join("\u001f")' "$HR_TMP/review.json" >"$HR_TMP/deferred"
+jq -r "$HR_JQ_FIELDS"'.deferred[] | [.finding, (.issue | tostring)] | fields' "$HR_TMP/review.json" \
+  >"$HR_TMP/deferred" 2>/dev/null ||
+  hr_deny "work/$ticket/review.md's forge-review block is malformed (a deferred finding holds a line break; name it on one line)"
 while IFS=$'\x1f' read -r finding issue; do
   hr_gh issue view "$issue" --repo "$HR_FORGE_REPO" --json state </dev/null >"$HR_TMP/issue.json" 2>/dev/null ||
     hr_deny "can't read issue #$issue (deferred finding $finding) from GitHub; try again"

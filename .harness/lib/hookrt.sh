@@ -225,6 +225,12 @@ while i < len(text):
 sys.exit(0 if q else 1)
 '
 
+# A jq definition: `fields` joins an array of strings into one line, separated by \u001f, and
+# fails if a field holds a line break or a \u001f. bash's read keeps only the first line, so a
+# field such as "Thebigtuna88\ngarbage" would otherwise be judged by its start (review round 5).
+HR_JQ_FIELDS='def fields: if all(.[]; type == "string" and (test("[\n\r\u001f]") | not))
+  then join("\u001f") else error("a field holds a line break") end; '
+
 # --- decisions ---------------------------------------------------------------------------------
 
 _hr_mark_failed() { # so a deny inside a $(…) whose status is lost still denies at the end
@@ -582,9 +588,12 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     # (nothing after it) stays plain. A read sends its words to GitHub, and the secret scan sees
     # them only as written, so a $ or ` anywhere in the command makes even a read guarded
     # (gh search code "$S" would send a value nobody scanned; round 3), and so does a glob outside
-    # quotes (gh search code ghp_* would send a file's name; round 4).
+    # quotes (gh search code ghp_* would send a file's name; round 4). While a GH_* or GITHUB_*
+    # variable is set, a read is guarded too, so hr_require_simple refuses it: GH_PAGER can make
+    # a read run any program, and GH_REPO or a token makes it read elsewhere (round 5).
     if [[ "$base" == gh ]] && [[ $cmdpos == 1 || $wrapped == 1 || $((i + 1)) -lt $n ]]; then
-      if [[ $cmdpos != 1 || "$cmd" == *[\$\`]* ]] || _hr_unquoted_glob "$cmd" || ! _hr_gh_reads "$i"; then
+      if [[ $cmdpos != 1 || -n "$_HR_GH_ENV" || "$cmd" == *[\$\`]* ]] || _hr_unquoted_glob "$cmd" ||
+        ! _hr_gh_reads "$i"; then
         rc=0
         break
       fi
@@ -889,15 +898,16 @@ hr_merge_prepare() {
   # Every answer must be exactly one JSON object: jq reads a stream, and would judge only part of
   # it otherwise (FRG-4 review round 1).
   # Types are checked before anything is turned into text, so "false" (a string) can't pass for
-  # false (review round 2).
-  got="$(jq -ser 'if length == 1 and (.[0] | type == "object" and (.state | type) == "string"
+  # false (review round 2), and a field with a line break can't be judged by its first line
+  # (round 5).
+  got="$(jq -ser "$HR_JQ_FIELDS"'if length == 1 and (.[0] | type == "object" and (.state | type) == "string"
       and (.baseRefName | type) == "string" and (.headRefName | type) == "string"
       and (.headRefOid | type) == "string" and (.isCrossRepository | type) == "boolean"
       and (.headRepositoryOwner | type) == "object" and (.headRepositoryOwner.login | type) == "string")
       then .[0] | [.state, .baseRefName, .headRefName, .headRefOid, (.isCrossRepository | tostring),
-        .headRepositoryOwner.login] | join("\u001f")
+        .headRepositoryOwner.login] | fields
       else error("not one object of the expected shape") end' "$pr" 2>/dev/null)" ||
-    hr_deny "GitHub's answer about PR #$HR_PR can't be read (not one object of the expected shape); try again"
+    hr_deny "GitHub's answer about PR #$HR_PR can't be read (not one object of the expected shape, or a field holds a line break); try again"
   IFS=$'\x1f' read -r state base branch head cross owner <<<"$got"
   [[ "$state" == OPEN ]] || hr_deny "PR #$HR_PR is $state, not open"
   [[ "$base" == dev ]] || hr_deny "PR #$HR_PR merges into '$base'; a merge goes only into dev (main is the owner's)"
@@ -913,12 +923,12 @@ hr_merge_prepare() {
     err="$(head -c 200 "$HR_TMP/gh.err" | tr '\n' ' ')"
     hr_deny "can't read dev...$HR_PR_HEAD from GitHub ($err); try again"
   fi
-  got="$(jq -ser 'if length == 1 and (.[0] | type == "object" and (.base_commit.sha | type) == "string"
+  got="$(jq -ser "$HR_JQ_FIELDS"'if length == 1 and (.[0] | type == "object" and (.base_commit.sha | type) == "string"
       and (.merge_base_commit.sha | type) == "string")
-      then .[0] | [.base_commit.sha, .merge_base_commit.sha] | join(" ")
+      then .[0] | [.base_commit.sha, .merge_base_commit.sha] | fields
       else error("not one object of the expected shape") end' "$cmp" 2>/dev/null)" ||
     hr_deny "GitHub's comparison of dev and PR #$HR_PR can't be read; try again"
-  read -r HR_PR_DEV ghmb <<<"$got"
+  IFS=$'\x1f' read -r HR_PR_DEV ghmb <<<"$got"
   [[ "$HR_PR_DEV" =~ $sha && "$ghmb" =~ $sha ]] ||
     hr_deny "GitHub's comparison of dev and PR #$HR_PR has no commit ids; try again"
 

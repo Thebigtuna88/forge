@@ -444,8 +444,24 @@ test_inherited_gh_variables_deny_guarded_gh_commands() {
     assert_exit 2 "$RC" "guarded gh command with $v"
     assert_contains "$ERR" "the environment sets ${v%%=*}" "reason with $v"
   done
-  run_hook sample-gate "$(bash_input 'gh pr view 5 --repo a/b' "$H")" GH_REPO=c/d
-  assert_exit 0 "$RC" "a gh read isn't guarded"
+}
+
+# Review round 5 (SEC-1): GH_PAGER (with GH_FORCE_TTY) makes even a read run a program of its
+# choosing, and GH_REPO or a token makes it read elsewhere, so while any GH_* or GITHUB_* variable
+# is set a read is guarded too (the plan: every checked gh command is refused).
+test_inherited_gh_variables_deny_gh_reads() {
+  mk_hook_harness
+  local v c
+  for v in GH_PAGER=x GH_FORCE_TTY=1 GH_REPO=c/d GITHUB_TOKEN=x; do
+    for c in 'gh pr view 5 --repo a/b' 'gh pr diff 25 --repo a/b | head'; do
+      run_hook sample-gate "$(bash_input "$c" "$H")" "$v"
+      assert_exit 2 "$RC" "a gh read with $v: $c"
+    done
+  done
+  run_hook sample-gate "$(bash_input 'gh pr diff 25 --repo a/b' "$H")" GH_PAGER=x GH_FORCE_TTY=1
+  assert_contains "$ERR" "the environment sets GH_"
+  run_hook sample-gate "$(bash_input 'gh pr diff 25 --repo a/b | head' "$H")"
+  assert_exit 0 "$RC" "a read with no gh variable set: $ERR"
 }
 
 # ghpath <project dir or ""> : which gh hr_gh would run, as Claude Code (or conformance) would
