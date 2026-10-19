@@ -161,14 +161,13 @@ _HR_GH_CMDS=" agent-task alias api attestation auth browse cache codespace compl
   ruleset run search secret skill ssh-key status variable workflow accessibility actions
   environment exit-codes formatting mintty reference telemetry "
 # gh commands that only read, as "<command>:<subcommand>" ("<command>:*" for any subcommand,
-# "<command>" alone when it takes none). A gh invocation that is one of these, with the two words
-# written right after gh and no $, ` or unquoted glob in the command, isn't guarded, so it may sit
-# in a pipeline.
-# Every other gh invocation is guarded: one plain command, judged by deny-repo-admin.
-# `gh auth status` isn't here, because its --show-token prints the login token.
+# "<command>" alone when it takes none). Like every gh command, a read is guarded, so it must be
+# one plain command; deny-repo-admin allows one of these without --web or -w. `gh auth status`
+# isn't here, because its --show-token prints the login token, nor is `gh browse`, which runs
+# the browser gh's settings name (review round 7).
 _HR_GH_READS=" issue:list issue:view pr:list pr:view pr:diff pr:checks pr:status run:list run:view
   run:watch workflow:list workflow:view repo:view release:list release:view label:list search:*
-  status browse "
+  status "
 # git commands that never create a commit or move a branch. Any other git command (including ones
 # a newer git adds) counts as guarded, so it must be one plain command and a gate decides on it.
 _HR_GIT_SAFE_SUBS=" status log show diff add rm mv restore grep blame ls-files ls-tree ls-remote "
@@ -205,29 +204,6 @@ except ValueError:
     sys.exit(3)
 out = str(len(words)).encode() + b"\0" + b"".join(os.fsencode(w) + b"\0" for w in words)
 sys.stdout.buffer.write(out)
-'
-
-# Exits 0 if the text has a * ? or [ the shell would expand as a glob: outside quotes and not
-# escaped by a backslash. Broken quoting counts as a glob (exit 0); none found exits 1.
-_HR_PY_GLOB='
-import sys
-text, q, i = sys.argv[1], None, 0
-while i < len(text):
-    c = text[i]
-    if q == "\x27":
-        if c == "\x27":
-            q = None
-    elif c == "\\":
-        i += 1
-    elif q == "\"":
-        if c == "\"":
-            q = None
-    elif c in "\x27\"":
-        q = c
-    elif c in "*?[":
-        sys.exit(0)
-    i += 1
-sys.exit(0 if q else 1)
 '
 
 # A jq definition: `fields` joins an array of strings into one line, separated by \u001f, and
@@ -507,12 +483,6 @@ _hr_gh_reads() { # <index of a gh word in HR_TOK>: 0 if that gh invocation only 
   [[ "$_HR_GH_READS" == *" $c1:$c2 "* || "$_HR_GH_READS" == *" $c1:* "* ]]
 }
 
-_hr_unquoted_glob() { # <text>: 0 if the shell would expand a glob in it (or python can't tell)
-  [[ "$1" == *[\*\?\[]* ]] || return 1
-  python3 -I -c "$_HR_PY_GLOB" "$1" 2>/dev/null
-  [[ $? != 1 ]]
-}
-
 hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2)
   local cmd="${1-$HR_CMD}" w seq tool
   local -a words
@@ -563,13 +533,6 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   for w in ${HR_TOK[@]+"${HR_TOK[@]}"}; do
     case "$(_hr_lower "$w")" in api | repo | workflow) verbs=1 ;; esac
   done
-  # A variable that steers gh (_HR_GH_ENV's kind) named anywhere in the command, however it is
-  # set or exported (GH_PAGER=… gh, export GH_PAGER=…; gh, G"H"_PAGER), makes a read guarded:
-  # set in the command, it never reaches the hook's own environment (review round 6).
-  local ghvar=0
-  for w in "${words[@]}"; do
-    case "$w" in gh_* | github_* | browser | pager) ghvar=1 ;; esac
-  done
   local i n=${#HR_TOK[@]} t u base rc=1 cmdpos=1 wrapped=0 skip=0 op='^[;&|()<>]+$'
   for ((i = 0; i < n; i++)); do
     t="${HR_TOK[$i]}"
@@ -595,22 +558,15 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     u="${t//\`/}"
     base="$(_hr_lower "${u##*/}")"
     # gh runs here, or may: in command position, after a wrapper (xargs gh), or with words after
-    # it. Unless gh itself is the command and the two words after it are written out and name a
-    # read-only command, the command is guarded. So a word the shell expands can't become a
-    # guarded subcommand (gh pr m???e, gh pr $X); a program that runs gh can't rewrite its words
-    # (xargs -I view gh repo view … runs gh repo delete; FRG-4 review round 2); and `which gh`
-    # (nothing after it) stays plain. A read sends its words to GitHub, and the secret scan sees
-    # them only as written, so a $ or ` anywhere in the command makes even a read guarded
-    # (gh search code "$S" would send a value nobody scanned; round 3), and so does a glob outside
-    # quotes (gh search code ghp_* would send a file's name; round 4). While a GH_* or GITHUB_*
-    # variable is set, a read is guarded too, so hr_require_simple refuses it: GH_PAGER can make
-    # a read run any program, and GH_REPO or a token makes it read elsewhere (round 5).
+    # it. Every such command is guarded, reads included, so it must be one plain command, which
+    # deny-repo-admin then judges by its real command (so --repo doesn't count as gh repo);
+    # `which gh` (nothing after it) stays plain. Reads used to be exempt, so they could sit in a
+    # pipeline, but FRG-4 review rounds 2-7 kept finding ways for the shell to change what such a
+    # read sends or runs (xargs, $, globs, ~, line continuations, comments, GH_PAGER=… or
+    # HOME=… in front), so the owner removed the exemption (decision 2026-10-19).
     if [[ "$base" == gh ]] && [[ $cmdpos == 1 || $wrapped == 1 || $((i + 1)) -lt $n ]]; then
-      if [[ $cmdpos != 1 || -n "$_HR_GH_ENV" || $ghvar == 1 || "$cmd" == *[\$\`]* ]] || _hr_unquoted_glob "$cmd" ||
-        ! _hr_gh_reads "$i"; then
-        rc=0
-        break
-      fi
+      rc=0
+      break
     fi
     if [[ $cmdpos == 1 ]]; then
       if [[ "$u" =~ ^[0-9]+$ && $((i + 1)) -lt $n && "${HR_TOK[$((i + 1))]}" == *[\<\>]* ]]; then

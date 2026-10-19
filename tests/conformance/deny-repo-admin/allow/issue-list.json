@@ -2,7 +2,7 @@
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
   "tool_input": {
-    "command": "gh pr view 5 --repo Thebigtuna88/forge --json files | jq '.files[].path'"
+    "command": "gh issue list --repo Thebigtuna88/forge --state open --limit 5"
   },
   "cwd": "@TMP@"
 }

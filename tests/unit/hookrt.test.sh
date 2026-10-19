@@ -401,8 +401,7 @@ test_gh_read_with_an_expansion_is_guarded() {
 }
 
 # Review round 4 (C1, SEC-1): an unquoted glob becomes file names before gh runs, so a file named
-# like a token would be sent unscanned (gh search code ghp_*). A quoted or escaped one doesn't
-# expand, so a jq filter in quotes stays plain.
+# like a token would be sent unscanned (gh search code ghp_*).
 test_gh_read_with_a_glob_is_guarded() {
   mk_hook_harness
   local c
@@ -412,24 +411,24 @@ test_gh_read_with_a_glob_is_guarded() {
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done
-  for c in "gh pr view 5 --json files --jq '.files[].path'" 'gh search code "ghp_*"' \
-    'gh search code ghp_\*' "gh pr view 5 --json files | jq '.files[] | .path'" \
-    'gh search issues "is it? [yes]" --repo a/b'; do
-    probe guarded "$c"
-    assert_eq "$OUT" PLAIN "plain: $c"
-  done
 }
 
-test_gh_reads_are_plain() {
+# Review round 7 (owner decision 2026-10-19): rounds 2-7 each found a new way for the shell to
+# change what a read in a pipeline sends or runs, so reads are guarded like every other gh
+# command: one plain command, judged by deny-repo-admin. A command that only names gh stays plain.
+test_gh_reads_are_guarded() {
   mk_hook_harness
   local c
-  for c in 'gh pr view 5 --repo a/b | head' "gh pr view 5 --repo a/b --json files | jq '.files[].path'" \
-    'gh issue list --repo a/b --state open' 'gh repo view a/b' 'gh pr diff 5 --repo a/b | wc -l' \
-    'gh pr checks 5' 'gh pr status' 'gh run list --limit 3' 'gh run view 1 --log | tail -5' \
-    'gh run watch 1' 'gh workflow list' 'gh workflow view ci.yml' 'gh release list' \
-    'gh release view v1' 'gh label list' 'gh search issues x --repo a/b' 'gh status' 'gh browse' \
-    "gh pr view 5 --json title --jq '.title | ascii_downcase'" 'which gh' 'brew upgrade gh' \
-    'ls /opt/homebrew/bin/gh' 'gh issue view 5 --comments | grep -i repo'; do
+  for c in 'gh pr view 5 --repo a/b' 'gh pr view 5 --repo a/b | head' 'gh issue list --repo a/b --state open' \
+    'gh repo view a/b' 'gh pr diff 5 --repo a/b | wc -l' 'gh pr checks 5' 'gh pr status' \
+    'gh run list --limit 3' 'gh run view 1 --log | tail -5' 'gh run watch 1' 'gh workflow list' \
+    'gh workflow view ci.yml' 'gh release list' 'gh release view v1' 'gh label list' \
+    'gh search issues x --repo a/b' 'gh status' 'gh browse' 'gh search code ~+' \
+    'XDG_CONFIG_HOME=/tmp/alt gh browse' 'HOME=/tmp/alt gh pr view 25 --web'; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+  for c in 'which gh' 'brew upgrade gh' 'ls /opt/homebrew/bin/gh'; do
     probe guarded "$c"
     assert_eq "$OUT" PLAIN "plain: $c"
   done
@@ -460,8 +459,8 @@ test_inherited_gh_variables_deny_gh_reads() {
   done
   run_hook sample-gate "$(bash_input 'gh pr diff 25 --repo a/b' "$H")" GH_PAGER=x GH_FORCE_TTY=1
   assert_contains "$ERR" "the environment sets GH_"
-  run_hook sample-gate "$(bash_input 'gh pr diff 25 --repo a/b | head' "$H")"
-  assert_exit 0 "$RC" "a read with no gh variable set: $ERR"
+  run_hook sample-gate "$(bash_input 'gh pr diff 25 --repo a/b' "$H")"
+  assert_exit 0 "$RC" "a plain read with no gh variable set: $ERR"
 }
 
 # Review round 6 (SEC-2): gh also takes its browser from BROWSER and its pager from PAGER, so an
@@ -505,8 +504,25 @@ test_gh_after_a_comment_is_guarded() {
     probe guarded "$c"
     assert_eq "$OUT" GUARDED "guarded: $c"
   done
-  probe guarded 'gh pr view 5 # just a note'
-  assert_eq "$OUT" PLAIN "a read with a comment on its own line"
+  run_hook sample-gate "$(bash_input 'gh pr view 5 # just a note' "$H")"
+  assert_exit 2 "$RC" "a read with a comment (a guarded command is one plain command)"
+}
+
+# Review round 7 (owner decision 2026-10-19): a read must be one plain command, so the shell can't
+# change what it sends ($, `, globs, ~) or how gh runs (a NAME=value in front, a pipe, a chain).
+test_gh_read_must_be_one_plain_command() {
+  mk_hook_harness
+  local c
+  for c in 'gh search code ~+' 'gh search code ~' 'XDG_CONFIG_HOME=/tmp/alt gh browse' \
+    'HOME=/tmp/alt gh pr view 25' 'gh pr view 5 --repo a/b | head' 'gh pr status && true' \
+    "gh pr view 5 --json title --jq '.title | ascii_downcase'"; do
+    run_hook sample-gate "$(bash_input "$c" "$H")"
+    assert_exit 2 "$RC" "refused: $c"
+  done
+  for c in 'gh pr view 5 --repo a/b' 'gh pr view 5 --json title --jq .title' 'gh pr checks 5'; do
+    run_hook sample-gate "$(bash_input "$c" "$H")"
+    assert_exit 0 "$RC" "a plain read: $c ($ERR)"
+  done
 }
 
 # ghpath <project dir or ""> : which gh hr_gh would run, as Claude Code (or conformance) would
@@ -558,8 +574,9 @@ test_fake_gh_needs_the_project_folder_to_be_the_sandbox() {
 test_plain_detection() {
   mk_hook_harness
   local c
+  # gh reads aren't here: every gh command is guarded (test_gh_reads_are_guarded, round 7).
   for c in 'ls -la' 'git status && git log --oneline -5' 'git log --grep fix | head' \
-    'gh pr view 3 | head' 'gh issue list' 'echo hi > f.txt' 'git -C /x diff | wc -l' \
+    'echo hi > f.txt' 'git -C /x diff | wc -l' \
     'cat README.md' 'for f in *.sh; do echo "$f"; done' '' \
     'ls *.sh | wc -l' 'rm -rf build/* && ls' 'for f in a b; do bash "$f"; done' 'ls * | head' \
     'ls work/*/manual | head' 'find work -type f | head' 'for d in a b; do git -C "$d" status; done' \

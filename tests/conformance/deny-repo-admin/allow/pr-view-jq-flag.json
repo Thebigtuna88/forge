@@ -2,7 +2,7 @@
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
   "tool_input": {
-    "command": "gh pr view 5 --json title --jq '.title | ascii_downcase'"
+    "command": "gh pr view 5 --json title --jq .title"
   },
   "cwd": "@TMP@"
 }

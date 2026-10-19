@@ -183,7 +183,7 @@ test_secret_split_by_quoting_refused() {
 }
 
 # Review round 2 (SEC-2): a read sends its words to GitHub too (a search query), so a gh read is
-# scanned like a write, and stays allowed in a pipeline when clean.
+# scanned like a write, and allowed when clean (as one plain command since round 7).
 test_secret_in_a_read_refused() {
   mk_gate
   run_hook deny-repo-admin "$(bash_input "gh search code $(secret)" "$T_TMP")"
@@ -191,8 +191,9 @@ test_secret_in_a_read_refused() {
   assert_contains "$ERR" "possible secret in the text this gh command would send"
   run_hook deny-repo-admin "$(bash_input "gh issue list --search $(secret) | head -5" "$T_TMP")"
   assert_exit 2 "$RC" "a secret in a read inside a pipeline"
-  run_hook deny-repo-admin "$(bash_input "gh issue list --repo Thebigtuna88/forge --state open | head -5" "$T_TMP")"
-  assert_exit 0 "$RC" "a clean read in a pipeline: $ERR"
+  assert_contains "$ERR" "possible secret in the text this gh command would send"
+  run_hook deny-repo-admin "$(bash_input "gh issue list --repo Thebigtuna88/forge --state open" "$T_TMP")"
+  assert_exit 0 "$RC" "a clean plain read: $ERR"
 }
 
 # Review round 4 (SEC-2): bash joins a line that ends in a backslash to the next one, so g\

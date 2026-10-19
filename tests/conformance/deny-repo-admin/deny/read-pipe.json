@@ -4,5 +4,6 @@
   "tool_input": {
     "command": "gh issue list --repo Thebigtuna88/forge --state open | head -5"
   },
-  "cwd": "@TMP@"
+  "cwd": "@TMP@",
+  "forge_reason": "must be one plain command"
 }

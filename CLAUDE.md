@@ -58,14 +58,12 @@ web-UI click), **write a script, never instructions**:
 
 - Commit: write the message to a file, then `git commit -F <file>`. Never `-m`, `-a`, `--amend`
   or `--no-verify`. Stage with explicit `git add <paths>`.
-- `git push`, `git commit`, every `gh` command except the read-only ones, and deploy commands are
-  **single simple commands**: one per Bash call, no `&&` `||` `;` `|` `&`, no `$( )`, backticks
-  or redirection. Use `git -C <dir>` instead of `cd … &&`. The read-only `gh` commands (`issue
-  list/view`, `pr list/view/diff/checks/status`, `run list/view/watch`, `workflow list/view`,
-  `repo view`, `release list/view`, `label list`, `search`, `status`, `browse`) may use pipes, when
-  `gh` itself is the command (never through `xargs`, `find -exec` or `env`) and the whole
-  command has no `$`, backtick or unquoted `*` `?` `[`, and names no `GH_*`, `GITHUB_*`,
-  `BROWSER` or `PAGER` variable.
+- `git push`, `git commit`, every `gh` command (reads too) and deploy commands are **single
+  simple commands**: one per Bash call, no `&&` `||` `;` `|` `&`, no `$( )`, backticks,
+  redirection, `~`, globs or `#`, and nothing in front of the tool (no `NAME=value`, `env`,
+  `xargs`). Use `git -C <dir>` instead of `cd … &&`, and `gh … --jq <filter>` instead of piping
+  into `jq` (a filter with `|`, `[ ]` or `$` is refused for now, FRG-22). Reads never open a
+  browser: no `gh browse`, `--web` or `-w`.
 - Text goes to GitHub only as `--title <text>` and `--body-file <file>` (scanned for secrets
   first); never `--body`, `-b`, `--fill` or an editor. PRs: `gh pr create --base dev --head
   feature/<KEY>-<n>-<slug> --title <text> --body-file <file>`. `gh api` only reads (GET).

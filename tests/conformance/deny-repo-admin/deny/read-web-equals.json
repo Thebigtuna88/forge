@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh issue list --web=true"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "opens a browser"
+}

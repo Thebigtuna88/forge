@@ -2,7 +2,7 @@
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
   "tool_input": {
-    "command": "gh run view 123 --log-failed | tail -20"
+    "command": "gh run view 123 --log-failed"
   },
   "cwd": "@TMP@"
 }

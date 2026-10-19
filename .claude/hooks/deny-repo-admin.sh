@@ -1,9 +1,8 @@
 #!/bin/bash -p
-# deny-repo-admin (spec 5.3, FRG-4): the gh allowlist. A gh command that only reads (hookrt's
-# _HR_GH_READS, with no $, ` or unquoted glob in the command) isn't guarded, so it may sit in a
-# pipeline and reaches here only when something else makes the command guarded; it is allowed.
-# Every other gh command must be one plain command (hr_require_simple, which also refuses while a
-# GH_* or GITHUB_* variable is set) and one of:
+# deny-repo-admin (spec 5.3, FRG-4): the gh allowlist. Every gh command must be one plain command
+# (hr_require_simple, which also refuses while a GH_*, GITHUB_*, BROWSER or PAGER variable is set)
+# and one of:
+#   a read (hookrt's _HR_GH_READS) without --web or -w
 #   gh auth status [--active]
 #   gh api <endpoint> as a GET only: no -X/--method but GET, no -f/-F/--field/--raw-field/--input
 #     (any of them turns it into a write), no -H, --hostname or graphql; options --paginate,
@@ -46,7 +45,16 @@ fi
 hr_guarded || hr_allow
 hr_require_simple
 [[ "${HR_TOK[0]:-}" == gh ]] || hr_allow
-if hr_gh_reads 0; then hr_allow; fi
+if hr_gh_reads 0; then
+  # --web (-w, alone or among other one-letter options) opens a browser, which runs whatever
+  # program gh's settings name, so a read never does (review round 7).
+  for w in "${HR_TOK[@]:1}"; do
+    if [[ "$w" == --web || "$w" == --web=* || "$w" =~ ^-[A-Za-z]*w[A-Za-z]*$ ]]; then
+      hr_deny "'$w' opens a browser, which runs the program gh's settings name; read on the command line instead"
+    fi
+  done
+  hr_allow
+fi
 cmd="${HR_TOK[1]:-}"
 sub="${HR_TOK[2]:-}"
 n=${#HR_TOK[@]}
