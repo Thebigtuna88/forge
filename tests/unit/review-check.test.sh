@@ -88,6 +88,28 @@ test_diff_ignores_every_setting() {
   assert_eq "$(cat "$T_TMP/hostile/merge-base")" "$BASE"
 }
 
+# Review round 13 (C1): a system setting naming a template folder can't put settings into the
+# scratch repository. review-diff clears the environment and fixes its PATH, so a copy runs a git
+# that reads a system config, as one in /etc/gitconfig would be read.
+test_diff_ignores_template_settings() {
+  mk_repo
+  diff_in "$T_TMP/clean"
+  local want
+  want="$(md5 -q <"$T_TMP/clean/diff.patch")"
+  mkdir -p "$T_TMP/tpl" "$T_TMP/fakebin"
+  printf '[diff]\n\tcontext = 0\n' >"$T_TMP/tpl/config"
+  printf '[init]\n\ttemplateDir = %s\n' "$T_TMP/tpl" >"$T_TMP/system.gitconfig"
+  printf '#!/bin/bash\nGIT_CONFIG_SYSTEM=%s exec /usr/bin/git "$@"\n' "$T_TMP/system.gitconfig" \
+    >"$T_TMP/fakebin/git"
+  chmod 755 "$T_TMP/fakebin/git"
+  sed "s|^PATH=/usr/bin:|PATH=$T_TMP/fakebin:/usr/bin:|" "$RD" >"$T_TMP/rd.sh"
+  assert_contains "$(cat "$T_TMP/rd.sh")" "PATH=$T_TMP/fakebin:" "the copy runs the fake git"
+  mkdir "$T_TMP/tpl-out"
+  bash "$T_TMP/rd.sh" "$T_TMP/repo" "$BASE" "$HEAD" "$T_TMP/tpl-out" 2>"$T_TMP/rd.err"
+  assert_exit 0 "$?" "review-diff with a template setting: $(cat "$T_TMP/rd.err")"
+  assert_eq "$(md5 -q <"$T_TMP/tpl-out/diff.patch")" "$want" "the same bytes whatever the templates"
+}
+
 test_missing_commit_says_fetch() {
   mk_repo
   HEAD=0123456789abcdef0123456789abcdef01234567

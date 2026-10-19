@@ -698,7 +698,8 @@ recorded merge base is still the merge base of GitHub's `dev` and the head.
 **The diff** (FRG-4) is made by one command, `.harness/lib/review-diff.sh <repo> <dev sha>
 <head sha> <out>`, which the runner uses to freeze `diff.patch` and the gate uses to recompute
 it. It runs git in a fresh scratch repository that borrows the objects and nothing else: no
-repository, global or system settings, no attributes, no replace refs, no commit-graph. So no
+repository, global or system settings, no templates, no attributes, no replace refs, no
+commit-graph. So no
 setting (external diff tools, text conversion, prefixes, context, rename detection, diff
 drivers) can change its bytes. It shows every file as text (`--text`, so nothing hides as
 "Binary files differ"), and it re-hashes every object both snapshots are made of, so a planted

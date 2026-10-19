@@ -45,7 +45,10 @@ objects="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/d
 iso="$out/iso.git"
 home="$out/home"
 mkdir "$home" || die 1 "can't create $home"
-git init -q --bare "$iso" >/dev/null 2>&1 || die 1 "can't create a scratch repository in $out"
+# No templates and no settings for init either: a system init.templateDir could copy a config file
+# into the scratch repository, and every later call would read it (review round 13).
+env -i PATH="$PATH" LC_ALL=C HOME="$home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+  git init -q --bare --template= "$iso" >/dev/null 2>&1 || die 1 "can't create a scratch repository in $out"
 printf '%s\n' "$objects" >"$iso/objects/info/alternates" || die 1 "can't write the alternates file"
 empty_tree=4b825dc642cb6eb9a060e54bf8d69288fbe4904b
 igit() { # git in the scratch repository, with no settings from anywhere

@@ -520,7 +520,8 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   #    - a command name the shell builds or globs that could become git, gh or a deploy tool;
   #    - a git invocation whose command is not one of git's own (an alias or something
   #      unknowable), or that may write;
-  #    - a gh invocation that isn't one of the read-only commands (_HR_GH_READS).
+  #    - every gh invocation, reads included (review round 7,
+  #      docs/decisions/2026-10-19-gh-reads-plain.md).
   local -a saved=(${HR_TOK[@]+"${HR_TOK[@]}"})
   if ! hr_tokens "${cmd//$'\n'/ ; }" punct; then
     HR_TOK=(${saved[@]+"${saved[@]}"})
