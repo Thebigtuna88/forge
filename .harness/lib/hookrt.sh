@@ -161,9 +161,9 @@ _HR_GH_CMDS=" agent-task alias api attestation auth browse cache codespace compl
   environment exit-codes formatting mintty reference telemetry "
 # gh commands that only read, as "<command>:<subcommand>" ("<command>:*" for any subcommand,
 # "<command>" alone when it takes none). A gh invocation that is one of these, with the two words
-# written right after gh, isn't guarded, so it may sit in a pipeline. Every other gh invocation is
-# guarded: one plain command, judged by deny-repo-admin. `gh auth status` isn't here, because its
-# --show-token prints the login token.
+# written right after gh and no $ or ` in the command, isn't guarded, so it may sit in a pipeline.
+# Every other gh invocation is guarded: one plain command, judged by deny-repo-admin.
+# `gh auth status` isn't here, because its --show-token prints the login token.
 _HR_GH_READS=" issue:list issue:view pr:list pr:view pr:diff pr:checks pr:status run:list run:view
   run:watch workflow:list workflow:view repo:view release:list release:view label:list search:*
   status browse "
@@ -549,9 +549,11 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     # read-only command, the command is guarded. So a word the shell expands can't become a
     # guarded subcommand (gh pr m???e, gh pr $X); a program that runs gh can't rewrite its words
     # (xargs -I view gh repo view … runs gh repo delete; FRG-4 review round 2); and `which gh`
-    # (nothing after it) stays plain.
+    # (nothing after it) stays plain. A read sends its words to GitHub, and the secret scan sees
+    # them only as written, so a $ or ` anywhere in the command makes even a read guarded
+    # (gh search code "$S" would send a value nobody scanned; round 3).
     if [[ "$base" == gh ]] && [[ $cmdpos == 1 || $wrapped == 1 || $((i + 1)) -lt $n ]]; then
-      if [[ $cmdpos != 1 ]] || ! _hr_gh_reads "$i"; then
+      if [[ $cmdpos != 1 || "$cmd" == *[\$\`]* ]] || ! _hr_gh_reads "$i"; then
         rc=0
         break
       fi

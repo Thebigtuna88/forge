@@ -383,6 +383,23 @@ test_gh_run_by_another_program_is_guarded() {
   done
 }
 
+# Review round 3 (SEC-1): the secret scan sees the command only as written, so a read's words
+# must not expand ($S, ${S}, `…`): the value GitHub receives would never be scanned. Any $ or `
+# in the command counts, even inside single quotes or in another command of it, since a word
+# after >(…) can still be gh's.
+test_gh_read_with_an_expansion_is_guarded() {
+  mk_hook_harness
+  local c
+  for c in 'read -r S < /a/secret.txt; gh search code "$S"' 'gh issue list --search "$S"' \
+    'gh search issues ${S} --repo a/b' "gh pr list --search '\$S'" 'gh pr view 5 --repo a/$R' \
+    'gh issue list --search `cat /a/secret.txt`' 'gh pr list > /a/out "$S"' \
+    'gh pr view 5 | head; gh status --org "$O"' 'gh browse "$S"' \
+    'gh pr list > >(cat; echo) "$S"' 'gh pr status && echo $?'; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+}
+
 test_gh_reads_are_plain() {
   mk_hook_harness
   local c

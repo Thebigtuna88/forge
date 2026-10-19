@@ -496,7 +496,9 @@ It provides:
   rewrite its words), and on the read-only list (`issue list/view`, `pr list/view/diff/checks/status`, `run
   list/view/watch`, `workflow list/view`, `repo view`, `release list/view`, `label list`,
   `search`, `status`, `browse`) leaves a command unguarded, so such a read may sit in a pipeline
-  and `--repo` doesn't count as `gh repo`. Any other `gh` invocation, wherever `gh` may run
+  and `--repo` doesn't count as `gh repo`. A read sends its words to GitHub, and the secret scan
+  sees them only as written, so a `$` or backtick anywhere in the command makes even a read
+  guarded (`gh search code "$S"` would send an unscanned value; FRG-4 review round 3). Any other `gh` invocation, wherever `gh` may run
   (after a wrapper such as `xargs`, or with words after it), is guarded. A guarded `gh` command
   is refused while the environment sets a `GH_*` or `GITHUB_*` variable, as git's are for
   `GIT_*`.

@@ -1,8 +1,9 @@
 #!/bin/bash -p
 # deny-repo-admin (spec 5.3, FRG-4): the gh allowlist. A gh command that only reads (hookrt's
-# _HR_GH_READS) isn't guarded, so it may sit in a pipeline and reaches here only when something
-# else makes the command guarded; it is allowed. Every other gh command must be one plain command
-# (hr_require_simple, which also refuses while a GH_* or GITHUB_* variable is set) and one of:
+# _HR_GH_READS, with no $ or ` in the command) isn't guarded, so it may sit in a pipeline and
+# reaches here only when something else makes the command guarded; it is allowed. Every other gh
+# command must be one plain command (hr_require_simple, which also refuses while a GH_* or
+# GITHUB_* variable is set) and one of:
 #   gh auth status [--active]
 #   gh api <endpoint> as a GET only: no -X/--method but GET, no -f/-F/--field/--raw-field/--input
 #     (any of them turns it into a write), no -H, --hostname or graphql; options --paginate,
