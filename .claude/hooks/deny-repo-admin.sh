@@ -46,10 +46,11 @@ hr_guarded || hr_allow
 hr_require_simple
 [[ "${HR_TOK[0]:-}" == gh ]] || hr_allow
 if hr_gh_reads 0; then
-  # --web (-w, alone or among other one-letter options) opens a browser, which runs whatever
-  # program gh's settings name, so a read never does (review round 7).
+  # --web (-w, alone or among other one-letter options, with or without an attached value such
+  # as -w=true or -cw=1) opens a browser, which runs whatever program gh's settings name, so a
+  # read never does (review rounds 7 and 8).
   for w in "${HR_TOK[@]:1}"; do
-    if [[ "$w" == --web || "$w" == --web=* || "$w" =~ ^-[A-Za-z]*w[A-Za-z]*$ ]]; then
+    if [[ "$w" == --web || "$w" == --web=* || "$w" =~ ^-[A-Za-z]*w[A-Za-z]*(=.*)?$ ]]; then
       hr_deny "'$w' opens a browser, which runs the program gh's settings name; read on the command line instead"
     fi
   done

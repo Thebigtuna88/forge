@@ -499,7 +499,9 @@ It provides:
   globs, `~`, line continuations, comments, `GH_PAGER=…` or `HOME=…` in front), and the owner
   removed the exemption (`docs/decisions/2026-10-19-gh-reads-plain.md`). A read that opens a
   browser (`gh browse`, `--web`, `-w`) is refused, since the browser is whatever program gh's
-  settings name. A guarded `gh` command is refused while the environment sets a `GH_*`,
+  settings name. A command that defines an alias (`alias`, zsh's `aliases[…]`, bash's
+  `BASH_ALIASES`, `expand_aliases`) is guarded, since an alias runs a tool under another name,
+  and so is a `NAME=gh` word with words after it (round 8). A guarded `gh` command is refused while the environment sets a `GH_*`,
   `GITHUB_*`, `BROWSER` or `PAGER` variable, as git's are for `GIT_*`. A `#` doesn't hide the
   rest of a line from the gates: its words are judged like any others, and a line ending in a
   backslash is joined to the next before `gh` is looked for and before the secret scan.

@@ -501,6 +501,13 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   for seq in "${_HR_GUARDED_SEQS[@]}" "${_HR_TOOLS[@]}"; do
     if _hr_seq_in "$seq" "${words[@]}"; then return 0; fi
   done
+  # An alias runs a command under another name (zsh, which Claude Code's Bash uses here, expands
+  # aliases without being asked; bash after shopt -s expand_aliases), so a command that defines
+  # one is guarded: alias g=gh, then g repo delete … (review round 8). hr_require_simple then
+  # refuses it, since a guarded command starts with the tool itself.
+  for w in "${words[@]}"; do
+    case "$w" in alias | aliases | bash_aliases | expand_aliases) return 0 ;; esac
+  done
   if [[ "$cmd" == *'$'* || "$cmd" == *'`'* ]]; then
     for w in "${words[@]}"; do
       if [[ "$_HR_DYNAMIC_WORDS" == *" $w "* ]]; then return 0; fi
@@ -563,7 +570,16 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     # `which gh` (nothing after it) stays plain. Reads used to be exempt, so they could sit in a
     # pipeline, but FRG-4 review rounds 2-7 kept finding ways for the shell to change what such a
     # read sends or runs (xargs, $, globs, ~, line continuations, comments, GH_PAGER=… or
-    # HOME=… in front), so the owner removed the exemption (decision 2026-10-19).
+    # HOME=… in front), so the owner removed the exemption (decision 2026-10-19). A NAME=gh word
+    # with words after it counts as gh too, since its value may become a command's name (zsh's
+    # hash g=…, an alias; round 8).
+    if [[ "$u" == *=* && $((i + 1)) -lt $n ]]; then
+      t="${u#*=}"
+      if [[ "$(_hr_lower "${t##*/}")" == gh ]]; then
+        rc=0
+        break
+      fi
+    fi
     if [[ "$base" == gh ]] && [[ $cmdpos == 1 || $wrapped == 1 || $((i + 1)) -lt $n ]]; then
       rc=0
       break

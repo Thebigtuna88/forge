@@ -508,6 +508,26 @@ test_gh_after_a_comment_is_guarded() {
   assert_exit 2 "$RC" "a read with a comment (a guarded command is one plain command)"
 }
 
+# Review round 8 (SEC-1): an alias defined in the command runs gh under another name (zsh, which
+# Claude Code's Bash uses here, expands aliases without being asked; bash after shopt -s
+# expand_aliases), so a command that defines one is guarded, and so is a NAME=gh word with words
+# after it (zsh's aliases[g]=gh, bash's BASH_ALIASES[g]=gh).
+test_alias_of_gh_is_guarded() {
+  mk_hook_harness
+  local c nl=$'\n'
+  for c in "shopt -s expand_aliases${nl}alias g=gh${nl}g repo delete a/b --yes" \
+    'alias g=gh; g repo delete a/b --yes' "alias g='gh repo delete a/b --yes'; g" 'alias g=g""h; g pr list' \
+    '\alias g=gh; g pr list' 'BASH_ALIASES[g]=gh; g repo delete a/b' 'aliases[g]=gh; g repo delete a/b' \
+    'alias g=git; g tag v1'; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+  for c in 'cat aliases.md' 'X=gh'; do
+    probe guarded "$c"
+    assert_eq "$OUT" PLAIN "plain: $c"
+  done
+}
+
 # Review round 7 (owner decision 2026-10-19): a read must be one plain command, so the shell can't
 # change what it sends ($, `, globs, ~) or how gh runs (a NAME=value in front, a pipe, a chain).
 test_gh_read_must_be_one_plain_command() {
