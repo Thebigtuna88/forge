@@ -82,7 +82,8 @@ export PATH
 # Claude Code's own GIT_EDITOR=true (an editor that changes nothing) is the only exception.
 # EMAIL and XDG_CONFIG_HOME stay, so git reads the same identity and global settings here.
 # GH_* and GITHUB_* variables (GH_REPO, GH_HOST, GH_TOKEN, GITHUB_TOKEN, GH_CONFIG_DIR, …) would
-# make gh act on another repository, host or login, so they are kept in _HR_GH_ENV the same way.
+# make gh act on another repository, host or login, so they are kept in _HR_GH_ENV the same way;
+# so are BROWSER and PAGER, the programs gh runs to open a link or page its output (round 6).
 unset _HR_GIT_ENV _HR_GH_ENV
 _HR_GIT_ENV=""
 _HR_GH_ENV=""
@@ -97,7 +98,7 @@ for _hr_v in $(compgen -e); do
       _HR_GIT_ENV+=" $_hr_v"
       unset "$_hr_v" 2>/dev/null || true
       ;;
-    GH_* | GITHUB_*)
+    GH_* | GITHUB_* | BROWSER | PAGER)
       _HR_GH_ENV+=" $_hr_v"
       unset "$_hr_v" 2>/dev/null || true
       ;;
@@ -186,6 +187,9 @@ _HR_FORBIDDEN=('&' '|' ';' '<' '>' '(' ')' '$' '`' '#' '*' '?' '[' ']' '{' '}' '
 
 # Splits shell words with Python's shlex. Writes "<count>\0<word>\0…" in a single write after
 # parsing, so a partial result can't be mistaken for a whole one; exits 3 if quoting is broken.
+# A # starts no comment here: callers turn line breaks into ;, where a comment would run on past
+# the line bash ends it at and hide the lines after it (review round 6). Its words are judged
+# like any others, which only ever adds to what is seen.
 _HR_PY_TOKENS='
 import os, shlex, sys
 mode, text = sys.argv[1], sys.argv[2]
@@ -193,6 +197,7 @@ try:
     if mode == "punct":
         lex = shlex.shlex(text, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
+        lex.commenters = ""
         words = list(lex)
     else:
         words = shlex.split(text, posix=True)
@@ -226,10 +231,12 @@ sys.exit(0 if q else 1)
 '
 
 # A jq definition: `fields` joins an array of strings into one line, separated by \u001f, and
-# fails if a field holds a line break or a \u001f. bash's read keeps only the first line, so a
-# field such as "Thebigtuna88\ngarbage" would otherwise be judged by its start (review round 5).
-HR_JQ_FIELDS='def fields: if all(.[]; type == "string" and (test("[\n\r\u001f]") | not))
-  then join("\u001f") else error("a field holds a line break") end; '
+# fails if a field holds a NUL, a line break or a \u001f. bash's read keeps only the first line,
+# so a field such as "Thebigtuna88\ngarbage" would otherwise be judged by its start (review
+# round 5), and bash drops a NUL, so "co\u0000dex" would become codex (round 6). Characters are
+# compared by code, since jq's string tests may stop at a NUL.
+HR_JQ_FIELDS='def fields: if all(.[]; type == "string" and (explode | all(. != 0 and . != 10 and . != 13 and . != 31)))
+  then join("\u001f") else error("a field holds a NUL or a line break") end; '
 
 # --- decisions ---------------------------------------------------------------------------------
 
@@ -556,6 +563,13 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
   for w in ${HR_TOK[@]+"${HR_TOK[@]}"}; do
     case "$(_hr_lower "$w")" in api | repo | workflow) verbs=1 ;; esac
   done
+  # A variable that steers gh (_HR_GH_ENV's kind) named anywhere in the command, however it is
+  # set or exported (GH_PAGER=… gh, export GH_PAGER=…; gh, G"H"_PAGER), makes a read guarded:
+  # set in the command, it never reaches the hook's own environment (review round 6).
+  local ghvar=0
+  for w in "${words[@]}"; do
+    case "$w" in gh_* | github_* | browser | pager) ghvar=1 ;; esac
+  done
   local i n=${#HR_TOK[@]} t u base rc=1 cmdpos=1 wrapped=0 skip=0 op='^[;&|()<>]+$'
   for ((i = 0; i < n; i++)); do
     t="${HR_TOK[$i]}"
@@ -592,7 +606,7 @@ hr_guarded() { # [command]: 0 if the command mentions a guarded action (spec 5.2
     # variable is set, a read is guarded too, so hr_require_simple refuses it: GH_PAGER can make
     # a read run any program, and GH_REPO or a token makes it read elsewhere (round 5).
     if [[ "$base" == gh ]] && [[ $cmdpos == 1 || $wrapped == 1 || $((i + 1)) -lt $n ]]; then
-      if [[ $cmdpos != 1 || -n "$_HR_GH_ENV" || "$cmd" == *[\$\`]* ]] || _hr_unquoted_glob "$cmd" ||
+      if [[ $cmdpos != 1 || -n "$_HR_GH_ENV" || $ghvar == 1 || "$cmd" == *[\$\`]* ]] || _hr_unquoted_glob "$cmd" ||
         ! _hr_gh_reads "$i"; then
         rc=0
         break
@@ -708,7 +722,7 @@ hr_require_simple() { # deny unless a guarded command is one plain command; fill
       [[ "$_HR_GH_CMDS" == *" ${HR_TOK[1]:-} "* ]] ||
         hr_deny "gh alias, extension or option before the command ('${HR_TOK[1]:-}'); use gh's own command"
       [[ -z "$_HR_GH_ENV" ]] ||
-        hr_deny "the environment sets${_HR_GH_ENV}, so gh could act on another repository, host or login than the one FORGE checks; start Claude Code without it"
+        hr_deny "the environment sets${_HR_GH_ENV}, so gh could act on another repository, host or login than the one FORGE checks, or run another program as its pager or browser; start Claude Code without it"
       return 0
       ;;
   esac

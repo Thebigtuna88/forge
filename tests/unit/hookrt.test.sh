@@ -464,6 +464,51 @@ test_inherited_gh_variables_deny_gh_reads() {
   assert_exit 0 "$RC" "a read with no gh variable set: $ERR"
 }
 
+# Review round 6 (SEC-2): gh also takes its browser from BROWSER and its pager from PAGER, so an
+# inherited one counts like a GH_* variable.
+test_inherited_browser_or_pager_deny_gh() {
+  mk_hook_harness
+  local v
+  for v in BROWSER=/usr/bin/true PAGER=/usr/bin/true; do
+    run_hook sample-gate "$(bash_input 'gh browse' "$H")" "$v"
+    assert_exit 2 "$RC" "a gh read with $v"
+    assert_contains "$ERR" "the environment sets ${v%%=*}" "reason with $v"
+    run_hook sample-gate "$(bash_input 'gh issue create --title x --body-file f' "$H")" "$v"
+    assert_exit 2 "$RC" "a guarded gh command with $v"
+  done
+}
+
+# Review round 6 (SEC-1): a variable set in the command itself steers gh as an inherited one
+# does (GH_PAGER=… gh pr view runs the pager), so a read that names a GH_*, GITHUB_*, BROWSER or
+# PAGER variable anywhere in the command is guarded, however the name is spelt or exported.
+test_gh_read_naming_a_gh_variable_is_guarded() {
+  mk_hook_harness
+  local c
+  for c in 'GH_PAGER=/usr/bin/true GH_FORCE_TTY=1 gh pr view 25' 'GH_REPO=o/r gh pr view 25 | head' \
+    'export GH_PAGER=x; gh pr view 25' 'BROWSER=/usr/bin/true gh browse' 'PAGER=x gh pr diff 25 | head' \
+    'G"H"_PAGER=x gh pr view 1' 'declare -x GITHUB_TOKEN=x; gh pr list'; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+  run_hook sample-gate "$(bash_input 'GH_PAGER=/usr/bin/true GH_FORCE_TTY=1 gh pr view 25' "$H")"
+  assert_exit 2 "$RC" "an inline GH_PAGER is refused"
+}
+
+# Review round 6 (C1): bash ends a comment at the line break, but the words were split with the
+# line breaks already turned into ;, so a comment hid every later line (gh pr view 5 # x, then
+# gh repo delete …). Text after # is now judged as words, which only ever adds to what is seen.
+test_gh_after_a_comment_is_guarded() {
+  mk_hook_harness
+  local c nl=$'\n'
+  for c in "gh pr view 5 # a comment${nl}gh repo delete a/b --yes" \
+    "gh pr view 5 #${nl}gh pr merge 5 --admin" "true # x${nl}gh api -X DELETE repos/a/b"; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+  probe guarded 'gh pr view 5 # just a note'
+  assert_eq "$OUT" PLAIN "a read with a comment on its own line"
+}
+
 # ghpath <project dir or ""> : which gh hr_gh would run, as Claude Code (or conformance) would
 # start the hook, with CLAUDE_PROJECT_DIR set to <project dir> (unset when empty).
 ghpath() {

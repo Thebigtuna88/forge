@@ -504,8 +504,11 @@ It provides:
   ending in a backslash is joined to the next before `gh` is looked for and before the scan.
   Any other `gh` invocation, wherever `gh` may run
   (after a wrapper such as `xargs`, or with words after it), is guarded. While the environment
-  sets a `GH_*` or `GITHUB_*` variable, a read is guarded too (`GH_PAGER` can make it run a
-  program; round 5), and every guarded `gh` command is refused, as git's are for `GIT_*`.
+  sets a `GH_*`, `GITHUB_*`, `BROWSER` or `PAGER` variable, a read is guarded too (`GH_PAGER`
+  can make it run a program; rounds 5 and 6), and every guarded `gh` command is refused, as
+  git's are for `GIT_*`; so is a read whose command names such a variable anywhere
+  (`GH_PAGER=… gh pr view`, `export GH_PAGER=…; gh …`; round 6). A `#` doesn't hide the rest of
+  a line from the gates: its words are judged like any others.
 - `hr_gh`: runs `gh` for a gate with prompts, pager and update checks off. Inside a conformance
   sandbox, and only there (the runtime itself sits at
   `<tmp>/forge-conformance.XXXXXX/s<n>/code/forge`), it runs the sandbox's fake `gh`.

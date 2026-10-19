@@ -64,7 +64,8 @@ web-UI click), **write a script, never instructions**:
   list/view`, `pr list/view/diff/checks/status`, `run list/view/watch`, `workflow list/view`,
   `repo view`, `release list/view`, `label list`, `search`, `status`, `browse`) may use pipes, when
   `gh` itself is the command (never through `xargs`, `find -exec` or `env`) and the whole
-  command has no `$`, backtick or unquoted `*` `?` `[`.
+  command has no `$`, backtick or unquoted `*` `?` `[`, and names no `GH_*`, `GITHUB_*`,
+  `BROWSER` or `PAGER` variable.
 - Text goes to GitHub only as `--title <text>` and `--body-file <file>` (scanned for secrets
   first); never `--body`, `-b`, `--fill` or an editor. PRs: `gh pr create --base dev --head
   feature/<KEY>-<n>-<slug> --title <text> --body-file <file>`. `gh api` only reads (GET).

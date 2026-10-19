@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh pr view 22 # a comment\ngh pr merge 22 --repo Thebigtuna88/forge --squash --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "must be one plain command"
+}

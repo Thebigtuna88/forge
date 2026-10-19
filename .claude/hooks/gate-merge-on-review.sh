@@ -44,10 +44,10 @@ jq -s '.[0]' "$HR_TMP/review.json" >"$HR_TMP/review.one"
 mv "$HR_TMP/review.one" "$HR_TMP/review.json"
 
 # Each row is one line of fields; a field with a line break can't be judged by its first line or
-# split a row in two (review round 5).
+# split a row in two (review round 5), and one with a NUL can't lose it in bash (round 6).
 jq -r "$HR_JQ_FIELDS"'[.repo, .branch, (.pr | tostring), .head, .merge_base, .diff_md5, (.diff_bytes | tostring)] | fields' \
   "$HR_TMP/review.json" >"$HR_TMP/bound" 2>/dev/null ||
-  hr_deny "work/$ticket/review.md's forge-review block is malformed (a field holds a line break)"
+  hr_deny "work/$ticket/review.md's forge-review block is malformed (a field holds a NUL or a line break)"
 bound="$(cat "$HR_TMP/bound")"
 IFS=$'\x1f' read -r r_repo r_branch r_pr r_head r_mb r_md5 r_bytes <<<"$bound"
 [[ "$r_repo" == "$HR_FORGE_REPO" && "$r_branch" == "$HR_PR_BRANCH" && "$r_pr" == "$HR_PR" ]] ||
@@ -63,7 +63,7 @@ bytes="$(wc -c <"$HR_PR_DIR/diff.patch" | tr -d ' ')"
 
 jq -r "$HR_JQ_FIELDS"'.lenses[] | [.lens, .mechanism, .verdict, .reply, .reply_sha256, (.rounds | tostring)] | fields' \
   "$HR_TMP/review.json" >"$HR_TMP/lenses" 2>/dev/null ||
-  hr_deny "work/$ticket/review.md's forge-review block is malformed (a lens's field holds a line break)"
+  hr_deny "work/$ticket/review.md's forge-review block is malformed (a lens's field holds a NUL or a line break)"
 seen=" "
 while IFS=$'\x1f' read -r lens mech verdict reply rsha rounds; do
   case "$lens" in
@@ -116,11 +116,11 @@ done
 
 jq -r "$HR_JQ_FIELDS"'.deferred[] | [.finding, (.issue | tostring)] | fields' "$HR_TMP/review.json" \
   >"$HR_TMP/deferred" 2>/dev/null ||
-  hr_deny "work/$ticket/review.md's forge-review block is malformed (a deferred finding holds a line break; name it on one line)"
+  hr_deny "work/$ticket/review.md's forge-review block is malformed (a deferred finding holds a NUL or a line break; name it on one line)"
 while IFS=$'\x1f' read -r finding issue; do
   hr_gh issue view "$issue" --repo "$HR_FORGE_REPO" --json state </dev/null >"$HR_TMP/issue.json" 2>/dev/null ||
     hr_deny "can't read issue #$issue (deferred finding $finding) from GitHub; try again"
-  jq -sr 'if length == 1 and (.[0] | type) == "object" then .[0].state | tostring else error("not one object") end' "$HR_TMP/issue.json" >"$HR_TMP/issue.state" 2>/dev/null ||
+  jq -sr "$HR_JQ_FIELDS"'if length == 1 and (.[0] | type) == "object" then [.[0].state | tostring] | fields else error("not one object") end' "$HR_TMP/issue.json" >"$HR_TMP/issue.state" 2>/dev/null ||
     hr_deny "GitHub's answer about issue #$issue (deferred finding $finding) can't be read; try again"
   istate="$(cat "$HR_TMP/issue.state")"
   [[ "$istate" == OPEN ]] ||
