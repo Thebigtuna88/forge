@@ -783,12 +783,20 @@ t_B9() {
   feature_pr B9 side
   local pr="$LAST_PR"
   owner_approve "$pr"
-  if ! capture helper_gh pr edit "$pr" --repo "$REPO" --base dev; then
+  # REST, not `gh pr edit`: that also reads fields needing read:org, which the helper's token lacks.
+  if ! capture helper_gh api -X PATCH "repos/$REPO/pulls/$pr" -f base=dev; then
     record B9 "$(classify_api)" "re-aiming at dev: $(evidence)"
     close_if_open "$pr"
     return
   fi
   sleep 3
+  local base
+  base="$(pr_view "$pr" baseRefName .baseRefName)" || base=""
+  if [[ "$base" != dev ]]; then
+    setup_fail B9 "re-aimed PR's base reads '${base:-unreadable}', not dev"
+    close_if_open "$pr"
+    return
+  fi
   helper_merge B9 "$pr" --squash
   record B9 "$OBS" "$(evidence)"
   close_if_open "$pr"

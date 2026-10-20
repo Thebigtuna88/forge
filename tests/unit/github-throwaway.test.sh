@@ -207,6 +207,36 @@ test_b11_open_needs_a_confirmed_result() {
   assert_contains "$out" "RESULT B11 open PASS expected=allowed observed=allowed"
 }
 
+test_b9_reaims_through_the_rest_api() {
+  # The helper's token has only public_repo. `gh pr edit` also reads fields that need read:org,
+  # so it failed on GitHub (owner's run, 2026-10-20). The REST call needs public_repo alone.
+  load
+  PHASE=open
+  FAILS=0
+  feature_pr() { LAST_PR=7; }
+  owner_approve() { :; }
+  sleep() { :; }
+  close_if_open() { :; }
+  helper_merge() { OBS=allowed; LAST_OUT=merged; }
+  helper_gh() { printf '%s\n' "$*" >>"$T_TMP/helper-gh.log"; }
+  pr_view() { echo "$FAKE_BASE"; }
+  local out
+  FAKE_BASE=dev
+  out="$(t_B9; echo "fails=$FAILS")"
+  assert_eq "$(cat "$T_TMP/helper-gh.log")" "api -X PATCH repos/$REPO/pulls/7 -f base=dev"
+  assert_contains "$out" "RESULT B9 open PASS expected=allowed observed=allowed"
+  # A re-aim GitHub didn't apply is a broken setup, not a result.
+  FAKE_BASE=side
+  out="$(t_B9; echo "fails=$FAILS")"
+  assert_contains "$out" "RESULT B9 open FAIL"
+  assert_contains "$out" "observed=setup-failed"
+}
+
+test_helper_never_uses_gh_pr_edit() {
+  # Same reason as above, for every test: the helper's gh must not run `pr edit`.
+  assert_eq "$(grep -c 'helper_gh pr edit' "$GT" || true)" "0" "helper_gh pr edit needs read:org"
+}
+
 test_ruleset_summary_includes_the_update_rules_parameter() {
   load
   owner_gh() {
