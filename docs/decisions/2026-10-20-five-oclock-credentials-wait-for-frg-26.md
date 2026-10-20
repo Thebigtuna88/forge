@@ -38,6 +38,23 @@ reach production.
 4. **Open, to be asked later:** whether test-mode keys of a real payment account (for example a
    Stripe test secret key) count as payment access. Until the owner answers, they do.
 
+## Addendum (owner, 2026-10-20): review integrity, and accepted risks shown first
+
+> Make review isolation a separate follow-up ticket immediately after the core setup. Keep L12
+> explicitly open until that work passes its tests. […] For now, don't treat core FRG-26 as
+> resolving review integrity. Before giving 5:00 credentials, show me which accepted risks
+> remain so I can decide with that information.
+
+5. **Review isolation is FRG-27 (#27)**, started immediately after the core FRG-26 setup. The
+   review script and its output must be protected from the agent, and each review must
+   identify the exact commit reviewed. A separate user alone isn't enough.
+6. **Core FRG-26 doesn't resolve review integrity.** L12 stays open until FRG-27's tests pass,
+   and nothing (plan, PR, status report) may describe it as closed before then.
+7. **Tested protections are necessary, not sufficient.** Before any 5:00 credential, payment
+   access or production deploy access is given, the agent shows the owner every accepted risk
+   that still remains: open known limits (spec 11), deferred findings, and anything still
+   Unconfirmed. Then **the owner decides**, with that information, whether to go ahead.
+
 ## Alternatives not taken
 
 - Start 5:00 with credentials once Phase 7 passes, relying on the hooks (what the spec allowed
