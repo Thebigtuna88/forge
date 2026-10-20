@@ -137,6 +137,11 @@ classify_push() { # after capture of a helper git push
 
 classify_api() { # after capture of a helper gh api call to an admin endpoint
   if [[ $LAST_RC -eq 0 ]]; then echo allowed; return; fi
+  # GitHub also answers 403 when a client sends too many requests: that proves nothing.
+  if printf '%s' "$LAST_OUT" | grep -Eiq 'rate limit|abuse detection|secondary rate'; then
+    echo inconclusive
+    return
+  fi
   if printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 403|HTTP 404|Must have admin rights|Resource not accessible by personal access token'; then
     echo refused
   else
@@ -259,12 +264,12 @@ ruleset_summary() { # one line describing the only ruleset, or error
   local id
   id="$(owner_gh api "repos/$REPO/rulesets" --jq '.[0].id' 2>/dev/null)" || { echo error; return; }
   [[ "$id" =~ ^[0-9]+$ ]] || { echo error; return; }
-  owner_gh api "repos/$REPO/rulesets/$id" --jq '[.enforcement, .target, (.conditions.ref_name.include | join(",")), (.conditions.ref_name.exclude | length | tostring), ([.rules[].type] | sort | join(",")), ([.bypass_actors[] | "\(.actor_type):\(.actor_id):\(.bypass_mode)"] | join(","))] | join(" ")' 2>/dev/null || echo error
+  owner_gh api "repos/$REPO/rulesets/$id" --jq '[.enforcement, .target, (.conditions.ref_name.include | join(",")), (.conditions.ref_name.exclude | length | tostring), ([.rules[] | if .type == "update" then "update:\(.parameters.update_allows_fetch_and_merge)" else .type end] | sort | join(",")), ([.bypass_actors[] | "\(.actor_type):\(.actor_id):\(.bypass_mode)"] | join(","))] | join(" ")' 2>/dev/null || echo error
 }
 
 want_ruleset() { # the two bypass choices this script may have installed
-  printf 'active branch refs/heads/main 0 deletion,non_fast_forward,update User:%s:always\n' "$(owner_uid)"
-  printf 'active branch refs/heads/main 0 deletion,non_fast_forward,update RepositoryRole:5:always\n'
+  printf 'active branch refs/heads/main 0 deletion,non_fast_forward,update:false User:%s:always\n' "$(owner_uid)"
+  printf 'active branch refs/heads/main 0 deletion,non_fast_forward,update:false RepositoryRole:5:always\n'
 }
 
 verify_phase() { # <phase> — the repository must be exactly in the state that phase needs
@@ -515,12 +520,11 @@ cmd_status() {
 
 # --- Bypass tests -------------------------------------------------------------------------------
 
-# Expected result of each test in each phase (plan section 6): allowed | refused | any.
+# Expected result of each test in each phase (plan section 6): allowed | refused.
 expect() { # <id> <phase>
   case "$1:$2" in
     B5:* | B12:* | B13:* | M4:*) echo refused ;;
     B16:* | M6:*) echo allowed ;;
-    B11:open) echo any ;;
     M2:open | M2:protected) echo allowed ;;
     *:open) echo allowed ;;
     *) echo refused ;;
@@ -530,7 +534,7 @@ expect() { # <id> <phase>
 record() { # <id> <observed allowed|refused|inconclusive> <evidence>
   local want verdict
   want="$(expect "$1" "$PHASE")"
-  if [[ "$2" != inconclusive && ( "$want" == any || "$want" == "$2" ) ]]; then verdict=PASS; else
+  if [[ "$2" != inconclusive && "$want" == "$2" ]]; then verdict=PASS; else
     verdict=FAIL
     FAILS=$((FAILS + 1))
   fi
@@ -763,9 +767,11 @@ t_B10() {
   close_if_open "$pr"
 }
 
-# B11: auto-merge is enabled on the repository. In the protected phases the helper turns it on
-# for its unapproved PR, which must not merge; then, as a control, the owner approves and the PR
-# must merge by itself (proving auto-merge was really armed).
+# B11: auto-merge is enabled on the repository. In the open phase, the helper's auto-merge must
+# work (the PR merges, or auto-merge is armed). In the protected phases the helper arms it for
+# its unapproved PR, which must not merge; then, as a control, the owner approves and the PR
+# must merge by itself (proving auto-merge was really armed). An unreadable state is
+# inconclusive.
 t_B11() {
   feature_pr B11
   local pr="$LAST_PR" armed st
@@ -775,12 +781,16 @@ t_B11() {
   first="$(evidence)"
   sleep 30
   st="$(pr_view "$pr" state .state)" || st=unknown
+  armed="$(pr_view "$pr" autoMergeRequest '.autoMergeRequest != null')" || armed=unknown
   if [[ "$PHASE" == open ]]; then
-    record B11 "$([[ "$st" == MERGED ]] && echo allowed || echo refused)" "$first [state $st]"
+    if [[ "$st" == MERGED || ( "$st" == OPEN && "$armed" == true ) ]]; then
+      record B11 allowed "$first [state $st, armed $armed]"
+    else
+      record B11 inconclusive "$first [state $st, armed $armed]"
+    fi
     close_if_open "$pr"
     return
   fi
-  armed="$(pr_view "$pr" autoMergeRequest '.autoMergeRequest != null')" || armed=unknown
   if [[ "$st" == MERGED ]]; then
     record B11 allowed "$first [merged without approval]"
     return
@@ -896,17 +906,34 @@ t_M4() {
   local id
   id="$(owner_gh api "repos/$REPO/rulesets" --jq '.[0].id' 2>/dev/null)" || id=""
   [[ "$id" =~ ^[0-9]+$ ]] || { setup_fail M4 "could not read the ruleset's id"; return; }
-  # Changing the ruleset: switch it off, and add the helper to its bypass list.
-  printf '{"enforcement":"disabled"}\n' >"$WORK/ruleset-off.json"
-  local hid
-  hid="$(owner_gh api "users/$HELPER" --jq .id 2>/dev/null)" || hid=""
-  [[ "$hid" =~ ^[0-9]+$ ]] || { setup_fail M4 "could not read the helper's user id"; return; }
-  printf '{"bypass_actors":[{"actor_id":%s,"actor_type":"User","bypass_mode":"always"}]}\n' "$hid" >"$WORK/ruleset-helper.json"
-  admin_attempts M4 -X PUT "repos/$REPO/branches/main/protection" --input "$WORK/weak.json" ";;" \
-    -X DELETE "repos/$REPO/branches/main/protection" ";;" \
-    -X PUT "repos/$REPO/rulesets/$id" --input "$WORK/ruleset-off.json" ";;" \
-    -X PUT "repos/$REPO/rulesets/$id" --input "$WORK/ruleset-helper.json" ";;" \
-    -X DELETE "repos/$REPO/rulesets/$id"
+  # Changing the ruleset. Both payloads are built from GitHub's own copy of the installed ruleset
+  # (so they are valid requests): one switches it off; the other adds the helper to the bypass
+  # list, in the actor form GitHub accepted for the owner on this repo (a User). If GitHub only
+  # accepted the Repository admin role, there is no proven form that names the helper, and that
+  # attempt is skipped (said in the evidence).
+  local rs kind
+  rs="$(owner_gh api "repos/$REPO/rulesets/$id" 2>/dev/null)" || { setup_fail M4 "could not read the ruleset"; return; }
+  printf '%s' "$rs" | jq '{name, target, enforcement: "disabled", conditions, rules, bypass_actors}' >"$WORK/ruleset-off.json" \
+    || { setup_fail M4 "could not build the switch-off payload"; return; }
+  kind="$(printf '%s' "$rs" | jq -r '.bypass_actors[0].actor_type')" || kind=""
+  if [[ "$kind" == User ]]; then
+    local hid
+    hid="$(owner_gh api "users/$HELPER" --jq .id 2>/dev/null)" || hid=""
+    [[ "$hid" =~ ^[0-9]+$ ]] || { setup_fail M4 "could not read the helper's user id"; return; }
+    printf '%s' "$rs" | jq --argjson hid "$hid" '{name, target, enforcement, conditions, rules, bypass_actors: (.bypass_actors + [{actor_id: $hid, actor_type: "User", bypass_mode: "always"}])}' \
+      >"$WORK/ruleset-helper.json" || { setup_fail M4 "could not build the helper-bypass payload"; return; }
+    admin_attempts M4 -X PUT "repos/$REPO/branches/main/protection" --input "$WORK/weak.json" ";;" \
+      -X DELETE "repos/$REPO/branches/main/protection" ";;" \
+      -X PUT "repos/$REPO/rulesets/$id" --input "$WORK/ruleset-off.json" ";;" \
+      -X PUT "repos/$REPO/rulesets/$id" --input "$WORK/ruleset-helper.json" ";;" \
+      -X DELETE "repos/$REPO/rulesets/$id"
+  else
+    admin_attempts M4 -X PUT "repos/$REPO/branches/main/protection" --input "$WORK/weak.json" ";;" \
+      -X DELETE "repos/$REPO/branches/main/protection" ";;" \
+      -X PUT "repos/$REPO/rulesets/$id" --input "$WORK/ruleset-off.json" ";;" \
+      -X DELETE "repos/$REPO/rulesets/$id"
+    say "M4 note: the add-the-helper-as-bypass attempt was skipped (the ruleset's bypass is $kind, so no proven actor form names the helper)"
+  fi
 }
 
 t_M6() { # the owner merges dev into main

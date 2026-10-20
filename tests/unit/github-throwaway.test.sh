@@ -54,9 +54,15 @@ secrets() { # <login> <token> [mode]
   export FRG26_SECRETS="$T_TMP/helper.env"
 }
 
+# These run the real script. They stay offline even if the agent guard were broken: an empty
+# environment and an empty home folder, so gh has no login (and no config) to use and stops
+# before contacting GitHub.
+offline() { /usr/bin/env -i HOME="$T_TMP/home" XDG_CONFIG_HOME="$T_TMP/home/.config" PATH=/usr/bin:/bin "$@"; }
+
 test_refuses_inside_claude_code() {
+  mkdir -p "$T_TMP/home"
   local out rc=0
-  out="$(CLAUDECODE=1 bash "$GT" status 2>&1)" || rc=$?
+  out="$(offline CLAUDECODE=1 /bin/bash "$GT" status 2>&1)" || rc=$?
   assert_exit 2 "$rc"
   assert_contains "$out" "never inside Claude Code"
 }
@@ -64,8 +70,9 @@ test_refuses_inside_claude_code() {
 test_main_runs_when_given_as_a_string() {
   # The handoffs run the script as `bash -p -c "<script>" frg26 <command>`: main must run then
   # (shown here by the agent guard answering, before anything else happens).
+  mkdir -p "$T_TMP/home"
   local out rc=0
-  out="$(CLAUDECODE=1 /bin/bash -p -c "$(cat "$GT")" frg26 status 2>&1)" || rc=$?
+  out="$(offline CLAUDECODE=1 /bin/bash -p -c "$(cat "$GT")" frg26 status 2>&1)" || rc=$?
   assert_exit 2 "$rc"
   assert_contains "$out" "never inside Claude Code"
 }
@@ -104,7 +111,7 @@ test_expected_table_matches_the_plan() {
     assert_eq "$(expect "$id" protected)" allowed "$id protected (control)"
     assert_eq "$(expect "$id" ruleset)" allowed "$id ruleset (control)"
   done
-  assert_eq "$(expect B11 open)" any "B11 open"
+  assert_eq "$(expect B11 open)" allowed "B11 open"
   assert_eq "$(expect B11 protected)" refused "B11 protected"
   # M2 is the gap the ruleset closes: allowed with protection alone, refused with the ruleset.
   assert_eq "$(expect M2 open)" allowed "M2 open"
@@ -129,7 +136,7 @@ test_record_judges_results() {
   assert_contains "$out" "fails=0"
   out="$(record B1 allowed "pushed"; echo "fails=$FAILS")"
   assert_contains "$out" "RESULT B1 protected FAIL"
-  # Inconclusive is never a pass, even where "any" result is acceptable.
+  # Inconclusive is never a pass.
   PHASE=open
   out="$(record B11 inconclusive "HTTP 503"; echo "fails=$FAILS")"
   assert_contains "$out" "RESULT B11 open FAIL"
@@ -166,6 +173,54 @@ test_classify_api() {
   assert_eq "$(classify_api)" inconclusive "422 is not an authorisation refusal"
   LAST_RC=1 LAST_OUT="HTTP 503 Service Unavailable"
   assert_eq "$(classify_api)" inconclusive "503"
+  LAST_RC=1 LAST_OUT="gh: API rate limit exceeded for user ID 1. (HTTP 403)"
+  assert_eq "$(classify_api)" inconclusive "a rate-limit 403 is not a permission refusal"
+  LAST_RC=1 LAST_OUT="gh: You have exceeded a secondary rate limit. (HTTP 403)"
+  assert_eq "$(classify_api)" inconclusive "secondary rate limit"
+}
+
+test_b11_open_needs_a_confirmed_result() {
+  load
+  PHASE=open
+  FAILS=0
+  feature_pr() { LAST_PR=7; }
+  wait_settled() { return 0; }
+  sleep() { :; }
+  close_if_open() { :; }
+  helper_gh() { echo "HTTP 503 Service Unavailable" >&2; return 1; }
+  pr_view() { return 1; }
+  local out
+  out="$(t_B11; echo "fails=$FAILS")"
+  assert_contains "$out" "RESULT B11 open FAIL" "unreadable state passed"
+  assert_contains "$out" "observed=inconclusive"
+  pr_view() { case "$2" in state) echo OPEN ;; autoMergeRequest) echo true ;; esac; }
+  out="$(t_B11; echo "fails=$FAILS")"
+  assert_contains "$out" "RESULT B11 open PASS expected=allowed observed=allowed"
+}
+
+test_ruleset_summary_includes_the_update_rules_parameter() {
+  load
+  owner_gh() {
+    local q="" path=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in --jq) q="$2"; shift ;; repos/*) path="$1" ;; esac
+      shift
+    done
+    case "$path" in
+      */rulesets) jq -r "$q" <<<'[{"id": 9}]' ;;
+      */rulesets/9) jq -r "$q" <<<"$FIXTURE" ;;
+      *) return 1 ;;
+    esac
+  }
+  owner_uid() { echo 42; }
+  FIXTURE='{"enforcement":"active","target":"branch","conditions":{"ref_name":{"include":["refs/heads/main"],"exclude":[]}},"rules":[{"type":"update","parameters":{"update_allows_fetch_and_merge":true}},{"type":"deletion"},{"type":"non_fast_forward"}],"bypass_actors":[{"actor_type":"User","actor_id":42,"bypass_mode":"always"}]}'
+  local got
+  got="$(ruleset_summary)"
+  assert_contains "$got" "update:true"
+  if want_ruleset | grep -Fxq -- "$got"; then _t_fail "a ruleset that lets main pull upstream changes was accepted"; fi
+  FIXTURE="${FIXTURE/true/false}"
+  got="$(ruleset_summary)"
+  want_ruleset | grep -Fxq -- "$got" || _t_fail "the installed ruleset was not recognised: $got"
 }
 
 test_helper_merge_needs_a_blocked_mergeable_pr_to_count_as_refused() {
