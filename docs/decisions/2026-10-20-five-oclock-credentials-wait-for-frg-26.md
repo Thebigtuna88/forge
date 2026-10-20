@@ -35,8 +35,9 @@ reach production.
    FRG-26 item counts as relevant.
 3. **"Tested" means FRG-26's own tests:** each restriction is tried with the agent's real
    credentials or macOS user, and GitHub or macOS (not a FORGE hook) refuses it.
-4. **Open, to be asked later:** whether test-mode keys of a real payment account (for example a
-   Stripe test secret key) count as payment access. Until the owner answers, they do.
+4. **Test-mode keys count as payment access** (owner, 2026-10-20). Test-mode keys of a real
+   payment account (for example a Stripe test secret key) wait for the relevant FRG-26
+   protections and the owner's review of the remaining risks, exactly like live keys.
 
 ## Addendum (owner, 2026-10-20): review integrity, and accepted risks shown first
 
