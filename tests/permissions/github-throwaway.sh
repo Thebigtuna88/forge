@@ -12,6 +12,8 @@
 #   github-throwaway.sh accept            helper: try to accept the invitation with its token
 #   github-throwaway.sh check-helper      helper login, token scopes = public_repo, permission = write
 #   github-throwaway.sh rate              the helper's API allowance: limit, used, reset (read-only)
+#   github-throwaway.sh diagnose          as the helper: GET /user, GET /rate_limit, one GraphQL
+#                                         query; statuses, rate-limit headers, messages (read-only)
 #   github-throwaway.sh reset             owner: main dev side back to the baseline (unprotected only)
 #   github-throwaway.sh protect           owner: apply the dev and main branch protection
 #   github-throwaway.sh ruleset           owner: add the main ruleset (only the owner may bypass)
@@ -399,6 +401,39 @@ cmd_rate() {
   need_helper_identity
   helper_rate || die "could not read the helper's API allowance: $(evidence)"
   say "HELPER-RATE $RATE_LINE"
+}
+
+# One diagnostic request as the helper, through the same helper_gh the tests use. Prints the HTTP
+# status, the listed headers only (never Authorization or cookies) and GitHub's answer in brief.
+diag() { # <label> <helper_gh arguments…>
+  local label="$1" clean status hdrs json summary ghmsg
+  shift
+  capture helper_gh "$@" || true
+  clean="$(printf '%s\n' "$LAST_OUT" | tr -d '\r')"
+  status="$(printf '%s\n' "$clean" | grep -m1 '^HTTP/')" || status="no HTTP status"
+  hdrs="$(printf '%s\n' "$clean" | sed -n '/^HTTP\//,/^$/p' \
+    | grep -iE '^(x-ratelimit-(limit|remaining|used|reset|resource)|retry-after|x-oauth-scopes|x-accepted-oauth-scopes|x-github-request-id):' \
+    | awk '{ i = index($0, ":"); printf "%s:%s; ", tolower(substr($0, 1, i - 1)), substr($0, i + 1) }')"
+  json="$(printf '%s\n' "$clean" | sed '1,/^$/d' | grep -v '^gh: ')"
+  summary="$(printf '%s' "$json" | jq -r '
+    if type != "object" then "no JSON body"
+    elif .login then "login=\(.login) id=\(.id)"
+    elif .resources then (.resources | "graphql limit=\(.graphql.limit) used=\(.graphql.used) remaining=\(.graphql.remaining) / rest limit=\(.core.limit) used=\(.core.used) remaining=\(.core.remaining)")
+    elif .errors then (.errors | map("\(.type // "error"): \(.message)") | join(" | "))
+    elif .data then "data=\(.data | tojson)"
+    elif .message then "message=\(.message)"
+    else "unrecognised JSON body" end' 2>/dev/null)" || summary="no JSON body"
+  ghmsg="$(printf '%s\n' "$clean" | grep -m1 '^gh: ')" || ghmsg=""
+  say "DIAG $label: exit=$LAST_RC $status | ${hdrs}| $summary${ghmsg:+ | $ghmsg}"
+}
+
+# Authenticates exactly as the tests do (load_helper, then helper_gh), and records what GitHub
+# answers to three requests: who the token is, the allowance, and a one-line GraphQL query.
+cmd_diagnose() {
+  load_helper token
+  diag "GET /user" api -i user
+  diag "GET /rate_limit" api -i rate_limit
+  diag "POST /graphql" api -i graphql -f "query=query { viewer { login } rateLimit { limit remaining used resetAt } }"
 }
 
 cmd_check_helper() {
@@ -1067,13 +1102,14 @@ main() {
     accept) cmd_accept ;;
     check-helper) cmd_check_helper ;;
     rate) cmd_rate ;;
+    diagnose) cmd_diagnose ;;
     reset) cmd_reset ;;
     protect) cmd_protect ;;
     ruleset) cmd_ruleset ;;
     tests) cmd_tests "$@" ;;
     actions-setting) cmd_actions_setting ;;
     status) cmd_status ;;
-    *) die "usage: github-throwaway.sh create|invite|accept|check-helper|rate|reset|protect|ruleset|tests <phase>|actions-setting|status" ;;
+    *) die "usage: github-throwaway.sh create|invite|accept|check-helper|rate|diagnose|reset|protect|ruleset|tests <phase>|actions-setting|status" ;;
   esac
 }
 

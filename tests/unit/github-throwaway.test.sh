@@ -281,6 +281,47 @@ test_a_phase_needs_enough_helper_allowance() {
   assert_contains "$out" "helper allowance: graphql limit=5000 used=1000 remaining=4000"
 }
 
+fake_diag_gh() { # stands in for helper_gh: logs its arguments, answers like `gh api -i`
+  printf '%s\n' "$*" >>"$T_TMP/helper-gh.log"
+  case "$*" in
+    "api -i user")
+      printf 'HTTP/2.0 200 OK\r\nAuthorization: token %s\r\nSet-Cookie: s=1\r\nX-Oauth-Scopes: public_repo\r\nX-Ratelimit-Limit: 60\r\nX-Ratelimit-Remaining: 52\r\nX-Ratelimit-Resource: core\r\nX-Github-Request-Id: AB:CD\r\n\r\n{"login":"TTHelper","id":345506119}\n' "$TOKEN" ;;
+    "api -i rate_limit")
+      printf 'HTTP/2.0 200 OK\r\nX-Ratelimit-Limit: 60\r\n\r\n%s\n' "$(rate_fixture 0)" ;;
+    "api -i graphql "*)
+      printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Limit: 0\r\nX-Ratelimit-Resource: graphql\r\n\r\n{"errors":[{"type":"RATE_LIMITED","message":"API rate limit already exceeded for user ID 345506119."}]}\ngh: API rate limit already exceeded for user ID 345506119.\n'
+      return 1 ;;
+  esac
+}
+
+test_diagnose_records_statuses_headers_and_messages_only() {
+  # The owner asked: authenticate exactly as the tests do, then record HTTP statuses, rate-limit
+  # headers and GitHub's messages for GET /user, GET /rate_limit and GraphQL, never the token
+  # or an Authorization header.
+  load
+  TOKEN="$(fake_token)"
+  HELPER=TTHelper
+  load_helper() { :; }
+  helper_gh() { fake_diag_gh "$@"; }
+  local out
+  out="$(cmd_diagnose 2>&1)"
+  assert_eq "$(sed -n 1,2p "$T_TMP/helper-gh.log")" "$(printf 'api -i user\napi -i rate_limit')"
+  assert_contains "$(sed -n 3p "$T_TMP/helper-gh.log")" "api -i graphql -f query="
+  assert_contains "$out" "DIAG GET /user: exit=0 HTTP/2.0 200 OK"
+  assert_contains "$out" "x-oauth-scopes: public_repo"
+  assert_contains "$out" "x-ratelimit-limit: 60"
+  assert_contains "$out" "x-github-request-id: AB:CD"
+  assert_contains "$out" "login=TTHelper"
+  assert_contains "$out" "DIAG GET /rate_limit: exit=0 HTTP/2.0 200 OK"
+  assert_contains "$out" "graphql limit=5000 used=5000 remaining=0"
+  assert_contains "$out" "DIAG POST /graphql: exit=1 HTTP/2.0 403 Forbidden"
+  assert_contains "$out" "x-ratelimit-resource: graphql"
+  assert_contains "$out" "RATE_LIMITED: API rate limit already exceeded for user ID 345506119."
+  assert_not_contains "$out" "$TOKEN" "the token"
+  assert_not_contains "$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')" "authorization" "an Authorization header"
+  assert_not_contains "$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')" "set-cookie" "a header outside the list"
+}
+
 test_ruleset_summary_includes_the_update_rules_parameter() {
   load
   owner_gh() {
