@@ -5,11 +5,13 @@
 
 FORGE_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-# mk_hook_harness: $T_TMP/code/forge (H) as a git repo on dev, with a sibling forge-worktrees/
-# and a private HOME, so no real git config or Claude settings leak in.
+# mk_hook_harness [base]: <base>/code/forge (H; base defaults to $T_TMP) as a git repo on dev,
+# with a sibling forge-worktrees/ and a private HOME, so no real git config or Claude settings
+# leak in.
 mk_hook_harness() {
-  H="$T_TMP/code/forge"
-  mkdir -p "$H/.harness/lib" "$H/.claude/hooks" "$T_TMP/code/forge-worktrees" "$T_TMP/home"
+  local base="${1:-$T_TMP}"
+  H="$base/code/forge"
+  mkdir -p "$H/.harness/lib" "$H/.claude/hooks" "$base/code/forge-worktrees" "$T_TMP/home"
   cp "$FORGE_SRC/.harness/lib/hookrt.sh" "$H/.harness/lib/"
   cp "$FORGE_SRC/.harness/deploy-targets.json" "$H/.harness/"
   cp "$FORGE_SRC"/tests/fixtures/hooks/*.sh "$H/.claude/hooks/"

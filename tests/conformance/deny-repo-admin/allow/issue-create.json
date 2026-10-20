@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh issue create --repo Thebigtuna88/forge --title 'FRG-30: a ticket' --body-file @TMP@/body.md --label bug"
+  },
+  "cwd": "@TMP@"
+}

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "GH_PAGER=/usr/bin/true GH_FORCE_TTY=1 gh pr view 25"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "must start with the tool itself"
+}

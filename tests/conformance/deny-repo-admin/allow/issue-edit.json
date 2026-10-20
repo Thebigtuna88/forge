@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh issue edit 5 --title 'FRG-5: new title' --add-label x"
+  },
+  "cwd": "@TMP@"
+}

@@ -1,0 +1,7 @@
+# Refused: review.md has two facts blocks.
+# shellcheck disable=SC2016 # jq filters are single-quoted on purpose
+# shellcheck source=tests/stubs/scene.sh
+source "$TMP/stubs/scene.sh"
+scene_genuine
+cat "$SC_WORK/review.md" "$SC_WORK/review.md" >"$TMP/two.md"
+mv "$TMP/two.md" "$SC_WORK/review.md"

@@ -316,7 +316,7 @@ test_guarded_detection() {
   mk_hook_harness
   local c
   for c in 'git push origin x' 'git commit -F m' 'gh pr merge 3' 'gh api repos/a/b' \
-    'gh repo view' 'gh workflow run deploy.yml' 'vercel deploy' 'xcrun altool --upload-app' \
+    'gh repo edit' 'gh workflow run deploy.yml' 'vercel deploy' 'xcrun altool --upload-app' \
     'echo "git push"' 'g"i"t p\ush origin x' 'GIT PUSH' 'cd x && git -C /y push' \
     $'git status\ngit push origin x' 'bash -c "git commit -F m"' '`git push`' \
     'x=$(printf pu)sh; git $x' 'git p origin main' 'git --exec-path=/x status' \
@@ -350,11 +350,276 @@ test_guarded_detection() {
   done
 }
 
+# FRG-4: gh is judged by its real command. Only the read-only commands, with the two words after
+# gh written out, are plain; any other gh invocation, wherever gh may run, is guarded.
+test_gh_guarded_detection() {
+  mk_hook_harness
+  local c
+  for c in 'gh issue create --repo a/b --title x --body-file f' 'gh secret set X' 'gh auth status' \
+    'gh auth token' 'gh pr comment 5 --body-file f' 'gh' 'gh pr' 'gh pr view5' 'gh co 5' \
+    'echo repo delete a/b | xargs gh' 'xargs gh < args.txt' 'nice gh repo delete a/b' \
+    'ssh host gh pr merge 5' 'gh pr view 5 && gh pr merge 5' 'gh pr view 5 | gh pr merge 5' \
+    'frobnicate /tmp/bin/?? repo delete a/b' 'gh $X view 5' 'gh pr "$X" 5' 'GH repo delete a/b' \
+    '/opt/homebrew/bin/gh repo delete a/b' 'which gh | cat' 'gh search' 'gh pr -R a/b merge 5' \
+    'gh issue --repo a/b view 5' "sh -c 'gh pr merge 5'" 'gh run rerun 5' 'gh workflow run x' \
+    'gh repo view && gh repo delete a/b' 'gh label create x' 'gh release create v1'; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+}
+
+# Review round 2 (SEC-1): a program that runs gh can rewrite its words (xargs -I view … turns
+# `gh repo view` into `gh repo delete`), so a read counts as a read only when gh itself is the
+# command; gh run by anything else, with words after it, is guarded.
+test_gh_run_by_another_program_is_guarded() {
+  mk_hook_harness
+  local c
+  for c in 'printf delete | xargs -I view gh repo view a/b --yes' 'xargs -I view gh pr view 5' \
+    'printf merge | xargs -I view gh pr view 25 --repo a/b --squash' "find . -exec gh pr view {} ';'" \
+    'parallel gh pr view ::: 5' 'env gh pr view 5' 'ssh host gh issue list' 'nice gh pr view 5' \
+    'time gh pr view 5' 'command gh pr view 5' 'sudo gh pr view 5'; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+}
+
+# Review round 3 (SEC-1): the secret scan sees the command only as written, so a read's words
+# must not expand ($S, ${S}, `…`): the value GitHub receives would never be scanned. Any $ or `
+# in the command counts, even inside single quotes or in another command of it, since a word
+# after >(…) can still be gh's.
+test_gh_read_with_an_expansion_is_guarded() {
+  mk_hook_harness
+  local c
+  for c in 'read -r S < /a/secret.txt; gh search code "$S"' 'gh issue list --search "$S"' \
+    'gh search issues ${S} --repo a/b' "gh pr list --search '\$S'" 'gh pr view 5 --repo a/$R' \
+    'gh issue list --search `cat /a/secret.txt`' 'gh pr list > /a/out "$S"' \
+    'gh pr view 5 | head; gh status --org "$O"' 'gh browse "$S"' \
+    'gh pr list > >(cat; echo) "$S"' 'gh pr status && echo $?'; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+}
+
+# Review round 4 (C1, SEC-1): an unquoted glob becomes file names before gh runs, so a file named
+# like a token would be sent unscanned (gh search code ghp_*).
+test_gh_read_with_a_glob_is_guarded() {
+  mk_hook_harness
+  local c
+  for c in 'gh search code ghp_*' 'gh search code *' 'gh issue list --search ghp_?bc' \
+    'gh pr list --search [g]hp_x' 'gh pr view 5 | head; gh search code x*' 'gh search code "a"*' \
+    "gh search code 'a'b*"; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+}
+
+# Review round 7 (owner decision 2026-10-19): rounds 2-7 each found a new way for the shell to
+# change what a read in a pipeline sends or runs, so reads are guarded like every other gh
+# command: one plain command, judged by deny-repo-admin. A command that only names gh stays plain.
+test_gh_reads_are_guarded() {
+  mk_hook_harness
+  local c
+  for c in 'gh pr view 5 --repo a/b' 'gh pr view 5 --repo a/b | head' 'gh issue list --repo a/b --state open' \
+    'gh repo view a/b' 'gh pr diff 5 --repo a/b | wc -l' 'gh pr checks 5' 'gh pr status' \
+    'gh run list --limit 3' 'gh run view 1 --log | tail -5' 'gh run watch 1' 'gh workflow list' \
+    'gh workflow view ci.yml' 'gh release list' 'gh release view v1' 'gh label list' \
+    'gh search issues x --repo a/b' 'gh status' 'gh browse' 'gh search code ~+' \
+    'XDG_CONFIG_HOME=/tmp/alt gh browse' 'HOME=/tmp/alt gh pr view 25 --web'; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+  for c in 'which gh' 'brew upgrade gh' 'ls /opt/homebrew/bin/gh'; do
+    probe guarded "$c"
+    assert_eq "$OUT" PLAIN "plain: $c"
+  done
+}
+
+test_inherited_gh_variables_deny_guarded_gh_commands() {
+  mk_hook_harness
+  local v
+  for v in GH_TOKEN=x GH_REPO=a/b GH_HOST=example.com GH_CONFIG_DIR="$T_TMP/x" GITHUB_TOKEN=x \
+    GH_ENTERPRISE_TOKEN=x GITHUB_API_URL=https://example.com; do
+    run_hook sample-gate "$(bash_input 'gh issue create --title x --body-file f' "$H")" "$v"
+    assert_exit 2 "$RC" "guarded gh command with $v"
+    assert_contains "$ERR" "the environment sets ${v%%=*}" "reason with $v"
+  done
+}
+
+# Review round 5 (SEC-1): GH_PAGER (with GH_FORCE_TTY) makes even a read run a program of its
+# choosing, and GH_REPO or a token makes it read elsewhere, so while any GH_* or GITHUB_* variable
+# is set a read is guarded too (the plan: every checked gh command is refused).
+test_inherited_gh_variables_deny_gh_reads() {
+  mk_hook_harness
+  local v c
+  for v in GH_PAGER=x GH_FORCE_TTY=1 GH_REPO=c/d GITHUB_TOKEN=x; do
+    for c in 'gh pr view 5 --repo a/b' 'gh pr diff 25 --repo a/b | head'; do
+      run_hook sample-gate "$(bash_input "$c" "$H")" "$v"
+      assert_exit 2 "$RC" "a gh read with $v: $c"
+    done
+  done
+  run_hook sample-gate "$(bash_input 'gh pr diff 25 --repo a/b' "$H")" GH_PAGER=x GH_FORCE_TTY=1
+  assert_contains "$ERR" "the environment sets GH_"
+  run_hook sample-gate "$(bash_input 'gh pr diff 25 --repo a/b' "$H")"
+  assert_exit 0 "$RC" "a plain read with no gh variable set: $ERR"
+}
+
+# Review round 6 (SEC-2): gh also takes its browser from BROWSER and its pager from PAGER, so an
+# inherited one counts like a GH_* variable.
+test_inherited_browser_or_pager_deny_gh() {
+  mk_hook_harness
+  local v
+  for v in BROWSER=/usr/bin/true PAGER=/usr/bin/true; do
+    run_hook sample-gate "$(bash_input 'gh browse' "$H")" "$v"
+    assert_exit 2 "$RC" "a gh read with $v"
+    assert_contains "$ERR" "the environment sets ${v%%=*}" "reason with $v"
+    run_hook sample-gate "$(bash_input 'gh issue create --title x --body-file f' "$H")" "$v"
+    assert_exit 2 "$RC" "a guarded gh command with $v"
+  done
+}
+
+# Review round 6 (SEC-1): a variable set in the command itself steers gh as an inherited one
+# does (GH_PAGER=… gh pr view runs the pager), so a read that names a GH_*, GITHUB_*, BROWSER or
+# PAGER variable anywhere in the command is guarded, however the name is spelt or exported.
+test_gh_read_naming_a_gh_variable_is_guarded() {
+  mk_hook_harness
+  local c
+  for c in 'GH_PAGER=/usr/bin/true GH_FORCE_TTY=1 gh pr view 25' 'GH_REPO=o/r gh pr view 25 | head' \
+    'export GH_PAGER=x; gh pr view 25' 'BROWSER=/usr/bin/true gh browse' 'PAGER=x gh pr diff 25 | head' \
+    'G"H"_PAGER=x gh pr view 1' 'declare -x GITHUB_TOKEN=x; gh pr list'; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+  run_hook sample-gate "$(bash_input 'GH_PAGER=/usr/bin/true GH_FORCE_TTY=1 gh pr view 25' "$H")"
+  assert_exit 2 "$RC" "an inline GH_PAGER is refused"
+}
+
+# Review round 6 (C1): bash ends a comment at the line break, but the words were split with the
+# line breaks already turned into ;, so a comment hid every later line (gh pr view 5 # x, then
+# gh repo delete …). Text after # is now judged as words, which only ever adds to what is seen.
+test_gh_after_a_comment_is_guarded() {
+  mk_hook_harness
+  local c nl=$'\n'
+  for c in "gh pr view 5 # a comment${nl}gh repo delete a/b --yes" \
+    "gh pr view 5 #${nl}gh pr merge 5 --admin" "true # x${nl}gh api -X DELETE repos/a/b"; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+  run_hook sample-gate "$(bash_input 'gh pr view 5 # just a note' "$H")"
+  assert_exit 2 "$RC" "a read with a comment (a guarded command is one plain command)"
+}
+
+# Review round 9 (SEC-1): a program that builds its command line from its input can turn input
+# into a command's name (printf h | xargs -I X gX repo delete … runs gh), so xargs with a
+# replacement (or an option FORGE doesn't know), find with -exec/-execdir/-ok/-okdir, and parallel
+# make a command guarded. xargs that only appends words to a command written out stays plain.
+test_wrapper_that_substitutes_is_guarded() {
+  mk_hook_harness
+  local c
+  for c in 'printf h | xargs -I X gX repo delete a/b --yes' 'printf h | xargs -IX gX repo delete a/b' \
+    'printf h | xargs -J X gX repo delete a/b' 'printf h | xargs -0 -I X gX pr list' \
+    'printf %s%s g h | xargs -I X X pr merge 5' 'printf h | xargs --replace=X gX pr list' \
+    'printf h | xargs -iX gX pr list' 'printf h | xargs -0IX gX pr list' 'printf h | xargs -q gX' \
+    'parallel echo ::: a' "find /opt -name x -exec {} repo delete a/b ';'" 'find . -execdir true {} +' \
+    "find . -ok rm {} ';'"; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+  for c in 'find . -name x | xargs wc -l' 'ls | xargs -n 1 echo' 'ls | xargs -n1 -0 echo' \
+    'printf a | xargs -0 echo' 'find . -name x -print'; do
+    probe guarded "$c"
+    assert_eq "$OUT" PLAIN "plain: $c"
+  done
+}
+
+# Review round 8 (SEC-1): an alias defined in the command runs gh under another name (zsh, which
+# Claude Code's Bash uses here, expands aliases without being asked; bash after shopt -s
+# expand_aliases), so a command that defines one is guarded, and so is a NAME=gh word with words
+# after it (zsh's aliases[g]=gh, bash's BASH_ALIASES[g]=gh).
+test_alias_of_gh_is_guarded() {
+  mk_hook_harness
+  local c nl=$'\n'
+  for c in "shopt -s expand_aliases${nl}alias g=gh${nl}g repo delete a/b --yes" \
+    'alias g=gh; g repo delete a/b --yes' "alias g='gh repo delete a/b --yes'; g" 'alias g=g""h; g pr list' \
+    '\alias g=gh; g pr list' 'BASH_ALIASES[g]=gh; g repo delete a/b' 'aliases[g]=gh; g repo delete a/b' \
+    'alias g=git; g tag v1'; do
+    probe guarded "$c"
+    assert_eq "$OUT" GUARDED "guarded: $c"
+  done
+  for c in 'cat aliases.md' 'X=gh'; do
+    probe guarded "$c"
+    assert_eq "$OUT" PLAIN "plain: $c"
+  done
+}
+
+# Review round 7 (owner decision 2026-10-19): a read must be one plain command, so the shell can't
+# change what it sends ($, `, globs, ~) or how gh runs (a NAME=value in front, a pipe, a chain).
+test_gh_read_must_be_one_plain_command() {
+  mk_hook_harness
+  local c
+  for c in 'gh search code ~+' 'gh search code ~' 'XDG_CONFIG_HOME=/tmp/alt gh browse' \
+    'HOME=/tmp/alt gh pr view 25' 'gh pr view 5 --repo a/b | head' 'gh pr status && true' \
+    "gh pr view 5 --json title --jq '.title | ascii_downcase'"; do
+    run_hook sample-gate "$(bash_input "$c" "$H")"
+    assert_exit 2 "$RC" "refused: $c"
+  done
+  for c in 'gh pr view 5 --repo a/b' 'gh pr view 5 --json title --jq .title' 'gh pr checks 5'; do
+    run_hook sample-gate "$(bash_input "$c" "$H")"
+    assert_exit 0 "$RC" "a plain read: $c ($ERR)"
+  done
+}
+
+# ghpath <project dir or ""> : which gh hr_gh would run, as Claude Code (or conformance) would
+# start the hook, with CLAUDE_PROJECT_DIR set to <project dir> (unset when empty).
+ghpath() {
+  if [[ -n "$1" ]]; then
+    run_hook probe "$(bash_input true)" PROBE=ghpath CLAUDE_PROJECT_DIR="$1"
+  else
+    run_hook probe "$(bash_input true)" PROBE=ghpath
+  fi
+}
+
+test_fake_gh_only_inside_a_conformance_sandbox() {
+  mk_hook_harness
+  mkdir -p "$T_TMP/stubs"
+  ghpath "$H"
+  assert_not_contains "$OUT" "$T_TMP" "outside a sandbox, gh comes from PATH"
+  local sbx="$T_TMP/forge-conformance.Ab3dE9/s12"
+  mk_hook_harness "$sbx"
+  ghpath "$H"
+  assert_eq "$OUT" "gh=$sbx/stubs/gh" "inside a sandbox, started there: its fake gh"
+  local base
+  for base in "$T_TMP/forge-conformance.Ab3dE/s1" "$T_TMP/forge-conformance.Ab3dE9/x1" \
+    "$T_TMP/conformance.Ab3dE9/s1" "$T_TMP/forge-conformance.Ab3dE9/s1/extra"; do
+    mk_hook_harness "$base"
+    ghpath "$H"
+    assert_not_contains "$OUT" "/stubs/gh" "not a sandbox: $base"
+  done
+}
+
+# Review round 1 (SEC-4): a checkout moved into a sandbox-shaped path, with a link left at the
+# folder Claude Code was started in, must not switch to the fake gh. The project folder Claude Code
+# gives the hook has to be exactly the runtime's own folder.
+test_fake_gh_needs_the_project_folder_to_be_the_sandbox() {
+  local sbx="$T_TMP/forge-conformance.Ab3dE9/s12"
+  mk_hook_harness "$sbx"
+  mkdir -p "$T_TMP/code"
+  ln -s "$H" "$T_TMP/code/forge"
+  ghpath "$T_TMP/code/forge"
+  assert_not_contains "$OUT" "/stubs/gh" "started through a link to the sandbox"
+  ghpath ""
+  assert_not_contains "$OUT" "/stubs/gh" "no project folder"
+  ghpath "$T_TMP/elsewhere"
+  assert_not_contains "$OUT" "/stubs/gh" "another project folder"
+  ghpath "$H/"
+  assert_not_contains "$OUT" "/stubs/gh" "the same folder spelled differently"
+}
+
 test_plain_detection() {
   mk_hook_harness
   local c
+  # gh reads aren't here: every gh command is guarded (test_gh_reads_are_guarded, round 7).
   for c in 'ls -la' 'git status && git log --oneline -5' 'git log --grep fix | head' \
-    'gh pr view 3 | head' 'gh issue list' 'echo hi > f.txt' 'git -C /x diff | wc -l' \
+    'echo hi > f.txt' 'git -C /x diff | wc -l' \
     'cat README.md' 'for f in *.sh; do echo "$f"; done' '' \
     'ls *.sh | wc -l' 'rm -rf build/* && ls' 'for f in a b; do bash "$f"; done' 'ls * | head' \
     'ls work/*/manual | head' 'find work -type f | head' 'for d in a b; do git -C "$d" status; done' \
@@ -374,7 +639,7 @@ test_simple_guarded_commands_pass() {
     'gh api repos/Thebigtuna88/forge/pulls' 'vercel deploy' \
     'git --no-pager -c color.ui=never push origin feature/FRG-2-a' \
     'git -c core.quotepath=false -c advice.detachedHead=false push origin feature/FRG-2-a' \
-    'gh repo view Thebigtuna88/forge' 'gh actions' 'gh copilot explain x' 'gh repo list' 'git merge dev' \
+    'gh repo edit Thebigtuna88/forge' 'gh actions' 'gh copilot explain x' 'gh repo list' 'git merge dev' \
     'git pull --ff-only origin dev'; do
     expect_allow "$c"
   done

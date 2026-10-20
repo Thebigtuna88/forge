@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "shopt -s expand_aliases\nalias g=gh\ng repo delete Thebigtuna88/forge --yes"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "must be one plain command"
+}

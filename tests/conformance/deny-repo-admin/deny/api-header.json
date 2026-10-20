@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh api -H X-HTTP-Method-Override:PUT repos/Thebigtuna88/forge"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "gh api may only read"
+}

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh pr edit 5 --base main"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "'--base' is not allowed"
+}

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh issue close 5 --reason duplicate"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "--reason completed"
+}

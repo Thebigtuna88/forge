@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git config core.hooksPath /tmp/hooks"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "git config may set only user.name"
+}

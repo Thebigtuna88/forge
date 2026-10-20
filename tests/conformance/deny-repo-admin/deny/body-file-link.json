@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh issue create --title x --body-file @TMP@/link.md"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "must be a regular file"
+}

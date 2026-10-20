@@ -50,5 +50,9 @@ case "$probe_what" in
   deny)
     hr_deny "probe was told to deny"
     ;;
+  ghpath)
+    p="$(_hr_gh_path)"
+    printf 'gh=%s\n' "$p"
+    ;;
 esac
 hr_allow

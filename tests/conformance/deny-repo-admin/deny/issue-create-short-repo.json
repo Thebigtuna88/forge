@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh issue create -R Thebigtuna88/forge --title x --body-file @TMP@/body.md"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "'-R' is not allowed"
+}

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh issue close 5 --comment x"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "'--comment' is not allowed"
+}

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "gh --repo Thebigtuna88/forge pr merge 5"
+  },
+  "cwd": "@TMP@",
+  "forge_reason": "gh alias, extension or option"
+}

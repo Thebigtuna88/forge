@@ -11,6 +11,10 @@
     ".github/workflows/",
     ".harness/bin/conformance",
     "tests/conformance/",
-    ".harness/gitleaks.toml"
+    ".harness/gitleaks.toml",
+    "CLAUDE.md",
+    ".harness/bin/handoff",
+    "docs/specs/",
+    "tests/stubs/"
   ]
 }
