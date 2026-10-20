@@ -70,6 +70,16 @@ test_main_runs_when_given_as_a_string() {
   assert_contains "$out" "never inside Claude Code"
 }
 
+test_script_survives_the_launchers_round_trip() {
+  # The handoffs hash printf '%s\n' "$(the blob)": that must equal the file's own sha256, which
+  # holds when the file has no NUL byte and ends with exactly one newline.
+  local direct trip
+  direct="$(shasum -a 256 <"$GT" | cut -d' ' -f1)"
+  trip="$(printf '%s\n' "$(cat "$GT")" | shasum -a 256 | cut -d' ' -f1)"
+  assert_eq "$trip" "$direct" "sha256 after the launcher's round trip"
+  assert_eq "$(tr -d '\000' <"$GT" | wc -c | tr -d ' ')" "$(wc -c <"$GT" | tr -d ' ')" "a NUL byte"
+}
+
 test_sourcing_does_not_run_main() {
   local out rc=0
   out="$(CLAUDECODE=1 bash -c 'source "$1"; echo sourced-ok' _ "$GT" 2>&1)" || rc=$?
