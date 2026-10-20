@@ -11,6 +11,7 @@
 #   github-throwaway.sh invite            owner: invite the helper with write access
 #   github-throwaway.sh accept            helper: try to accept the invitation with its token
 #   github-throwaway.sh check-helper      helper login, token scopes = public_repo, permission = write
+#   github-throwaway.sh rate              the helper's API allowance: limit, used, reset (read-only)
 #   github-throwaway.sh reset             owner: main dev side back to the baseline (unprotected only)
 #   github-throwaway.sh protect           owner: apply the dev and main branch protection
 #   github-throwaway.sh ruleset           owner: add the main ruleset (only the owner may bypass)
@@ -36,6 +37,8 @@ readonly BASELINE_TAG=frg26-baseline
 # The default branch is side, not dev as in FORGE, so that deleting dev can be tested (GitHub
 # never deletes a default branch, protected or not).
 readonly DEFAULT_BRANCH=side
+# GraphQL points the helper must have left before a phase starts (each gh pr command uses some).
+readonly MIN_GRAPHQL=300
 SECRETS="${FRG26_SECRETS:-/Users/atl/code/forge/work/owner-secrets/frg26/helper.env}"
 
 HELPER=""
@@ -371,6 +374,31 @@ cmd_accept() {
   fi
   say "ACCEPT-WITH-PUBLIC_REPO: refused ($(evidence))"
   exit 3
+}
+
+# The helper's API allowance, read-only (GitHub doesn't count this request against it). Sets
+# RATE_LINE (for people) and RATE_LEFT (GraphQL points remaining); 1 if it can't be read.
+helper_rate() {
+  RATE_LINE="" RATE_LEFT=""
+  capture helper_gh api rate_limit || return 1
+  RATE_LINE="$(printf '%s' "$LAST_OUT" | jq -r '.resources | "graphql limit=\(.graphql.limit) used=\(.graphql.used) remaining=\(.graphql.remaining) resets=\(.graphql.reset | todate) / rest limit=\(.core.limit) used=\(.core.used) remaining=\(.core.remaining)"' 2>/dev/null)" || return 1
+  RATE_LEFT="$(printf '%s' "$LAST_OUT" | jq -r '.resources.graphql.remaining' 2>/dev/null)" || return 1
+  [[ "$RATE_LEFT" =~ ^[0-9]+$ ]]
+}
+
+# A phase that ran out of allowance halfway would stop on a rate limit, so it doesn't start.
+need_allowance() {
+  helper_rate || die "could not read the helper's API allowance: $(evidence)"
+  say "helper allowance: $RATE_LINE"
+  [[ "$RATE_LEFT" -ge $MIN_GRAPHQL ]] \
+    || die "the helper has only $RATE_LEFT GraphQL points left (a phase needs about $MIN_GRAPHQL): $RATE_LINE. Run this step again after that reset time."
+}
+
+cmd_rate() {
+  load_helper token
+  need_helper_identity
+  helper_rate || die "could not read the helper's API allowance: $(evidence)"
+  say "HELPER-RATE $RATE_LINE"
 }
 
 cmd_check_helper() {
@@ -1009,6 +1037,7 @@ cmd_tests() {
   need_helper_identity
   assert_throwaway
   verify_phase "$PHASE"
+  need_allowance
   RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   CLONE="$WORK/clone"
   helper_git clone -q --template="$WORK/template" "https://github.com/$REPO.git" "$CLONE" || die "clone failed"
@@ -1017,6 +1046,7 @@ cmd_tests() {
   t_M1; t_M2; t_M3; t_M4; t_M6
   # Last: in the open phase these rewrite or delete dev and main (a reset follows).
   t_B14a; t_B14b; t_M5a; t_M5b
+  if helper_rate; then say "helper allowance after the phase: $RATE_LINE"; fi
   if [[ $FAILS -eq 0 ]]; then
     say "PHASE $PHASE: ALL PASS"
     exit 0
@@ -1036,13 +1066,14 @@ main() {
     invite) cmd_invite ;;
     accept) cmd_accept ;;
     check-helper) cmd_check_helper ;;
+    rate) cmd_rate ;;
     reset) cmd_reset ;;
     protect) cmd_protect ;;
     ruleset) cmd_ruleset ;;
     tests) cmd_tests "$@" ;;
     actions-setting) cmd_actions_setting ;;
     status) cmd_status ;;
-    *) die "usage: github-throwaway.sh create|invite|accept|check-helper|reset|protect|ruleset|tests <phase>|actions-setting|status" ;;
+    *) die "usage: github-throwaway.sh create|invite|accept|check-helper|rate|reset|protect|ruleset|tests <phase>|actions-setting|status" ;;
   esac
 }
 

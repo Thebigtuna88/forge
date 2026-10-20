@@ -244,6 +244,43 @@ test_helper_never_uses_gh_pr_edit() {
   assert_eq "$(grep -c 'helper_gh pr edit' "$GT" || true)" "0" "helper_gh pr edit needs read:org"
 }
 
+rate_fixture() { # <graphql remaining>
+  printf '{"resources":{"core":{"limit":5000,"used":12,"remaining":4988,"reset":1792540800},"graphql":{"limit":5000,"used":%s,"remaining":%s,"reset":1792540800}}}' \
+    "$((5000 - $1))" "$1"
+}
+
+test_helper_rate_reads_the_allowance() {
+  # The owner's runs stopped on "GraphQL: API rate limit already exceeded" for the helper:
+  # the script must be able to show the helper's allowance (GitHub doesn't count that request).
+  load
+  helper_gh() { printf '%s\n' "$*" >>"$T_TMP/helper-gh.log"; rate_fixture 10; }
+  helper_rate || _t_fail "a valid allowance was not read"
+  assert_eq "$(cat "$T_TMP/helper-gh.log")" "api rate_limit"
+  assert_eq "$RATE_LEFT" 10
+  assert_contains "$RATE_LINE" "graphql limit=5000 used=4990 remaining=10 resets=2026-10-21T00:00:00Z"
+  assert_contains "$RATE_LINE" "rest limit=5000 used=12 remaining=4988"
+  helper_gh() { echo "HTTP 503" >&2; return 1; }
+  if helper_rate; then _t_fail "an unreadable allowance was accepted"; fi
+}
+
+test_a_phase_needs_enough_helper_allowance() {
+  # A phase that would run out halfway stops before its first test, naming the reset time.
+  load
+  local out rc
+  helper_gh() { rate_fixture 10; }
+  rc=0; out="$( need_allowance 2>&1 )" || rc=$?
+  assert_exit 2 "$rc" "10 points left"
+  assert_contains "$out" "only 10 GraphQL points left"
+  assert_contains "$out" "resets=2026-10-21T00:00:00Z"
+  helper_gh() { echo "HTTP 503" >&2; return 1; }
+  rc=0; out="$( need_allowance 2>&1 )" || rc=$?
+  assert_exit 2 "$rc" "unreadable allowance"
+  helper_gh() { rate_fixture 4000; }
+  rc=0; out="$( need_allowance 2>&1 )" || rc=$?
+  assert_exit 0 "$rc" "4000 points left"
+  assert_contains "$out" "helper allowance: graphql limit=5000 used=1000 remaining=4000"
+}
+
 test_ruleset_summary_includes_the_update_rules_parameter() {
   load
   owner_gh() {
