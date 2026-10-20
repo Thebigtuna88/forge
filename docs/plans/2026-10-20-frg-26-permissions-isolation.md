@@ -134,24 +134,31 @@ CODEOWNERS also joins the owner-only paths.
 **What it doesn't guarantee:** that codex ran or said CLEAN. GitHub checks your approval.
 Until FRG-27, the review summary comes from files I could edit (L12).
 
-**Tests** (helper's real token, throwaway repo; GitHub's exact error saved as proof):
+**Tests** (helper's real token, throwaway repo; GitHub's exact error saved as proof). A refusal
+counts only when GitHub gives a protection or permission reason: a PR still open, free of
+conflicts and reported BLOCKED; a push rejected with GH006/GH013; an admin call answered 403 or
+404. Anything else (network errors, validation errors, unreadable state) is *inconclusive*,
+which is a FAIL. The throwaway repo's default branch is `side`, not `dev`, so that deleting
+`dev` can be tested (GitHub never deletes a default branch).
 
 | # | Helper tries… | Must happen |
 |---|---|---|
 | B1 | Push straight to `dev` | Refused |
 | B2 | Push to `dev` editing `.github/CODEOWNERS` | Refused |
 | B3 | PR changing CODEOWNERS to itself, then merge | Refused |
-| B4 | Same with a new CODEOWNERS at the root or in `docs/` | Refused |
+| B4a | Same with CODEOWNERS moved to the root | Refused |
+| B4b | Same with CODEOWNERS moved to `docs/` | Refused |
 | B5 | Approve its own PR | Refused |
 | B6 | Merge with no approval | Refused |
 | B7 | You approve → it pushes one more commit → merges | Refused |
 | B8 | You approve → it pulls `dev` into the PR ("update branch") → merges | Refused |
 | B9 | You approve a PR aimed elsewhere → it re-aims it at `dev` → merges | Refused; if GitHub allows it, recorded as a gap and you decide |
 | B10 | Merge with the admin override | Refused |
-| B11 | Auto-merge on an unapproved PR | May queue, must not merge |
+| B11 | Auto-merge (switched on for the throwaway repo) on an unapproved PR | Armed, must not merge; control: after your approval it merges by itself |
 | B12 | Change or delete `dev`'s protection | Refused |
 | B13 | Create a ruleset or change settings | Refused |
-| B14 | Force-push or delete `dev` | Refused |
+| B14a | Force-push `dev` | Refused |
+| B14b | Delete `dev` | Refused |
 | B15 | (Read-only) "Allow GitHub Actions to approve pull requests" | Off |
 | B16 | Control: you approve, nothing changes, it merges | **Allowed** |
 
@@ -172,8 +179,9 @@ Until FRG-27, the review summary comes from files I could edit (L12).
 | M1 | Helper pushes to `main` | Refused |
 | M2 | Helper's `dev`→`main` PR, **approved by you**, merged by helper | Refused |
 | M3 | Helper merges with the admin override | Refused |
-| M4 | Helper changes or deletes the ruleset or protection | Refused |
-| M5 | Helper force-pushes or deletes `main` | Refused |
+| M4 | Helper changes (switch off, add itself as bypass) or deletes the ruleset, or changes or deletes `main`'s protection | Refused |
+| M5a | Helper force-pushes `main` | Refused |
+| M5b | Helper deletes `main` | Refused |
 | M6 | Control: **you** merge `dev`→`main` | **Allowed** |
 
 ## 7. Your home folder (D8)
@@ -217,10 +225,21 @@ Code. If I ran "push to `main`" myself, even expecting a refusal, I'd be getting
    the helper's token, which has far less power than your own login (already reachable to me
    today). Item 14 moves handoff secrets out of my reach in stage 3.
 4. Handoff: **fails-first** run of B1–B16 and M1–M6 with no protection.
-5. Handoff: **Step 0** look at the ruleset bypass choices. If "only you" isn't offered → stop,
-   alternatives (D6).
-6. Handoff: apply the `dev` rules and the `main` ruleset on the throwaway repo; run B1–B16 and
-   M1–M6. All must pass.
+5. Handoff: apply the `dev` and `main` protection; run the tests again. Everything must be
+   refused except the controls and M2, which shows the gap the ruleset must close.
+6. Handoff: **Step 0** look at the ruleset bypass choices. If "only you" isn't offered → stop,
+   alternatives (D6). Otherwise add the `main` ruleset and run the tests a third time; all must
+   pass, M2 now refused.
+
+   **A failed phase stops the handoff** (the stop rule, section 3): nothing more is changed, and
+   I come back to you.
+
+   **How the handoffs run the script:** each step reads it from the reviewed git commit into
+   memory, checks its sha256, and runs that copy in an empty environment. No file can be swapped
+   between the check and the run.
+   *Limitation:* until stage 3 we share one Mac user, so the programs the script calls (`gh` in
+   `/opt/homebrew`) and your gh and git settings stay changeable by me. This is the same-user
+   limit FRG-26 exists to remove (L12, L13).
 7. **Checkpoint with you:** results, any gap (for example B9), and whether to carry on.
    *Undo for stage 1: delete the throwaway repo; revoke the token.*
 
