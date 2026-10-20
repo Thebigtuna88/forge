@@ -616,11 +616,16 @@ helper_merge() { # <id> <pr> <merge flags…>
     [[ "$(expect "$id" "$PHASE")" == allowed ]] || break
     sleep 5
   done
-  case "$facts" in
-    "OPEN MERGEABLE BLOCKED "*) OBS=refused ;;
-    *) OBS=inconclusive ;;
-  esac
+  # Refused needs both: the merge command itself was rejected for a protection reason, and GitHub
+  # reports the PR open, free of conflicts and BLOCKED.
+  OBS=inconclusive
+  if [[ $LAST_RC -ne 0 && "$facts" == "OPEN MERGEABLE BLOCKED "* ]] && merge_rejected_by_policy; then OBS=refused; fi
   LAST_OUT="$LAST_OUT [$facts]"
+}
+
+merge_rejected_by_policy() { # LAST_OUT is a protection or ruleset refusal (not a rate limit)
+  printf '%s' "$LAST_OUT" | grep -Eiq 'rate limit|abuse detection' && return 1
+  printf '%s' "$LAST_OUT" | grep -Eiq 'base branch policy prohibits|approving review|code owner|rule violation|protected branch|not authorized to push|Must have admin rights'
 }
 
 owner_approve() { # <pr>
@@ -731,17 +736,43 @@ t_B8() {
   feature_pr B8
   local pr="$LAST_PR"
   owner_approve "$pr"
+  local old_head dev_sha
+  old_head="$(pr_view "$pr" headRefOid .headRefOid)" || old_head=""
   dev_ahead B8-advance
   [[ "$OBS" == allowed ]] || { setup_fail B8 "could not advance dev ($(evidence))"; close_if_open "$pr"; return; }
+  dev_sha="$(owner_gh api "repos/$REPO/branches/dev" --jq .commit.sha 2>/dev/null)" || dev_sha=""
+  if [[ ! "$old_head" =~ ^[0-9a-f]{40}$ || ! "$dev_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    setup_fail B8 "could not read the PR head or dev"
+    close_if_open "$pr"
+    return
+  fi
   if ! capture helper_gh api -X PUT "repos/$REPO/pulls/$pr/update-branch"; then
     setup_fail B8 "update-branch refused ($(evidence))"
     close_if_open "$pr"
     return
   fi
-  sleep 5
+  # update-branch is asynchronous: wait until the PR's head is a new commit with dev as a parent.
+  if ! branch_updated "$pr" "$old_head" "$dev_sha"; then
+    setup_fail B8 "the PR branch never picked up dev $dev_sha"
+    close_if_open "$pr"
+    return
+  fi
   helper_merge B8 "$pr" --squash
   record B8 "$OBS" "$(evidence)"
   close_if_open "$pr"
+}
+
+branch_updated() { # <pr> <old head> <dev sha> — 0 once the head moved and has dev as a parent
+  local _ head parents
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    head="$(pr_view "$1" headRefOid .headRefOid)" || head=""
+    if [[ "$head" =~ ^[0-9a-f]{40}$ && "$head" != "$2" ]]; then
+      parents="$(owner_gh api "repos/$REPO/commits/$head" --jq '[.parents[].sha] | join(" ")' 2>/dev/null)" || parents=""
+      [[ " $parents " == *" $3 "* ]] && return 0
+    fi
+    sleep 3
+  done
+  return 1
 }
 
 t_B9() {

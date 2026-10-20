@@ -240,10 +240,38 @@ test_helper_merge_needs_a_blocked_mergeable_pr_to_count_as_refused() {
   FAKE_FACTS="OPEN MERGEABLE CLEAN APPROVED"
   helper_merge B6 7 --squash
   assert_eq "$OBS" inconclusive "open but not blocked: something else went wrong"
+  # Blocked on GitHub, but the merge request itself failed for another reason: proves nothing.
+  pr_view() {
+    case "$2" in
+      mergeable) echo MERGEABLE ;;
+      *) echo "OPEN MERGEABLE BLOCKED REVIEW_REQUIRED" ;;
+    esac
+  }
+  helper_gh() { echo "HTTP 503 Service Unavailable" >&2; return 1; }
+  helper_merge B6 7 --squash
+  assert_eq "$OBS" inconclusive "a failed request with a blocked PR"
+  helper_gh() { echo "gh: API rate limit exceeded; base branch policy prohibits the merge" >&2; return 1; }
+  helper_merge B6 7 --squash
+  assert_eq "$OBS" inconclusive "a rate limit with a policy-looking message"
   pr_view() { return 1; }
   helper_merge B6 7 --squash
   assert_eq "$OBS" inconclusive "state unreadable (network)"
   assert_contains "$LAST_OUT" "never settled"
+}
+
+test_branch_updated_waits_for_a_head_with_dev_as_parent() {
+  load
+  sleep() { :; }
+  local old=1111111111111111111111111111111111111111 new=2222222222222222222222222222222222222222
+  local dev=3333333333333333333333333333333333333333
+  pr_view() { echo "$FAKE_HEAD"; }
+  owner_gh() { echo "$FAKE_PARENTS"; }
+  FAKE_HEAD=$old FAKE_PARENTS=""
+  if branch_updated 7 "$old" "$dev"; then _t_fail "accepted an unchanged head"; fi
+  FAKE_HEAD=$new FAKE_PARENTS="$old 4444444444444444444444444444444444444444"
+  if branch_updated 7 "$old" "$dev"; then _t_fail "accepted a new head without dev as a parent"; fi
+  FAKE_HEAD=$new FAKE_PARENTS="$old $dev"
+  branch_updated 7 "$old" "$dev" || _t_fail "a head merging dev was not accepted"
 }
 
 test_redact_hides_the_token() {
