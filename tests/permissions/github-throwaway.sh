@@ -547,7 +547,11 @@ setup_fail() { # <id> <what failed>
   say "RESULT $1 $PHASE FAIL expected=$(expect "$1" "$PHASE") observed=setup-failed :: $2"
 }
 
-stamp() { date -u +%H%M%S; }
+# Names of branches, files and commits carry this run's id (date, time and process id), so a later
+# run never reuses a branch or a file an earlier run left behind. Within a run each test's name
+# also carries its own id.
+RUN_ID=""
+stamp() { printf '%s' "$RUN_ID"; }
 
 fresh_from() { # <remote branch> <local branch>
   helper_git -C "$CLONE" fetch -q --prune origin || die "fetch failed"
@@ -996,6 +1000,7 @@ cmd_tests() {
   need_helper_identity
   assert_throwaway
   verify_phase "$PHASE"
+  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   CLONE="$WORK/clone"
   helper_git clone -q --template="$WORK/template" "https://github.com/$REPO.git" "$CLONE" || die "clone failed"
   say "== FRG-26 bypass tests, phase $PHASE, helper $HELPER, $(date -u +%Y-%m-%dT%H:%M:%SZ) =="

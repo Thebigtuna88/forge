@@ -126,6 +126,15 @@ test_every_test_in_the_run_has_an_expectation() {
   assert_eq "$ran" "B1 B10 B11 B12 B13 B14a B14b B16 B2 B3 B4a B4b B5 B6 B7 B8 B9 M1 M2 M3 M4 M5a M5b M6 "
 }
 
+test_names_carry_a_per_run_id() {
+  # Branch and file names must differ between runs, even at the same time on another day.
+  load
+  RUN_ID="20261020T101010Z-111"
+  assert_eq "$(stamp)" "20261020T101010Z-111"
+  # shellcheck disable=SC2016 # the literal source text is what's searched for
+  assert_contains "$(grep -F 'RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"' "$GT")" 'RUN_ID=' "cmd_tests sets a dated, per-process run id"
+}
+
 test_record_judges_results() {
   load
   PHASE=protected
