@@ -784,8 +784,9 @@ t_B9() {
   local pr="$LAST_PR"
   owner_approve "$pr"
   # REST, not `gh pr edit`: that also reads fields needing read:org, which the helper's token lacks.
+  # Re-aiming is setup, not the bypass under test (the merge is): any failure proves nothing.
   if ! capture helper_gh api -X PATCH "repos/$REPO/pulls/$pr" -f base=dev; then
-    record B9 "$(classify_api)" "re-aiming at dev: $(evidence)"
+    setup_fail B9 "re-aiming at dev failed: $(evidence)"
     close_if_open "$pr"
     return
   fi

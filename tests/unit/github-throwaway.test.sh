@@ -230,6 +230,13 @@ test_b9_reaims_through_the_rest_api() {
   out="$(t_B9; echo "fails=$FAILS")"
   assert_contains "$out" "RESULT B9 open FAIL"
   assert_contains "$out" "observed=setup-failed"
+  # A refused re-aim never tries the merge B9 is about: setup-failed, never a protected PASS.
+  PHASE=protected
+  FAKE_BASE=dev
+  helper_gh() { echo "gh: Resource not accessible by personal access token (HTTP 403)" >&2; return 1; }
+  out="$(t_B9; echo "fails=$FAILS")"
+  assert_contains "$out" "RESULT B9 protected FAIL"
+  assert_contains "$out" "observed=setup-failed"
 }
 
 test_helper_never_uses_gh_pr_edit() {
