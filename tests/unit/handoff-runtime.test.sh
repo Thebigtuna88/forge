@@ -655,6 +655,36 @@ test_live_refuses_a_missing_or_changed_filter() {
   [[ ! -f "$H/work/owner/$ID/RESULT.txt" ]] || _t_fail "RESULT.txt written despite the refusal"
 }
 
+# Bash 3.2 gives a local the export flag of a same-named exported variable. With the runtime's
+# local names exported by the owner's shell, the commands the runtime runs while it holds a
+# secret (mktemp, git, tr, rm) must still never receive one in their environment.
+test_secrets_never_reach_a_childs_environment() {
+  mk_harness
+  printf 'TOKEN=%s\n' "$SECRET2" >"$H/.env.helper"
+  mkdir "$T_TMP/spy"
+  local tool real
+  for tool in mktemp git tr rm; do
+    real="/usr/bin/$tool"
+    [[ -x "$real" ]] || real="/bin/$tool"
+    # shellcheck disable=SC2016 # the wrapper's own $@
+    printf '#!/bin/bash\n/usr/bin/env >>%s\nexec %s "$@"\n' "$T_TMP/envs" "$real" >"$T_TMP/spy/$tool"
+    chmod +x "$T_TMP/spy/$tool"
+  done
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" "ho_redact_file hide $H/.env.helper" \
+    "ho_info reveal /bin/cat $H/.env $H/.env.helper"
+  OUT="$(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_SANDBOX_NETWORK_DISABLED \
+    value=ambient s=ambient out=ambient line=ambient content=ambient sec=ambient new=ambient \
+    values=ambient PATH="$T_TMP/spy:$STUBS:$PATH" STUB_CLIPBOARD="$T_TMP/clipboard" \
+    python3 -I "$TESTLIB/ptyrun.py" --answer "$SECRET" -- bash "$SCRIPT")"
+  RC=$?
+  assert_exit 0 "$RC" "$OUT"
+  assert_contains "$(cat "$T_TMP/envs")" "value=ambient" "the spies ran with the owner's variables"
+  local s
+  for s in "$SECRET" "$SECRET2"; do
+    assert_not_contains "$(cat "$T_TMP/envs")" "$s" "a child's environment"
+  done
+}
+
 # The filter's pin is checked with the checked interpreter, so a shasum on PATH that answers the
 # pin for whatever it reads can't get a different filter accepted.
 test_live_filter_pin_ignores_a_lying_shasum() {

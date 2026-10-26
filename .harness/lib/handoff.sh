@@ -81,6 +81,8 @@ _HO_PY="" # the checked interpreter (ho_begin)
 _HO_REDACT_CODE="" # the checked text of the filter (ho_begin)
 _HO_SCRIPT_TEXT="" # the frozen script's text (ho_begin)
 _HO_OWN_TEXT="" # the handoff's own text (_ho_build_own_text), for _ho_in_own_text
+# None of these may reach a child's environment, even if the owner's environment exports a name.
+declare +x _HO_SECRETS _HO_LINES _HO_TMP _HO_REDACT_CODE _HO_SCRIPT_TEXT _HO_OWN_TEXT
 
 _ho_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 _ho_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -101,6 +103,7 @@ _ho_last_line() {
 # Returns 1 if masking failed (it then prints a placeholder); the caller fails the run.
 _ho_clean() {
   local s rc=0
+  declare +x s # see _ho_add_secret: s holds text not yet masked
   s="$(_ho_redact "$1")" || {
     s="(hidden: live redaction failed)"
     rc=1
@@ -122,8 +125,12 @@ _ho_clean() {
 
 # Remember a secret for redaction, keeping the list longest first (so a secret that contains
 # another is replaced whole).
+# Every local that holds a secret or unmasked text is marked `declare +x`: in bash 3.2 a local
+# keeps the export flag of an exported variable of the same name in the owner's environment,
+# which would hand the secret to every command run meanwhile (review round 8).
 _ho_add_secret() {
   local new=() placed=0 sec
+  declare +x new sec
   if [[ ${#_HO_SECRETS[@]} -gt 0 ]]; then
     for sec in "${_HO_SECRETS[@]}"; do
       if [[ $placed == 0 && ${#1} -ge ${#sec} ]]; then
@@ -177,6 +184,7 @@ _ho_redact_log() {
   [[ ${#_HO_SECRETS[@]} -gt 0 ]] || return 0
   [[ -e "$1" || -L "$1" ]] || return 0
   local content
+  declare +x content # see _ho_add_secret
   content="$(cat "$1")" || {
     rm -f "$1"
     return 1
@@ -514,6 +522,7 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
 
   set +x # tracing is refused at startup; this only guards against a later change
   local value="" tmp shown
+  declare +x value # see _ho_add_secret
   shown="$(_ho_masked "$var")" || _ho_fatal "live redaction failed for the prompt of step $name"
   # IFS= keeps leading and trailing spaces, so the charset check refuses them instead of trimming.
   IFS= read -r -s -p "Enter $shown (input hidden): " value </dev/tty || value=""
@@ -606,6 +615,7 @@ ho_redact_file() { # <name> <absolute file> — hide the values stored in a giti
   set +x # tracing is refused at startup; this only guards against a later change
   local out="" line="" value="" n=0
   local -a values=()
+  declare +x out line value values # see _ho_add_secret
   if [[ -z "$why" ]]; then
     out="$("$_HO_PY" -I -c "$_HO_READ_VALUES" "$file" 2>/dev/null)" || out="ERR could not read $file"
     line="${out%%$'\n'*}"
