@@ -425,8 +425,9 @@ Passes only if **all** of these hold:
    leading and trailing whitespace.
 8. The pasted file lives at `work/owner/<id>/PASTED-*.txt` and is its own regular file (not a
    symlink or hard link). Verify refuses to take `RESULT.txt` itself as input.
-9. `.harness/state/pastes.log` in the main checkout (a regular file, not a link) has a line
-   naming `work/owner/<id>/PASTED-*.txt` with the file's sha256 as it is now (FRG-5).
+9. `.harness/state/pastes.log` in the main checkout (a regular file with one link, in folders
+   that are not links) has a line naming `work/owner/<id>/PASTED-*.txt` with the file's sha256 as
+   it is now (FRG-5).
 
 **From FRG-5 on** (owner decision 2026-10-16-handoff-evidence-provenance), the paste file is
 written by the `capture-owner-paste` UserPromptSubmit hook, not by the agent, and verify's check 9
@@ -454,7 +455,8 @@ fails by design. The fix is a fresh handoff, not a patched verify.
 Runs when the agent finishes a turn. It reads the turn's last message from the input's
 `last_assistant_message` (FRG-5: Claude Code's docs say the transcript file may lag behind).
 - **Blocks** (exit 2, with "rewrite this as an owner handoff") when the message gives the owner
-  prose run-instructions, i.e. it contains a shell block or `$ ` lines aimed at the owner
+  prose run-instructions, i.e. it contains a block marked as shell, `$ ` lines, or a setup command
+  at the start of a line or list item, aimed at the owner
   (`brew install`, `gh auth`, `npm i -g`, `export *_KEY=`, `curl … | sh`, etc.) or phrases like
   "run this in your terminal", "go to … and click", **and** it doesn't also contain an
   `OWNER-RUN.sh` path and "HANDOFF-RESULT".
@@ -509,8 +511,9 @@ other exception is `capture-owner-paste` (UserPromptSubmit, FRG-5), registered w
 without `onFailure`, on purpose: there a blocking failure would stop the owner's message reaching
 the agent, and fail-closed is kept at verify instead (4.5). The runtime lets exactly these two
 hooks fail open, known by their file names: a crash or an input they can't judge allows and logs
-`FAILED-OPEN`, while an explicit deny still denies. Conformance checks that each is registered
-only for its own event.
+`FAILED-OPEN`, while an explicit deny still denies. They load the runtime with header lines that
+exit 0, not 2, if it can't load. Conformance checks that each is registered only for its own
+event, and that they, and only they, use those header lines.
 
 Registration is project-scoped, in the committed `.claude/settings.json` (never `~/.claude`):
 
@@ -595,7 +598,7 @@ It provides:
 | `secret-scan` | Pre / Bash | `git commit` if `gitleaks git --staged` finds a secret, or gitleaks is missing; also any `git commit` using `-m`, `-a`, `--no-verify` or without `-F <file>` | enforce |
 | `gate-merge-on-review` | Pre / Bash | `gh pr merge` in any form but `gh pr merge <n> --repo Thebigtuna88/forge --squash --match-head-commit <40-character sha>` (so no `--auto`, `--admin`, `--delete-branch`, `--rebase`, `--merge`, `--subject`, `--body`), and that form unless all hold (FRG-4): GitHub says the PR is open, its base is `dev`, its head is a ticket branch of this repository (not a fork) at exactly that sha, its merge base with `dev` is the one recomputed locally, and `dev` requires no merge queue (where `gh pr merge` could turn on auto-merge); every answer and file it reads is exactly one JSON value; `work/<KEY>-<n>-<slug>/review.md` (6.6) is bound to that repository, branch, PR, head **and** merge base, and the diff recomputed now has its md5 and byte count; every lens listed is CLEAN, run by `codex` or `subagent` (`code` only by `codex`; `author`, `inline`, `self` refused), and its reply file still has the recorded sha256 and is itself a CLEAN reply for this lens and this diff's md5 and bytes; `code` and `security` are present; every deferred finding cites an issue open now; and gitleaks finds no secret in what the squash commit would hold (the PR's title, body, commit messages and authors). The hook recomputes everything; it trusts none of review.md's text. Merges through the API are refused by `deny-repo-admin` | enforce |
 | `gate-self-modification` | Pre / Bash | `gh pr merge` when the PR touches any path in `self-modification-paths.json`, the live list or the one at the PR's merge base (or a project's own owner-only list in `projects.json`) → "owner must merge this". The changed paths come from the recomputed diff, not GitHub's file list (which stops at 100); names are compared case-folded and Unicode-normalised, a rename counts as both paths, and any symlink or submodule in the diff counts as owner-only. A missing or malformed list refuses | enforce |
-| `guard-live-checkout` (added) | Pre / Edit, Write, MultiEdit, NotebookEdit **and** Bash | Edits inside the main checkout (the one the hook sits in, so it follows FORGE if it moves) or a project's main checkout under `projects/<name>`, other than gitignored scratch areas (`work/`, `.harness/state/`); in `work/owner/<id>/` anything but a draft `OWNER-RUN.sh` (results, pastes, `VERIFIED.txt`, `META.json`, logs), and `.harness/state/pastes.log` (FRG-5, 4.5); any write to a `.claude/settings.local.json` or `~/.claude/settings*.json` (these could switch hooks off). Paths are judged as written and with links resolved, compared as macOS compares names. For Bash, a best-effort check for write operators (`>`, `tee`, `sed -i`, `cp`, `mv`, `rm`) aimed at those paths | enforce (Edit/Write); **observe** (Bash part) |
+| `guard-live-checkout` (added) | Pre / Edit, Write, MultiEdit, NotebookEdit **and** Bash | Edits inside the main checkout (the one the hook sits in, so it follows FORGE if it moves) or a project's main checkout under `projects/<name>`, other than gitignored scratch areas (`work/`, `.harness/state/`); in `work/owner/<id>/` anything but a draft `OWNER-RUN.sh` (results, pastes, `VERIFIED.txt`, `META.json`, logs), and `.harness/state/pastes.log` (FRG-5, 4.5); any write to a `.claude/settings.local.json` or `~/.claude/settings*.json` (these could switch hooks off). Paths are judged as written and with links resolved, compared as macOS compares names, and a file with more than one hard link is refused wherever it is; settings files in `CLAUDE_CONFIG_DIR` count as `~/.claude`'s. For Bash, a best-effort check for write operators (`>`, `tee`, `sed -i`, `cp`, `mv`, `rm`) aimed at those paths, following `cd` | enforce (Edit/Write); **observe** (Bash part) |
 | `deny-repo-admin` (added) | Pre / Bash | Every `gh` command not on its allowlist (FRG-4): the read-only commands; `gh auth status` (no `--show-token`); `gh api <path>` as a GET only (no `-X`/`--method` but GET, no `-f`/`-F`/`--field`/`--raw-field`/`--input`, no `-H`, `--hostname` or `graphql`); `gh issue create/edit/comment/close/reopen` and `gh pr create/edit/comment/close/ready` with listed options only (a PR only into `dev` from a ticket branch, its base never edited); and the one merge form. So `gh repo edit`/`delete`/`rename`/`archive`/…, rulesets, secrets, variables, `gh auth login/logout/refresh/token/setup-git`, `gh config`, `gh alias`, `gh extension`, `gh workflow run` and anything a newer `gh` adds are refused. Text reaches GitHub only through `--title` and `--body-file`, and the whole command, each of its words as the shell passes them, and every body file are scanned by gitleaks first. (`git config` writes to `alias.*` or `core.hooksPath` are refused by `deny-history-rewrite`, FRG-3) | enforce |
 | `deny-history-rewrite` (added) | Pre / Bash | `git rebase`, `git commit --amend`, `git filter-branch`, `git filter-repo`, `git replace`, `git update-ref -d`, `git push` of rewritten history (already caught by the force rules) | enforce |
 | `gate-deploy-target` | Pre / Bash | Any command that matches a **production** pattern in `deploy-targets.json` (`vercel --prod`, `vercel deploy --prod`, `vercel promote`, `vercel alias`, `vercel domains`, `vercel dns`, `vercel env`, `xcrun altool --upload*`, `fastlane` upload lanes, `eas submit`), compared ignoring case; **any deploy tool command matching neither list** (fail closed). Preview patterns are allowed. A deploy command must already be one plain command starting with the tool itself (5.2); `gh workflow run` is refused by `deny-repo-admin` | enforce |

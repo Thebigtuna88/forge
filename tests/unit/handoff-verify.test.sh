@@ -333,6 +333,24 @@ test_check9_record_names_another_file() {
   expect_fail_unrecorded "$PASTE"
 }
 
+# Capture refuses a linked .harness/state, so verify must too (review round 1).
+test_check9_record_in_a_linked_folder_is_refused() {
+  genuine_run
+  paste_result
+  record_paste "$PASTE"
+  mv "$H/.harness/state" "$T_TMP/state"
+  ln -s "$T_TMP/state" "$H/.harness/state"
+  expect_fail_unrecorded "$PASTE"
+}
+
+test_check9_hard_linked_record_is_refused() {
+  genuine_run
+  paste_result
+  record_paste "$PASTE"
+  ln "$H/.harness/state/pastes.log" "$T_TMP/alias.log"
+  expect_fail_unrecorded "$PASTE"
+}
+
 test_check9_linked_record_is_refused() {
   genuine_run
   paste_result

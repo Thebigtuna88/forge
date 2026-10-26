@@ -1272,6 +1272,21 @@ test_fails_when_a_case_expects_a_record_that_is_not_made() {
   expect_fail "capture-owner-paste allow/lost.json: expected the paste to be recorded in .harness/state/pastes.log"
 }
 
+# Round 1: the fail-open hooks load the runtime with a header that exits 0; no other hook may.
+test_fails_when_a_fail_open_hook_uses_the_blocking_header() {
+  mk_fail_open_harness
+  sed -i '' 's/{ echo "FORGE hook failed open: hookrt failed to load"; exit 0; }/{ echo "hookrt failed to load" >\&2; exit 2; }/' \
+    "$H/.claude/hooks/capture-owner-paste.sh"
+  expect_fail "capture-owner-paste.sh fails open, so it must load the runtime with the fail-open header lines"
+}
+
+test_fails_when_a_gate_uses_the_fail_open_header() {
+  mk_fail_open_harness
+  sed -i '' 's/{ echo "hookrt failed to load" >&2; exit 2; }/{ echo "FORGE hook failed open: hookrt failed to load"; exit 0; }/' \
+    "$H/.claude/hooks/sample-gate.sh"
+  expect_fail "sample-gate.sh line"
+}
+
 test_fails_when_a_case_records_a_paste_it_should_not() {
   mk_fail_open_harness
   prompt_case allow extra "$DEMO_BLOCK" false "$READY_SETUP"

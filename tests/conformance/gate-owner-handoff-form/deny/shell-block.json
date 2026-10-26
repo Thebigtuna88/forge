@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "Please run:\n```bash\ngit status\n```",
+  "cwd": "@ROOT@",
+  "forge_reason": "rewrite this as an owner handoff"
+}

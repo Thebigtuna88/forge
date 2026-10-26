@@ -399,11 +399,15 @@ cmd_verify() {
   # 9. the paste was saved by the capture-owner-paste hook from the owner's own message (FRG-5,
   # decision 2026-10-16-handoff-evidence-provenance): .harness/state/pastes.log in the main
   # checkout names this file with its sha256 as it is now.
-  local plog rel
-  plog="$(dirname "$(dirname "$root")")/.harness/state/pastes.log"
+  # The record, and the folders .harness and .harness/state holding it, may not be links (capture
+  # refuses them too), and the record may have no second hard link.
+  local main plog rel
+  main="$(dirname "$(dirname "$root")")"
+  plog="$main/.harness/state/pastes.log"
   rel="work/owner/$id/$(basename "$pasted")"
-  if [[ -L "$plog" || ! -f "$plog" ]]; then
-    fail "9: no paste record ($plog is missing or a link): the paste must be saved by the capture-owner-paste hook, from the owner's own message"
+  if [[ -L "$main/.harness" || -L "$main/.harness/state" || -L "$plog" || ! -f "$plog" ]] \
+    || [[ "$(stat -f '%l' "$plog")" != 1 ]]; then
+    fail "9: no usable paste record ($plog is missing, a link, in a linked folder or hard-linked): the paste must be saved by the capture-owner-paste hook, from the owner's own message"
   elif ! awk -v f="$rel" -v s="$(sha256 "$pasted")" '$3 == f && $4 == s { found = 1 } END { exit !found }' "$plog"; then
     fail "9: $rel with its current sha256 is not in $plog: the paste must be saved by the capture-owner-paste hook, from the owner's own message, and not changed since"
   fi

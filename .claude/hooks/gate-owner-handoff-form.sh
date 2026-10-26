@@ -4,13 +4,14 @@
 # OWNER-RUN.sh path and "HANDOFF-RESULT"), it sends the agent back with "rewrite this as an owner
 # handoff". It reads the turn's last message from the input's last_assistant_message. It never
 # blocks twice in a row (stop_hook_active) and fails open: Claude Code ignores onFailure on Stop
-# hooks, and a Stop hook that blocked on its own errors would block every turn (hookrt). A text
-# heuristic, so it starts in observe mode (L6); the owner promotes it by a PR to mode.json.
+# hooks, and a Stop hook that blocked on its own errors would block every turn (hookrt; it even
+# exits 0 if the runtime can't load). A text heuristic, so it starts in observe mode (L6); the
+# owner promotes it by a PR to mode.json.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 unset HOOKRT_LOADED
 # shellcheck source=.harness/lib/hookrt.sh
-source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&2; exit 2; }
-[ "${HOOKRT_LOADED:-}" = 1 ] || { echo "hookrt not loaded" >&2; exit 2; }
+source "$here/../../.harness/lib/hookrt.sh" || { echo "FORGE hook failed open: hookrt failed to load"; exit 0; }
+[ "${HOOKRT_LOADED:-}" = 1 ] || { echo "FORGE hook failed open: hookrt not loaded"; exit 0; }
 
 hr_init gate-owner-handoff-form
 rc=0

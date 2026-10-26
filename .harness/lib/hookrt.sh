@@ -106,9 +106,12 @@ export PATH
 # GH_* and GITHUB_* variables (GH_REPO, GH_HOST, GH_TOKEN, GITHUB_TOKEN, GH_CONFIG_DIR, …) would
 # make gh act on another repository, host or login, so they are kept in _HR_GH_ENV the same way;
 # so are BROWSER and PAGER, the programs gh runs to open a link or page its output (round 6).
-unset _HR_GIT_ENV _HR_GH_ENV
+# CLAUDE_CONFIG_DIR, where Claude Code may keep its user settings, is kept only as a value in
+# _HR_CLAUDE_CONFIG_DIR, so guard-live-checkout protects the settings files there too (FRG-5).
+unset _HR_GIT_ENV _HR_GH_ENV _HR_CLAUDE_CONFIG_DIR
 _HR_GIT_ENV=""
 _HR_GH_ENV=""
+_HR_CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-}"
 for _hr_v in $(compgen -e); do
   case "$_hr_v" in
     HOME | USER | LOGNAME | TMPDIR | CLAUDE_PROJECT_DIR | PATH | LC_ALL | EMAIL | XDG_CONFIG_HOME) ;;
@@ -1119,27 +1122,29 @@ hr_plain_numbers() { # <file.json>: 0 if every number in it is written as plain 
 
 # --- FRG-5: main-checkout guard, deploy and spend gates, handoff form, paste capture -------------
 
-# guard-live-checkout (spec 5.3). Arguments: file|bash, the main checkout, HOME, cwd, then the
-# file path (file tools) or the command (Bash). Prints the first reason and exits 1 if it would
-# write somewhere guarded, exits 0 if not. A path is judged both as written (with .. folded) and
-# with every link resolved, and names are compared as macOS compares them (Unicode-normalised,
-# case-folded, invisible format characters dropped), so a case change or a link can't move a
-# path out of the guard. Guarded:
+# guard-live-checkout (spec 5.3). Arguments: file|bash, the main checkout, HOME,
+# CLAUDE_CONFIG_DIR (or ""), cwd, then the file path (file tools) or the command (Bash). Prints
+# the first reason and exits 1 if it would write somewhere guarded, exits 0 if not. A path is
+# judged both as written (with .. folded) and with every link resolved, and names are compared as
+# macOS compares them (Unicode-normalised, case-folded, invisible format characters dropped), so a
+# case change or a link can't move a path out of the guard. A file with more than one hard link is
+# refused wherever it is, since it may be a guarded file under another name. Guarded:
 # - the main checkout, other than its scratch folders work/ and .harness/state/, and the same for
 #   each project main checkout under projects/<name>;
 # - in work/owner/<id>/ everything but a draft OWNER-RUN.sh (META.json state "draft"): results,
 #   pastes, VERIFIED.txt, META.json and logs are written only by the handoff tools, the owner's
 #   run and capture-owner-paste; and .harness/state/pastes.log, which only capture-owner-paste
 #   writes;
-# - Claude Code's settings.local.json in any .claude folder, and ~/.claude/settings*.json (they
-#   could switch the hooks off).
+# - Claude Code's settings.local.json in any .claude folder, and settings*.json in ~/.claude and
+#   in CLAUDE_CONFIG_DIR (they could switch the hooks off).
 # For Bash it is a best-effort look at output redirections (> >> >| &> <>) and at tee, cp (its
-# destination), mv, rm and sed -i; a word holding $ or a backtick is skipped (L6).
+# destination), mv, rm and sed -i, following cd and pushd from one command to the next; a word
+# holding $ or a backtick is skipped (L6).
 # shellcheck disable=SC2016 # Python source; its $HOME is text for Python, not the shell
 _HR_PY_LIVE='
 import json, os, re, shlex, stat, sys, unicodedata
 
-mode, root, home, cwd, arg = sys.argv[1:6]
+mode, root, home, config_dir, cwd, arg = sys.argv[1:7]
 
 
 def norm(p):
@@ -1148,7 +1153,7 @@ def norm(p):
 
 
 ROOT = os.path.realpath(root)
-HOME_CLAUDE = norm(os.path.realpath(os.path.join(home, ".claude"))) if home else None
+SETTINGS_DIRS = [norm(os.path.realpath(d)) for d in (os.path.join(home, ".claude") if home else "", config_dir) if d]
 
 
 def meta_state(base, hid):
@@ -1192,7 +1197,7 @@ def classify(path):
     head, _, base = n.rpartition("/")
     if base == "settings.local.json" and head.endswith("/.claude"):
         return "Claude Code\x27s local settings %s could switch the hooks off; only the owner changes them" % path
-    if HOME_CLAUDE and head == HOME_CLAUDE and re.fullmatch(r"settings.*\.json", base):
+    if head in SETTINGS_DIRS and re.fullmatch(r"settings.*\.json", base):
         return "Claude Code\x27s user settings %s could switch the hooks off; only the owner changes them, by a handoff" % path
     r = norm(ROOT)
     if n == r or n.startswith(r + "/"):
@@ -1200,48 +1205,66 @@ def classify(path):
     return None
 
 
-def check(target):
+def expand(target):
     if home and (target == "~" or target.startswith("~/")):
-        target = home + target[1:]
+        return home + target[1:]
     for var in ("$HOME", "${HOME}"):
-        if home and target.startswith(var + "/"):
-            target = home + target[len(var):]
+        if home and (target == var or target.startswith(var + "/")):
+            return home + target[len(var):]
+    return target
+
+
+def check(target, where):
+    target = expand(target)
     if not os.path.isabs(target):
-        if not cwd:
-            return "can\x27t tell which folder %s is in (no cwd)" % target
-        target = os.path.join(cwd, target)
-    return classify(os.path.normpath(target)) or classify(os.path.realpath(target))
+        if not where:
+            return "can\x27t tell which folder %s is in" % target
+        target = os.path.join(where, target)
+    reason = classify(os.path.normpath(target)) or classify(os.path.realpath(target))
+    if reason:
+        return reason
+    try:
+        st = os.stat(target)
+    except OSError:
+        return None
+    if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+        return ("%s has more than one hard link, so it may be a guarded file under another name; edit a "
+                "file with a single link" % target)
+    return None
 
 
 def bash_targets(command):
+    # [(target, the folder it is relative to, or None if unknown)], in the order the shell runs them.
     lex = shlex.shlex(command.replace("\\\n", "").replace("\n", " ; "), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = ""
     toks = list(lex)
-    commands, cur, targets, i = [], [], [], 0
+    commands, words, redirects, i = [], [], [], 0
     while i < len(toks):
         t = toks[i]
         nxt = toks[i + 1] if i + 1 < len(toks) else ""
         if t and set(t) <= set("();<>|&"):
             if ">" in t:
                 if not (t.endswith("&") and re.fullmatch(r"[0-9]+|-", nxt)):
-                    targets.append(nxt)
+                    redirects.append(nxt)
                 i += 2
                 continue
             if "<" in t:
                 i += 2
                 continue
-            commands.append(cur)
-            cur = []
+            commands.append((words, redirects))
+            words, redirects = [], []
             i += 1
             continue
         if t.isdigit() and nxt[:1] in ("<", ">"):
             i += 1
             continue
-        cur.append(t)
+        words.append(t)
         i += 1
-    commands.append(cur)
-    for words in commands:
+    commands.append((words, redirects))
+    out, where = [], cwd or None
+    for words, redirects in commands:
+        out.extend((t, where) for t in redirects)
         while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0])
                          or os.path.basename(words[0]) in ("sudo", "command", "nohup", "time", "env", "builtin", "exec", "nice")):
             words = words[1:]
@@ -1256,41 +1279,52 @@ def bash_targets(command):
                 opts.append(w)
             else:
                 args.append(w)
-        if name in ("rm", "mv", "tee"):
-            targets.extend(args)
+        if name in ("cd", "pushd", "popd"):
+            dest = expand(args[0]) if args else home
+            if name == "popd" or not dest or dest == "-" or "$" in dest or "`" in dest:
+                where = None
+            elif os.path.isabs(dest):
+                where = dest
+            elif where:
+                where = os.path.join(where, dest)
+        elif name in ("rm", "mv", "tee"):
+            out.extend((t, where) for t in args)
         elif name == "cp":
-            targets.extend(args[-1:])
+            out.extend((t, where) for t in args[-1:])
         elif name == "sed" and any(o.startswith("-i") or o.startswith("--in-place") for o in opts):
             files = [a for a in args if a]
             if not any(o in ("-e", "-f") or o.startswith("--expression") or o.startswith("--file") for o in opts):
                 files = files[1:]
-            targets.extend(files)
-    return [t for t in targets if t and "$" not in t.replace("$HOME/", "").replace("${HOME}/", "") and "`" not in t]
+            out.extend((t, where) for t in files)
+    return [(t, w) for t, w in out if t and "$" not in t.replace("$HOME/", "").replace("${HOME}/", "") and "`" not in t]
 
 
 if mode == "file":
     if not arg:
         print("no file path in the tool call, so the guard can\x27t tell what it would change")
         sys.exit(1)
-    reason = check(arg)
+    reason = check(arg, cwd)
 else:
     try:
         targets = bash_targets(arg)
     except ValueError:
         sys.exit(0)
-    reason = next((r for r in map(check, targets) if r), None)
+    reason = next((r for r in (check(t, w) for t, w in targets) if r), None)
 if reason:
     print(reason.replace("\n", " "))
     sys.exit(1)
 '
 hr_live_check() { # <file|bash> <path or command>: 0 if it writes nowhere guarded, 1 if it does
   # (the reason in $HR_TMP/live.out), anything else if it can't tell
-  python3 -I -c "$_HR_PY_LIVE" "$1" "$HR_ROOT" "${HOME:-}" "$HR_CWD" "$2" >"$HR_TMP/live.out" 2>&1
+  python3 -I -c "$_HR_PY_LIVE" "$1" "$HR_ROOT" "${HOME:-}" "$_HR_CLAUDE_CONFIG_DIR" "$HR_CWD" "$2" >"$HR_TMP/live.out" 2>&1
 }
 
-# gate-deploy-target (spec 5.3). Arguments: deploy-targets.json, then the command's words. Prints
-# "other" (not a deploy tool), "production", "preview" or "neither"; exits 3 if the file is
-# missing or malformed. An entry matches a command whose first word is the entry's first word and
+# gate-deploy-target (spec 5.3). Arguments: deploy-targets.json, the number of floor tools, the
+# runtime's floor tools (_HR_DEPLOY_FLOOR), then the command's words. Prints "other" (not a deploy
+# tool), "production", "preview" or "neither"; exits 3 if the file is missing or malformed. A
+# command is a deploy tool's when its first word is the tool's first word and the tool's other
+# words follow in order, anywhere (xcrun --sdk iphoneos altool), for the file's tools and the
+# floor alike. An entry matches a command whose first word is the entry's first word and
 # which holds each of its other words (a word also matches itself followed by =value).
 # Production is compared ignoring case, so --PROD counts; preview only exactly.
 _HR_PY_DEPLOY='
@@ -1311,7 +1345,18 @@ try:
 except Exception:
     print("missing, not JSON, or without lists of tools, production and preview")
     sys.exit(3)
-words = sys.argv[2:]
+floor_count = int(sys.argv[2])
+tools = tools + sys.argv[3:3 + floor_count]
+words = sys.argv[3 + floor_count:]
+low = [w.lower() for w in words]
+
+
+def is_tool(tool):
+    tw = tool.lower().split()
+    if not low or low[0] != tw[0]:
+        return False
+    rest = iter(low[1:])
+    return all(any(w == x for w in rest) for x in tw[1:])
 
 
 def match(entry, fold):
@@ -1321,7 +1366,7 @@ def match(entry, fold):
     return fold(words[0]) == fold(entry[0]) and all(has(e) for e in entry[1:])
 
 
-if not words or not any([w.lower() for w in words[:len(t.split())]] == t.lower().split() for t in tools):
+if not any(is_tool(t) for t in tools):
     print("other")
 elif any(match(e, str.lower) for e in production):
     print("production")
@@ -1331,19 +1376,22 @@ else:
     print("neither")
 '
 hr_deploy_class() { # judges HR_TOK (after hr_require_simple); the answer in $HR_TMP/deploy.out
-  python3 -I -c "$_HR_PY_DEPLOY" "$HR_ROOT/.harness/deploy-targets.json" ${HR_TOK[@]+"${HR_TOK[@]}"} >"$HR_TMP/deploy.out" 2>&1
+  python3 -I -c "$_HR_PY_DEPLOY" "$HR_ROOT/.harness/deploy-targets.json" "${#_HR_DEPLOY_FLOOR[@]}" \
+    "${_HR_DEPLOY_FLOOR[@]}" ${HR_TOK[@]+"${HR_TOK[@]}"} >"$HR_TMP/deploy.out" 2>&1
 }
 
 # gate-spend (spec 5.3, 8.5). Arguments: spend-limits.json, the command. Every provider's hosts
 # and key_vars, the payments section's, and always_blocked are refused anywhere in the command,
 # as written and with quotes and backslashes removed, ignoring case; a key variable only as a
-# whole name. Prints the hits and exits 1, exits 0 if none, 3 if the file is missing or malformed.
+# whole name. Prints the hits and exits 1, exits 0 if none, 3 if the file is missing or malformed
+# (a hosts or key_vars that is present must be a list of names; null is malformed, not empty).
 _HR_PY_SPEND='
 import json, re, sys
 
-def strings(v, key):
-    if v is None:
+def strings(section, key):
+    if key not in section:
         return []
+    v = section[key]
     if not isinstance(v, list) or not all(isinstance(s, str) and s for s in v):
         raise ValueError(key)
     return v
@@ -1351,12 +1399,12 @@ def strings(v, key):
 try:
     with open(sys.argv[1], encoding="utf-8") as fh:
         cfg = json.load(fh)
-    sections = list(cfg["providers"].values()) + [cfg.get("payments", {})]
+    sections = list(cfg["providers"].values()) + [cfg["payments"] if "payments" in cfg else {}]
     if not all(isinstance(s, dict) for s in sections):
         raise ValueError("providers")
-    hosts = [h for s in sections for h in strings(s.get("hosts"), "hosts")]
-    keys = [k for s in sections for k in strings(s.get("key_vars"), "key_vars")]
-    blocked = strings(cfg["always_blocked"], "always_blocked")
+    hosts = [h for s in sections for h in strings(s, "hosts")]
+    keys = [k for s in sections for k in strings(s, "key_vars")]
+    blocked = strings(cfg, "always_blocked")
     if not blocked:
         raise ValueError("always_blocked")
 except Exception:
@@ -1382,8 +1430,11 @@ hr_spend_hits() { # judges HR_CMD; the hits in $HR_TMP/spend.out
 # the Stop hook already sent the agent back (stop_hook_active), 3 when there is no
 # last_assistant_message to read (the hook then fails open), 1 with the reason when the turn's last
 # message gives the owner commands or terminal or web-UI instructions to carry out by hand and is
-# not an owner handoff (an OWNER-RUN.sh path and "HANDOFF-RESULT"), 0 otherwise. A text heuristic,
-# so it starts in observe mode (L6).
+# not an owner handoff (an OWNER-RUN.sh path and "HANDOFF-RESULT"), 0 otherwise: a fenced block
+# marked as shell (bash, sh, zsh, console, …), a line starting with "$ ", a known setup command
+# (brew install, gh auth, npm i -g, export …KEY=, curl … | sh, …) at the start of a line or list
+# item, or a phrase such as "run this in your terminal" or "go to … and click". A text heuristic,
+# so it starts in observe mode (L6); an unmarked block of other commands isn't caught.
 _HR_PY_FORM='
 import json, re, sys
 
@@ -1402,19 +1453,21 @@ if not isinstance(msg, str):
     sys.exit(3)
 if "OWNER-RUN.sh" in msg and "HANDOFF-RESULT" in msg:
     sys.exit(0)
-COMMAND = re.compile(r"^\s*(?:\$\s+)?(?:sudo\s|brew\s+(?:install|upgrade|reinstall|tap)\b|gh\s+auth\b"
+LIST = r"(?:(?:[-*+]|\u2022|[0-9]+[.)])\s+)?"
+COMMAND = re.compile(r"^\s*" + LIST + r"(?:\$\s+)?(?:sudo\s|brew\s+(?:install|upgrade|reinstall|tap)\b|gh\s+auth\b"
                      r"|npm\s+(?:i|install)\s+(?:-g|--global)\b|pnpm\s+(?:add|install)\s+(?:-g|--global)\b"
                      r"|export\s+\w*(?:KEY|TOKEN|SECRET|PASSWORD)\w*=|curl\s.*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b"
                      r"|xcode-select\s+--install|softwareupdate\b)", re.I)
 PHRASE = re.compile(r"run (?:this|these|the following)(?: commands?)? in (?:your|a|the) terminal"
                     r"|in your terminal,? (?:run|type|paste)|paste (?:this|these|the following) into (?:your|a|the) terminal"
                     r"|open (?:the )?terminal and|go to [^\n]{1,80}? and click|type (?:this|the following) (?:in|into)", re.I)
-fence = False
+SHELL_FENCE = re.compile(r"^\s*" + chr(96) * 3 + r"\s*(?:bash|sh|zsh|shell|console|terminal|shell-session)\s*$", re.I)
+DOLLAR = re.compile(r"^\s*" + LIST + r"\$\s+\S")
 for line in msg.split("\n"):
-    if line.lstrip().startswith(chr(96) * 3):
-        fence = not fence
-        continue
-    if COMMAND.match(line) or (fence and re.match(r"^\s*\$\s", line)):
+    if SHELL_FENCE.match(line):
+        print("a shell block for the owner to run: " + line.strip()[:80])
+        sys.exit(1)
+    if COMMAND.match(line) or DOLLAR.match(line):
         print("a command for the owner to type: " + line.strip()[:80])
         sys.exit(1)
 m = PHRASE.search(msg)
@@ -1435,7 +1488,10 @@ hr_handoff_form() { # judges the Stop input; the reason in $HR_TMP/form.out
 # replacing one, written in full before it gets its name) and appends
 # "<utc> <id> <file> <sha256>" to .harness/state/pastes.log in one write. It prints one line for
 # the agent (the hook's stdout is added to the conversation): what it saved, or why it saved
-# nothing. A message without a block gets no line. It never blocks the message.
+# nothing. A message without a block gets no line. It never blocks the message. A record file that
+# is a link or has a second hard link is refused. Exits 5 when the capture itself failed (the hook
+# then fails open, which logs FAILED-OPEN), 0 otherwise, including when the message had nothing
+# to save.
 _HR_PY_CAPTURE='
 import hashlib, json, os, re, secrets, stat, sys, time
 
@@ -1463,7 +1519,7 @@ def main(root):
         doc = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     except Exception:
         say("not saved: the hook input is not JSON")
-        return
+        return 5
     prompt = doc.get("prompt") if isinstance(doc, dict) else None
     if not isinstance(prompt, str):
         return
@@ -1529,20 +1585,22 @@ def main(root):
         state_dir = subdir(subdir(top, ".harness"), "state", create=True)
         fd = os.open("pastes.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=state_dir)
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode) or os.write(fd, line.encode("ascii")) != len(line):
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or os.write(fd, line.encode("ascii")) != len(line):
                 raise OSError("pastes.log")
         finally:
             os.close(fd)
     except OSError:
         say("saved %s, but could not record it in .harness/state/pastes.log, so handoff verify will refuse it" % rel)
-        return
+        return 5
     say("saved %s (sha256 %s). Verify it with: .harness/bin/handoff verify %s/%s" % (rel, line.split()[-1], root, rel))
 
 
 try:
-    main(sys.argv[1])
+    sys.exit(main(sys.argv[1]) or 0)
 except Exception as exc:
     say("not saved: the capture failed (%s)" % type(exc).__name__)
+    sys.exit(5)
 '
 hr_capture_paste() { # records the owner's pasted result block; prints its note for the agent
   printf '%s' "$HR_INPUT" | python3 -I -c "$_HR_PY_CAPTURE" "$HR_ROOT"

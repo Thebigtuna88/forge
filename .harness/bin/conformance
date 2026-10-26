@@ -348,8 +348,11 @@ fi
 # shellcheck disable=SC2016 # Python source; its $ signs are for Python, not the shell
 SOURCE_CHECK_PY='
 import re, shlex, sys
-# The standard header lines are the only place a hook may use $(dirname …), unset or source.
+# The standard header lines are the only place a hook may use $(dirname …), unset or source. A
+# fail-open hook loads the runtime with the header line in argv 4, which exits 0, not 2.
 headers = {sys.argv[2], sys.argv[3], "unset HOOKRT_LOADED"}
+if len(sys.argv) > 4 and sys.argv[4]:
+    headers = {sys.argv[2], sys.argv[4], "unset HOOKRT_LOADED"}
 raw_lines = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read().split("\n")
 assign = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\"\$\(.*\)\"$")
 LIST_OPS = ("&&", "||", "|", "|&", "!")
@@ -637,7 +640,21 @@ for b in dict.fromkeys(bad):
 HEADER_LINE='here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
 # shellcheck disable=SC2016 # the literal header text
 HEADER_SOURCE='source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&2; exit 2; }'
+# The two fail-open hooks (FRG-5) load the runtime this way instead, so even a runtime that can't
+# load never blocks the owner's message or every turn; they must, and no other hook may.
+# shellcheck disable=SC2016 # the literal header text
+HEADER_SOURCE_FAIL_OPEN='source "$here/../../.harness/lib/hookrt.sh" || { echo "FORGE hook failed open: hookrt failed to load"; exit 0; }'
+# shellcheck disable=SC2016 # the literal header text
+HEADER_LOADED_FAIL_OPEN='[ "${HOOKRT_LOADED:-}" = 1 ] || { echo "FORGE hook failed open: hookrt not loaded"; exit 0; }'
 for h in ${hooks[@]+"${hooks[@]}"}; do
+  alt=""
+  for fo in "${fail_open_hooks[@]}"; do
+    [[ "${fo% *}" == "$h" ]] && alt="$HEADER_SOURCE_FAIL_OPEN"
+  done
+  if [[ -n "$alt" ]] && ! { grep -qxF "$HEADER_SOURCE_FAIL_OPEN" "$HOOKS_DIR/$h.sh" &&
+    grep -qxF "$HEADER_LOADED_FAIL_OPEN" "$HOOKS_DIR/$h.sh"; }; then
+    fail "$h.sh fails open, so it must load the runtime with the fail-open header lines (exit 0 if hookrt can't load)"
+  fi
   while IFS= read -r n; do
     if [[ "$n" == E* ]]; then
       fail "$h.sh line ${n#E}: a hook may not run eval, source, ., command, builtin, exec, env, trap, set, shopt, enable, unset or a shell (they run or change code the source check can't see)"
@@ -664,7 +681,7 @@ for h in ${hooks[@]+"${hooks[@]}"}; do
       continue
     fi
     fail "$h.sh line $n: a command substitution may only be the whole value of a plain assignment (name=\"\$(…)\", one per line, not nested); backticks and <( >( aren't allowed, so a failure inside can't be hidden"
-  done < <(python3 -I -c "$SOURCE_CHECK_PY" "$HOOKS_DIR/$h.sh" "$HEADER_LINE" "$HEADER_SOURCE" || echo "G0")
+  done < <(python3 -I -c "$SOURCE_CHECK_PY" "$HOOKS_DIR/$h.sh" "$HEADER_LINE" "$HEADER_SOURCE" "$alt" || echo "G0")
 done
 
 if [[ -e "$CASES_DIR" || -L "$CASES_DIR" ]]; then

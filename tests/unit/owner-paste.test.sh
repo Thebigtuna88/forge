@@ -76,13 +76,21 @@ test_capture_saves_the_block_byte_for_byte_and_records_it() {
   assert_eq "$(find "$H/work/owner/$DEMO" -name '.PASTED-*' | wc -l | tr -d ' ')" 0 "temporary file removed"
 }
 
-test_capture_keeps_both_pastes_made_in_the_same_second() {
+# A paste never replaces another: with PASTED-<utc>.txt taken for this second and the next few,
+# the hook saves PASTED-<utc>-2.txt and leaves the existing files as they were (review round 1:
+# two runs could fall in different seconds, so this plants the collision).
+test_capture_never_replaces_an_existing_paste() {
   mk_hooks "$T_TMP/code/forge" capture-owner-paste
   ready_handoff "$DEMO"
+  local s
+  for s in 0 1 2 3 4 5 6 7 8 9; do
+    printf 'planted\n' >"$H/work/owner/$DEMO/PASTED-$(date -u -v+"$s"S +%Y%m%dT%H%M%SZ).txt"
+  done
   hook capture-owner-paste "$(prompt "$(block "$DEMO")")"
-  hook capture-owner-paste "$(prompt "$(block "$DEMO")")"
-  assert_eq "$(pastes | wc -l | tr -d ' ')" 2 "two pastes saved"
-  assert_eq "$(wc -l <"$H/.harness/state/pastes.log" | tr -d ' ')" 2 "two records"
+  assert_exit 0 "$RC" "$ERR"
+  assert_eq "$(pastes | grep -c -- '-2\.txt$')" 1 "saved under the -2 name"
+  assert_eq "$(cat "$H"/work/owner/"$DEMO"/PASTED-*Z.txt | sort -u)" planted "existing pastes untouched"
+  assert_contains "$OUT" "Z-2.txt"
 }
 
 test_capture_says_why_it_saved_nothing() {
@@ -111,6 +119,62 @@ test_capture_does_not_follow_a_linked_paste_record() {
   assert_exit 0 "$RC"
   assert_contains "$OUT" "could not record it in .harness/state/pastes.log, so handoff verify will refuse it"
   assert_eq "$(cat "$T_TMP/elsewhere.log")" old "the link's target is untouched"
+  assert_contains "$(cat "$H/.harness/observed.log")" "capture-owner-paste FAILED-OPEN"
+}
+
+# A record with a second hard link could be edited under its other name (review round 1).
+test_capture_refuses_a_hard_linked_paste_record() {
+  mk_hooks "$T_TMP/code/forge" capture-owner-paste
+  ready_handoff "$DEMO"
+  : >"$H/.harness/state/pastes.log"
+  ln "$H/.harness/state/pastes.log" "$T_TMP/alias.log"
+  hook capture-owner-paste "$(prompt "$(block "$DEMO")")"
+  assert_exit 0 "$RC"
+  assert_contains "$OUT" "could not record it"
+  assert_eq "$(cat "$T_TMP/alias.log")" "" "nothing recorded"
+  assert_contains "$(cat "$H/.harness/observed.log")" "capture-owner-paste FAILED-OPEN"
+}
+
+# Even a runtime that can't load must not block the owner's message or every turn (round 1).
+test_fail_open_hooks_allow_when_the_runtime_is_missing() {
+  mk_hooks "$T_TMP/code/forge" capture-owner-paste gate-owner-handoff-form
+  rm "$H/.harness/lib/hookrt.sh"
+  hook capture-owner-paste "$(prompt "$(block "$DEMO")")"
+  assert_exit 0 "$RC" "capture: $ERR"
+  assert_contains "$OUT" "FORGE hook failed open: hookrt failed to load"
+  hook gate-owner-handoff-form "$(jq -n '{hook_event_name: "Stop", stop_hook_active: false, last_assistant_message: "brew install jq", cwd: "/"}')"
+  assert_exit 0 "$RC" "handoff form: $ERR"
+}
+
+# Settings in CLAUDE_CONFIG_DIR can switch the hooks off as well as ~/.claude's (round 1).
+test_guard_protects_settings_in_claude_config_dir() {
+  mk_hooks "$T_TMP/code/forge" guard-live-checkout
+  mkdir -p "$T_TMP/cc"
+  OUT="$(cd "$H" && jq -n --arg f "$T_TMP/cc/settings.json" --arg d "$H" \
+    '{hook_event_name: "PreToolUse", tool_name: "Write", tool_input: {file_path: $f, content: "{}"}, cwd: $d}' |
+    env -i PATH="$PATH" HOME="$T_TMP/home" TMPDIR="$T_TMP" CLAUDE_PROJECT_DIR="$H" CLAUDE_CONFIG_DIR="$T_TMP/cc" \
+      "$H/.claude/hooks/guard-live-checkout.sh" 2>&1)"
+  RC=$?
+  assert_exit 2 "$RC" "$OUT"
+  assert_contains "$OUT" "could switch the hooks off"
+}
+
+# The deploy gate counts the runtime's own floor of tools even when the file leaves one out.
+test_deploy_gate_keeps_the_tool_floor() {
+  mk_hooks "$T_TMP/code/forge" gate-deploy-target
+  printf '%s\n' '{"tools": ["fastlane"], "production": [["vercel", "--prod"]], "preview": []}' >"$H/.harness/deploy-targets.json"
+  hook gate-deploy-target "$(jq -n --arg d "$H" '{hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {command: "vercel --prod"}, cwd: $d}')"
+  assert_exit 2 "$RC"
+  assert_contains "$ERR" "matches a production pattern"
+}
+
+# A hosts or key_vars list set to null is malformed, not empty (round 1).
+test_spend_gate_refuses_null_lists() {
+  mk_hooks "$T_TMP/code/forge" gate-spend
+  printf '%s\n' '{"providers": {"openai": {"hosts": null, "key_vars": null}}, "always_blocked": ["sk_live_"]}' >"$H/.harness/spend-limits.json"
+  hook gate-spend "$(jq -n --arg d "$H" '{hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {command: "curl https://api.openai.com/v1/models"}, cwd: $d}')"
+  assert_exit 2 "$RC"
+  assert_contains "$ERR" "can't read .harness/spend-limits.json"
 }
 
 # The owner's message must always reach the agent: a capture that fails says so and exits 0, and
