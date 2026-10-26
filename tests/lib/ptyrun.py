@@ -5,7 +5,8 @@ Usage: python3 -I ptyrun.py [--answer TEXT]... -- COMMAND [ARGS...]
 Each answer is typed when the next "[y/N] " or "(input hidden): " prompt appears.
 Prints everything the command wrote to the terminal and exits with the command's status.
 
-Cleanup: every descendant seen in a process snapshot (taken every POLL seconds) is killed when
+Cleanup: every descendant seen in a process snapshot (taken repeatedly while the command runs,
+before each wait of up to POLL seconds for output and while waiting for it to exit) is killed when
 the run ends, if it still looks like the same process (pid and start time). Known limits,
 accepted in docs/decisions/2026-10-25-pty-driver-cleanup-limit.md (stronger isolation: FRG-28):
 a process that detaches itself (forks, setsid, loses its parent) between two snapshots, whether

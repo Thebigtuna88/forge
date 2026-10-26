@@ -8,7 +8,8 @@
 ## The limit, narrowly
 
 `tests/lib/ptyrun.py` runs handoff tests in a pseudo-terminal. When a run ends, it kills every
-descendant it saw in its process snapshots, taken every 0.1 s. **With the unprivileged approaches
+descendant it saw in the process snapshots it takes repeatedly while the test runs. They come
+roughly a tenth of a second apart, not on a fixed schedule. **With the unprivileged approaches
 tested, it can't guarantee cleanup of a descendant that detaches itself between two snapshots:**
 it forks, calls `setsid()`, and its parent exits. That process is re-parented to launchd, nothing
 links it to the run any more, and it keeps running after the test, along with any children it
@@ -45,7 +46,7 @@ The scripts and their output are in `work/FRG-15-pty-containment/` on the owner'
 | 2 | kqueue `NOTE_FORK` alone | Fires on a fork but reports no child pid (data 0), so it can't follow the child (`kq_track.py`) |
 | 3 | The gap itself: fork, `setsid()`, start `sleep`, middle process exits | Outlived the driver in **20 of 20** runs, parent 1 (launchd) (`escaper.py`, `escape_demo.sh`) |
 | 4 | Tag the run with an environment variable and find processes carrying it | On this Mac, `ps -E` and `sysctl KERN_PROCARGS2` returned only the command line of a `/bin/sleep` started by the same user, not its environment (`env_visible.sh`). `ps -E` found the marker in 0 of the 20 escaped processes (`escape_demo.sh`) |
-| 5 | The cleanup steps below | Listed an escaped `sleep`, and separately an escaped `bash` together with its own `sleep` child. The identity-checked `kill` ended all of them (`cleanup_recipe.sh`, with and without `tree`) |
+| 5 | The cleanup steps below | Listed an escaped `sleep`, and separately an escaped `bash` together with its own `sleep` child. The kill steps (identity recheck before each signal, children first) ended all of them, including with survivors that ignore SIGTERM, where the `kill -9` step ran (`cleanup_recipe.sh`, with and without `tree` and `SURVIVOR_IGNORES_TERM=1`) |
 
 Also ruled out: killing "every new process whose parent is launchd". It would hit the owner's
 unrelated apps and services, and it would miss a survivor's children.
@@ -61,20 +62,24 @@ pidfd. This was already recorded on FRG-15 and in `ptyrun.py`.
 ## Cleanup: finding and stopping survivors
 
 Snapshot every process of your user, by pid and start time, before and after the run. Then list
-the ones that are new and still running:
+the ones that are new and still the same process:
 
 ```bash
 d="$(mktemp -d)"
 ps -U "$USER" -o pid=,lstart= | sort >"$d/before.txt"
 bash tests/run.sh
 ps -U "$USER" -o pid=,lstart= | sort >"$d/after.txt"
-for p in $(comm -13 "$d/before.txt" "$d/after.txt" | awk '{print $1}'); do
-  ps -o pid=,ppid=,lstart=,command= -p "$p"
+comm -13 "$d/before.txt" "$d/after.txt" | while read -r p start; do
+  [ "$(ps -o lstart= -p "$p" | xargs)" = "$(echo "$start" | xargs)" ] &&
+    ps -o pid=,ppid=,user=,lstart=,command= -p "$p"
 done
 ```
 
 Each line is a **candidate**: a process of yours that started during the run and is still
-running. It shows pid, parent pid, start time and command. A survivor's children are listed too:
+running. It shows pid, parent pid, user, start time and command. Before printing, the loop checks
+that the pid still has the start time recorded in the second snapshot, so a pid reused since then
+isn't shown. Start times have one-second precision, so a reuse within the same second could still
+slip through; the user column shows if it's someone else's. A survivor's children are listed too:
 their parent is the survivor, not launchd. Apps or tools you started meanwhile also appear, so
 decide from the command and start time.
 
