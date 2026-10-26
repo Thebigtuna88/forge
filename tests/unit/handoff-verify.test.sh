@@ -151,6 +151,25 @@ test_check4_redaction_filter_changed_after_run() {
   assert_contains "$VERIFY_OUT" "redaction filter"
 }
 
+# Verify hashes the filter with /usr/bin/shasum in an empty environment, so a shasum on PATH that
+# answers the pin can't hide a changed filter.
+test_check4_redaction_filter_check_ignores_a_lying_shasum() {
+  genuine_run
+  paste_result
+  local pin
+  pin="$(sed -n 's/^HO_REDACT_SHA256=//p' "$H/.harness/lib/handoff.sh")"
+  mkdir "$T_TMP/fake"
+  # shellcheck disable=SC2016 # the fake's own $# and $@
+  printf '#!/bin/bash\nif [ "$#" -ge 3 ]; then exec /usr/bin/shasum "$@"; fi\ncat >/dev/null\necho "%s  -"\n' "$pin" \
+    >"$T_TMP/fake/shasum"
+  chmod +x "$T_TMP/fake/shasum"
+  printf '# filter updated\n' >>"$H/.harness/lib/handoff_redact.py"
+  VERIFY_OUT="$(env PATH="$T_TMP/fake:$PATH" "$HANDOFF" verify "$PASTE" 2>&1)"
+  VERIFY_RC=$?
+  assert_exit 1 "$VERIFY_RC" "verify should fail check 4"
+  assert_contains "$VERIFY_OUT" "redaction filter"
+}
+
 test_check4_redaction_filter_missing_after_run() {
   genuine_run
   paste_result

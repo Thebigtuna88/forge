@@ -190,3 +190,10 @@ codex `code` + `security` rounds to CLEAN.
     leave a piece;
   - the filter's error messages name no path;
   - the mid-step log tests hold the step open until the log has been read.
+- **Review rounds 5 and 6** widened the "own text" to everything the runtime generates: its own
+  and the filter's source (fixed messages, the `[REDACTED]` marker), each step's log path, and
+  the interpreter's path. Also:
+  - the filter's messages are fixed text;
+  - the filter's pin is hashed by the checked interpreter at run time, and by `/usr/bin/shasum`
+    in an empty environment in verify;
+  - a masking failure while cleaning evidence fails the run.

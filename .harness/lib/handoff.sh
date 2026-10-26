@@ -40,7 +40,7 @@ HO_SCRIPT="$HO_DIR/$(basename "${BASH_SOURCE[1]}")"
 # filter once, checks that text and keeps it, and every step runs the kept text (python3 -c), so
 # replacing the file afterwards changes nothing.
 HO_REDACT="$(dirname "$HO_RUNTIME")/handoff_redact.py"
-HO_REDACT_SHA256=cd1e8dc8609d5cc95ffc3aa13de822f8e00eacd7fd6f00cbc5a1dcf20f5e70f1
+HO_REDACT_SHA256=3c5a4e4771bd0b9bd5c4fa83614be326e231ecbc0f537d0f335cc1ffbbd1f964
 # The Python that runs it: Apple's own interpreter, found by fixed path; it and every folder above
 # it must be root-owned and not writable by this user (_ho_root_only). Never the /usr/bin/python3
 # shim, whose choice follows DEVELOPER_DIR.
@@ -98,18 +98,26 @@ _ho_last_line() {
 }
 
 # One-line evidence: no newlines, no control characters, no block markers, at most 200 chars.
+# Returns 1 if masking failed (it then prints a placeholder); the caller fails the run.
 _ho_clean() {
-  local s
-  s="$(_ho_redact "$1")" || s="(hidden: live redaction failed)"
+  local s rc=0
+  s="$(_ho_redact "$1")" || {
+    s="(hidden: live redaction failed)"
+    rc=1
+  }
   s="$(printf '%s' "$s" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037')"
   while [[ "$s" == *-----* ]]; do s="${s//-----/}"; done
   s="$(printf '%s' "$s" | tr -s ' ')"
   s="${s# }"
   s="${s% }"
   # Again after normalising: removing ----- or control characters can join a split secret.
-  s="$(_ho_redact "$s")" || s="(hidden: live redaction failed)"
+  s="$(_ho_redact "$s")" || {
+    s="(hidden: live redaction failed)"
+    rc=1
+  }
   [[ -n "$s" ]] || s="(no output)"
   printf '%s' "${s:0:200}"
+  return "$rc"
 }
 
 # Remember a secret for redaction, keeping the list longest first (so a secret that contains
@@ -140,7 +148,8 @@ _ho_redact() {
 }
 
 # Succeeds if the value appears anywhere in this handoff's own text (_HO_OWN_TEXT, built by
-# ho_begin): the frozen script; its folder, the runtime's path, id, checksums and start time; the
+# ho_begin): the frozen script; its folder, the runtime's and the interpreter's paths (the
+# latter is the filter's argv[0]), id, checksums and start time; the
 # runtime's and the filter's own source (every fixed message, the [REDACTED] marker, and the
 # filter text on its command line); and each step's log path. Everything the runtime prints or
 # passes on a command line, apart from step output, comes from that text, so such a value could
@@ -158,7 +167,7 @@ _ho_build_own_text() {
       logs="$logs$HO_DIR/logs/${BASH_REMATCH[2]}.log"$'\n'
     fi
   done <<<"$_HO_SCRIPT_TEXT"
-  _HO_OWN_TEXT="$_HO_SCRIPT_TEXT"$'\n'"$HO_DIR"$'\n'"$HO_RUNTIME"$'\n'"$_HO_ID $_HO_SCRIPT_SHA $_HO_RUNTIME_SHA $_HO_AT"
+  _HO_OWN_TEXT="$_HO_SCRIPT_TEXT"$'\n'"$HO_DIR"$'\n'"$HO_RUNTIME"$'\n'"$_HO_PY"$'\n'"$_HO_ID $_HO_SCRIPT_SHA $_HO_RUNTIME_SHA $_HO_AT"
   _HO_OWN_TEXT="$_HO_OWN_TEXT"$'\n'"$logs$runtime"$'\n'"$_HO_REDACT_CODE"
 }
 
@@ -286,16 +295,21 @@ _ho_check_redaction() { # <name>
   fi
 }
 
+# A masking failure while cleaning evidence fails the run (fail closed): the evidence may be
+# missing, and the result must not read OK.
 _ho_record() { # <PASS|FAIL|INFO> <name> <evidence>
-  _HO_LINES+=("check $2: $1 $(_ho_clean "$3")")
+  local ev
+  ev="$(_ho_clean "$3")" || _HO_FAILED=1
+  _HO_LINES+=("check $2: $1 $ev")
 }
 
 _ho_fatal() { # script bug or misuse: recorded under the reserved name "_runtime"
-  local text
+  local text ev
   printf -v text '\n✘ %s\n' "$1"
   _ho_say "$text" >&2 || true
   _HO_FAILED=1
-  _HO_LINES+=("check _runtime: FAIL $(_ho_clean "$1")")
+  ev="$(_ho_clean "$1")" || true
+  _HO_LINES+=("check _runtime: FAIL $ev")
   ho_end
 }
 
@@ -357,10 +371,16 @@ ho_begin() { # <id>
   if [[ -z "$_HO_PY" ]]; then
     _ho_refuse "no root-owned python3 from Apple's Command Line Tools or Xcode was found; the redaction filter needs one (install them with: xcode-select --install)."
   fi
-  # The filter's text is read once and checked; steps run this text, not the file.
-  local code="" redact_sha
-  if [[ ! -L "$HO_REDACT" && -f "$HO_REDACT" ]]; then code="$(cat "$HO_REDACT")" || code=""; fi
-  redact_sha="$(printf '%s\n' "$code" | shasum -a 256 | awk '{print $1}')"
+  # The filter's text is read once (a shell builtin) and hashed by the checked interpreter, never
+  # by a tool found on PATH, which could approve a different filter. Steps run this text, not the
+  # file.
+  local code="" redact_sha=""
+  if [[ ! -L "$HO_REDACT" && -f "$HO_REDACT" ]]; then code="$(<"$HO_REDACT")" || code=""; fi
+  if [[ -n "$code" ]]; then
+    redact_sha="$(printf '%s\n' "$code" \
+      | "$_HO_PY" -I -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')" \
+      || redact_sha=""
+  fi
   if [[ -z "$code" || "$redact_sha" != "$HO_REDACT_SHA256" ]]; then
     _ho_refuse "the redaction filter $HO_REDACT is missing or is not the reviewed one (sha256 $redact_sha), so a step could show a secret."
   fi

@@ -655,6 +655,28 @@ test_live_refuses_a_missing_or_changed_filter() {
   [[ ! -f "$H/work/owner/$ID/RESULT.txt" ]] || _t_fail "RESULT.txt written despite the refusal"
 }
 
+# The filter's pin is checked with the checked interpreter, so a shasum on PATH that answers the
+# pin for whatever it reads can't get a different filter accepted.
+test_live_filter_pin_ignores_a_lying_shasum() {
+  mk_harness
+  local pin
+  pin="$(sed -n 's/^HO_REDACT_SHA256=//p' "$H/.harness/lib/handoff.sh")"
+  mkdir "$T_TMP/fake"
+  # shellcheck disable=SC2016 # the fake's own $# and $@
+  printf '#!/bin/bash\nif [ "$#" -ge 3 ]; then exec /usr/bin/shasum "$@"; fi\ncat >/dev/null\necho "%s  -"\n' "$pin" \
+    >"$T_TMP/fake/shasum"
+  chmod +x "$T_TMP/fake/shasum"
+  printf 'import os\nos.write(1, os.read(0, 65536))\n' >"$H/.harness/lib/handoff_redact.py"
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" "ho_info reveal /bin/cat $H/.env"
+  OUT="$(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_SANDBOX_NETWORK_DISABLED \
+    PATH="$T_TMP/fake:$STUBS:$PATH" STUB_CLIPBOARD="$T_TMP/clipboard" \
+    python3 -I "$TESTLIB/ptyrun.py" --answer "$SECRET" -- bash "$SCRIPT")"
+  RC=$?
+  assert_exit 3 "$RC"
+  assert_contains "$OUT" "redaction filter"
+  no_secret_piece "$OUT" "the screen"
+}
+
 # The filter dies mid-step: the step's output is not shown raw, and the run ends FAILED. Only this
 # fixture's filter is stopped, found by its log path (the [e] keeps the step's own command line,
 # which holds the pattern, from matching).
@@ -754,6 +776,9 @@ test_redact_file_refuses_values_in_the_handoffs_own_text() {
   expect_own_text_refused clipboard           # a fixed runtime message
   expect_own_text_refused bytearray           # the filter's text, on its command line
   expect_own_text_refused /logs/deploy-prod-1.log  # a step's log path, also on that line
+  local py
+  py="$(/usr/bin/readlink -f /Library/Developer/CommandLineTools/usr/bin/python3)"
+  expect_own_text_refused "${py##*/Developer/}"    # the interpreter's path: the filter's argv[0]
   assert_not_contains "$OUT" "deploy-prod-1: /usr/bin/true" "the later step never ran"
 }
 

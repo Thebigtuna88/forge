@@ -355,12 +355,15 @@ cmd_verify() {
   elif [[ "$l_runtime" != "runtime-sha256: $(sha256 "$runtime")" ]]; then
     fail "4: runtime-sha256 does not match $runtime (runtime changed: re-run as a fresh handoff)"
   else
-    # The runtime pins its redaction filter (FRG-14); the filter beside it must still match.
+    # The runtime pins its redaction filter (FRG-14); the filter beside it must still match. It is
+    # read with a shell builtin and hashed by /usr/bin/shasum in an empty environment, never a
+    # tool found on PATH.
     local pin filter now=""
     pin="$(sed -n -E 's/^HO_REDACT_SHA256=([0-9a-f]{64})$/\1/p' "$runtime")"
     filter="$(dirname "$runtime")/handoff_redact.py"
     if [[ ! -L "$filter" && -f "$filter" ]]; then
-      now="$(printf '%s\n' "$(cat "$filter")" | shasum -a 256 | awk '{print $1}')"
+      now="$(printf '%s\n' "$(<"$filter")" | /usr/bin/env -i /usr/bin/shasum -a 256)" || now=""
+      now="${now%% *}"
     fi
     if [[ -z "$pin" || "$now" != "$pin" ]]; then
       fail "4: the redaction filter $filter is missing or no longer the one the runtime pins (re-run as a fresh handoff)"

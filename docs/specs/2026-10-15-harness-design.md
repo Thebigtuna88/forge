@@ -278,7 +278,9 @@ ho_end
 - shell tracing is on (`bash -x`), which would print secrets;
 - a symlink sits at `logs/` or `RESULT.txt` (the last three added in the FRG-1 review);
 - the live redaction filter `.harness/lib/handoff_redact.py` is missing, a symlink, or not the
-  one whose sha256 `handoff.sh` pins (FRG-14). So `runtime-sha256` covers the filter too.
+  one whose sha256 `handoff.sh` pins (FRG-14). So `runtime-sha256` covers the filter too. The
+  filter is read with a shell builtin and hashed by the checked interpreter, never by a tool on
+  `PATH`.
   `ho_begin` reads the filter once and every step runs that checked text (`python3 -c`), so
   replacing the file mid-run changes nothing;
 - no `python3` from Apple's Command Line Tools or Xcode is found at its fixed path with it and
@@ -333,12 +335,13 @@ Details:
   block. Evidence is masked the same way, through the filter, never one secret at a time.
 - **No secret in the handoff's own text.** `ho_secret_to_file` refuses a typed value, and
   `ho_redact_file` refuses a file with a value, that appears anywhere in the handoff's own text:
-  the frozen script, its folder, the runtime's path, the id, the checksums or the start time;
-  the runtime's and the filter's own source (fixed messages, the `[REDACTED]` marker, the
+  the frozen script, its folder, the runtime's and the interpreter's paths, the id, the
+  checksums or the start time; the runtime's and the filter's own source (fixed messages, the `[REDACTED]` marker, the
   filter text on its command line); and each step's log path. Every line the runtime prints or
   passes on a command line, other than step output, is built from that text: banners,
   questions, prompts, paths, failure reasons, the block's header, and the filter's arguments. So a value found there could never be kept hidden, and a real secret
-  found there has leaked already. The filter's own error messages name no path. It holds back only the longest end of the output that could
+  found there has leaked already. The filter's own messages are fixed text, with no path,
+  system message or traceback. If masking fails while evidence is cleaned, the run ends FAILED. It holds back only the longest end of the output that could
   still become a secret (less than one secret's length), and shows that as soon as more output
   rules it out or the step ends. There is no timer, which could show part of a
   secret: a step that prints the start of a secret and then waits for input shows those
@@ -413,7 +416,7 @@ Passes only if **all** of these hold:
    before the script was frozen).
 4. `runtime-sha256` equals the sha256 of the current `.harness/lib/handoff.sh`, and the
    runtime named in `META.json` is that file. The redaction filter beside it still matches the
-   sha256 the runtime pins (FRG-14).
+   sha256 the runtime pins (FRG-14), as hashed by `/usr/bin/shasum` in an empty environment.
 5. Every step declared in the script appears exactly once, and no undeclared step appears.
 6. Every step is `PASS` or `INFO`, and `result: OK`.
 7. The paste matches `RESULT.txt` (written by the runtime on the owner's run), ignoring

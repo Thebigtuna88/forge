@@ -21,7 +21,8 @@ Bytes already known to be inside a secret stay masked when the piece is finally 
 flushed on a timer, since that could show part of a secret.
 
 It ignores SIGINT, so a Ctrl-C meant for the step can't stop it mid-output. If it is killed, the
-held piece is dropped, never shown. Exit status: 0 when everything was shown and logged; 2 for a
+held piece is dropped, never shown. Its own messages are fixed text, with no path, system message
+or traceback, since they reach the screen unmasked. Exit status: 0 when everything was shown and logged; 2 for a
 usage error or a log it can't create (it never writes through a symlink or onto an existing file);
 3 when writing failed partway (the screen went away, or the log could not be written).
 """
@@ -95,8 +96,8 @@ def main():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         secrets = read_secrets()
-    except OSError as e:
-        sys.stderr.write("handoff_redact: cannot read the secrets: %s\n" % e.strerror)
+    except OSError:
+        sys.stderr.write("handoff_redact: cannot read the secrets\n")
         return 2
     if secrets is None:
         sys.stderr.write("handoff_redact: the list of secrets was cut short; showing nothing\n")
@@ -105,9 +106,10 @@ def main():
     if sys.argv[1] != "-":
         try:
             log = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        except OSError as e:
-            # No path in the message: this goes to the screen unmasked (the runtime names the step).
-            sys.stderr.write("handoff_redact: cannot create the log: %s\n" % e.strerror)
+        except OSError:
+            # Fixed text only (no path, no system message): this reaches the screen unmasked, and
+            # the runtime names the step.
+            sys.stderr.write("handoff_redact: cannot create the log\n")
             return 2
     log_ok = True
 
@@ -153,4 +155,7 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except OSError:  # the screen went away mid-output
+        sys.exit(3)
+    except Exception:  # anything else: fixed text, never a traceback or a system message
+        sys.stderr.write("handoff_redact: failed\n")
         sys.exit(3)
