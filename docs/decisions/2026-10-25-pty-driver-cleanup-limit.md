@@ -11,9 +11,9 @@
 descendant it saw in the process snapshots it takes repeatedly while the test runs. They come
 roughly a tenth of a second apart, not on a fixed schedule. **With the unprivileged approaches
 tested, it can't guarantee cleanup of a descendant that detaches itself between two snapshots:**
-it forks, calls `setsid()`, and its parent exits. That process is re-parented to launchd, nothing
-links it to the run any more, and it keeps running after the test, along with any children it
-starts.
+it forks, calls `setsid()`, and its parent exits. That process is re-parented to launchd, and
+nothing links it to the run any more. If it's still running when the test ends, it isn't killed:
+it keeps running, along with any children it starts.
 
 What matters is that behaviour, not intent. A program trying to evade cleanup does it, and so
 does ordinary daemon start-up by a well-meaning tool.
