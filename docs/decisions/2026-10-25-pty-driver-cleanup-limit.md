@@ -70,16 +70,17 @@ ps -U "$USER" -o pid=,lstart= | sort >"$d/before.txt"
 bash tests/run.sh
 ps -U "$USER" -o pid=,lstart= | sort >"$d/after.txt"
 comm -13 "$d/before.txt" "$d/after.txt" | while read -r p start; do
-  [ "$(ps -o lstart= -p "$p" | xargs)" = "$(echo "$start" | xargs)" ] &&
-    ps -o pid=,ppid=,user=,lstart=,command= -p "$p"
+  row="$(ps -o pid=,ppid=,user=,lstart=,command= -p "$p")"
+  [ "$(echo "$row" | awk '{print $4, $5, $6, $7, $8}')" = \
+    "$(echo "$start" | awk '{print $1, $2, $3, $4, $5}')" ] && echo "$row"
 done
 ```
 
 Each line is a **candidate**: a process of yours that started during the run and is still
-running. It shows pid, parent pid, user, start time and command. Before printing, the loop checks
-that the pid still has the start time recorded in the second snapshot, so a pid reused since then
-isn't shown. Start times have one-second precision, so a reuse within the same second could still
-slip through; the user column shows if it's someone else's. A survivor's children are listed too:
+running. It shows pid, parent pid, user, start time and command. The loop reads each row once,
+and prints it only if that row's start time is the one recorded in the second snapshot, so a pid
+reused since then isn't shown. Start times have one-second precision, so a reuse within the same
+second could still slip through; the user column shows if it's someone else's. A survivor's children are listed too:
 their parent is the survivor, not launchd. Apps or tools you started meanwhile also appear, so
 decide from the command and start time.
 
