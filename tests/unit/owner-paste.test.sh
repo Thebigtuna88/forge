@@ -79,6 +79,17 @@ test_capture_saves_the_block_byte_for_byte_and_records_it() {
 # A paste never replaces another: with PASTED-<utc>.txt taken for this second and the next few,
 # the hook saves PASTED-<utc>-2.txt and leaves the existing files as they were (review round 1:
 # two runs could fall in different seconds, so this plants the collision).
+# A paste that ends right at the END line is saved without an added line break (review round 2).
+test_capture_adds_no_byte_to_a_paste_ending_at_the_end_line() {
+  mk_hooks "$T_TMP/code/forge" capture-owner-paste
+  ready_handoff "$DEMO"
+  local raw
+  raw="$(block "$DEMO")"
+  hook capture-owner-paste "$(prompt "$raw")"
+  assert_exit 0 "$RC" "$ERR"
+  assert_eq "$(cat "$(pastes)"; printf .)" "$raw." "saved bytes"
+}
+
 test_capture_never_replaces_an_existing_paste() {
   mk_hooks "$T_TMP/code/forge" capture-owner-paste
   ready_handoff "$DEMO"
@@ -166,6 +177,20 @@ test_deploy_gate_keeps_the_tool_floor() {
   hook gate-deploy-target "$(jq -n --arg d "$H" '{hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {command: "vercel --prod"}, cwd: $d}')"
   assert_exit 2 "$RC"
   assert_contains "$ERR" "matches a production pattern"
+}
+
+# Every provider but manual, and the payments section, must list hosts, key_vars and commands;
+# a missing one is malformed, not empty (round 2).
+test_spend_gate_refuses_missing_lists() {
+  mk_hooks "$T_TMP/code/forge" gate-spend
+  local cfg
+  for cfg in '{"providers": {"openai": {}}, "payments": {"hosts": [], "key_vars": [], "commands": []}, "always_blocked": ["sk_live_"]}' \
+    '{"providers": {"openai": {"hosts": ["api.openai.com"], "key_vars": [], "commands": []}}, "always_blocked": ["sk_live_"]}'; do
+    printf '%s\n' "$cfg" >"$H/.harness/spend-limits.json"
+    hook gate-spend "$(jq -n --arg d "$H" '{hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {command: "curl https://api.stripe.com/v1/charges"}, cwd: $d}')"
+    assert_exit 2 "$RC" "$cfg"
+    assert_contains "$ERR" "can't read .harness/spend-limits.json"
+  done
 }
 
 # A hosts or key_vars list set to null is malformed, not empty (round 1).

@@ -1136,10 +1136,11 @@ hr_plain_numbers() { # <file.json>: 0 if every number in it is written as plain 
 #   run and capture-owner-paste; and .harness/state/pastes.log, which only capture-owner-paste
 #   writes;
 # - Claude Code's settings.local.json in any .claude folder, and settings*.json in ~/.claude and
-#   in CLAUDE_CONFIG_DIR (they could switch the hooks off).
+#   in CLAUDE_CONFIG_DIR (they could switch the hooks off), and the real file behind any of those,
+#   or behind the project settings of this checkout, its projects or the worktrees, that is a link.
 # For Bash it is a best-effort look at output redirections (> >> >| &> <>) and at tee, cp (its
-# destination), mv, rm and sed -i, following cd and pushd from one command to the next; a word
-# holding $ or a backtick is skipped (L6).
+# destination), mv, rm and sed -i, following cd and pushd from one command to the next and
+# skipping here-document bodies; a word holding $ or a backtick is skipped (L6).
 # shellcheck disable=SC2016 # Python source; its $HOME is text for Python, not the shell
 _HR_PY_LIVE='
 import json, os, re, shlex, stat, sys, unicodedata
@@ -1154,6 +1155,24 @@ def norm(p):
 
 ROOT = os.path.realpath(root)
 SETTINGS_DIRS = [norm(os.path.realpath(d)) for d in (os.path.join(home, ".claude") if home else "", config_dir) if d]
+
+
+def settings_targets():
+    # The real files behind Claude Code settings files that are links: the user settings, and the
+    # project settings of this checkout, its projects and the worktrees beside it.
+    names = []
+    for d in (os.path.join(home, ".claude") if home else "", config_dir):
+        if d and os.path.isdir(d):
+            names += [os.path.join(d, n) for n in os.listdir(d) if re.fullmatch(r"settings.*\.json", n)]
+    folders = [ROOT]
+    for parent in (os.path.join(ROOT, "projects"), os.path.join(os.path.dirname(ROOT), "forge-worktrees")):
+        if os.path.isdir(parent):
+            folders += [os.path.join(parent, n) for n in os.listdir(parent)]
+    names += [os.path.join(f, ".claude", n) for f in folders for n in ("settings.json", "settings.local.json")]
+    return {norm(os.path.realpath(n)) for n in names if os.path.islink(n)}
+
+
+SETTINGS_TARGETS = settings_targets()
 
 
 def meta_state(base, hid):
@@ -1197,6 +1216,8 @@ def classify(path):
     head, _, base = n.rpartition("/")
     if base == "settings.local.json" and head.endswith("/.claude"):
         return "Claude Code\x27s local settings %s could switch the hooks off; only the owner changes them" % path
+    if n in SETTINGS_TARGETS:
+        return "%s is where a Claude Code settings file links to, so it could switch the hooks off; only the owner changes it" % path
     if head in SETTINGS_DIRS and re.fullmatch(r"settings.*\.json", base):
         return "Claude Code\x27s user settings %s could switch the hooks off; only the owner changes them, by a handoff" % path
     r = norm(ROOT)
@@ -1233,9 +1254,23 @@ def check(target, where):
     return None
 
 
+def without_heredocs(command):
+    # The command lines, minus the bodies of here-documents (text, not commands).
+    out, ends = [], []
+    for line in command.split("\n"):
+        if ends:
+            if (line.lstrip("\t") if ends[0][1] else line) == ends[0][0]:
+                ends.pop(0)
+            continue
+        out.append(line)
+        for dash, quote, word in re.findall(r"(?<![<])<<(-?)\s*([\"\x27]?)([A-Za-z0-9_]+)\2", line):
+            ends.append((word, dash == "-"))
+    return out
+
+
 def bash_targets(command):
     # [(target, the folder it is relative to, or None if unknown)], in the order the shell runs them.
-    lex = shlex.shlex(command.replace("\\\n", "").replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lex = shlex.shlex(" ; ".join(without_heredocs(command.replace("\\\n", ""))), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = ""
     toks = list(lex)
@@ -1380,43 +1415,56 @@ hr_deploy_class() { # judges HR_TOK (after hr_require_simple); the answer in $HR
     "${_HR_DEPLOY_FLOOR[@]}" ${HR_TOK[@]+"${HR_TOK[@]}"} >"$HR_TMP/deploy.out" 2>&1
 }
 
-# gate-spend (spec 5.3, 8.5). Arguments: spend-limits.json, the command. Every provider's hosts
-# and key_vars, the payments section's, and always_blocked are refused anywhere in the command,
-# as written and with quotes and backslashes removed, ignoring case; a key variable only as a
-# whole name. Prints the hits and exits 1, exits 0 if none, 3 if the file is missing or malformed
-# (a hosts or key_vars that is present must be a list of names; null is malformed, not empty).
+# gate-spend (spec 5.3, 8.5). Arguments: spend-limits.json, the command. Every provider's hosts,
+# key_vars and commands, the payments section's, and always_blocked are refused anywhere in the
+# command, as written and with quotes and backslashes removed, ignoring case; a key variable and a
+# command only as a whole name (a command also as the last part of a path: /usr/local/bin/openai).
+# A provider's command-line tools are listed because they make paid calls with a key they read
+# from the environment, naming no host. Prints the hits and exits 1, exits 0 if none, 3 if the
+# file is missing or malformed: every provider but the free manual one, and the payments section,
+# must hold all three lists (empty is fine, missing or null is not), and always_blocked must be a
+# non-empty list.
 _HR_PY_SPEND='
 import json, re, sys
 
+LISTS = ("hosts", "key_vars", "commands")
+
+
 def strings(section, key):
-    if key not in section:
-        return []
     v = section[key]
     if not isinstance(v, list) or not all(isinstance(s, str) and s for s in v):
         raise ValueError(key)
     return v
 
+
 try:
     with open(sys.argv[1], encoding="utf-8") as fh:
         cfg = json.load(fh)
-    sections = list(cfg["providers"].values()) + [cfg["payments"] if "payments" in cfg else {}]
+    providers = cfg["providers"]
+    if not isinstance(providers, dict) or not isinstance(cfg["payments"], dict):
+        raise ValueError("providers")
+    sections = [s for name, s in providers.items() if name != "manual"] + [cfg["payments"]]
     if not all(isinstance(s, dict) for s in sections):
         raise ValueError("providers")
-    hosts = [h for s in sections for h in strings(s, "hosts")]
-    keys = [k for s in sections for k in strings(s, "key_vars")]
+    found = {key: [x for s in sections for x in strings(s, key)] for key in LISTS}
     blocked = strings(cfg, "always_blocked")
     if not blocked:
         raise ValueError("always_blocked")
 except Exception:
-    print("missing, not JSON, or without providers and always_blocked lists")
+    print("missing, not JSON, or without the providers, payments and always_blocked lists")
     sys.exit(3)
 cmd = sys.argv[2]
 texts = [t.lower() for t in (cmd, re.sub(r"[\"\x27\\\\]", "", cmd))]
-hits = ["paid host " + h for h in hosts if any(h.lower() in t for t in texts)]
-for k in keys:
-    pattern = re.compile(r"(?<![a-z0-9_])" + re.escape(k.lower()) + r"(?![a-z0-9_])")
-    if any(pattern.search(t) for t in texts):
-        hits.append("key variable " + k)
+
+
+def named(word, edge):
+    pattern = re.compile(r"(?<![" + edge + r"])" + re.escape(word.lower()) + r"(?![" + edge + r"])")
+    return any(pattern.search(t) for t in texts)
+
+
+hits = ["paid host " + h for h in found["hosts"] if any(h.lower() in t for t in texts)]
+hits += ["key variable " + k for k in found["key_vars"] if named(k, "a-z0-9_")]
+hits += ["provider command " + c for c in found["commands"] if named(c, "a-z0-9_.-")]
 hits += ["blocked text " + b for b in blocked if any(b.lower() in t for t in texts)]
 if hits:
     print("; ".join(hits))
@@ -1429,8 +1477,10 @@ hr_spend_hits() { # judges HR_CMD; the hits in $HR_TMP/spend.out
 # gate-owner-handoff-form (spec 4.6), on the Stop input on stdin: exits 4 when Claude Code says
 # the Stop hook already sent the agent back (stop_hook_active), 3 when there is no
 # last_assistant_message to read (the hook then fails open), 1 with the reason when the turn's last
-# message gives the owner commands or terminal or web-UI instructions to carry out by hand and is
-# not an owner handoff (an OWNER-RUN.sh path and "HANDOFF-RESULT"), 0 otherwise: a fenced block
+# message gives the owner commands or terminal or web-UI instructions to carry out by hand, 0
+# otherwise. Only an owner handoff's own lines are exempt (a line that is just
+# `bash <…>/work/owner/<id>/OWNER-RUN.sh`, alone or in a fenced block of such lines, and "paste
+# back the HANDOFF-RESULT block"); the rest of the message is still checked for a fenced block
 # marked as shell (bash, sh, zsh, console, …), a line starting with "$ ", a known setup command
 # (brew install, gh auth, npm i -g, export …KEY=, curl … | sh, …) at the start of a line or list
 # item, or a phrase such as "run this in your terminal" or "go to … and click". A text heuristic,
@@ -1451,8 +1501,6 @@ msg = doc.get("last_assistant_message")
 if not isinstance(msg, str):
     print("no last_assistant_message in the Stop input")
     sys.exit(3)
-if "OWNER-RUN.sh" in msg and "HANDOFF-RESULT" in msg:
-    sys.exit(0)
 LIST = r"(?:(?:[-*+]|\u2022|[0-9]+[.)])\s+)?"
 COMMAND = re.compile(r"^\s*" + LIST + r"(?:\$\s+)?(?:sudo\s|brew\s+(?:install|upgrade|reinstall|tap)\b|gh\s+auth\b"
                      r"|npm\s+(?:i|install)\s+(?:-g|--global)\b|pnpm\s+(?:add|install)\s+(?:-g|--global)\b"
@@ -1463,8 +1511,20 @@ PHRASE = re.compile(r"run (?:this|these|the following)(?: commands?)? in (?:your
                     r"|open (?:the )?terminal and|go to [^\n]{1,80}? and click|type (?:this|the following) (?:in|into)", re.I)
 SHELL_FENCE = re.compile(r"^\s*" + chr(96) * 3 + r"\s*(?:bash|sh|zsh|shell|console|terminal|shell-session)\s*$", re.I)
 DOLLAR = re.compile(r"^\s*" + LIST + r"\$\s+\S")
-for line in msg.split("\n"):
+HANDOFF = re.compile(r"^\s*(?:\$\s+)?bash\s+\S*/work/owner/[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*/OWNER-RUN\.sh\s*$")
+FENCE = re.compile(r"^\s*" + chr(96) * 3)
+lines = msg.split("\n")
+for i, line in enumerate(lines):
+    if HANDOFF.match(line):
+        continue
     if SHELL_FENCE.match(line):
+        body = []
+        for later in lines[i + 1:]:
+            if FENCE.match(later):
+                break
+            body.append(later)
+        if any(b.strip() for b in body) and all(HANDOFF.match(b) or not b.strip() for b in body):
+            continue
         print("a shell block for the owner to run: " + line.strip()[:80])
         sys.exit(1)
     if COMMAND.match(line) or DOLLAR.match(line):
@@ -1484,7 +1544,8 @@ hr_handoff_form() { # judges the Stop input; the reason in $HR_TMP/form.out
 # holds exactly one HANDOFF-RESULT block (lines compared as handoff verify compares them: carriage
 # returns dropped, outer blanks trimmed), naming a <date>-<slug> handoff whose work/owner/<id>/
 # is a real folder (no links on the way) with a META.json in state "ready", it saves the block's
-# lines exactly as received, BEGIN to END, to work/owner/<id>/PASTED-<utc>.txt (a new file, never
+# lines exactly as received, BEGIN to END (and the line break after END if there was one), to
+# work/owner/<id>/PASTED-<utc>.txt (a new file, never
 # replacing one, written in full before it gets its name) and appends
 # "<utc> <id> <file> <sha256>" to .harness/state/pastes.log in one write. It prints one line for
 # the agent (the hook's stdout is added to the conversation): what it saved, or why it saved
@@ -1537,7 +1598,7 @@ def main(root):
     if not ID_RE.fullmatch(hid):
         say("not saved: the block names no handoff id of the form <date>-<slug>")
         return
-    data = ("\n".join(lines[b:e + 1]) + "\n").encode("utf-8")
+    data = ("\n".join(lines[b:e + 1]) + ("\n" if e + 1 < len(lines) else "")).encode("utf-8")
     try:
         top = os.open(root, DIR)
         folder = subdir(subdir(subdir(top, "work"), "owner"), hid)

@@ -1,5 +1,5 @@
 {
-  "description": "Paid providers and their limits (spec 8.5, owner-only). gate-spend (FRG-5) refuses any command naming a provider's hosts or key_vars, the payments section's, or an always_blocked text, whether or not the provider is enabled; only a project's budget wrapper (FRG-11) will be exempt. Only manual is enabled, with a cap of 0.",
+  "description": "Paid providers and their limits (spec 8.5, owner-only). gate-spend (FRG-5) refuses any command naming a provider's hosts, key_vars or commands (its command-line tools, which read a key from the environment), the payments section's, or an always_blocked text, whether or not the provider is enabled; only a project's budget wrapper (FRG-11) will be exempt. Every provider but manual, and payments, must list all three (empty is fine). Only manual is enabled, with a cap of 0.",
   "currency": "USD",
   "providers": {
     "manual": {
@@ -12,7 +12,8 @@
       "hosts": [],
       "key_vars": [
         "HIGGSFIELD_API_KEY"
-      ]
+      ],
+      "commands": []
     },
     "fal": {
       "enabled": false,
@@ -23,6 +24,9 @@
       ],
       "key_vars": [
         "FAL_KEY"
+      ],
+      "commands": [
+        "fal"
       ]
     },
     "replicate": {
@@ -33,6 +37,9 @@
       ],
       "key_vars": [
         "REPLICATE_API_TOKEN"
+      ],
+      "commands": [
+        "replicate"
       ]
     },
     "openai": {
@@ -43,6 +50,9 @@
       ],
       "key_vars": [
         "OPENAI_API_KEY"
+      ],
+      "commands": [
+        "openai"
       ]
     }
   },
@@ -53,6 +63,9 @@
     ],
     "key_vars": [
       "STRIPE_SECRET_KEY"
+    ],
+    "commands": [
+      "stripe"
     ]
   },
   "always_blocked": [
