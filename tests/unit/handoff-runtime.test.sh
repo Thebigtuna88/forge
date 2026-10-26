@@ -735,6 +735,37 @@ test_live_step_banner_is_masked() {
   no_secret_piece "$OUT" "the screen"
 }
 
+# Everything else the runtime shows that comes from the script is masked too: a confirm question
+# and a file path.
+test_live_runtime_text_from_the_script_is_masked() {
+  mk_harness
+  printf 'TOKEN=%s\n' "$SECRET" >"$H/.env.helper"
+  printf 'OTHER=%s\n' "$SECRET2" >"$H/.env.x$SECRET"
+  mk_script "$ID" "ho_redact_file hide $H/.env.helper" "ho_confirm go 'Deploy to x$SECRET now?'" \
+    "ho_redact_file again $H/.env.x$SECRET"
+  pty_run --answer y -- bash "$SCRIPT"
+  assert_exit 0 "$RC" "$OUT"
+  assert_contains "$OUT" "Deploy to x[REDACTED] now? [y/N]"
+  assert_contains "$OUT" "again: hide the values stored in $H/.env.x[REDACTED]"
+  no_secret_piece "$OUT" "the screen"
+  no_secret_piece "$(cat "$H/work/owner/$ID/RESULT.txt")" "RESULT.txt"
+}
+
+# A step name that equals a known secret is masked in the result block, which verify then refuses
+# (fail closed), rather than putting the secret in the block the owner pastes back.
+test_live_step_name_matching_a_secret_is_masked_in_the_block() {
+  mk_harness
+  printf 'TOKEN=deploy-prod-1\n' >"$H/.env.helper"
+  mk_script "$ID" "ho_redact_file hide $H/.env.helper" 'ho_check deploy-prod-1 /usr/bin/true'
+  pty_run -- bash "$SCRIPT"
+  local result
+  result="$(cat "$H/work/owner/$ID/RESULT.txt")"
+  assert_contains "$result" "check [REDACTED]: PASS"
+  assert_not_contains "$result" "deploy-prod-1"
+  assert_not_contains "$OUT" "deploy-prod-1"
+  assert_not_contains "$(cat "$T_TMP/clipboard")" "deploy-prod-1"
+}
+
 # Blank lines (spaces only) and Windows line endings in a stored secrets file are fine.
 test_redact_file_accepts_blank_lines_and_crlf() {
   mk_harness

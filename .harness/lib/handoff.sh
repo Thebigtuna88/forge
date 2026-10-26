@@ -158,13 +158,29 @@ _ho_secret_lines() {
   printf '#END\n'
 }
 
-# A step's banner (its name and command) goes through the filter too, without a log: a command's
-# literal arguments can match a known secret.
+# Text the runtime shows that holds words from the script (step names, commands, paths, questions,
+# reasons) goes through the filter too, without a log: any of them can match a known secret.
+# Before ho_begin there are no secrets yet. If the filter fails, a placeholder is shown instead.
+_ho_say() { # <text>
+  if [[ -z "$_HO_PY" ]]; then
+    printf '%s' "$1"
+    return 0
+  fi
+  printf '%s' "$1" | "$_HO_PY" -I -c "$_HO_REDACT_CODE" - 3< <(_ho_secret_lines) && return 0
+  printf '(hidden: live redaction failed)\n'
+  return 1
+}
+
+# The same masking for a value used inside other output (a prompt).
+_ho_masked() { # <text>
+  printf '%s' "$1" | "$_HO_PY" -I -c "$_HO_REDACT_CODE" - 3< <(_ho_secret_lines)
+}
+
 _ho_banner() { # <name> <command…>
-  local name="$1"
+  local name="$1" text
   shift
-  printf '\n▶ %s: %s\n' "$name" "$*" | "$_HO_PY" -I -c "$_HO_REDACT_CODE" - 3< <(_ho_secret_lines) \
-    || _ho_fatal "live redaction failed for the banner of step $name"
+  printf -v text '\n▶ %s: %s\n' "$name" "$*"
+  _ho_say "$text" || _ho_fatal "live redaction failed for the banner of step $name"
 }
 
 # Run a step's command under script(1) so it keeps the terminal; builtins work too. Its output
@@ -249,7 +265,9 @@ _ho_record() { # <PASS|FAIL|INFO> <name> <evidence>
 }
 
 _ho_fatal() { # script bug or misuse: recorded under the reserved name "_runtime"
-  printf '\n✘ %s\n' "$1" >&2
+  local text
+  printf -v text '\n✘ %s\n' "$1"
+  _ho_say "$text" >&2 || true
   _HO_FAILED=1
   _HO_LINES+=("check _runtime: FAIL $(_ho_clean "$1")")
   ho_end
@@ -393,8 +411,11 @@ ho_confirm() { # <name> "<question>" — PASS only if the owner types y
   local name="${1:-}" question="${2:-}" ans=""
   _ho_new_name "$name"
   [[ -n "$question" ]] || _ho_fatal "ho_confirm $name: no question given"
-  printf '\n? %s\n' "$name"
-  read -r -p "$question [y/N] " ans </dev/tty || ans=""
+  local text shown
+  printf -v text '\n? %s\n' "$name"
+  _ho_say "$text" || _ho_fatal "live redaction failed for the question of step $name"
+  shown="$(_ho_masked "$question")" || _ho_fatal "live redaction failed for the question of step $name"
+  read -r -p "$shown [y/N] " ans </dev/tty || ans=""
   case "$ans" in
     y | Y | yes | Yes | YES)
       _ho_record PASS "$name" "confirmed"
@@ -413,7 +434,9 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
   local name="${1:-}" var="${2:-}" file="${3:-}"
   _ho_new_name "$name"
   [[ "$var" =~ ^[A-Z_][A-Z0-9_]*$ ]] || _ho_fatal "ho_secret_to_file $name: invalid variable name '$var'"
-  printf '\n▶ %s: store %s in %s\n' "$name" "$var" "$file"
+  local text
+  printf -v text '\n▶ %s: store %s in %s\n' "$name" "$var" "$file"
+  _ho_say "$text" || _ho_fatal "live redaction failed for the banner of step $name"
 
   local why="" dir
   dir="$(dirname "$file")"
@@ -433,14 +456,16 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
   if [[ -n "$why" ]]; then
     _HO_FAILED=1
     _ho_record FAIL "$name" "refused: $why"
-    printf '  ✘ FAIL (%s)\n' "$why"
+    printf -v text '  ✘ FAIL (%s)\n' "$why"
+    _ho_say "$text" || true
     return 1
   fi
 
   set +x # tracing is refused at startup; this only guards against a later change
-  local value="" tmp
+  local value="" tmp shown
+  shown="$(_ho_masked "$var")" || _ho_fatal "live redaction failed for the prompt of step $name"
   # IFS= keeps leading and trailing spaces, so the charset check refuses them instead of trimming.
-  IFS= read -r -s -p "Enter $var (input hidden): " value </dev/tty || value=""
+  IFS= read -r -s -p "Enter $shown (input hidden): " value </dev/tty || value=""
   printf '\n' >/dev/tty
   if [[ -z "$value" ]]; then
     _HO_FAILED=1
@@ -477,14 +502,16 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
   if [[ -n "${tmp:-}" && -e "$tmp" ]] && ! rm -f "$tmp"; then
     _HO_FAILED=1
     _ho_record FAIL "$name" "could not remove the temp file $tmp; it may hold the secret"
-    printf '  ✘ FAIL (could not remove %s)\n' "$tmp"
+    printf -v text '  ✘ FAIL (could not remove %s)\n' "$tmp"
+    _ho_say "$text" || true
     return 1
   fi
   _HO_TMP=""
   if [[ $ok != 1 ]]; then
     _HO_FAILED=1
     _ho_record FAIL "$name" "could not write $file; nothing stored"
-    printf '  ✘ FAIL (could not write %s)\n' "$file"
+    printf -v text '  ✘ FAIL (could not write %s)\n' "$file"
+    _ho_say "$text" || true
     return 1
   fi
   _ho_record PASS "$name" "stored $var in $file (mode 600)"
@@ -494,9 +521,10 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
 
 ho_redact_file() { # <name> <absolute file> — hide the values stored in a gitignored secrets file
   _ho_need_begun
-  local name="${1:-}" file="${2:-}"
+  local name="${1:-}" file="${2:-}" text
   _ho_new_name "$name"
-  printf '\n▶ %s: hide the values stored in %s\n' "$name" "$file"
+  printf -v text '\n▶ %s: hide the values stored in %s\n' "$name" "$file"
+  _ho_say "$text" || _ho_fatal "live redaction failed for the banner of step $name"
 
   local why="" dir
   dir="$(dirname "$file")"
@@ -552,7 +580,8 @@ ho_redact_file() { # <name> <absolute file> — hide the values stored in a giti
     values=()
     _HO_FAILED=1
     _ho_record FAIL "$name" "refused: $why"
-    printf '  ✘ FAIL (%s)\n' "$why"
+    printf -v text '  ✘ FAIL (%s)\n' "$why"
+    _ho_say "$text" || true
     return 1
   fi
   for value in "${values[@]}"; do
@@ -580,9 +609,19 @@ ho_end() { # print the block, save RESULT.txt, copy to clipboard, exit
   [[ "$_HO_ENDED" == 0 ]] || return 0
   _HO_ENDED=1
   trap - EXIT
-  local result=OK block
+  local result=OK block checks=""
   if [[ "$_HO_FAILED" != 0 || ${#_HO_LINES[@]} -eq 0 ]]; then
     result=FAILED
+  fi
+  # The check lines hold step names and reasons from the script as well as evidence, so all of
+  # each line goes through the filter (FRG-14). A name that matches a known secret then shows as
+  # [REDACTED], and verify refuses the block, which is fail closed.
+  if [[ ${#_HO_LINES[@]} -gt 0 ]]; then
+    checks="$(printf '%s\n' "${_HO_LINES[@]}")"
+    if ! checks="$(_ho_masked "$checks")"; then
+      result=FAILED
+      checks="check _runtime: FAIL the result lines could not be masked, so they are not shown"
+    fi
   fi
   block="$(
     printf '%s\n' "----- HANDOFF-RESULT BEGIN -----" \
@@ -590,7 +629,7 @@ ho_end() { # print the block, save RESULT.txt, copy to clipboard, exit
       "script-sha256: $_HO_SCRIPT_SHA" \
       "runtime-sha256: $_HO_RUNTIME_SHA" \
       "at: $_HO_AT"
-    if [[ ${#_HO_LINES[@]} -gt 0 ]]; then printf '%s\n' "${_HO_LINES[@]}"; fi
+    if [[ -n "$checks" ]]; then printf '%s\n' "$checks"; fi
     printf '%s\n' "result: $result" "----- HANDOFF-RESULT END -----"
   )"
   rm -f "$HO_DIR/RESULT.txt"

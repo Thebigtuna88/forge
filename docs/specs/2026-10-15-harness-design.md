@@ -325,8 +325,12 @@ Details:
   contain or overlap one another are hidden whole, and a run of masked bytes shows as one
   `[REDACTED]`. The secrets reach it on a private pipe (descriptor 3): never on a command line,
   and not in the step's environment. The list ends with the line `#END`; a list without it may
-  have been cut short, so the filter shows nothing and the run ends FAILED. Each step's banner
-  (`▶ name: command`) goes through the filter too, without a log. It holds back only the longest end of the output that could
+  have been cut short, so the filter shows nothing and the run ends FAILED. Everything else the
+  runtime shows that holds words from the script goes through the filter too, without a log:
+  step banners (`▶ name: command`), confirm questions, prompts, file paths and failure reasons.
+  The block's check lines are masked as a whole before the block is saved, shown or copied, so
+  a step name that matches a known secret shows as `[REDACTED]`, and verify then refuses the
+  block. It holds back only the longest end of the output that could
   still become a secret (less than one secret's length), and shows that as soon as more output
   rules it out or the step ends. There is no timer, which could show part of a
   secret: a step that prints the start of a secret and then waits for input shows those
@@ -373,8 +377,9 @@ strings, optionally ending in `|| ho_abort`: no `$` or backticks (except inside 
 where they stay literal), no other operators, redirection, globs, assignments or function
 definitions. Forbidden names are checked after quote removal, and no `ho_check`/`ho_info` step
 may name a file that a `ho_secret_to_file` step writes or a `ho_redact_file` step names.
-`ho_redact_file` takes exactly one absolute path, which must already be inside a git repository,
-untracked and gitignored when the script is linted (the runtime checks again at run time).
+`ho_redact_file` takes exactly one absolute path (read with the grammar's own tokenizer, so a
+quoted path is judged whole), which must already be inside a git repository, untracked and
+gitignored when the script is linted (the runtime checks again at run time).
 
 In addition, lint rejects a script (and `handoff ready` refuses to freeze it) if it:
 - doesn't source the runtime by its exact absolute path, or doesn't call `ho_begin` first and

@@ -171,3 +171,11 @@ codex `code` + `security` rounds to CLEAN.
     which refuses the Xcode copy under the admin-writable `/Applications`;
   - lint checks that a `ho_redact_file` path is gitignored and untracked;
   - the reader skips blank lines made of spaces and ignores a trailing CR.
+- **Review round 3 additions:**
+  - everything else the runtime shows from the script goes through the filter: confirm
+    questions, prompts, paths and failure reasons;
+  - the block's check lines are masked as a whole before the block is saved, shown or copied, so
+    a step name equal to a known secret becomes `[REDACTED]`, and verify refuses the block (fail
+    closed);
+  - lint reads `ho_redact_file` paths with the grammar's tokenizer, so a quoted path with spaces
+    is judged whole.

@@ -177,23 +177,26 @@ lint_errors() { # prints one error per line; empty output = clean
   fi
 
   # ho_redact_file names a stored secrets file: it must be provably gitignored and untracked now
-  # (the runtime checks again when the owner runs it). Absolute paths only; the grammar reports
-  # the rest.
-  local rfile rdir
-  while IFS= read -r rfile; do
-    rfile="${rfile//\'/}"
-    rfile="${rfile//\"/}"
-    [[ "$rfile" == /* ]] || continue
-    rdir="$(dirname "$rfile")"
-    if ! git -C "$rdir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-      echo "ho_redact_file: $rfile is not inside a git repository, so it cannot be proven gitignored"
-    elif git -C "$rdir" ls-files --error-unmatch "$rfile" >/dev/null 2>&1; then
-      echo "ho_redact_file: $rfile is tracked by git"
-    elif ! git -C "$rdir" check-ignore -q "$rfile"; then
-      echo "ho_redact_file: $rfile is not gitignored"
+  # (the runtime checks again when the owner runs it). The grammar's own tokenizer gives each
+  # path after quote removal. Absolute paths only; the grammar reports the rest.
+  local rfiles rfile rdir
+  if command -v python3 >/dev/null 2>&1; then
+    if ! rfiles="$(python3 -I "$GRAMMAR" --redact-files "$file" 2>&1)"; then
+      echo "could not list the ho_redact_file paths: $rfiles"
+      rfiles=""
     fi
-  done < <(printf '%s\n' "$code" \
-    | sed -n -E 's/^[[:space:]]*ho_redact_file[[:space:]]+[^[:space:]]+[[:space:]]+([^[:space:]]+).*/\1/p')
+    while IFS= read -r rfile; do
+      [[ "$rfile" == /* ]] || continue
+      rdir="$(dirname "$rfile")"
+      if ! git -C "$rdir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "ho_redact_file: $rfile is not inside a git repository, so it cannot be proven gitignored"
+      elif git -C "$rdir" ls-files --error-unmatch "$rfile" >/dev/null 2>&1; then
+        echo "ho_redact_file: $rfile is tracked by git"
+      elif ! git -C "$rdir" check-ignore -q "$rfile"; then
+        echo "ho_redact_file: $rfile is not gitignored"
+      fi
+    done <<<"$rfiles"
+  fi
 
   # The allowlist grammar (spec 4.4): only helper steps of plain words and quoted strings.
   if ! command -v python3 >/dev/null 2>&1; then

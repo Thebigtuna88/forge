@@ -14,7 +14,7 @@ REDACT="$FORGE_SRC/.harness/lib/handoff_redact.py"
 # reading until none arrives for 0.3 s, and prints "after <i>: [<everything shown so far>]". Every
 # chunk in these tests shows something, so new output proves the filter has read and judged the
 # whole chunk, not just that time passed. Then it closes the filter's input and prints
-# "final: [<all shown>]" and "rc: <status>". With FEED_SIGINT=1 it sends SIGINT after the first
+# "final: [<all shown>]", "rc: <status>" and "stderr: [<its messages>]". With FEED_SIGINT=1 it sends SIGINT after the first
 # chunk's output appears (the filter ignores SIGINT before it reads any output). The secret list
 # ends with "#END", as the runtime sends it, unless FEED_NO_END=1.
 feed() {
@@ -26,7 +26,7 @@ os.write(w, secrets.encode() + b"\n" + (b"" if os.environ.get("FEED_NO_END") == 
 os.close(w)
 os.dup2(r, 3)
 p = subprocess.Popen(["/usr/bin/python3", "-I", redact, log], stdin=subprocess.PIPE,
-                     stdout=subprocess.PIPE, pass_fds=(3,))
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(3,))
 os.close(3)
 shown = b""
 
@@ -42,17 +42,24 @@ def drain(first_wait, then_wait):
         wait = then_wait
 
 for i, chunk in enumerate(chunks, 1):
-    p.stdin.write(chunk.encode())
-    p.stdin.flush()
+    try:
+        p.stdin.write(chunk.encode())
+        p.stdin.flush()
+    except BrokenPipeError:  # the filter has already exited
+        pass
     drain(5, 0.3)
     print("after %d: [%s]" % (i, shown.decode()))
     if i == 1 and os.environ.get("FEED_SIGINT") == "1":
         p.send_signal(signal.SIGINT)
         time.sleep(0.2)
-p.stdin.close()
+try:
+    p.stdin.close()
+except BrokenPipeError:
+    pass
 drain(5, 0.3)
 print("final: [%s]" % shown.decode())
 print("rc: %d" % p.wait())
+print("stderr: [%s]" % p.stderr.read().decode().strip())
 PY
 )"
 }
@@ -131,13 +138,25 @@ test_the_log_holds_what_was_shown_and_is_private() {
   assert_file_mode "$T_TMP/log" 600
 }
 
-test_refuses_an_existing_log_or_a_symlink() {
+# The refusal itself is checked (status 2 and its message), so a filter that can't start at all
+# doesn't pass this test.
+test_refuses_a_symlinked_log() {
   printf 'precious\n' >"$T_TMP/target"
   ln -s "$T_TMP/target" "$T_TMP/log"
   feed '%@+%@@%+' "$T_TMP/log" 'hello'
-  [[ "$FEED_OUT" != *"rc: 0"* ]] || _t_fail "the filter accepted a symlinked log: $FEED_OUT"
+  assert_contains "$FEED_OUT" "rc: 2"
+  assert_contains "$FEED_OUT" "stderr: [handoff_redact: cannot create the log $T_TMP/log:"
   assert_contains "$FEED_OUT" "final: []"
   assert_eq "$(cat "$T_TMP/target")" precious
+}
+
+test_refuses_an_existing_log() {
+  printf 'old log\n' >"$T_TMP/log"
+  feed '%@+%@@%+' "$T_TMP/log" 'hello'
+  assert_contains "$FEED_OUT" "rc: 2"
+  assert_contains "$FEED_OUT" "stderr: [handoff_redact: cannot create the log $T_TMP/log:"
+  assert_contains "$FEED_OUT" "final: []"
+  assert_eq "$(cat "$T_TMP/log")" "old log"
 }
 
 test_sigint_does_not_stop_the_filter() {
@@ -150,6 +169,7 @@ test_sigint_does_not_stop_the_filter() {
 test_a_cut_short_secret_list_shows_nothing() {
   FEED_NO_END=1 feed '%@+%@@%+' "$T_TMP/log" 'token %@+%@@%+'
   assert_contains "$FEED_OUT" "final: []"
+  assert_contains "$FEED_OUT" "stderr: [handoff_redact: the list of secrets was cut short; showing nothing]"
   [[ "$FEED_OUT" != *"rc: 0"* ]] || _t_fail "the filter accepted a list without #END: $FEED_OUT"
 }
 

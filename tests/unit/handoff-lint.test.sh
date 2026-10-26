@@ -174,6 +174,21 @@ test_rejects_redact_file_that_is_not_gitignored() {
   expect_rejected "ho_redact_file: $T_TMP/h/plain.env is not gitignored" "ho_redact_file hide $T_TMP/h/plain.env"
 }
 
+# A quoted path with a space is checked whole: here only its first word would be gitignored.
+test_rejects_redact_file_judged_on_the_whole_quoted_path() {
+  new_with 'ho_check ok /usr/bin/true' "ho_redact_file hide '$T_TMP/h/.env dir/plain.txt'"
+  mkdir -p "$T_TMP/h/.env dir"
+  lint
+  assert_exit 1 "$LINT_RC"
+  assert_contains "$LINT_OUT" "ho_redact_file: $T_TMP/h/.env dir/plain.txt is not gitignored"
+}
+
+test_redact_file_with_a_quoted_path_passes() {
+  new_with "ho_redact_file hide '$T_TMP/h/.env.helper token' || ho_abort" 'ho_check ok /usr/bin/true'
+  lint
+  assert_exit 0 "$LINT_RC" "$LINT_OUT"
+}
+
 test_rejects_redact_file_outside_a_repository() {
   expect_rejected "is not inside a git repository" 'ho_redact_file hide /etc/hosts'
 }

@@ -175,8 +175,23 @@ def main(path, runtime, ident):
         print(e)
 
 
+def redact_files(path):
+    """Print the path of every ho_redact_file step, after quote removal, one per line."""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for raw in fh.read().split("\n"):
+            try:
+                w = split_words(raw)
+            except Bad:
+                continue
+            if len(w) >= 3 and w[0] == ("ho_redact_file", False):
+                print(w[2][0])
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--redact-files":
+        redact_files(sys.argv[2])
+        sys.exit(0)
     if len(sys.argv) != 4:
-        print("usage: handoff_grammar.py <OWNER-RUN.sh> <runtime> <id>")
+        print("usage: handoff_grammar.py <OWNER-RUN.sh> <runtime> <id> | --redact-files <OWNER-RUN.sh>")
         sys.exit(2)
     main(*sys.argv[1:])
