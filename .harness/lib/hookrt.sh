@@ -1158,8 +1158,9 @@ SETTINGS_DIRS = [norm(os.path.realpath(d)) for d in (os.path.join(home, ".claude
 
 
 def settings_targets():
-    # The real files behind Claude Code settings files that are links: the user settings, and the
-    # project settings of this checkout, its projects and the worktrees beside it.
+    # Where Claude Code settings files really are, whether the file or a folder on its way is a
+    # link: the user settings, and the project settings of this checkout, its projects and the
+    # worktrees beside it (also a file that does not exist yet).
     names = []
     for d in (os.path.join(home, ".claude") if home else "", config_dir):
         if d and os.path.isdir(d):
@@ -1169,7 +1170,7 @@ def settings_targets():
         if os.path.isdir(parent):
             folders += [os.path.join(parent, n) for n in os.listdir(parent)]
     names += [os.path.join(f, ".claude", n) for f in folders for n in ("settings.json", "settings.local.json")]
-    return {norm(os.path.realpath(n)) for n in names if os.path.islink(n)}
+    return {norm(os.path.realpath(n)) for n in names}
 
 
 SETTINGS_TARGETS = settings_targets()
@@ -1216,13 +1217,15 @@ def classify(path):
     head, _, base = n.rpartition("/")
     if base == "settings.local.json" and head.endswith("/.claude"):
         return "Claude Code\x27s local settings %s could switch the hooks off; only the owner changes them" % path
-    if n in SETTINGS_TARGETS:
-        return "%s is where a Claude Code settings file links to, so it could switch the hooks off; only the owner changes it" % path
     if head in SETTINGS_DIRS and re.fullmatch(r"settings.*\.json", base):
         return "Claude Code\x27s user settings %s could switch the hooks off; only the owner changes them, by a handoff" % path
     r = norm(ROOT)
     if n == r or n.startswith(r + "/"):
-        return in_checkout(n[len(r) + 1:].split("/") if n != r else [], ROOT, "the main checkout " + ROOT)
+        reason = in_checkout(n[len(r) + 1:].split("/") if n != r else [], ROOT, "the main checkout " + ROOT)
+        if reason:
+            return reason
+    if n in SETTINGS_TARGETS:
+        return "%s is where a Claude Code settings file really is, so it could switch the hooks off; only the owner changes it" % path
     return None
 
 
@@ -1254,6 +1257,58 @@ def check(target, where):
     return None
 
 
+def heredoc_ends(line):
+    # [(delimiter, strip leading tabs)] for each << on the line outside quotes and comments; the
+    # delimiter is its word with quotes and backslashes removed, as the shell compares it.
+    found, i, quote = [], 0, None
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == "\\" and quote == "\"":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "\"\x27":
+            quote = c
+        elif c == "\\":
+            i += 1
+        elif c == "#" and (i == 0 or line[i - 1] in " \t;&|()"):
+            break
+        elif line.startswith("<<", i) and not line.startswith("<<<", i):
+            j = i + 2
+            dash = line.startswith("-", j)
+            j += dash
+            while j < len(line) and line[j] in " \t":
+                j += 1
+            word, wq = "", None
+            while j < len(line):
+                ch = line[j]
+                if wq:
+                    if ch == wq:
+                        wq = None
+                    else:
+                        word += ch
+                elif ch in "\"\x27":
+                    wq = ch
+                elif ch == "\\" and j + 1 < len(line):
+                    j += 1
+                    word += line[j]
+                elif ch in " \t;&|<>()":
+                    break
+                else:
+                    word += ch
+                j += 1
+            if word:
+                found.append((word, dash))
+            i = j
+            continue
+        i += 1
+    return found
+
+
 def without_heredocs(command):
     # The command lines, minus the bodies of here-documents (text, not commands).
     out, ends = [], []
@@ -1263,8 +1318,7 @@ def without_heredocs(command):
                 ends.pop(0)
             continue
         out.append(line)
-        for dash, quote, word in re.findall(r"(?<![<])<<(-?)\s*([\"\x27]?)([A-Za-z0-9_]+)\2", line):
-            ends.append((word, dash == "-"))
+        ends += heredoc_ends(line)
     return out
 
 
@@ -1644,10 +1698,16 @@ def main(root):
     line = "%s %s %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), hid, rel, hashlib.sha256(data).hexdigest())
     try:
         state_dir = subdir(subdir(top, ".harness"), "state", create=True)
-        fd = os.open("pastes.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=state_dir)
+        fd = os.open("pastes.log", os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=state_dir)
         try:
             st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or os.write(fd, line.encode("ascii")) != len(line):
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                raise OSError("pastes.log")
+            # A record cut short by an earlier failure is left unfinished; verify ignores an
+            # unfinished last line, and this record starts on a line of its own.
+            if st.st_size and os.pread(fd, 1, st.st_size - 1) != b"\n":
+                line = "\n" + line
+            if os.write(fd, line.encode("ascii")) != len(line):
                 raise OSError("pastes.log")
         finally:
             os.close(fd)

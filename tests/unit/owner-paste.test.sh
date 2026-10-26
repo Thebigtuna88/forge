@@ -133,6 +133,19 @@ test_capture_does_not_follow_a_linked_paste_record() {
   assert_contains "$(cat "$H/.harness/observed.log")" "capture-owner-paste FAILED-OPEN"
 }
 
+# A record left unfinished by an earlier failure: the next record starts on a line of its own
+# (review round 3).
+test_capture_starts_a_record_after_an_unfinished_line() {
+  mk_hooks "$T_TMP/code/forge" capture-owner-paste
+  ready_handoff "$DEMO"
+  printf 'cut short' >"$H/.harness/state/pastes.log"
+  hook capture-owner-paste "$(prompt "$(block "$DEMO")")"
+  assert_exit 0 "$RC" "$ERR"
+  assert_eq "$(head -n 1 "$H/.harness/state/pastes.log")" "cut short"
+  [[ "$(sed -n 2p "$H/.harness/state/pastes.log")" =~ ^[0-9T:Z-]+\ $DEMO\ work/owner/$DEMO/PASTED-[0-9TZ-]+\.txt\ [0-9a-f]{64}$ ]] ||
+    _t_fail "second line: $(cat "$H/.harness/state/pastes.log")"
+}
+
 # A record with a second hard link could be edited under its other name (review round 1).
 test_capture_refuses_a_hard_linked_paste_record() {
   mk_hooks "$T_TMP/code/forge" capture-owner-paste
@@ -193,13 +206,20 @@ test_spend_gate_refuses_missing_lists() {
   done
 }
 
-# A hosts or key_vars list set to null is malformed, not empty (round 1).
+# A list set to null is malformed, not empty (round 1). Each starts from the live file with one
+# list set to null, so nothing else about it is wrong (round 3).
 test_spend_gate_refuses_null_lists() {
   mk_hooks "$T_TMP/code/forge" gate-spend
-  printf '%s\n' '{"providers": {"openai": {"hosts": null, "key_vars": null}}, "always_blocked": ["sk_live_"]}' >"$H/.harness/spend-limits.json"
-  hook gate-spend "$(jq -n --arg d "$H" '{hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {command: "curl https://api.openai.com/v1/models"}, cwd: $d}')"
-  assert_exit 2 "$RC"
-  assert_contains "$ERR" "can't read .harness/spend-limits.json"
+  local path
+  for path in .providers.openai.hosts .providers.openai.key_vars .providers.openai.commands .payments.hosts .always_blocked; do
+    jq "$path = null" "$FORGE_SRC/.harness/spend-limits.json" >"$H/.harness/spend-limits.json"
+    hook gate-spend "$(jq -n --arg d "$H" '{hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {command: "ls"}, cwd: $d}')"
+    assert_exit 2 "$RC" "$path = null"
+    assert_contains "$ERR" "can't read .harness/spend-limits.json"
+  done
+  cp "$FORGE_SRC/.harness/spend-limits.json" "$H/.harness/spend-limits.json"
+  hook gate-spend "$(jq -n --arg d "$H" '{hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {command: "ls"}, cwd: $d}')"
+  assert_exit 0 "$RC" "the live file itself: $ERR"
 }
 
 # The owner's message must always reach the agent: a capture that fails says so and exits 0, and

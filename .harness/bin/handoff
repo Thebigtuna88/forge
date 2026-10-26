@@ -307,9 +307,15 @@ cmd_verify() {
     fail "2: handoff $id was never readied (state: $(meta_get "$dir" state))"
   fi
 
+  # Every later check reads one snapshot of the paste, so the bytes checked are the bytes hashed
+  # for check 9, even if the file changes meanwhile.
+  SNAP="$(mktemp)" || die "could not make a temporary file"
+  trap 'rm -f "$SNAP"' EXIT
+  cat -- "$pasted" >"$SNAP" || die "could not read $pasted"
+
   # 1. exactly one well-formed block
   local block
-  if ! block="$(extract_block "$pasted")"; then
+  if ! block="$(extract_block "$SNAP")"; then
     fail "1: the paste must contain exactly one HANDOFF-RESULT block"
     printf 'VERIFY FAILED: %s\n%s' "$id" "$fails" >&2
     return 1
@@ -400,7 +406,8 @@ cmd_verify() {
   # decision 2026-10-16-handoff-evidence-provenance): .harness/state/pastes.log in the main
   # checkout names this file with its sha256 as it is now.
   # The record, and the folders .harness and .harness/state holding it, may not be links (capture
-  # refuses them too), and the record may have no second hard link.
+  # refuses them too), and the record may have no second hard link. Only finished lines (ending in
+  # a line break) with exactly four fields count, so a record cut short is never read.
   local main plog rel
   main="$(dirname "$(dirname "$root")")"
   plog="$main/.harness/state/pastes.log"
@@ -408,7 +415,8 @@ cmd_verify() {
   if [[ -L "$main/.harness" || -L "$main/.harness/state" || -L "$plog" || ! -f "$plog" ]] \
     || [[ "$(stat -f '%l' "$plog")" != 1 ]]; then
     fail "9: no usable paste record ($plog is missing, a link, in a linked folder or hard-linked): the paste must be saved by the capture-owner-paste hook, from the owner's own message"
-  elif ! awk -v f="$rel" -v s="$(sha256 "$pasted")" '$3 == f && $4 == s { found = 1 } END { exit !found }' "$plog"; then
+  elif ! { if [[ -n "$(tail -c 1 "$plog")" ]]; then sed '$d' "$plog"; else cat "$plog"; fi; } |
+    awk -v f="$rel" -v s="$(sha256 "$SNAP")" 'NF == 4 && $3 == f && $4 == s { found = 1 } END { exit !found }'; then
     fail "9: $rel with its current sha256 is not in $plog: the paste must be saved by the capture-owner-paste hook, from the owner's own message, and not changed since"
   fi
 

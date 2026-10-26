@@ -351,6 +351,34 @@ test_check9_hard_linked_record_is_refused() {
   expect_fail_unrecorded "$PASTE"
 }
 
+# A record cut short (no line break at its end) never counts (review round 3).
+test_check9_unfinished_record_is_refused() {
+  genuine_run
+  paste_result
+  record_paste "$PASTE"
+  printf '%s' "$(cat "$H/.harness/state/pastes.log")" >"$T_TMP/log"
+  cat "$T_TMP/log" >"$H/.harness/state/pastes.log"
+  expect_fail_unrecorded "$PASTE"
+}
+
+# Verify reads the paste once: the block it checks is the block whose hash must be recorded. Here
+# the paste is swapped for recorded bytes after the block was read (a fake shasum swaps it on its
+# first use, check 3), which a second read for check 9 would accept (review round 3).
+test_check9_hashes_the_bytes_it_checked() {
+  genuine_run
+  { cat "$DIR/RESULT.txt"; printf 'thanks\n'; } >"$T_TMP/recorded"
+  cp "$T_TMP/recorded" "$PASTE"
+  record_paste "$PASTE"
+  paste_result
+  mkdir "$T_TMP/fake"
+  printf '#!/bin/bash\ncp %q %q\nexec /usr/bin/shasum "$@"\n' "$T_TMP/recorded" "$PASTE" >"$T_TMP/fake/shasum"
+  chmod +x "$T_TMP/fake/shasum"
+  VERIFY_OUT="$(env PATH="$T_TMP/fake:$PATH" "$HANDOFF" verify "$PASTE" 2>&1)"
+  VERIFY_RC=$?
+  assert_exit 1 "$VERIFY_RC" "verify should fail check 9: $VERIFY_OUT"
+  assert_contains "$VERIFY_OUT" "9: "
+}
+
 test_check9_linked_record_is_refused() {
   genuine_run
   paste_result
