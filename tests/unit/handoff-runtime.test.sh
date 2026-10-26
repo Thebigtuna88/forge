@@ -530,25 +530,28 @@ test_live_secret_never_reaches_the_screen() {
 }
 
 # script(1) buffers its log, so the step prints 200 kB after the secret: enough that, without live
-# redaction, the raw secret would already be in the log mid-step.
+# redaction, the raw secret would already be in the log mid-step. The step then waits until the
+# test creates "release" (at most 20 s), so it is certainly still running when the log is read.
+HOLD_STEP="cat \$0/.env; yes | head -c 200000; touch \$1/printed; n=200; while [ ! -e \$1/release ] && [ \$n -gt 0 ]; do sleep 0.1; n=\$((n-1)); done"
+
 test_live_log_never_holds_the_secret_mid_step() {
   mk_harness
-  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
-    "ho_info reveal /bin/bash -c 'cat $H/.env; yes | head -c 200000; touch $T_TMP/printed; sleep 3'"
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" "ho_info reveal /bin/bash -c '$HOLD_STEP' $H $T_TMP"
   pty_run_bg --answer "$SECRET" -- bash "$SCRIPT"
   wait_for_file "$T_TMP/printed" || _t_fail "the step never printed"
   sleep 0.5
   local log
   log="$(cat "$H/work/owner/$ID/logs/reveal.log" 2>/dev/null)"
+  [[ ! -e "$H/work/owner/$ID/RESULT.txt" ]] || _t_fail "the run had already ended when the log was read"
   assert_contains "$log" "API_KEY=" "mid-step, the step's output is already in the log"
   no_secret_piece "$log" "mid-step, the log"
+  touch "$T_TMP/release"
   wait "$BG"
 }
 
 test_live_log_of_a_killed_run_never_holds_the_secret() {
   mk_harness
-  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
-    "ho_info reveal /bin/bash -c 'cat $H/.env; yes | head -c 200000; touch $T_TMP/printed; sleep 3'"
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" "ho_info reveal /bin/bash -c '$HOLD_STEP' $H $T_TMP"
   pty_run_bg --answer "$SECRET" -- bash "$SCRIPT"
   wait_for_file "$T_TMP/printed" || _t_fail "the step never printed"
   sleep 0.5
@@ -556,6 +559,7 @@ test_live_log_of_a_killed_run_never_holds_the_secret() {
   owner="$(pgrep -f "^bash $SCRIPT\$")"
   [[ -n "$owner" ]] || _t_fail "could not find the owner's script to kill"
   kill -KILL "$owner"
+  touch "$T_TMP/release"
   wait "$BG"
   local log
   log="$(cat "$H/work/owner/$ID/logs/reveal.log" 2>/dev/null)"
@@ -724,46 +728,52 @@ test_redact_file_hides_stored_values() {
   no_secret_piece "$(cat "$T_TMP/clipboard")" "the clipboard"
 }
 
-# A step's banner (its command) is masked too: a literal argument can match a known secret.
-test_live_step_banner_is_masked() {
-  mk_harness
-  printf 'TOKEN=%s\n' "$SECRET" >"$H/.env.helper"
-  mk_script "$ID" "ho_redact_file hide $H/.env.helper" "ho_info probe /bin/echo 'x$SECRET'"
+# A value that appears in the handoff's own text (its script, folder, id or checksums) couldn't be
+# kept hidden: banners, questions, paths, the log path on the filter's command line and the
+# block's header all come from that text. ho_redact_file refuses such a file and ends the run.
+expect_own_text_refused() { # <value>
+  printf 'TOKEN=%s\n' "$1" >"$H/.env.helper"
   pty_run -- bash "$SCRIPT"
-  assert_exit 0 "$RC" "$OUT"
-  assert_contains "$OUT" "probe: /bin/echo x[REDACTED]"
-  no_secret_piece "$OUT" "the screen"
-}
-
-# Everything else the runtime shows that comes from the script is masked too: a confirm question
-# and a file path.
-test_live_runtime_text_from_the_script_is_masked() {
-  mk_harness
-  printf 'TOKEN=%s\n' "$SECRET" >"$H/.env.helper"
-  printf 'OTHER=%s\n' "$SECRET2" >"$H/.env.x$SECRET"
-  mk_script "$ID" "ho_redact_file hide $H/.env.helper" "ho_confirm go 'Deploy to x$SECRET now?'" \
-    "ho_redact_file again $H/.env.x$SECRET"
-  pty_run --answer y -- bash "$SCRIPT"
-  assert_exit 0 "$RC" "$OUT"
-  assert_contains "$OUT" "Deploy to x[REDACTED] now? [y/N]"
-  assert_contains "$OUT" "again: hide the values stored in $H/.env.x[REDACTED]"
-  no_secret_piece "$OUT" "the screen"
-  no_secret_piece "$(cat "$H/work/owner/$ID/RESULT.txt")" "RESULT.txt"
-}
-
-# A step name that equals a known secret is masked in the result block, which verify then refuses
-# (fail closed), rather than putting the secret in the block the owner pastes back.
-test_live_step_name_matching_a_secret_is_masked_in_the_block() {
-  mk_harness
-  printf 'TOKEN=deploy-prod-1\n' >"$H/.env.helper"
-  mk_script "$ID" "ho_redact_file hide $H/.env.helper" 'ho_check deploy-prod-1 /usr/bin/true'
-  pty_run -- bash "$SCRIPT"
+  assert_exit 1 "$RC"
   local result
   result="$(cat "$H/work/owner/$ID/RESULT.txt")"
-  assert_contains "$result" "check [REDACTED]: PASS"
-  assert_not_contains "$result" "deploy-prod-1"
-  assert_not_contains "$OUT" "deploy-prod-1"
-  assert_not_contains "$(cat "$T_TMP/clipboard")" "deploy-prod-1"
+  assert_contains "$result" "check hide: FAIL refused: a value in $H/.env.helper appears in this handoff's own text"
+  assert_contains "$OUT" "Stopping here"
+  assert_not_contains "$result" "check deploy-prod-1"
+}
+
+test_redact_file_refuses_values_in_the_handoffs_own_text() {
+  mk_harness
+  mk_script "$ID" "ho_redact_file hide $H/.env.helper" "ho_confirm go 'Deploy to x$SECRET now?'" \
+    'ho_check deploy-prod-1 /usr/bin/true'
+  expect_own_text_refused "$SECRET"           # in a confirm question
+  expect_own_text_refused deploy-prod-1       # a step name
+  expect_own_text_refused work/owner          # part of the handoff's folder
+  expect_own_text_refused "${ID:0:10}"        # part of the handoff's id
+  assert_not_contains "$OUT" "deploy-prod-1: /usr/bin/true" "the later step never ran"
+}
+
+# The same for a typed secret: refused, nothing stored, the run goes on.
+test_secret_to_file_refuses_a_value_in_the_handoffs_own_text() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" "ho_confirm go 'Deploy to x$SECRET now?'"
+  pty_run --answer "$SECRET" --answer y -- bash "$SCRIPT"
+  assert_exit 1 "$RC"
+  assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check key: FAIL refused: the value appears in this handoff's own text"
+  [[ ! -e "$H/.env" ]] || _t_fail "the value was stored"
+}
+
+# Evidence is masked as a whole, not one secret at a time: B starts where A ends, and the step's
+# output only joins them once its "-----" is removed from the evidence.
+test_overlapping_secrets_in_evidence_are_masked_whole() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file a A $H/.env" "ho_secret_to_file b B $H/.env" \
+    "ho_info split /bin/echo %@%@%@-----++++@@"
+  pty_run --answer '%@%@%@++' --answer '%@++++@@' -- bash "$SCRIPT"
+  local result
+  result="$(cat "$H/work/owner/$ID/RESULT.txt")"
+  assert_contains "$result" "check split: INFO [REDACTED]"$'\n'
+  assert_not_contains "$result" "++@@"
 }
 
 # Blank lines (spaces only) and Windows line endings in a stored secrets file are fine.
@@ -777,6 +787,7 @@ test_redact_file_accepts_blank_lines_and_crlf() {
   no_secret_piece "$OUT" "the screen"
 }
 
+# A refused ho_redact_file ends the run: later steps could use the values it was to hide.
 expect_redact_file_refused() { # <file> <reason>
   mk_script "$ID" "ho_redact_file hide $1" 'ho_check after /usr/bin/true'
   pty_run -- bash "$SCRIPT"
@@ -785,6 +796,7 @@ expect_redact_file_refused() { # <file> <reason>
   result="$(cat "$H/work/owner/$ID/RESULT.txt")"
   assert_contains "$result" "check hide: FAIL refused: $2"
   assert_contains "$result" "result: FAILED"
+  assert_not_contains "$result" "check after" "no later step runs"
   no_secret_piece "$OUT" "the screen"
   no_secret_piece "$result" "RESULT.txt"
 }

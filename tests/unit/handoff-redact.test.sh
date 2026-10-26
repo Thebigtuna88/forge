@@ -139,13 +139,13 @@ test_the_log_holds_what_was_shown_and_is_private() {
 }
 
 # The refusal itself is checked (status 2 and its message), so a filter that can't start at all
-# doesn't pass this test.
+# doesn't pass this test. The message names no path: it reaches the screen unmasked.
 test_refuses_a_symlinked_log() {
   printf 'precious\n' >"$T_TMP/target"
   ln -s "$T_TMP/target" "$T_TMP/log"
   feed '%@+%@@%+' "$T_TMP/log" 'hello'
   assert_contains "$FEED_OUT" "rc: 2"
-  assert_contains "$FEED_OUT" "stderr: [handoff_redact: cannot create the log $T_TMP/log:"
+  assert_contains "$FEED_OUT" "stderr: [handoff_redact: cannot create the log: File exists]"
   assert_contains "$FEED_OUT" "final: []"
   assert_eq "$(cat "$T_TMP/target")" precious
 }
@@ -154,7 +154,7 @@ test_refuses_an_existing_log() {
   printf 'old log\n' >"$T_TMP/log"
   feed '%@+%@@%+' "$T_TMP/log" 'hello'
   assert_contains "$FEED_OUT" "rc: 2"
-  assert_contains "$FEED_OUT" "stderr: [handoff_redact: cannot create the log $T_TMP/log:"
+  assert_contains "$FEED_OUT" "stderr: [handoff_redact: cannot create the log: File exists]"
   assert_contains "$FEED_OUT" "final: []"
   assert_eq "$(cat "$T_TMP/log")" "old log"
 }

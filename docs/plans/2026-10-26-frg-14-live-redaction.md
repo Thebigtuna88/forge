@@ -179,3 +179,14 @@ codex `code` + `security` rounds to CLEAN.
     closed);
   - lint reads `ho_redact_file` paths with the grammar's tokenizer, so a quoted path with spaces
     is judged whole.
+- **Review round 4: one rule instead of more patches.** Rounds 3 and 4 kept finding places where
+  a secret that equals part of the handoff's own text could surface: a step name, the id, the
+  folder, a checksum, the filter's error message, or the log path on its command line. So the
+  runtime now refuses such a value at its source: `ho_secret_to_file` stores nothing, and
+  `ho_redact_file` refuses the file. Also:
+  - a refused `ho_redact_file` ends the run, because later steps may use the values it was to
+    hide;
+  - the evidence's second redaction pass masks through the filter, so overlapping secrets can't
+    leave a piece;
+  - the filter's error messages name no path;
+  - the mid-step log tests hold the step open until the log has been read.

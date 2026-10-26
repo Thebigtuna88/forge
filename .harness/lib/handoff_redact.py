@@ -96,7 +96,7 @@ def main():
     try:
         secrets = read_secrets()
     except OSError as e:
-        sys.stderr.write("handoff_redact: cannot read the secrets: %s\n" % e)
+        sys.stderr.write("handoff_redact: cannot read the secrets: %s\n" % e.strerror)
         return 2
     if secrets is None:
         sys.stderr.write("handoff_redact: the list of secrets was cut short; showing nothing\n")
@@ -106,7 +106,8 @@ def main():
         try:
             log = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         except OSError as e:
-            sys.stderr.write("handoff_redact: cannot create the log %s: %s\n" % (sys.argv[1], e))
+            # No path in the message: this goes to the screen unmasked (the runtime names the step).
+            sys.stderr.write("handoff_redact: cannot create the log: %s\n" % e.strerror)
             return 2
     log_ok = True
 

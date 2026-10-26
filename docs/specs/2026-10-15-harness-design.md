@@ -298,8 +298,8 @@ can stop before an irreversible step.
 | `ho_check <name> <cmd…>` | `PASS` or `FAIL` + last non-empty output line | command exits 0 |
 | `ho_info <name> <cmd…>` | `INFO` + last output line | never fails |
 | `ho_confirm <name> "<question>"` | `PASS` (answered `y`) or `FAIL` | owner types `y` at `/dev/tty` |
-| `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty and uses only `A-Z a-z 0-9 . _ + / = : @ % , -`; the target is a regular file (or absent) and gitignored (`git check-ignore`), as is its temp file; and every write step succeeds |
-| `ho_redact_file <name> <file>` | `PASS hiding N values from <file>` (a count, never a value) | the file is absolute, reached through no symlink, a regular readable file (opened without following a symlink, and confirmed after opening to be the file at that path), untracked and gitignored, and every line that isn't blank (spaces only) or a comment is `VAR=value` (a trailing CR is ignored) with a value of at least 8 characters from the `ho_secret_to_file` set. Its values are then hidden like collected secrets for the rest of the run (FRG-14) |
+| `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty, uses only `A-Z a-z 0-9 . _ + / = : @ % , -`, and doesn't appear in the handoff's own text (FRG-14); the target is a regular file (or absent) and gitignored (`git check-ignore`), as is its temp file; and every write step succeeds |
+| `ho_redact_file <name> <file>` | `PASS hiding N values from <file>` (a count, never a value); on any refusal the run stops at once (`result: FAILED`), since later steps may use those values | no value appears in the handoff's own text (see below), the file is absolute, reached through no symlink, a regular readable file (opened without following a symlink, and confirmed after opening to be the file at that path), untracked and gitignored, and every line that isn't blank (spaces only) or a comment is `VAR=value` (a trailing CR is ignored) with a value of at least 8 characters from the `ho_secret_to_file` set. Its values are then hidden like collected secrets for the rest of the run (FRG-14) |
 | `ho_abort` | `result: FAILED` | ends the run early with the block |
 | `ho_end` | the block | — |
 
@@ -330,7 +330,14 @@ Details:
   step banners (`▶ name: command`), confirm questions, prompts, file paths and failure reasons.
   The block's check lines are masked as a whole before the block is saved, shown or copied, so
   a step name that matches a known secret shows as `[REDACTED]`, and verify then refuses the
-  block. It holds back only the longest end of the output that could
+  block. Evidence is masked the same way, through the filter, never one secret at a time.
+- **No secret in the handoff's own text.** `ho_secret_to_file` refuses a typed value, and
+  `ho_redact_file` refuses a file with a value, that appears anywhere in the handoff's own text:
+  the frozen script, its folder, the runtime's path, the id, the checksums or the start time.
+  Every line the runtime prints, other than step output, is built from that text: banners,
+  questions, prompts, paths, failure reasons, the block's header, and the log path on the
+  filter's command line. So a value found there could never be kept hidden, and a real secret
+  found there has leaked already. The filter's own error messages name no path. It holds back only the longest end of the output that could
   still become a secret (less than one secret's length), and shows that as soon as more output
   rules it out or the step ends. There is no timer, which could show part of a
   secret: a step that prints the start of a secret and then waits for input shows those

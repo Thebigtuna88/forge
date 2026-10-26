@@ -40,7 +40,7 @@ HO_SCRIPT="$HO_DIR/$(basename "${BASH_SOURCE[1]}")"
 # filter once, checks that text and keeps it, and every step runs the kept text (python3 -c), so
 # replacing the file afterwards changes nothing.
 HO_REDACT="$(dirname "$HO_RUNTIME")/handoff_redact.py"
-HO_REDACT_SHA256=a817ef2bd995c4a0f757c07fa7931ae499aeb86e2741518cbab9f53493ce0e79
+HO_REDACT_SHA256=cd1e8dc8609d5cc95ffc3aa13de822f8e00eacd7fd6f00cbc5a1dcf20f5e70f1
 # The Python that runs it: Apple's own interpreter, found by fixed path; it and every folder above
 # it must be root-owned and not writable by this user (_ho_root_only). Never the /usr/bin/python3
 # shim, whose choice follows DEVELOPER_DIR.
@@ -79,6 +79,7 @@ _HO_SECRETS=() # values collected by ho_secret_to_file or loaded by ho_redact_fi
 _HO_REDACT_RC=0 # the live redaction filter's status for the last step
 _HO_PY="" # the checked interpreter (ho_begin)
 _HO_REDACT_CODE="" # the checked text of the filter (ho_begin)
+_HO_SCRIPT_TEXT="" # the frozen script's text (ho_begin), for _ho_in_own_text
 
 _ho_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 _ho_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -98,14 +99,14 @@ _ho_last_line() {
 # One-line evidence: no newlines, no control characters, no block markers, at most 200 chars.
 _ho_clean() {
   local s
-  s="$(_ho_redact "$1")"
+  s="$(_ho_redact "$1")" || s="(hidden: live redaction failed)"
   s="$(printf '%s' "$s" | LC_ALL=C tr '\n\r\t' '   ' | LC_ALL=C tr -d '\000-\037')"
   while [[ "$s" == *-----* ]]; do s="${s//-----/}"; done
   s="$(printf '%s' "$s" | tr -s ' ')"
   s="${s# }"
   s="${s% }"
   # Again after normalising: removing ----- or control characters can join a split secret.
-  s="$(_ho_redact "$s")"
+  s="$(_ho_redact "$s")" || s="(hidden: live redaction failed)"
   [[ -n "$s" ]] || s="(no output)"
   printf '%s' "${s:0:200}"
 }
@@ -127,13 +128,24 @@ _ho_add_secret() {
   _HO_SECRETS=("${new[@]}")
 }
 
-# Replace every secret collected in this run with [REDACTED].
+# Mask every known secret with [REDACTED], through the filter, so secrets that overlap are hidden
+# whole (FRG-14; replacing them one at a time would leave a piece). Fails if the filter does.
 _ho_redact() {
-  local s="$1" sec
-  if [[ ${#_HO_SECRETS[@]} -gt 0 ]]; then
-    for sec in "${_HO_SECRETS[@]}"; do s="${s//"$sec"/[REDACTED]}"; done
+  if [[ ${#_HO_SECRETS[@]} -eq 0 ]]; then
+    printf '%s' "$1"
+    return 0
   fi
-  printf '%s' "$s"
+  _ho_masked "$1"
+}
+
+# Succeeds if the value appears anywhere in this handoff's own text: its script, folder, runtime
+# path, id, checksums or start time. Everything the runtime prints apart from step output (banners,
+# questions, prompts, paths, reasons, the log path on the filter's command line, the block's
+# header) comes from that text, so such a value could not be kept hidden (FRG-14).
+_ho_in_own_text() { # <value>
+  local own
+  own="$_HO_SCRIPT_TEXT"$'\n'"$HO_DIR"$'\n'"$HO_RUNTIME"$'\n'"$_HO_ID $_HO_SCRIPT_SHA $_HO_RUNTIME_SHA $_HO_AT"
+  [[ "$own" == *"$1"* ]]
 }
 
 # Replace a step's log with a redacted copy. Returns 1 if that fails (the log may still hold a
@@ -339,6 +351,7 @@ ho_begin() { # <id>
     _ho_refuse "the redaction filter $HO_REDACT is missing or is not the reviewed one (sha256 $redact_sha), so a step could show a secret."
   fi
   _HO_REDACT_CODE="$code"
+  _HO_SCRIPT_TEXT="$(cat "$HO_SCRIPT")" || _ho_refuse "could not read $HO_SCRIPT"
   # Only a script that `handoff ready` froze may run: META.json must say ready and record this
   # exact script. (A draft can't be run early and its result replayed after ready.)
   local st frozen
@@ -482,6 +495,13 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
     printf '  ✘ FAIL (unsupported characters in the value; nothing stored)\n'
     return 1
   fi
+  if _ho_in_own_text "$value"; then
+    value=""
+    _HO_FAILED=1
+    _ho_record FAIL "$name" "refused: the value appears in this handoff's own text (its script, folder, id or checksums), where it could not be hidden; nothing stored"
+    printf '  ✘ FAIL (the value appears in this handoff'"'"'s own text, where it could not be hidden; nothing stored)\n'
+    return 1
+  fi
   _ho_add_secret "$value"
 
   # Write a private temp file next to the target (it must be gitignored too), then move it.
@@ -568,6 +588,15 @@ ho_redact_file() { # <name> <absolute file> — hide the values stored in a giti
   line=""
   if [[ -z "$why" && ${#values[@]} -eq 0 ]]; then why="no values in $file"; fi
   if [[ -z "$why" ]]; then
+    for value in "${values[@]}"; do
+      if _ho_in_own_text "$value"; then
+        why="a value in $file appears in this handoff's own text (its script, folder, id or checksums), where it could not be hidden"
+        break
+      fi
+    done
+    value=""
+  fi
+  if [[ -z "$why" ]]; then
     if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
       why="$file is not inside a git repository, so it cannot be proven gitignored"
     elif git -C "$dir" ls-files --error-unmatch "$file" >/dev/null 2>&1; then
@@ -576,13 +605,15 @@ ho_redact_file() { # <name> <absolute file> — hide the values stored in a giti
       why="$file is not gitignored"
     fi
   fi
+  # Later steps may use these secrets, so if they can't be hidden the run stops here.
   if [[ -n "$why" ]]; then
     values=()
     _HO_FAILED=1
     _ho_record FAIL "$name" "refused: $why"
     printf -v text '  ✘ FAIL (%s)\n' "$why"
     _ho_say "$text" || true
-    return 1
+    printf '\nStopping here: the values to hide could not be loaded, so no later step runs.\n'
+    ho_end
   fi
   for value in "${values[@]}"; do
     _ho_add_secret "$value"
