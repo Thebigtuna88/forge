@@ -279,6 +279,11 @@ ho_end
 - a symlink sits at `logs/` or `RESULT.txt` (the last three added in the FRG-1 review);
 - the live redaction filter `.harness/lib/handoff_redact.py` is missing, a symlink, or not the
   one whose sha256 `handoff.sh` pins (FRG-14). So `runtime-sha256` covers the filter too.
+  `ho_begin` reads the filter once and every step runs that checked text (`python3 -c`), so
+  replacing the file mid-run changes nothing;
+- no root-owned `python3` from Apple's Command Line Tools or Xcode is found at its fixed path.
+  The filter never runs on the `/usr/bin/python3` shim, whose choice of interpreter follows
+  `DEVELOPER_DIR`.
 
 The refusal means running the script through Claude Code's `!` prefix fails too. That's
 intended: the owner uses a separate Terminal window.
@@ -293,7 +298,7 @@ can stop before an irreversible step.
 | `ho_info <name> <cmd…>` | `INFO` + last output line | never fails |
 | `ho_confirm <name> "<question>"` | `PASS` (answered `y`) or `FAIL` | owner types `y` at `/dev/tty` |
 | `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty and uses only `A-Z a-z 0-9 . _ + / = : @ % , -`; the target is a regular file (or absent) and gitignored (`git check-ignore`), as is its temp file; and every write step succeeds |
-| `ho_redact_file <name> <file>` | `PASS hiding N values from <file>` (a count, never a value) | the file is absolute, a regular readable file, untracked and gitignored, and every non-blank, non-comment line is `VAR=value` with a value of at least 8 characters from the `ho_secret_to_file` set. Its values are then hidden like collected secrets for the rest of the run (FRG-14) |
+| `ho_redact_file <name> <file>` | `PASS hiding N values from <file>` (a count, never a value) | the file is absolute, reached through no symlink, a regular readable file (opened without following a symlink, and confirmed after opening to be the file at that path), untracked and gitignored, and every non-blank, non-comment line is `VAR=value` with a value of at least 8 characters from the `ho_secret_to_file` set. Its values are then hidden like collected secrets for the rest of the run (FRG-14) |
 | `ho_abort` | `result: FAILED` | ends the run early with the block |
 | `ho_end` | the block | — |
 
@@ -309,16 +314,18 @@ Details:
   clipboard or the block; if a later step prints it anyway, the runtime replaces it with
   `[REDACTED]` in the evidence and in that step's log. Evidence is redacted both before and
   after it is normalised, so stripping `-----` or control characters can't rejoin a secret.
-- Commands run as `script -q /dev/null /bin/bash -c '"$@"' … | python3 -I handoff_redact.py
+- Commands run as `script -q /dev/null /bin/bash -c '"$@"' … | <python3> -I -c <checked filter>
   <log>`, so they keep the terminal and shell builtins work. The handoff folder and its logs are
   mode 700, logs and `RESULT.txt` mode 600. Each step's log is removed before the step runs, and
   `RESULT.txt` is written fresh; if it can't be saved, `ho_end` prints no block and exits 1.
 - **Live redaction (FRG-14).** The filter shows the step's output and writes its log with every
-  known secret (collected this run, or loaded by `ho_redact_file`) replaced by `[REDACTED]`
-  before either sees it, longest first. The secrets reach it on a private pipe (descriptor 3):
-  never on a command line, and not in the step's environment. It holds back only the end of the
-  output that could still become a secret, plus any secret overlapping it, and shows that as soon
-  as more output rules it out or the step ends. There is no timer, which could show part of a
+  known secret (collected this run, or loaded by `ho_redact_file`) masked before either sees it:
+  every byte any occurrence of any secret covers, judged on the original bytes, so secrets that
+  contain or overlap one another are hidden whole, and a run of masked bytes shows as one
+  `[REDACTED]`. The secrets reach it on a private pipe (descriptor 3): never on a command line,
+  and not in the step's environment. It holds back only the longest end of the output that could
+  still become a secret (less than one secret's length), and shows that as soon as more output
+  rules it out or the step ends. There is no timer, which could show part of a
   secret: a step that prints the start of a secret and then waits for input shows those
   characters only when it continues. The filter ignores SIGINT; if it is killed, what it held is
   dropped.
@@ -388,7 +395,8 @@ Passes only if **all** of these hold:
    `handoff ready`, and the run's `at:` is not older than `readied` (no replaying a run made
    before the script was frozen).
 4. `runtime-sha256` equals the sha256 of the current `.harness/lib/handoff.sh`, and the
-   runtime named in `META.json` is that file.
+   runtime named in `META.json` is that file. The redaction filter beside it still matches the
+   sha256 the runtime pins (FRG-14).
 5. Every step declared in the script appears exactly once, and no undeclared step appears.
 6. Every step is `PASS` or `INFO`, and `result: OK`.
 7. The paste matches `RESULT.txt` (written by the runtime on the owner's run), ignoring

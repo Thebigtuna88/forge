@@ -1,22 +1,27 @@
 """Live redaction filter for handoff steps (spec 4.3, FRG-14).
 
-usage: /usr/bin/python3 -I handoff_redact.py <log> 3<secrets
+usage: <python3> -I handoff_redact.py <log> 3<secrets
+       (the runtime runs this file's checked text with -c, so argv is then ['-c', <log>])
 
 The runtime pipes a step's terminal output (from script(1)) into this filter. It copies the output
-to its own stdout (the owner's screen) and to <log>, replacing every collected secret with
-[REDACTED] before either sees it. The secrets arrive one per line on file descriptor 3, never on
-the command line or in the environment.
+to its own stdout (the owner's screen) and to <log>, replacing every known secret with [REDACTED]
+before either sees it. The secrets arrive one per line on file descriptor 3, never on the command
+line or in the environment.
 
-What it holds back: only the end of the output received so far, and only while that end could
-still become a secret (it is the start of one), together with any secret that overlaps it. All
-other output is shown at once. A held piece is shown as soon as more output proves it isn't a
-secret, or when the step ends. Nothing is ever flushed on a timer, since that could show part of a
-secret. Secrets are replaced longest first, so one that contains another is replaced whole.
+Masking: every byte that any occurrence of any secret covers is masked, judged on the original
+bytes, so secrets that contain or overlap one another are hidden whole. A run of masked bytes
+becomes one [REDACTED], even across reads.
+
+Holding back: only the longest end of the output so far that could still become a secret (a
+proper prefix of one), at most one secret's length minus one. Everything else is shown at once.
+A held piece is shown as soon as more output proves it isn't a secret, or when the step ends.
+Bytes already known to be inside a secret stay masked when the piece is finally shown. Nothing is
+flushed on a timer, since that could show part of a secret.
 
 It ignores SIGINT, so a Ctrl-C meant for the step can't stop it mid-output. If it is killed, the
 held piece is dropped, never shown. Exit status: 0 when everything was shown and logged; 2 for a
 usage error or a log it can't create (it never writes through a symlink or onto an existing file);
-3 when writing the log failed partway (the screen output stays redacted).
+3 when writing failed partway (the screen went away, or the log could not be written).
 """
 
 import os
@@ -32,34 +37,41 @@ def read_secrets():
     return sorted(found, key=len, reverse=True)
 
 
-def hold_start(buf, secrets):
-    """Where the held piece begins: the earliest suffix of buf that is a proper prefix of a
-    secret, moved back over any whole secret that overlaps it."""
-    p = len(buf)
-    longest = max(len(s) for s in secrets)
+def covered(buf, secrets, lead):
+    """One flag per byte of buf: inside some occurrence of a secret, or among the first `lead`
+    bytes (already known to be inside one that began in output shown earlier)."""
+    cov = bytearray(len(buf))
+    cov[:lead] = b"\x01" * min(lead, len(buf))
+    for s in secrets:
+        i = buf.find(s)
+        while i != -1:
+            cov[i:i + len(s)] = b"\x01" * len(s)
+            i = buf.find(s, i + 1)
+    return cov
+
+
+def hold_start(buf, secrets, longest):
+    """Start of the longest suffix of buf that is a proper prefix of some secret."""
     for k in range(min(longest - 1, len(buf)), 0, -1):
         tail = buf[-k:]
         if any(len(s) > k and s.startswith(tail) for s in secrets):
-            p = len(buf) - k
-            break
-    moved = True
-    while moved:
-        moved = False
-        for s in secrets:
-            i = buf.find(s, max(0, p - len(s) + 1))
-            while i != -1 and i < p:
-                if i + len(s) > p:
-                    p = i
-                    moved = True
-                    break
-                i = buf.find(s, i + 1)
-    return p
+            return len(buf) - k
+    return len(buf)
 
 
-def redact(data, secrets):
-    for s in secrets:
-        data = data.replace(s, MASK)
-    return data
+def masked(seg, cov, in_mask):
+    """seg with each run of covered bytes replaced by one MASK. in_mask says the output shown
+    just before seg ended inside a mask, so a run at the start of seg continues it."""
+    out = bytearray()
+    for i, byte in enumerate(seg):
+        if cov[i]:
+            if not in_mask:
+                out += MASK
+                in_mask = True
+        else:
+            out.append(byte)
+            in_mask = False
+    return bytes(out), in_mask
 
 
 def write_all(fd, data):
@@ -95,16 +107,28 @@ def main():
             except OSError:
                 log_ok = False
 
-    held = b""
+    longest = max((len(s) for s in secrets), default=0)
+    held, lead, in_mask = b"", 0, False
     while True:
         data = os.read(0, 4096)
         if not data:
             break
+        if not secrets:
+            show(data)
+            continue
         buf = held + data
-        p = hold_start(buf, secrets) if secrets else len(buf)
-        show(redact(buf[:p], secrets))
+        cov = covered(buf, secrets, lead)
+        p = hold_start(buf, secrets, longest)
+        if p:
+            out, in_mask = masked(buf[:p], cov, in_mask)
+            show(out)
         held = buf[p:]
-    show(redact(held, secrets))
+        lead = 0
+        while lead < len(held) and cov[p + lead]:
+            lead += 1
+    if held:
+        out, _ = masked(held, covered(held, secrets, lead), in_mask)
+        show(out)
     os.close(log)
     return 0 if log_ok else 3
 

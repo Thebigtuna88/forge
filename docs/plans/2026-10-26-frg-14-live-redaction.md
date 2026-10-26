@@ -28,13 +28,13 @@ After FRG-14:
 
 1. script(1) still gives the step a terminal, but writes no log (`/dev/null`). Its output goes into
    a pipe.
-2. A small filter, the new file `.harness/lib/handoff_redact.py`, run as `/usr/bin/python3 -I`,
-   reads that pipe. It writes the redacted output to your screen and to the step's log.
+2. A small filter, the new file `.harness/lib/handoff_redact.py`, run on Apple's own Python
+   with `-I` (see the details at the end), reads that pipe. It writes the redacted output to your screen and to the step's log.
 3. **How the secrets reach the filter:** through a private pipe on a separate file descriptor
    (bash process substitution), one per line. Never on a command line, so `ps` can't show them.
    Never in an environment variable, so the step can't inherit them.
-4. **Matching:** the filter replaces every secret, longest first. A secret that contains another is
-   replaced whole, as the runtime does today.
+4. **Matching:** the filter masks every byte that any occurrence of any secret covers, so a secret
+   that contains or overlaps another is hidden whole (as built; see the details at the end).
 5. **A secret split across two writes:** the filter holds back only the end of what it has
    received, and only if that end could be the start of a secret. The rest is shown at once. The
    held part is shown as soon as more output proves it isn't a secret, or when the step ends.
@@ -134,8 +134,21 @@ codex `code` + `security` rounds to CLEAN.
 
 - **The filter is pinned.** `handoff.sh` holds the filter's sha256 (`HO_REDACT_SHA256`), and
   `ho_begin` refuses to run if `handoff_redact.py` is missing, a symlink, or different. So the
-  `runtime-sha256` in every result also covers the filter, and verify's "runtime unchanged" check
-  (spec 4.5) applies to it. Changing the filter means updating that line in the same PR.
+  `runtime-sha256` in every result also covers the filter, and verify's check 4 (spec 4.5) also
+  confirms that the filter still matches the pin. `ho_begin` reads the filter once and every step
+  runs that checked text (`python3 -c`), so replacing the file mid-run changes nothing. Changing
+  the filter means updating that line in the same PR.
+- **The interpreter is Apple's own,** found by fixed path (Command Line Tools, then Xcode) and
+  required to be root-owned and not writable. It is never the `/usr/bin/python3` shim, whose
+  choice of interpreter follows `DEVELOPER_DIR` (review round 1).
+- **Masking covers every matched byte** (review round 1). Every byte that any occurrence of any
+  secret covers is masked, judged on the original bytes, so overlapping secrets can't leave a
+  piece showing. The filter carries "already masked" across reads, so it never holds more than
+  one secret's length minus one, even for output that matches a secret over and over.
+- **`ho_redact_file` reads through the checked interpreter.** It opens the file without following
+  a symlink, refuses anything but a regular file, confirms after opening that it is still the file
+  at that path with no symlink anywhere in the path, and only then are git's tracked and ignored
+  checks applied to that path (review round 1).
 - **What today's log really held** (found by the red run). script(1) buffers its log, so before
   FRG-14 the raw secret reached the log mid-step only once a step had printed enough to fill that
   buffer (the tests print 200 kB). After that, it stayed if the run was killed. The screen always

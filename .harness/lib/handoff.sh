@@ -36,10 +36,15 @@ HO_RUNTIME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOU
 HO_DIR="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
 HO_SCRIPT="$HO_DIR/$(basename "${BASH_SOURCE[1]}")"
 # The live redaction filter every step's output passes through (FRG-14). Its sha256 is fixed
-# here, so this file's runtime-sha256 in the evidence covers the filter too; ho_begin checks it.
+# here, so this file's runtime-sha256 in the evidence covers the filter too. ho_begin reads the
+# filter once, checks that text and keeps it, and every step runs the kept text (python3 -c), so
+# replacing the file afterwards changes nothing.
 HO_REDACT="$(dirname "$HO_RUNTIME")/handoff_redact.py"
-HO_REDACT_SHA256=ce3de22171a150025de18a293226c27e77a213f65333b1499b60095e9dfe0691
-readonly HO_RUNTIME HO_DIR HO_SCRIPT HO_REDACT HO_REDACT_SHA256
+HO_REDACT_SHA256=035e325c6a0be8df1dfe25de5fbd1f003795e4583b74168b3b2c40383d698565
+# The Python that runs it: Apple's own interpreter, found by fixed path and required to be
+# root-owned. Never the /usr/bin/python3 shim, whose choice follows DEVELOPER_DIR.
+HO_PYTHONS="/Library/Developer/CommandLineTools/usr/bin/python3 /Applications/Xcode.app/Contents/Developer/usr/bin/python3"
+readonly HO_RUNTIME HO_DIR HO_SCRIPT HO_REDACT HO_REDACT_SHA256 HO_PYTHONS
 
 # Steps run from / so that no command picks up a repository from wherever Terminal was opened:
 # a step names its repository (--repo, git -C) and uses absolute paths.
@@ -71,6 +76,8 @@ _HO_AT=""
 _HO_TMP="" # a secret temp file being written; removed on any exit
 _HO_SECRETS=() # values collected by ho_secret_to_file or loaded by ho_redact_file, kept only to redact them
 _HO_REDACT_RC=0 # the live redaction filter's status for the last step
+_HO_PY="" # the checked interpreter (ho_begin)
+_HO_REDACT_CODE="" # the checked text of the filter (ho_begin)
 
 _ho_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 _ho_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -159,11 +166,50 @@ _ho_run() { # <log> <command…>
   shift
   # shellcheck disable=SC2016 # "$@" is expanded by the inner bash, which runs the command
   /usr/bin/script -q /dev/null /bin/bash -c '"$@"' ho-step "$@" \
-    | /usr/bin/python3 -I "$HO_REDACT" "$log" 3< <(_ho_secret_lines)
+    | "$_HO_PY" -I -c "$_HO_REDACT_CODE" "$log" 3< <(_ho_secret_lines)
   st=("${PIPESTATUS[@]}")
   _HO_REDACT_RC="${st[1]}"
   return "${st[0]}"
 }
+
+# ho_redact_file's reader, run by the checked interpreter with the file as its argument. It prints
+# "OK" and one value per line, or a single "ERR <reason>" line (never a value).
+_HO_READ_VALUES='import os, re, stat, sys
+p = sys.argv[1]
+def refuse(why):
+    sys.stdout.write("ERR " + why + "\n")
+    sys.exit(0)
+if os.path.realpath(p) != p:
+    refuse("%s is reached through a symbolic link" % p)
+try:
+    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except OSError as e:
+    refuse("%s could not be opened (%s)" % (p, e.strerror))
+opened = os.fstat(fd)
+if not stat.S_ISREG(opened.st_mode):
+    refuse("%s is not a regular file" % p)
+now = os.stat(p)
+if (now.st_dev, now.st_ino) != (opened.st_dev, opened.st_ino) or os.path.realpath(p) != p:
+    refuse("%s changed while it was being opened" % p)
+data = b""
+while True:
+    chunk = os.read(fd, 65536)
+    if not chunk:
+        break
+    data += chunk
+safe = re.compile(rb"^[A-Z_][A-Z0-9_]*=([A-Za-z0-9._+/=:@%,-]{8,})$")
+values = []
+for no, line in enumerate(data.split(b"\n"), 1):
+    if not line or line.startswith(b"#"):
+        continue
+    m = safe.match(line)
+    if not m:
+        refuse("line %d of %s holds a value that can\x27t be hidden safely (not VAR=value, shorter than 8 characters, or characters ho_secret_to_file never stores)" % (no, p))
+    values.append(m.group(1).decode())
+if not values:
+    refuse("no values in %s" % p)
+sys.stdout.write("OK\n" + "".join(v + "\n" for v in values))'
+readonly _HO_READ_VALUES
 
 # After a step: if the filter failed, its output may be incomplete and the log missing, so the run
 # ends FAILED (fail closed).
@@ -231,11 +277,26 @@ ho_begin() { # <id>
   if [[ ! "$_HO_SCRIPT_SHA" =~ ^[0-9a-f]{64}$ || ! "$_HO_RUNTIME_SHA" =~ ^[0-9a-f]{64}$ ]]; then
     _ho_refuse "could not compute the sha256 of the script and runtime, so this run couldn't be verified."
   fi
-  local redact_sha
-  redact_sha="$(_ho_sha256 "$HO_REDACT" 2>/dev/null)" || redact_sha=""
-  if [[ -L "$HO_REDACT" || "$redact_sha" != "$HO_REDACT_SHA256" ]]; then
-    _ho_refuse "the redaction filter $HO_REDACT is missing or is not the reviewed one (sha256 ${redact_sha:-none}), so a step could show a secret."
+  local cand real
+  for cand in $HO_PYTHONS; do
+    real="$(/usr/bin/readlink -f "$cand" 2>/dev/null)" || real=""
+    if [[ -n "$real" && -f "$real" && -x "$real" && ! -w "$real" && ! -w "$(dirname "$real")" ]] \
+      && [[ "$(/usr/bin/stat -f %u "$real")" == 0 && "$(/usr/bin/stat -f %u "$(dirname "$real")")" == 0 ]]; then
+      _HO_PY="$real"
+      break
+    fi
+  done
+  if [[ -z "$_HO_PY" ]]; then
+    _ho_refuse "no root-owned python3 from Apple's Command Line Tools or Xcode was found; the redaction filter needs one (install them with: xcode-select --install)."
   fi
+  # The filter's text is read once and checked; steps run this text, not the file.
+  local code="" redact_sha
+  if [[ ! -L "$HO_REDACT" && -f "$HO_REDACT" ]]; then code="$(cat "$HO_REDACT")" || code=""; fi
+  redact_sha="$(printf '%s\n' "$code" | shasum -a 256 | awk '{print $1}')"
+  if [[ -z "$code" || "$redact_sha" != "$HO_REDACT_SHA256" ]]; then
+    _ho_refuse "the redaction filter $HO_REDACT is missing or is not the reviewed one (sha256 $redact_sha), so a step could show a secret."
+  fi
+  _HO_REDACT_CODE="$code"
   # Only a script that `handoff ready` froze may run: META.json must say ready and record this
   # exact script. (A draft can't be run early and its result replayed after ready.)
   local st frozen
@@ -423,35 +484,46 @@ ho_redact_file() { # <name> <absolute file> — hide the values stored in a giti
     why="$file does not exist"
   elif [[ ! -r "$file" ]]; then
     why="$file is not readable"
-  elif ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    why="$file is not inside a git repository, so it cannot be proven gitignored"
-  elif git -C "$dir" ls-files --error-unmatch "$file" >/dev/null 2>&1; then
-    why="$file is tracked by git"
-  elif ! git -C "$dir" check-ignore -q "$file"; then
-    why="$file is not gitignored"
   fi
 
-  # Every VAR=value line must hold a value that is safe to hide: at least 8 characters (a shorter
-  # one would blank out ordinary output) of the kind ho_secret_to_file stores. Blank lines and
-  # comments are skipped. Nothing is hidden unless the whole file qualifies, and no value is shown.
+  # The checked interpreter reads the values (_HO_READ_VALUES): it opens the file without following
+  # a symlink, refuses anything but a regular file, and confirms after opening that it is still the
+  # file at that path, with no symlink anywhere in the path. Git's checks below then judge that
+  # same symlink-free path. Every VAR=value line must hold a value that is safe to hide: at least
+  # 8 characters (a shorter one would blank out ordinary output) of the kind ho_secret_to_file
+  # stores. Blank lines and comments are skipped. Nothing is hidden unless the whole file
+  # qualifies and passes git's checks. The values come back through a pipe and are never shown.
   set +x # tracing is refused at startup; this only guards against a later change
-  local line="" value="" n=0 lineno=0
+  local out="" line="" value="" n=0
   local -a values=()
   if [[ -z "$why" ]]; then
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      lineno=$((lineno + 1))
-      if [[ -z "$line" || "$line" == \#* ]]; then continue; fi
-      value="${line#*=}"
-      if [[ ! "$line" =~ ^[A-Z_][A-Z0-9_]*= || ${#value} -lt 8 || ! "$value" =~ ^[A-Za-z0-9._+/=:@%,-]+$ ]]; then
-        why="line $lineno of $file holds a value that can't be hidden safely (not VAR=value, shorter than 8 characters, or characters ho_secret_to_file never stores)"
-        break
-      fi
-      values+=("$value")
-    done <"$file"
+    out="$("$_HO_PY" -I -c "$_HO_READ_VALUES" "$file" 2>/dev/null)" || out="ERR could not read $file"
+    line="${out%%$'\n'*}"
+    if [[ "$line" != OK ]]; then
+      why="${line#ERR }"
+      [[ -n "$why" ]] || why="could not read $file"
+    else
+      out="${out#OK}"
+      out="${out#$'\n'}"
+      while [[ -n "$out" ]]; do
+        line="${out%%$'\n'*}"
+        if [[ "$out" == *$'\n'* ]]; then out="${out#*$'\n'}"; else out=""; fi
+        if [[ -n "$line" ]]; then values+=("$line"); fi
+      done
+    fi
   fi
+  out=""
   line=""
-  value=""
   if [[ -z "$why" && ${#values[@]} -eq 0 ]]; then why="no values in $file"; fi
+  if [[ -z "$why" ]]; then
+    if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      why="$file is not inside a git repository, so it cannot be proven gitignored"
+    elif git -C "$dir" ls-files --error-unmatch "$file" >/dev/null 2>&1; then
+      why="$file is tracked by git"
+    elif ! git -C "$dir" check-ignore -q "$file"; then
+      why="$file is not gitignored"
+    fi
+  fi
   if [[ -n "$why" ]]; then
     values=()
     _HO_FAILED=1

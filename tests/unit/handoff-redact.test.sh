@@ -9,10 +9,13 @@ source "$(dirname "$0")/../lib/fixture.sh"
 
 REDACT="$FORGE_SRC/.harness/lib/handoff_redact.py"
 
-# feed <secrets, one per line> <log> <chunk>...: runs the filter with the secrets on fd 3, writes
-# each chunk and waits 0.3 s, then prints "after <i>: [<everything shown so far>]". Then closes
-# its input and prints "final: [<all shown>]" and "rc: <status>". With FEED_SIGINT=1 it sends
-# SIGINT to the filter after the first chunk.
+# feed <secrets, one per line> <log> <chunk>...: runs the filter with the secrets on fd 3 and
+# writes each chunk in one write. It then waits until new output appears (up to 5 s) and goes on
+# reading until none arrives for 0.3 s, and prints "after <i>: [<everything shown so far>]". Every
+# chunk in these tests shows something, so new output proves the filter has read and judged the
+# whole chunk, not just that time passed. Then it closes the filter's input and prints
+# "final: [<all shown>]" and "rc: <status>". With FEED_SIGINT=1 it sends SIGINT after the first
+# chunk's output appears (the filter ignores SIGINT before it reads any output).
 feed() {
   FEED_OUT="$(python3 -I - "$REDACT" "$@" <<'PY'
 import os, select, signal, subprocess, sys, time
@@ -26,26 +29,27 @@ p = subprocess.Popen(["/usr/bin/python3", "-I", redact, log], stdin=subprocess.P
 os.close(3)
 shown = b""
 
-def drain(wait):
+def drain(first_wait, then_wait):
+    """Read until nothing arrives: first_wait for the first byte, then_wait for each next one."""
     global shown
+    wait = first_wait
     while select.select([p.stdout], [], [], wait)[0]:
         data = os.read(p.stdout.fileno(), 65536)
         if not data:
             return
         shown += data
-        wait = 0.05
+        wait = then_wait
 
 for i, chunk in enumerate(chunks, 1):
     p.stdin.write(chunk.encode())
     p.stdin.flush()
-    time.sleep(0.3)
-    drain(0)
+    drain(5, 0.3)
     print("after %d: [%s]" % (i, shown.decode()))
     if i == 1 and os.environ.get("FEED_SIGINT") == "1":
         p.send_signal(signal.SIGINT)
         time.sleep(0.2)
 p.stdin.close()
-drain(2)
+drain(5, 0.3)
 print("final: [%s]" % shown.decode())
 print("rc: %d" % p.wait())
 PY
@@ -79,18 +83,38 @@ test_a_held_piece_is_shown_when_the_step_ends() {
 
 # B starts with A: A alone must not be redacted early, leaving the rest of B on the screen.
 test_a_secret_that_starts_another_is_held_until_it_is_clear() {
-  feed $'%@%\n%@%+@+' "$T_TMP/log" '%@%' '+@+'
-  assert_contains "$FEED_OUT" "after 1: []"
-  assert_contains "$FEED_OUT" "final: [[REDACTED]]"
-  feed $'%@%\n%@%+@+' "$T_TMP/log2" '%@%' 'Q'
-  assert_contains "$FEED_OUT" "final: [[REDACTED]Q]"
+  feed $'%@%\n%@%+@+' "$T_TMP/log" 'x %@%' '+@+'
+  assert_contains "$FEED_OUT" "after 1: [x ]"
+  assert_contains "$FEED_OUT" "final: [x [REDACTED]]"
+  feed $'%@%\n%@%+@+' "$T_TMP/log2" 'x %@%' 'Q'
+  assert_contains "$FEED_OUT" "final: [x [REDACTED]Q]"
 }
 
-# A complete secret whose end could start another secret: neither half may be shown early.
-test_a_secret_straddling_the_held_piece_is_held_whole() {
+# A complete secret whose end could start another secret: no piece of either is shown.
+test_a_secret_straddling_the_held_piece_stays_masked() {
   feed $'%@+@\n+@%%' "$T_TMP/log" 'z%@+@'
-  assert_contains "$FEED_OUT" "after 1: [z]"
+  assert_contains "$FEED_OUT" "after 1: [z[REDACTED]]"
   assert_contains "$FEED_OUT" "final: [z[REDACTED]]"
+  assert_not_contains "$FEED_OUT" "+@]"
+}
+
+# Two secrets that overlap without one containing the other (A's end is B's start): every byte
+# either covers is masked, in one write or split at the overlap.
+test_overlapping_secrets_are_masked_together() {
+  feed $'%@%@%@++\n%@++++@@' "$T_TMP/log" '%@%@%@++++@@ end'
+  assert_contains "$FEED_OUT" "final: [[REDACTED] end]"
+  feed $'%@%@%@++\n%@++++@@' "$T_TMP/log2" '%@%@%@++' '++@@ end'
+  assert_contains "$FEED_OUT" "final: [[REDACTED] end]"
+  feed $'%@++++@@\n%@%@%@++' "$T_TMP/log3" 'x %@%@%@++++@@'
+  assert_contains "$FEED_OUT" "final: [x [REDACTED]]"
+}
+
+# A long run that matches a secret over and over is shown as one mask at once, not held until
+# the end: what the filter holds stays below one secret's length.
+test_a_long_run_of_matches_is_not_held() {
+  feed '%%%%%%%%' "$T_TMP/log" "$(printf '%%%.0s' $(seq 1 3000))" 'Z'
+  assert_contains "$FEED_OUT" "after 1: [[REDACTED]]"
+  assert_contains "$FEED_OUT" "final: [[REDACTED]Z]"
 }
 
 test_no_secrets_means_plain_pass_through() {

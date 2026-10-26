@@ -142,6 +142,23 @@ test_check4_runtime_changed_after_run() {
   expect_fail 4 "$PASTE"
 }
 
+# The runtime pins its redaction filter (FRG-14), so a changed or missing filter fails check 4 too.
+test_check4_redaction_filter_changed_after_run() {
+  genuine_run
+  paste_result
+  printf '# filter updated\n' >>"$H/.harness/lib/handoff_redact.py"
+  expect_fail 4 "$PASTE"
+  assert_contains "$VERIFY_OUT" "redaction filter"
+}
+
+test_check4_redaction_filter_missing_after_run() {
+  genuine_run
+  paste_result
+  rm "$H/.harness/lib/handoff_redact.py"
+  expect_fail 4 "$PASTE"
+  assert_contains "$VERIFY_OUT" "redaction filter"
+}
+
 test_check5_declared_step_missing() {
   genuine_run
   grep -v '^check ver:' "$DIR/RESULT.txt" >"$PASTE"

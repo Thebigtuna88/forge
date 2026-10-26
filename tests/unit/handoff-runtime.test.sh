@@ -603,7 +603,36 @@ test_live_secrets_are_not_on_command_lines_or_in_the_environment() {
     assert_not_contains "$text" "${SECRET:0:4}" "$where (first half)"
     assert_not_contains "$text" "${SECRET:4}" "$where (second half)"
   done
-  assert_contains "$(cat "$T_TMP/ps.txt")" "handoff_redact.py" "the filter was running during the step"
+  assert_contains "$(cat "$T_TMP/ps.txt")" "Live redaction filter for handoff steps" "the filter was running during the step"
+}
+
+# ho_begin keeps the checked filter text; replacing the file mid-run changes nothing.
+test_live_filter_replaced_mid_run_changes_nothing() {
+  mk_harness
+  printf 'import os, sys\nos.write(1, os.read(0, 65536))\n' >"$T_TMP/copier.py"
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
+    "ho_check swap /bin/cp $T_TMP/copier.py $H/.harness/lib/handoff_redact.py" \
+    "ho_info reveal /bin/cat $H/.env"
+  pty_run --answer "$SECRET" -- bash "$SCRIPT"
+  assert_exit 0 "$RC" "$OUT"
+  assert_contains "$(cat "$H/.harness/lib/handoff_redact.py")" "os.read(0" "the file was replaced"
+  assert_contains "$OUT" "API_KEY=[REDACTED]"
+  no_secret_piece "$OUT" "the screen"
+  no_secret_piece "$(cat "$H/work/owner/$ID/logs/reveal.log")" "the log"
+}
+
+# The filter runs on Apple's interpreter itself, not the /usr/bin/python3 shim, whose choice of
+# interpreter follows DEVELOPER_DIR: with DEVELOPER_DIR pointing nowhere, the shim can't start
+# anything, but the filter still runs. (No secrets here: collecting one needs git, which is a
+# DEVELOPER_DIR shim too and would refuse.)
+test_live_filter_does_not_depend_on_developer_dir() {
+  mk_harness
+  mk_script "$ID" 'ho_info plain /bin/echo hello world'
+  # Only the owner's script gets the bad DEVELOPER_DIR (the test driver itself runs on the shim).
+  pty_run -- /usr/bin/env DEVELOPER_DIR=/nonexistent bash "$SCRIPT"
+  assert_exit 0 "$RC" "$OUT"
+  assert_contains "$OUT" "hello world"
+  assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check plain: INFO hello world"
 }
 
 # The runtime runs only the reviewed filter: its sha256 is fixed in handoff.sh, so runtime-sha256
@@ -626,7 +655,7 @@ test_live_refuses_a_missing_or_changed_filter() {
 test_live_redaction_failure_ends_the_run_and_shows_nothing() {
   mk_harness
   mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
-    "ho_info reveal /bin/bash -c 'pkill -TERM -f $H/.harness/lib/handoff_redact.py; sleep 0.5; cat $H/.env; sleep 0.5'" \
+    "ho_info reveal /bin/bash -c 'pkill -TERM -f \"Live redaction filter for handoff step[s]\"; sleep 0.5; cat $H/.env; sleep 0.5'" \
     'ho_check after /usr/bin/true'
   pty_run --answer "$SECRET" -- bash "$SCRIPT"
   assert_exit 1 "$RC"
@@ -717,6 +746,11 @@ test_redact_file_refuses_unsafe_or_unusable_files() {
   expect_redact_file_refused "$H/.env.short" "line 2 of $H/.env.short holds a value that can't be hidden safely"
   printf '# no values\n' >"$H/.env.empty"
   expect_redact_file_refused "$H/.env.empty" "no values in $H/.env.empty"
+  # A path through a symlinked folder could lead outside the checked location.
+  mkdir "$H/real"
+  ln -s "$H/real" "$H/linkdir"
+  printf 'TOKEN=%s\n' "$SECRET" >"$H/real/.env.x"
+  expect_redact_file_refused "$H/linkdir/.env.x" "$H/linkdir/.env.x is reached through a symbolic link"
 }
 
 run_tests
