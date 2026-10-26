@@ -39,7 +39,7 @@ HO_SCRIPT="$HO_DIR/$(basename "${BASH_SOURCE[1]}")"
 # here, so this file's runtime-sha256 in the evidence covers the filter too. ho_begin reads the
 # filter once, checks that text and keeps it, and every step runs the kept text (python3 -c), so
 # replacing the file afterwards changes nothing.
-HO_REDACT="$(dirname "$HO_RUNTIME")/handoff_redact.py"
+HO_REDACT="${HO_RUNTIME%/*}/handoff_redact.py"
 HO_REDACT_SHA256=3c5a4e4771bd0b9bd5c4fa83614be326e231ecbc0f537d0f335cc1ffbbd1f964
 # The Python that runs it: Apple's own interpreter, found by fixed path; it and every folder above
 # it must be root-owned and not writable by this user (_ho_root_only). Never the /usr/bin/python3
@@ -161,7 +161,7 @@ _ho_in_own_text() { # <value>
 # Build _HO_OWN_TEXT (called once by ho_begin, after the checksums and the filter are known).
 _ho_build_own_text() {
   local runtime line logs=""
-  runtime="$(cat "$HO_RUNTIME")" || _ho_refuse "could not read $HO_RUNTIME"
+  runtime="$(<"$HO_RUNTIME")" || _ho_refuse "could not read $HO_RUNTIME"
   while IFS= read -r line; do
     if [[ "$line" =~ ^[[:space:]]*ho_(check|info)[[:space:]]+([a-z0-9-]+) ]]; then
       logs="$logs$HO_DIR/logs/${BASH_REMATCH[2]}.log"$'\n'
@@ -277,13 +277,16 @@ sys.stdout.write("OK\n" + "".join(v + "\n" for v in values))'
 readonly _HO_READ_VALUES
 
 # True if the path and every folder above it, up to /, are owned by root and not writable by this
-# user, so nothing this user runs can replace what the path leads to.
+# user, so nothing this user runs can replace what the path leads to. Only shell builtins and
+# /usr/bin/stat: no tool found on PATH takes part in this check.
 _ho_root_only() { # <absolute path>
   local p="$1"
+  [[ "$p" == /* ]] || return 1
   while :; do
     [[ ! -L "$p" && ! -w "$p" && "$(/usr/bin/stat -f %u "$p" 2>/dev/null)" == 0 ]] || return 1
     [[ "$p" != / ]] || return 0
-    p="$(dirname "$p")"
+    p="${p%/*}"
+    [[ -n "$p" ]] || p=/
   done
 }
 
@@ -385,7 +388,7 @@ ho_begin() { # <id>
     _ho_refuse "the redaction filter $HO_REDACT is missing or is not the reviewed one (sha256 $redact_sha), so a step could show a secret."
   fi
   _HO_REDACT_CODE="$code"
-  _HO_SCRIPT_TEXT="$(cat "$HO_SCRIPT")" || _ho_refuse "could not read $HO_SCRIPT"
+  _HO_SCRIPT_TEXT="$(<"$HO_SCRIPT")" || _ho_refuse "could not read $HO_SCRIPT"
   _ho_build_own_text
   # Only a script that `handoff ready` froze may run: META.json must say ready and record this
   # exact script. (A draft can't be run early and its result replayed after ready.)
