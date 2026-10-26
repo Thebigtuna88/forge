@@ -6,14 +6,15 @@ FORGE_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TESTLIB="$FORGE_SRC/tests/lib"
 STUBS="$FORGE_SRC/tests/stubs"
 
-# mk_harness: copy the handoff runtime and tool into $T_TMP/h, a fresh git repo where
-# work/, .env and .env.* are gitignored (as in the real repo). Sets H (harness root) and
-# HANDOFF (the tool).
+# mk_harness: copy the handoff runtime, its redaction filter and the tool into $T_TMP/h, a fresh
+# git repo where work/, .env and .env.* are gitignored (as in the real repo). Sets H (harness
+# root) and HANDOFF (the tool).
 mk_harness() {
   H="$T_TMP/h"
   mkdir -p "$H/.harness/lib" "$H/.harness/bin"
   cp "$FORGE_SRC/.harness/lib/handoff.sh" "$H/.harness/lib/"
   cp "$FORGE_SRC/.harness/lib/handoff_grammar.py" "$H/.harness/lib/"
+  cp "$FORGE_SRC/.harness/lib/handoff_redact.py" "$H/.harness/lib/"
   cp "$FORGE_SRC/.harness/bin/handoff" "$H/.harness/bin/"
   git -C "$H" init -q
   printf 'work/\n.env\n.env.*\n' >"$H/.gitignore"

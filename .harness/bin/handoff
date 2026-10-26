@@ -45,10 +45,10 @@ meta_set() { # <dir> <jq filter> [jq args…]
 # Lines that are not comments (first non-blank character is not '#').
 code_lines() { grep -v '^[[:space:]]*#' "$1" | grep -v '^[[:space:]]*$' || true; }
 
-# "<name> <kind>" for every declared step, kind = check|info|confirm|secret_to_file.
+# "<name> <kind>" for every declared step, kind = check|info|confirm|secret_to_file|redact_file.
 declared_steps() {
   code_lines "$1" \
-    | sed -n -E 's/^[[:space:]]*ho_(check|info|confirm|secret_to_file)[[:space:]]+([^[:space:]]+).*/\2 \1/p'
+    | sed -n -E 's/^[[:space:]]*ho_(check|info|confirm|secret_to_file|redact_file)[[:space:]]+([^[:space:]]+).*/\2 \1/p'
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -92,6 +92,7 @@ ho_begin "$id"
 #   ho_info <name> <command…>
 #   ho_confirm <name> "<question>" || ho_abort
 #   ho_secret_to_file <name> <VAR> <absolute gitignored file> || ho_abort
+#   ho_redact_file <name> <absolute gitignored file> || ho_abort
 
 ho_end
 EOF
@@ -166,13 +167,35 @@ lint_errors() { # prints one error per line; empty output = clean
   local steps names bad dup
   steps="$(declared_steps "$file")"
   if [[ -z "$steps" ]]; then
-    echo "no steps: add at least one ho_check, ho_info, ho_confirm or ho_secret_to_file"
+    echo "no steps: add at least one ho_check, ho_info, ho_confirm, ho_secret_to_file or ho_redact_file"
   else
     names="$(printf '%s\n' "$steps" | awk '{print $1}')"
     bad="$(printf '%s\n' "$names" | grep -vE '^[a-z0-9]+(-[a-z0-9]+)*$' || true)"
     [[ -z "$bad" ]] || echo "invalid step name(s): $(printf '%s' "$bad" | tr '\n' ' ')"
     dup="$(printf '%s\n' "$names" | sort | uniq -d)"
     [[ -z "$dup" ]] || echo "duplicate step name(s): $(printf '%s' "$dup" | tr '\n' ' ')"
+  fi
+
+  # ho_redact_file names a stored secrets file: it must be provably gitignored and untracked now
+  # (the runtime checks again when the owner runs it). The grammar's own tokenizer gives each
+  # path after quote removal. Absolute paths only; the grammar reports the rest.
+  local rfiles rfile rdir
+  if command -v python3 >/dev/null 2>&1; then
+    if ! rfiles="$(python3 -I "$GRAMMAR" --redact-files "$file" 2>&1)"; then
+      echo "could not list the ho_redact_file paths: $rfiles"
+      rfiles=""
+    fi
+    while IFS= read -r rfile; do
+      [[ "$rfile" == /* ]] || continue
+      rdir="$(dirname "$rfile")"
+      if ! git -C "$rdir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "ho_redact_file: $rfile is not inside a git repository, so it cannot be proven gitignored"
+      elif git -C "$rdir" ls-files --error-unmatch "$rfile" >/dev/null 2>&1; then
+        echo "ho_redact_file: $rfile is tracked by git"
+      elif ! git -C "$rdir" check-ignore -q "$rfile"; then
+        echo "ho_redact_file: $rfile is not gitignored"
+      fi
+    done <<<"$rfiles"
   fi
 
   # The allowlist grammar (spec 4.4): only helper steps of plain words and quoted strings.
@@ -331,6 +354,20 @@ cmd_verify() {
     fail "4: runtime $runtime no longer exists"
   elif [[ "$l_runtime" != "runtime-sha256: $(sha256 "$runtime")" ]]; then
     fail "4: runtime-sha256 does not match $runtime (runtime changed: re-run as a fresh handoff)"
+  else
+    # The runtime pins its redaction filter (FRG-14); the filter beside it must still match. It is
+    # read with a shell builtin and hashed by /usr/bin/shasum in an empty environment, never a
+    # tool found on PATH.
+    local pin filter now=""
+    pin="$(sed -n -E 's/^HO_REDACT_SHA256=([0-9a-f]{64})$/\1/p' "$runtime")"
+    filter="$(dirname "$runtime")/handoff_redact.py"
+    if [[ ! -L "$filter" && -f "$filter" ]]; then
+      now="$(printf '%s\n' "$(<"$filter")" | /usr/bin/env -i /usr/bin/shasum -a 256)" || now=""
+      now="${now%% *}"
+    fi
+    if [[ -z "$pin" || "$now" != "$pin" ]]; then
+      fail "4: the redaction filter $filter is missing or no longer the one the runtime pins (re-run as a fresh handoff)"
+    fi
   fi
 
   # 5 + 6. every declared step exactly once, nothing undeclared, right status for its kind

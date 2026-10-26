@@ -50,6 +50,41 @@ test_genuine_paste_verifies() {
   assert_eq "$(jq -r .state "$DIR/META.json")" verified
 }
 
+# ho_redact_file (FRG-14) is a declared step that must PASS, like ho_check.
+test_redact_file_step_verifies() {
+  mk_harness
+  "$HANDOFF" new demo "Demo handoff" >/dev/null
+  ID="$(date -u +%Y-%m-%d)-demo"
+  DIR="$H/work/owner/$ID"
+  printf 'TOKEN=%s\n' '%@+%@@%+' >"$H/.env.helper"
+  local body
+  body="$(sed '$d' "$DIR/OWNER-RUN.sh")"
+  { printf '%s\n' "$body" "ho_redact_file hide $H/.env.helper || ho_abort" 'ho_check ok /usr/bin/true'; printf 'ho_end\n'; } >"$DIR/OWNER-RUN.sh"
+  "$HANDOFF" ready "$ID" >/dev/null || _t_fail "ready failed"
+  pty_run -- bash "$DIR/OWNER-RUN.sh"
+  PASTE="$DIR/PASTED-20260101T000000Z.txt"
+  paste_result
+  verify "$PASTE"
+  assert_exit 0 "$VERIFY_RC" "$VERIFY_OUT"
+  assert_contains "$(cat "$DIR/VERIFIED.txt")" "check hide: PASS hiding 1 value from $H/.env.helper"
+}
+
+test_failed_redact_file_step_does_not_verify() {
+  mk_harness
+  "$HANDOFF" new demo "Demo handoff" >/dev/null
+  ID="$(date -u +%Y-%m-%d)-demo"
+  DIR="$H/work/owner/$ID"
+  local body
+  body="$(sed '$d' "$DIR/OWNER-RUN.sh")"
+  { printf '%s\n' "$body" "ho_redact_file hide $H/.env.missing" 'ho_check ok /usr/bin/true'; printf 'ho_end\n'; } >"$DIR/OWNER-RUN.sh"
+  "$HANDOFF" ready "$ID" >/dev/null || _t_fail "ready failed"
+  pty_run -- bash "$DIR/OWNER-RUN.sh"
+  PASTE="$DIR/PASTED-20260101T000000Z.txt"
+  paste_result
+  expect_fail 6 "$PASTE"
+  assert_contains "$VERIFY_OUT" "step 'hide' did not pass"
+}
+
 test_paste_with_surrounding_text_crlf_and_indent_verifies() {
   genuine_run
   { printf 'here you go:\r\n'; sed 's/^/   /; s/$/\r/' "$DIR/RESULT.txt"; printf 'thanks\n'; } >"$PASTE"
@@ -105,6 +140,42 @@ test_check4_runtime_changed_after_run() {
   paste_result
   printf '# runtime updated\n' >>"$H/.harness/lib/handoff.sh"
   expect_fail 4 "$PASTE"
+}
+
+# The runtime pins its redaction filter (FRG-14), so a changed or missing filter fails check 4 too.
+test_check4_redaction_filter_changed_after_run() {
+  genuine_run
+  paste_result
+  printf '# filter updated\n' >>"$H/.harness/lib/handoff_redact.py"
+  expect_fail 4 "$PASTE"
+  assert_contains "$VERIFY_OUT" "redaction filter"
+}
+
+# Verify hashes the filter with /usr/bin/shasum in an empty environment, so a shasum on PATH that
+# answers the pin can't hide a changed filter.
+test_check4_redaction_filter_check_ignores_a_lying_shasum() {
+  genuine_run
+  paste_result
+  local pin
+  pin="$(sed -n 's/^HO_REDACT_SHA256=//p' "$H/.harness/lib/handoff.sh")"
+  mkdir "$T_TMP/fake"
+  # shellcheck disable=SC2016 # the fake's own $# and $@
+  printf '#!/bin/bash\nif [ "$#" -ge 3 ]; then exec /usr/bin/shasum "$@"; fi\ncat >/dev/null\necho "%s  -"\n' "$pin" \
+    >"$T_TMP/fake/shasum"
+  chmod +x "$T_TMP/fake/shasum"
+  printf '# filter updated\n' >>"$H/.harness/lib/handoff_redact.py"
+  VERIFY_OUT="$(env PATH="$T_TMP/fake:$PATH" "$HANDOFF" verify "$PASTE" 2>&1)"
+  VERIFY_RC=$?
+  assert_exit 1 "$VERIFY_RC" "verify should fail check 4"
+  assert_contains "$VERIFY_OUT" "redaction filter"
+}
+
+test_check4_redaction_filter_missing_after_run() {
+  genuine_run
+  paste_result
+  rm "$H/.harness/lib/handoff_redact.py"
+  expect_fail 4 "$PASTE"
+  assert_contains "$VERIFY_OUT" "redaction filter"
 }
 
 test_check5_declared_step_missing() {

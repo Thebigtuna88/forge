@@ -276,7 +276,19 @@ ho_end
   sha256 (it was never frozen by `handoff ready`, or it is already verified);
 - its own sha256 or the runtime's can't be computed;
 - shell tracing is on (`bash -x`), which would print secrets;
-- a symlink sits at `logs/` or `RESULT.txt` (the last three added in the FRG-1 review).
+- allexport is on (`set -a`, or an exported `SHELLOPTS` carrying it), which would export a secret
+  as soon as it is read (FRG-14);
+- a symlink sits at `logs/` or `RESULT.txt` (the last three added in the FRG-1 review);
+- the live redaction filter `.harness/lib/handoff_redact.py` is missing, a symlink, or not the
+  one whose sha256 `handoff.sh` pins (FRG-14). So `runtime-sha256` covers the filter too. The
+  filter is read with a shell builtin and hashed by the checked interpreter, never by a tool on
+  `PATH`.
+  `ho_begin` reads the filter once and every step runs that checked text (`python3 -c`), so
+  replacing the file mid-run changes nothing;
+- no `python3` from Apple's Command Line Tools or Xcode is found at its fixed path with it and
+  every folder above it root-owned and not writable by the owner (so the Xcode copy under the
+  admin-writable `/Applications` is refused). The filter never runs on the `/usr/bin/python3`
+  shim, whose choice of interpreter follows `DEVELOPER_DIR`.
 
 The refusal means running the script through Claude Code's `!` prefix fails too. That's
 intended: the owner uses a separate Terminal window.
@@ -290,14 +302,16 @@ can stop before an irreversible step.
 | `ho_check <name> <cmd…>` | `PASS` or `FAIL` + last non-empty output line | command exits 0 |
 | `ho_info <name> <cmd…>` | `INFO` + last output line | never fails |
 | `ho_confirm <name> "<question>"` | `PASS` (answered `y`) or `FAIL` | owner types `y` at `/dev/tty` |
-| `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty and uses only `A-Z a-z 0-9 . _ + / = : @ % , -`; the target is a regular file (or absent) and gitignored (`git check-ignore`), as is its temp file; and every write step succeeds |
+| `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty, uses only `A-Z a-z 0-9 . _ + / = : @ % , -`, and doesn't appear in the handoff's own text (FRG-14); the target is a regular file (or absent) and gitignored (`git check-ignore`), as is its temp file; and every write step succeeds |
+| `ho_redact_file <name> <file>` | `PASS hiding N values from <file>` (a count, never a value); on any refusal the run stops at once (`result: FAILED`), since later steps may use those values | no value appears in the handoff's own text (see below), the file is absolute, reached through no symlink, a regular readable file (opened without following a symlink, and confirmed after opening to be the file at that path), untracked and gitignored, and every line that isn't blank (spaces only) or a comment is `VAR=value` (a trailing CR is ignored) with a value of at least 8 characters from the `ho_secret_to_file` set. Its values are then hidden like collected secrets for the rest of the run (FRG-14) |
 | `ho_abort` | `result: FAILED` | ends the run early with the block |
 | `ho_end` | the block | — |
 
 Details:
 - Step names are `[a-z0-9-]+` and unique within a script.
-- Command output still streams to the owner's screen and is saved to `logs/<name>.log`. Only
-  the last line (trimmed to 200 characters, newlines and `-----` stripped) goes into the block.
+- Command output still streams to the owner's screen and is saved to `logs/<name>.log`, both
+  through the live redaction filter (below). Only the last line (trimmed to 200 characters,
+  newlines and `-----` stripped) goes into the block.
 - `ho_secret_to_file` reads with echo off, writes or replaces the single `VAR=value` line in
   the file via a private temp file, `chmod 600`, and unsets the variable. The value is written
   unquoted, which is why its characters are restricted: it means the same to a shell and a
@@ -305,13 +319,44 @@ Details:
   clipboard or the block; if a later step prints it anyway, the runtime replaces it with
   `[REDACTED]` in the evidence and in that step's log. Evidence is redacted both before and
   after it is normalised, so stripping `-----` or control characters can't rejoin a secret.
-- Commands run as `script -q <log> /bin/bash -c '"$@"' …`, so they keep the terminal and shell
-  builtins work. The handoff folder and its logs are mode 700, `RESULT.txt` mode 600. Each
-  step's log is removed before the step runs, and `RESULT.txt` is written fresh; if it can't be
-  saved, `ho_end` prints no block and exits 1.
-- Redaction happens after a step ends, so it protects the evidence and the saved log, not the
-  live screen; see limit L11 and FRG-14. If a log can't be replaced by its redacted copy, the
-  run ends FAILED (the log may hold a secret).
+- Commands run as `script -q /dev/null /bin/bash -c '"$@"' … | <python3> -I -c <checked filter>
+  <log>`, so they keep the terminal and shell builtins work. The handoff folder and its logs are
+  mode 700, logs and `RESULT.txt` mode 600. Each step's log is removed before the step runs, and
+  `RESULT.txt` is written fresh; if it can't be saved, `ho_end` prints no block and exits 1.
+- **Live redaction (FRG-14).** The filter shows the step's output and writes its log with every
+  known secret (collected this run, or loaded by `ho_redact_file`) masked before either sees it:
+  every byte any occurrence of any secret covers, judged on the original bytes, so secrets that
+  contain or overlap one another are hidden whole, and a run of masked bytes shows as one
+  `[REDACTED]`. The secrets reach it on a private pipe (descriptor 3): never on a command line,
+  and not in the step's environment. The list ends with the line `#END`; a list without it may
+  have been cut short, so the filter shows nothing and the run ends FAILED. Everything else the
+  runtime shows that holds words from the script goes through the filter too, without a log:
+  step banners (`▶ name: command`), confirm questions, prompts, file paths and failure reasons.
+  The block's check lines are masked as a whole before the block is saved, shown or copied, so
+  a step name that matches a known secret shows as `[REDACTED]`, and verify then refuses the
+  block. Evidence is masked the same way, through the filter, never one secret at a time.
+- **No secret in the handoff's own text.** `ho_secret_to_file` refuses a typed value, and
+  `ho_redact_file` refuses a file with a value, that appears anywhere in the handoff's own text:
+  the frozen script, its folder, the runtime's and the interpreter's paths, the id, the
+  checksums or the start time; the runtime's and the filter's own source (fixed messages, the `[REDACTED]` marker, the
+  filter text on its command line); and each step's log path. Every line the runtime prints or
+  passes on a command line, other than step output, is built from that text: banners,
+  questions, prompts, paths, failure reasons, the block's header, and the filter's arguments. So a value found there could never be kept hidden, and a real secret
+  found there has leaked already. The filter's own messages are fixed text, with no path,
+  system message or traceback. If masking fails while evidence is cleaned, the run ends FAILED. It holds back only the longest end of the output that could
+  still become a secret (less than one secret's length), and shows that as soon as more output
+  rules it out or the step ends. There is no timer, which could show part of a
+  secret: a step that prints the start of a secret and then waits for input shows those
+  characters only when it continues. The filter ignores SIGINT; if it is killed, what it held is
+  dropped.
+- **Fail closed.** If the filter fails (it can't create the log, it dies, or writing fails), the
+  run ends FAILED: `check _runtime: FAIL live redaction failed in step <name>`. The evidence and
+  the log are also redacted again after the step, as before FRG-14. If a log can't be replaced by
+  its redacted copy, the run ends FAILED (the log may hold a secret).
+- **What it doesn't stop:** a step built to get around it, for example by writing to the
+  terminal device directly, splitting a secret with screen codes, or encoding it. That is L11
+  ("steps run arbitrary programs"), narrowed by FRG-30. Live redaction protects against a step
+  printing a secret by accident.
 - Ctrl-C, TERM or a hang-up ends the run through the same exit path: the block reports FAILED
   and any secret temp file is removed.
 - Steps run from `/`, never from wherever Terminal was opened, so a step names its repository
@@ -344,7 +389,10 @@ step lines, and `ho_end`. Each step line is one helper call made of plain words 
 strings, optionally ending in `|| ho_abort`: no `$` or backticks (except inside single quotes,
 where they stay literal), no other operators, redirection, globs, assignments or function
 definitions. Forbidden names are checked after quote removal, and no `ho_check`/`ho_info` step
-may name a file that a `ho_secret_to_file` step wrote.
+may name a file that a `ho_secret_to_file` step writes or a `ho_redact_file` step names.
+`ho_redact_file` takes exactly one absolute path (read with the grammar's own tokenizer, so a
+quoted path is judged whole), which must already be inside a git repository, untracked and
+gitignored when the script is linted (the runtime checks again at run time).
 
 In addition, lint rejects a script (and `handoff ready` refuses to freeze it) if it:
 - doesn't source the runtime by its exact absolute path, or doesn't call `ho_begin` first and
@@ -369,7 +417,8 @@ Passes only if **all** of these hold:
    `handoff ready`, and the run's `at:` is not older than `readied` (no replaying a run made
    before the script was frozen).
 4. `runtime-sha256` equals the sha256 of the current `.harness/lib/handoff.sh`, and the
-   runtime named in `META.json` is that file.
+   runtime named in `META.json` is that file. The redaction filter beside it still matches the
+   sha256 the runtime pins (FRG-14), as hashed by `/usr/bin/shasum` in an empty environment.
 5. Every step declared in the script appears exactly once, and no undeclared step appears.
 6. Every step is `PASS` or `INFO`, and `result: OK`.
 7. The paste matches `RESULT.txt` (written by the runtime on the owner's run), ignoring
@@ -1068,7 +1117,8 @@ a known limit, with cleanup steps and when to revisit it, in
 
 | Area | Must prove |
 |---|---|
-| `handoff.sh` | refuses without a TTY and with `CLAUDECODE` set; each helper's PASS/FAIL/INFO; secret never appears in logs, screen capture or block; refuses a non-gitignored secret file; `ho_abort` produces `result: FAILED` |
+| `handoff.sh` | refuses without a TTY and with `CLAUDECODE` set; each helper's PASS/FAIL/INFO; secret never appears in logs, screen capture or block; refuses a non-gitignored secret file; `ho_abort` produces `result: FAILED`; live redaction (FRG-14): no piece of a secret on screen or in the log, mid-step or after a killed run, split across writes or overlapping another; secrets on no command line and not in the step's environment; a missing or changed filter refuses, a filter dying mid-step ends the run FAILED; `ho_redact_file` hides stored values and refuses unsafe files |
+| `handoff_redact.py` | shows text at once; holds back only a possible start of a secret, shows it once ruled out or at the end; longest secret whole; private log, never through a symlink; ignores SIGINT |
 | `handoff lint` | rejects each forbidden pattern in 4.4, one test each |
 | `handoff verify` | fails on each of checks 1–8 in 4.5, one test each; passes on a genuine run |
 | `hookrt.sh` | missing, malformed, unknown-value and missing-key `mode.json` all mean enforce; load failure denies |
@@ -1110,7 +1160,7 @@ its mitigation and, where one exists, a stronger option the owner can adopt late
 | L2 | **Same GitHub identity.** The agent uses the owner's `gh` login, so GitHub can't tell agent from owner; only the local hook stops a `dev`→`main` merge. | Personal accounts can't use bypass lists or required reviewers against yourself. | `gate-merge-on-review` (base must be `dev`, API merges denied), `deny-repo-admin`. | A separate free **machine account** for the agent with write access, with `main` requiring the owner's approving review. |
 | L3 | **Handoff runtime checks are a speed bump.** The TTY and `CLAUDECODE` checks can be faked (the test suite does it). | Any program with a shell can fake a terminal. | Evidence = the owner's paste matching `RESULT.txt`, frozen script sha, unchanged runtime; `handoff lint`. | — (the owner's paste is the real control) |
 | L4 | **The paste file is written by the agent** (until FRG-5). The agent saves the owner's pasted text to disk; a dishonest agent could write something else, with a matching `RESULT.txt` (FRG-1 review S1). | Claude Code has no "owner-signed" input. | The paste is visible in the chat transcript; verify cross-checks `RESULT.txt`; charter. **Decided 2026-10-16:** FRG-5 adds a UserPromptSubmit hook that captures the paste and a guard on evidence files. | Agent runs as a separate macOS user. |
-| L11 | **Handoff steps run arbitrary programs.** The grammar limits shell syntax, but an allowed step (`python3 -c …`) can do anything the owner can: forge evidence, or print a collected secret to the screen before redaction (FRG-1 review S15, C3, S18). | The agent writes the scripts the owner runs. | Allowlist grammar; secret-file rule; redaction of evidence and logs; owner sees each step's command on screen. | FRG-14: reject inline interpreters, live redaction. |
+| L11 | **Handoff steps run arbitrary programs.** The grammar limits shell syntax, but an allowed step (`python3 -c …`) can do anything the owner can: forge evidence, or deliberately get a known secret past live redaction (write to the terminal device directly, split it with screen codes, encode it) (FRG-1 review S15, C3, S18). | The agent writes the scripts the owner runs. | Allowlist grammar; secret-file rule; live redaction of the screen and logs and redaction of evidence (FRG-14, for secrets printed by accident); owner sees each step's command on screen. | FRG-30: reject inline interpreters, with runtime replacements (after FRG-26's checkpoint). |
 | L12 | **Evidence the agent writes can be forged or swapped by the agent** (FRG-4 review round 1). The merge gate re-checks `review.md` and the reply files (binding, recomputed diff, hashes, read-proof), which proves which code they describe, not that a reviewer wrote them: the agent could write CLEAN replies and a matching `review.md` itself. Likewise a second command running at the same moment could replace a `--body-file` between the scan and `gh` sending it. | Agent, reviewer runner and files share one macOS user; nothing on disk is beyond the agent's reach. | The gates stop mistakes and shortcuts, not a deliberately dishonest agent (as L1, L4); every PR touching an owner-only path is merged by the owner; review summaries are posted on the PR; charter rules 3, 6 and 9. **Decided 2026-10-18** (owner): accepted as a known limit. | Agent (and codex) run as separate macOS users, or a GitHub machine account whose merges need the owner's approval (L2). |
 | L13 | **Commands deliberately disguised from the gates** (FRG-4 review rounds 6-10). A command built to hide that it runs `gh`, `git` or a deploy tool (its name or words spelled so the text check doesn't recognise them) may not be judged as that tool. Accepted risk, not fixed: round 10's SEC-1, deferred to FRG-26. | The hooks read a command's text; what the shell makes of it can't be fully predicted, and each patch was followed by a new spelling. | The gates recognise ordinary commands and mistakes (conformance proves each listed case); the round 2-9 checks stay; charter rule 9; GitHub branch protection on `main` and `dev`. Against a deliberate attempt, nothing technical holds while the agent uses the owner's admin login (L2). **Decided 2026-10-19** (owner): `docs/decisions/2026-10-19-disguised-commands-known-limit.md`. | FRG-26: define what the agent's own GitHub credentials and macOS user must be unable to do, and test each restriction. A separate account alone isn't enough. |
 | L5 | **Read-proof proves access, not diligence.** A reviewer can hash the diff and still review it badly. | — | Adversarial prompt, structured findings, multiple lenses, stall rule, owner merges `main`. | Owner skims `review.md` for risky PRs. |

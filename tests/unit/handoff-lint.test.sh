@@ -155,6 +155,51 @@ test_rejects_reading_a_secret_file_before_it_is_written() {
   assert_contains "$LINT_OUT" "reads the secret file"
 }
 
+# ho_redact_file (FRG-14): names a secrets file whose values the runtime hides.
+test_redact_file_step_passes() {
+  new_with "ho_redact_file hide $T_TMP/h/.env.helper || ho_abort" 'ho_check ok /usr/bin/true'
+  lint
+  assert_exit 0 "$LINT_RC" "$LINT_OUT"
+}
+
+test_rejects_redact_file_without_an_absolute_path() {
+  expect_rejected "ho_redact_file hide takes </absolute/path>" 'ho_redact_file hide relative/.env'
+}
+
+test_rejects_redact_file_with_extra_words() {
+  expect_rejected "ho_redact_file hide takes </absolute/path>" "ho_redact_file hide $T_TMP/h/.env /bin/cat"
+}
+
+test_rejects_redact_file_that_is_not_gitignored() {
+  expect_rejected "ho_redact_file: $T_TMP/h/plain.env is not gitignored" "ho_redact_file hide $T_TMP/h/plain.env"
+}
+
+# A quoted path with a space is checked whole: here only its first word would be gitignored.
+test_rejects_redact_file_judged_on_the_whole_quoted_path() {
+  new_with 'ho_check ok /usr/bin/true' "ho_redact_file hide '$T_TMP/h/.env dir/plain.txt'"
+  mkdir -p "$T_TMP/h/.env dir"
+  lint
+  assert_exit 1 "$LINT_RC"
+  assert_contains "$LINT_OUT" "ho_redact_file: $T_TMP/h/.env dir/plain.txt is not gitignored"
+}
+
+test_redact_file_with_a_quoted_path_passes() {
+  new_with "ho_redact_file hide '$T_TMP/h/.env.helper token' || ho_abort" 'ho_check ok /usr/bin/true'
+  lint
+  assert_exit 0 "$LINT_RC" "$LINT_OUT"
+}
+
+test_rejects_redact_file_outside_a_repository() {
+  expect_rejected "is not inside a git repository" 'ho_redact_file hide /etc/hosts'
+}
+
+test_rejects_reading_a_redacted_file() {
+  new_with "ho_redact_file hide $T_TMP/h/.env.helper || ho_abort" "ho_info reveal /bin/cat $T_TMP/h/.env.helper"
+  lint
+  assert_exit 1 "$LINT_RC"
+  assert_contains "$LINT_OUT" "reads the secret file"
+}
+
 # Bootstrap (spec 4.9): the handoff that installs shellcheck may be readied without it.
 test_shellcheck_install_handoff_passes_without_shellcheck() {
   new_with 'ho_check install-shellcheck brew install shellcheck || ho_abort'
