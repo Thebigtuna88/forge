@@ -58,6 +58,11 @@ fi
 case "$-" in
   *x*) _ho_refuse "shell tracing (bash -x) is on; it would print secrets. Run: bash OWNER-RUN.sh" ;;
 esac
+# allexport (set -a, or inherited through an exported SHELLOPTS) exports every variable as it is
+# assigned, so a secret read into a variable would reach every command run meanwhile (FRG-14).
+case "$-" in
+  *a*) _ho_refuse "the shell exports every variable (set -a / allexport, maybe through an exported SHELLOPTS); it would hand secrets to other commands. Run it from a shell without allexport." ;;
+esac
 
 if [[ -w "$HO_SCRIPT" ]]; then
   _ho_refuse "OWNER-RUN.sh is still writable, so it was never frozen by 'handoff ready' (or you ran it with sudo)."

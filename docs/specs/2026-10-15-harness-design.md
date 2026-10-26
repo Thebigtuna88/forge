@@ -276,6 +276,8 @@ ho_end
   sha256 (it was never frozen by `handoff ready`, or it is already verified);
 - its own sha256 or the runtime's can't be computed;
 - shell tracing is on (`bash -x`), which would print secrets;
+- allexport is on (`set -a`, or an exported `SHELLOPTS` carrying it), which would export a secret
+  as soon as it is read (FRG-14);
 - a symlink sits at `logs/` or `RESULT.txt` (the last three added in the FRG-1 review);
 - the live redaction filter `.harness/lib/handoff_redact.py` is missing, a symlink, or not the
   one whose sha256 `handoff.sh` pins (FRG-14). So `runtime-sha256` covers the filter too. The

@@ -685,6 +685,20 @@ test_secrets_never_reach_a_childs_environment() {
   done
 }
 
+# allexport would export a secret the moment it is read, whatever `declare +x` says, so the
+# runtime refuses it, including when it comes in through an exported SHELLOPTS.
+test_refuses_allexport() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env"
+  pty_run --answer "$SECRET" -- /usr/bin/env SHELLOPTS=allexport bash "$SCRIPT"
+  assert_exit 3 "$RC"
+  assert_contains "$OUT" "allexport"
+  [[ ! -e "$H/.env" ]] || _t_fail "a secret was collected under allexport"
+  pty_run --answer "$SECRET" -- bash -a "$SCRIPT"
+  assert_exit 3 "$RC"
+  assert_contains "$OUT" "allexport"
+}
+
 # The filter's pin is checked with the checked interpreter, so a shasum on PATH that answers the
 # pin for whatever it reads can't get a different filter accepted.
 test_live_filter_pin_ignores_a_lying_shasum() {
