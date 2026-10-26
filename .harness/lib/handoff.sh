@@ -79,7 +79,8 @@ _HO_SECRETS=() # values collected by ho_secret_to_file or loaded by ho_redact_fi
 _HO_REDACT_RC=0 # the live redaction filter's status for the last step
 _HO_PY="" # the checked interpreter (ho_begin)
 _HO_REDACT_CODE="" # the checked text of the filter (ho_begin)
-_HO_SCRIPT_TEXT="" # the frozen script's text (ho_begin), for _ho_in_own_text
+_HO_SCRIPT_TEXT="" # the frozen script's text (ho_begin)
+_HO_OWN_TEXT="" # the handoff's own text (_ho_build_own_text), for _ho_in_own_text
 
 _ho_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 _ho_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -138,14 +139,27 @@ _ho_redact() {
   _ho_masked "$1"
 }
 
-# Succeeds if the value appears anywhere in this handoff's own text: its script, folder, runtime
-# path, id, checksums or start time. Everything the runtime prints apart from step output (banners,
-# questions, prompts, paths, reasons, the log path on the filter's command line, the block's
-# header) comes from that text, so such a value could not be kept hidden (FRG-14).
+# Succeeds if the value appears anywhere in this handoff's own text (_HO_OWN_TEXT, built by
+# ho_begin): the frozen script; its folder, the runtime's path, id, checksums and start time; the
+# runtime's and the filter's own source (every fixed message, the [REDACTED] marker, and the
+# filter text on its command line); and each step's log path. Everything the runtime prints or
+# passes on a command line, apart from step output, comes from that text, so such a value could
+# not be kept hidden (FRG-14).
 _ho_in_own_text() { # <value>
-  local own
-  own="$_HO_SCRIPT_TEXT"$'\n'"$HO_DIR"$'\n'"$HO_RUNTIME"$'\n'"$_HO_ID $_HO_SCRIPT_SHA $_HO_RUNTIME_SHA $_HO_AT"
-  [[ "$own" == *"$1"* ]]
+  [[ "$_HO_OWN_TEXT" == *"$1"* ]]
+}
+
+# Build _HO_OWN_TEXT (called once by ho_begin, after the checksums and the filter are known).
+_ho_build_own_text() {
+  local runtime line logs=""
+  runtime="$(cat "$HO_RUNTIME")" || _ho_refuse "could not read $HO_RUNTIME"
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*ho_(check|info)[[:space:]]+([a-z0-9-]+) ]]; then
+      logs="$logs$HO_DIR/logs/${BASH_REMATCH[2]}.log"$'\n'
+    fi
+  done <<<"$_HO_SCRIPT_TEXT"
+  _HO_OWN_TEXT="$_HO_SCRIPT_TEXT"$'\n'"$HO_DIR"$'\n'"$HO_RUNTIME"$'\n'"$_HO_ID $_HO_SCRIPT_SHA $_HO_RUNTIME_SHA $_HO_AT"
+  _HO_OWN_TEXT="$_HO_OWN_TEXT"$'\n'"$logs$runtime"$'\n'"$_HO_REDACT_CODE"
 }
 
 # Replace a step's log with a redacted copy. Returns 1 if that fails (the log may still hold a
@@ -352,6 +366,7 @@ ho_begin() { # <id>
   fi
   _HO_REDACT_CODE="$code"
   _HO_SCRIPT_TEXT="$(cat "$HO_SCRIPT")" || _ho_refuse "could not read $HO_SCRIPT"
+  _ho_build_own_text
   # Only a script that `handoff ready` froze may run: META.json must say ready and record this
   # exact script. (A draft can't be run early and its result replayed after ready.)
   local st frozen

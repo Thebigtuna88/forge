@@ -333,10 +333,11 @@ Details:
   block. Evidence is masked the same way, through the filter, never one secret at a time.
 - **No secret in the handoff's own text.** `ho_secret_to_file` refuses a typed value, and
   `ho_redact_file` refuses a file with a value, that appears anywhere in the handoff's own text:
-  the frozen script, its folder, the runtime's path, the id, the checksums or the start time.
-  Every line the runtime prints, other than step output, is built from that text: banners,
-  questions, prompts, paths, failure reasons, the block's header, and the log path on the
-  filter's command line. So a value found there could never be kept hidden, and a real secret
+  the frozen script, its folder, the runtime's path, the id, the checksums or the start time;
+  the runtime's and the filter's own source (fixed messages, the `[REDACTED]` marker, the
+  filter text on its command line); and each step's log path. Every line the runtime prints or
+  passes on a command line, other than step output, is built from that text: banners,
+  questions, prompts, paths, failure reasons, the block's header, and the filter's arguments. So a value found there could never be kept hidden, and a real secret
   found there has leaked already. The filter's own error messages name no path. It holds back only the longest end of the output that could
   still become a secret (less than one secret's length), and shows that as soon as more output
   rules it out or the step ends. There is no timer, which could show part of a

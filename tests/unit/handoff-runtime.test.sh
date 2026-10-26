@@ -750,6 +750,10 @@ test_redact_file_refuses_values_in_the_handoffs_own_text() {
   expect_own_text_refused deploy-prod-1       # a step name
   expect_own_text_refused work/owner          # part of the handoff's folder
   expect_own_text_refused "${ID:0:10}"        # part of the handoff's id
+  expect_own_text_refused REDACTED            # inside the [REDACTED] marker
+  expect_own_text_refused clipboard           # a fixed runtime message
+  expect_own_text_refused bytearray           # the filter's text, on its command line
+  expect_own_text_refused /logs/deploy-prod-1.log  # a step's log path, also on that line
   assert_not_contains "$OUT" "deploy-prod-1: /usr/bin/true" "the later step never ran"
 }
 
