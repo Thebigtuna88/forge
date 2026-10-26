@@ -1056,8 +1056,9 @@ or 1.
   **macOS** runners, which are free for public repos.
 
 The pty driver kills, when a run ends, every descendant it saw in its process snapshots, after a
-best-effort check that each is still the same process. A process that deliberately detaches
-between two snapshots can escape, and keeps the permissions of the user running the tests; the
+best-effort check that each is still the same process. A process that detaches itself (fork,
+setsid, parent exits) between two snapshots can escape, whether to evade cleanup or as ordinary
+daemon start-up, and it and its children keep the permissions of the user running the tests; the
 identity check has one-second precision. None of the unprivileged approaches tested on macOS
 closes either gap. The driver is not a security sandbox; the tests start no daemons. Accepted as
 a known limit, with cleanup steps and when to revisit it, in
