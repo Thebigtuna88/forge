@@ -15,13 +15,14 @@ REDACT="$FORGE_SRC/.harness/lib/handoff_redact.py"
 # chunk in these tests shows something, so new output proves the filter has read and judged the
 # whole chunk, not just that time passed. Then it closes the filter's input and prints
 # "final: [<all shown>]" and "rc: <status>". With FEED_SIGINT=1 it sends SIGINT after the first
-# chunk's output appears (the filter ignores SIGINT before it reads any output).
+# chunk's output appears (the filter ignores SIGINT before it reads any output). The secret list
+# ends with "#END", as the runtime sends it, unless FEED_NO_END=1.
 feed() {
   FEED_OUT="$(python3 -I - "$REDACT" "$@" <<'PY'
 import os, select, signal, subprocess, sys, time
 redact, secrets, log, chunks = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 r, w = os.pipe()
-os.write(w, secrets.encode() + b"\n")
+os.write(w, secrets.encode() + b"\n" + (b"" if os.environ.get("FEED_NO_END") == "1" else b"#END\n"))
 os.close(w)
 os.dup2(r, 3)
 p = subprocess.Popen(["/usr/bin/python3", "-I", redact, log], stdin=subprocess.PIPE,
@@ -143,6 +144,21 @@ test_sigint_does_not_stop_the_filter() {
   FEED_SIGINT=1 feed '%@+%@@%+' "$T_TMP/log" 'before ' '%@+%@@%+ after'
   assert_contains "$FEED_OUT" "final: [before [REDACTED] after]"
   assert_contains "$FEED_OUT" "rc: 0"
+}
+
+# A secret list that doesn't end with "#END" may have been cut short: nothing is shown.
+test_a_cut_short_secret_list_shows_nothing() {
+  FEED_NO_END=1 feed '%@+%@@%+' "$T_TMP/log" 'token %@+%@@%+'
+  assert_contains "$FEED_OUT" "final: []"
+  [[ "$FEED_OUT" != *"rc: 0"* ]] || _t_fail "the filter accepted a list without #END: $FEED_OUT"
+}
+
+# "-" instead of a log path: the runtime's step banners, shown masked with no log.
+test_no_log_mode_masks_and_writes_no_file() {
+  feed '%@+%@@%+' "-" 'run /bin/echo %@+%@@%+'
+  assert_contains "$FEED_OUT" "final: [run /bin/echo [REDACTED]]"
+  assert_contains "$FEED_OUT" "rc: 0"
+  [[ ! -e "-" && ! -e "$T_TMP/-" ]] || _t_fail "a file named - was written"
 }
 
 test_needs_exactly_the_log_path() {

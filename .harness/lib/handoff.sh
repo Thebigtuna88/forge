@@ -40,9 +40,10 @@ HO_SCRIPT="$HO_DIR/$(basename "${BASH_SOURCE[1]}")"
 # filter once, checks that text and keeps it, and every step runs the kept text (python3 -c), so
 # replacing the file afterwards changes nothing.
 HO_REDACT="$(dirname "$HO_RUNTIME")/handoff_redact.py"
-HO_REDACT_SHA256=035e325c6a0be8df1dfe25de5fbd1f003795e4583b74168b3b2c40383d698565
-# The Python that runs it: Apple's own interpreter, found by fixed path and required to be
-# root-owned. Never the /usr/bin/python3 shim, whose choice follows DEVELOPER_DIR.
+HO_REDACT_SHA256=a817ef2bd995c4a0f757c07fa7931ae499aeb86e2741518cbab9f53493ce0e79
+# The Python that runs it: Apple's own interpreter, found by fixed path; it and every folder above
+# it must be root-owned and not writable by this user (_ho_root_only). Never the /usr/bin/python3
+# shim, whose choice follows DEVELOPER_DIR.
 HO_PYTHONS="/Library/Developer/CommandLineTools/usr/bin/python3 /Applications/Xcode.app/Contents/Developer/usr/bin/python3"
 readonly HO_RUNTIME HO_DIR HO_SCRIPT HO_REDACT HO_REDACT_SHA256 HO_PYTHONS
 
@@ -149,10 +150,21 @@ _ho_redact_log() {
   (set -C && umask 077 && _ho_redact "$content" >"$1") 2>/dev/null || return 1
 }
 
-# The collected secrets, one per line, for the filter's private descriptor (printf is a builtin,
-# so they are never on a command line).
+# The collected secrets, one per line, then "#END", for the filter's private descriptor (printf
+# is a builtin, so they are never on a command line). The filter refuses a list without "#END":
+# a list cut short would leave secrets unmasked.
 _ho_secret_lines() {
   if [[ ${#_HO_SECRETS[@]} -gt 0 ]]; then printf '%s\n' "${_HO_SECRETS[@]}"; fi
+  printf '#END\n'
+}
+
+# A step's banner (its name and command) goes through the filter too, without a log: a command's
+# literal arguments can match a known secret.
+_ho_banner() { # <name> <command…>
+  local name="$1"
+  shift
+  printf '\n▶ %s: %s\n' "$name" "$*" | "$_HO_PY" -I -c "$_HO_REDACT_CODE" - 3< <(_ho_secret_lines) \
+    || _ho_fatal "live redaction failed for the banner of step $name"
 }
 
 # Run a step's command under script(1) so it keeps the terminal; builtins work too. Its output
@@ -200,7 +212,9 @@ while True:
 safe = re.compile(rb"^[A-Z_][A-Z0-9_]*=([A-Za-z0-9._+/=:@%,-]{8,})$")
 values = []
 for no, line in enumerate(data.split(b"\n"), 1):
-    if not line or line.startswith(b"#"):
+    if line.endswith(b"\r"):
+        line = line[:-1]
+    if not line.strip() or line.startswith(b"#"):
         continue
     m = safe.match(line)
     if not m:
@@ -210,6 +224,17 @@ if not values:
     refuse("no values in %s" % p)
 sys.stdout.write("OK\n" + "".join(v + "\n" for v in values))'
 readonly _HO_READ_VALUES
+
+# True if the path and every folder above it, up to /, are owned by root and not writable by this
+# user, so nothing this user runs can replace what the path leads to.
+_ho_root_only() { # <absolute path>
+  local p="$1"
+  while :; do
+    [[ ! -L "$p" && ! -w "$p" && "$(/usr/bin/stat -f %u "$p" 2>/dev/null)" == 0 ]] || return 1
+    [[ "$p" != / ]] || return 0
+    p="$(dirname "$p")"
+  done
+}
 
 # After a step: if the filter failed, its output may be incomplete and the log missing, so the run
 # ends FAILED (fail closed).
@@ -280,8 +305,7 @@ ho_begin() { # <id>
   local cand real
   for cand in $HO_PYTHONS; do
     real="$(/usr/bin/readlink -f "$cand" 2>/dev/null)" || real=""
-    if [[ -n "$real" && -f "$real" && -x "$real" && ! -w "$real" && ! -w "$(dirname "$real")" ]] \
-      && [[ "$(/usr/bin/stat -f %u "$real")" == 0 && "$(/usr/bin/stat -f %u "$(dirname "$real")")" == 0 ]]; then
+    if [[ -n "$real" && -f "$real" && -x "$real" ]] && _ho_root_only "$real"; then
       _HO_PY="$real"
       break
     fi
@@ -328,7 +352,7 @@ ho_check() { # <name> <command…> — PASS only if the command exits 0
   _ho_new_name "$name"
   [[ $# -gt 0 ]] || _ho_fatal "ho_check $name: no command given"
   local log="$HO_DIR/logs/$name.log" rc=0 last
-  printf '\n▶ %s: %s\n' "$name" "$*"
+  _ho_banner "$name" "$@"
   rm -f "$log"
   _ho_run "$log" "$@" || rc=$?
   _ho_check_redaction "$name"
@@ -352,7 +376,7 @@ ho_info() { # <name> <command…> — recorded, never fails
   _ho_new_name "$name"
   [[ $# -gt 0 ]] || _ho_fatal "ho_info $name: no command given"
   local log="$HO_DIR/logs/$name.log" rc=0 last
-  printf '\n▶ %s: %s\n' "$name" "$*"
+  _ho_banner "$name" "$@"
   rm -f "$log"
   _ho_run "$log" "$@" || rc=$?
   _ho_check_redaction "$name"

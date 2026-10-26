@@ -651,11 +651,13 @@ test_live_refuses_a_missing_or_changed_filter() {
   [[ ! -f "$H/work/owner/$ID/RESULT.txt" ]] || _t_fail "RESULT.txt written despite the refusal"
 }
 
-# The filter dies mid-step: the step's output is not shown raw, and the run ends FAILED.
+# The filter dies mid-step: the step's output is not shown raw, and the run ends FAILED. Only this
+# fixture's filter is stopped, found by its log path (the [e] keeps the step's own command line,
+# which holds the pattern, from matching).
 test_live_redaction_failure_ends_the_run_and_shows_nothing() {
   mk_harness
   mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
-    "ho_info reveal /bin/bash -c 'pkill -TERM -f \"Live redaction filter for handoff step[s]\"; sleep 0.5; cat $H/.env; sleep 0.5'" \
+    "ho_info reveal /bin/bash -c 'pkill -TERM -f \"$H/work/owner/$ID/logs/rev[e]al.log\"; sleep 0.5; cat $H/.env; sleep 0.5'" \
     'ho_check after /usr/bin/true'
   pty_run --answer "$SECRET" -- bash "$SCRIPT"
   assert_exit 1 "$RC"
@@ -720,6 +722,28 @@ test_redact_file_hides_stored_values() {
   no_secret_piece "$result" "RESULT.txt"
   no_secret_piece "$(cat "$H/work/owner/$ID/logs/reveal.log")" "the log"
   no_secret_piece "$(cat "$T_TMP/clipboard")" "the clipboard"
+}
+
+# A step's banner (its command) is masked too: a literal argument can match a known secret.
+test_live_step_banner_is_masked() {
+  mk_harness
+  printf 'TOKEN=%s\n' "$SECRET" >"$H/.env.helper"
+  mk_script "$ID" "ho_redact_file hide $H/.env.helper" "ho_info probe /bin/echo 'x$SECRET'"
+  pty_run -- bash "$SCRIPT"
+  assert_exit 0 "$RC" "$OUT"
+  assert_contains "$OUT" "probe: /bin/echo x[REDACTED]"
+  no_secret_piece "$OUT" "the screen"
+}
+
+# Blank lines (spaces only) and Windows line endings in a stored secrets file are fine.
+test_redact_file_accepts_blank_lines_and_crlf() {
+  mk_harness
+  printf 'TOKEN=%s\r\n   \r\n\nOTHER=%s\n' "$SECRET" "$SECRET2" >"$H/.env.helper"
+  mk_script "$ID" "ho_redact_file hide $H/.env.helper" "ho_info reveal /bin/cat $H/.env.helper"
+  pty_run -- bash "$SCRIPT"
+  assert_exit 0 "$RC" "$OUT"
+  assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check hide: PASS hiding 2 values from $H/.env.helper"
+  no_secret_piece "$OUT" "the screen"
 }
 
 expect_redact_file_refused() { # <file> <reason>

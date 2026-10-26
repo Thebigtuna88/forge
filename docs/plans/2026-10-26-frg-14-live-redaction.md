@@ -163,3 +163,11 @@ codex `code` + `security` rounds to CLEAN.
 - **Test design note:** the runtime prints each step's command before running it. So a test
   whose step prompts with a literal `[y/N] ` gets answered early; the tests build such prompts at
   run time.
+- **Review round 2 additions:**
+  - the secret list ends with `#END`, and a list cut short makes the filter show nothing (fail
+    closed);
+  - each step's banner (`▶ name: command`) is masked by the filter too;
+  - the interpreter and every folder above it must be root-owned and not writable by the owner,
+    which refuses the Xcode copy under the admin-writable `/Applications`;
+  - lint checks that a `ho_redact_file` path is gitignored and untracked;
+  - the reader skips blank lines made of spaces and ignores a trailing CR.

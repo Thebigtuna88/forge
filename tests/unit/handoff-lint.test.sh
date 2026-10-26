@@ -170,6 +170,14 @@ test_rejects_redact_file_with_extra_words() {
   expect_rejected "ho_redact_file hide takes </absolute/path>" "ho_redact_file hide $T_TMP/h/.env /bin/cat"
 }
 
+test_rejects_redact_file_that_is_not_gitignored() {
+  expect_rejected "ho_redact_file: $T_TMP/h/plain.env is not gitignored" "ho_redact_file hide $T_TMP/h/plain.env"
+}
+
+test_rejects_redact_file_outside_a_repository() {
+  expect_rejected "is not inside a git repository" 'ho_redact_file hide /etc/hosts'
+}
+
 test_rejects_reading_a_redacted_file() {
   new_with "ho_redact_file hide $T_TMP/h/.env.helper || ho_abort" "ho_info reveal /bin/cat $T_TMP/h/.env.helper"
   lint

@@ -1,12 +1,14 @@
 """Live redaction filter for handoff steps (spec 4.3, FRG-14).
 
-usage: <python3> -I handoff_redact.py <log> 3<secrets
+usage: <python3> -I handoff_redact.py <log | -> 3<secrets
        (the runtime runs this file's checked text with -c, so argv is then ['-c', <log>])
 
 The runtime pipes a step's terminal output (from script(1)) into this filter. It copies the output
-to its own stdout (the owner's screen) and to <log>, replacing every known secret with [REDACTED]
-before either sees it. The secrets arrive one per line on file descriptor 3, never on the command
-line or in the environment.
+to its own stdout (the owner's screen) and to <log> ("-": no log, for the runtime's own step
+banners), replacing every known secret with [REDACTED] before either sees it. The secrets arrive
+one per line on file descriptor 3, never on the command line or in the environment, followed by
+the line "#END" ("#" is never in a secret). Without that line the list may be cut short, so the
+filter shows nothing and exits 2.
 
 Masking: every byte that any occurrence of any secret covers is masked, judged on the original
 bytes, so secrets that contain or overlap one another are hidden whole. A run of masked bytes
@@ -29,11 +31,18 @@ import signal
 import sys
 
 MASK = b"[REDACTED]"
+END = b"#END"
 
 
 def read_secrets():
+    """The secrets, longest first; None if the list didn't end with END (cut short)."""
     with os.fdopen(3, "rb") as f:
-        found = {s for s in f.read().split(b"\n") if s}
+        lines = f.read().split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    if not lines or lines[-1] != END:
+        return None
+    found = {s for s in lines[:-1] if s}
     return sorted(found, key=len, reverse=True)
 
 
@@ -81,7 +90,7 @@ def write_all(fd, data):
 
 def main():
     if len(sys.argv) != 2:
-        sys.stderr.write("usage: handoff_redact.py <log> 3<secrets\n")
+        sys.stderr.write("usage: handoff_redact.py <log | -> 3<secrets\n")
         return 2
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
@@ -89,11 +98,16 @@ def main():
     except OSError as e:
         sys.stderr.write("handoff_redact: cannot read the secrets: %s\n" % e)
         return 2
-    try:
-        log = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    except OSError as e:
-        sys.stderr.write("handoff_redact: cannot create the log %s: %s\n" % (sys.argv[1], e))
+    if secrets is None:
+        sys.stderr.write("handoff_redact: the list of secrets was cut short; showing nothing\n")
         return 2
+    log = None
+    if sys.argv[1] != "-":
+        try:
+            log = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except OSError as e:
+            sys.stderr.write("handoff_redact: cannot create the log %s: %s\n" % (sys.argv[1], e))
+            return 2
     log_ok = True
 
     def show(out):
@@ -101,7 +115,7 @@ def main():
         if not out:
             return
         write_all(1, out)
-        if log_ok:
+        if log is not None and log_ok:
             try:
                 write_all(log, out)
             except OSError:
@@ -129,7 +143,8 @@ def main():
     if held:
         out, _ = masked(held, covered(held, secrets, lead), in_mask)
         show(out)
-    os.close(log)
+    if log is not None:
+        os.close(log)
     return 0 if log_ok else 3
 
 
