@@ -50,6 +50,41 @@ test_genuine_paste_verifies() {
   assert_eq "$(jq -r .state "$DIR/META.json")" verified
 }
 
+# ho_redact_file (FRG-14) is a declared step that must PASS, like ho_check.
+test_redact_file_step_verifies() {
+  mk_harness
+  "$HANDOFF" new demo "Demo handoff" >/dev/null
+  ID="$(date -u +%Y-%m-%d)-demo"
+  DIR="$H/work/owner/$ID"
+  printf 'TOKEN=%s\n' '%@+%@@%+' >"$H/.env.helper"
+  local body
+  body="$(sed '$d' "$DIR/OWNER-RUN.sh")"
+  { printf '%s\n' "$body" "ho_redact_file hide $H/.env.helper || ho_abort" 'ho_check ok /usr/bin/true'; printf 'ho_end\n'; } >"$DIR/OWNER-RUN.sh"
+  "$HANDOFF" ready "$ID" >/dev/null || _t_fail "ready failed"
+  pty_run -- bash "$DIR/OWNER-RUN.sh"
+  PASTE="$DIR/PASTED-20260101T000000Z.txt"
+  paste_result
+  verify "$PASTE"
+  assert_exit 0 "$VERIFY_RC" "$VERIFY_OUT"
+  assert_contains "$(cat "$DIR/VERIFIED.txt")" "check hide: PASS hiding 1 value from $H/.env.helper"
+}
+
+test_failed_redact_file_step_does_not_verify() {
+  mk_harness
+  "$HANDOFF" new demo "Demo handoff" >/dev/null
+  ID="$(date -u +%Y-%m-%d)-demo"
+  DIR="$H/work/owner/$ID"
+  local body
+  body="$(sed '$d' "$DIR/OWNER-RUN.sh")"
+  { printf '%s\n' "$body" "ho_redact_file hide $H/.env.missing" 'ho_check ok /usr/bin/true'; printf 'ho_end\n'; } >"$DIR/OWNER-RUN.sh"
+  "$HANDOFF" ready "$ID" >/dev/null || _t_fail "ready failed"
+  pty_run -- bash "$DIR/OWNER-RUN.sh"
+  PASTE="$DIR/PASTED-20260101T000000Z.txt"
+  paste_result
+  expect_fail 6 "$PASTE"
+  assert_contains "$VERIFY_OUT" "step 'hide' did not pass"
+}
+
 test_paste_with_surrounding_text_crlf_and_indent_verifies() {
   genuine_run
   { printf 'here you go:\r\n'; sed 's/^/   /; s/$/\r/' "$DIR/RESULT.txt"; printf 'thanks\n'; } >"$PASTE"

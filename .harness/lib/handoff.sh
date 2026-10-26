@@ -35,7 +35,11 @@ fi
 HO_RUNTIME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 HO_DIR="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
 HO_SCRIPT="$HO_DIR/$(basename "${BASH_SOURCE[1]}")"
-readonly HO_RUNTIME HO_DIR HO_SCRIPT
+# The live redaction filter every step's output passes through (FRG-14). Its sha256 is fixed
+# here, so this file's runtime-sha256 in the evidence covers the filter too; ho_begin checks it.
+HO_REDACT="$(dirname "$HO_RUNTIME")/handoff_redact.py"
+HO_REDACT_SHA256=ce3de22171a150025de18a293226c27e77a213f65333b1499b60095e9dfe0691
+readonly HO_RUNTIME HO_DIR HO_SCRIPT HO_REDACT HO_REDACT_SHA256
 
 # Steps run from / so that no command picks up a repository from wherever Terminal was opened:
 # a step names its repository (--repo, git -C) and uses absolute paths.
@@ -65,7 +69,8 @@ _HO_SCRIPT_SHA=""
 _HO_RUNTIME_SHA=""
 _HO_AT=""
 _HO_TMP="" # a secret temp file being written; removed on any exit
-_HO_SECRETS=() # values collected by ho_secret_to_file in this run, kept only to redact them
+_HO_SECRETS=() # values collected by ho_secret_to_file or loaded by ho_redact_file, kept only to redact them
+_HO_REDACT_RC=0 # the live redaction filter's status for the last step
 
 _ho_sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 _ho_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -137,12 +142,35 @@ _ho_redact_log() {
   (set -C && umask 077 && _ho_redact "$content" >"$1") 2>/dev/null || return 1
 }
 
-# Run a step's command under script(1) so it keeps the terminal; builtins work too.
+# The collected secrets, one per line, for the filter's private descriptor (printf is a builtin,
+# so they are never on a command line).
+_ho_secret_lines() {
+  if [[ ${#_HO_SECRETS[@]} -gt 0 ]]; then printf '%s\n' "${_HO_SECRETS[@]}"; fi
+}
+
+# Run a step's command under script(1) so it keeps the terminal; builtins work too. Its output
+# goes through the live redaction filter, which shows it and writes the log with every collected
+# secret replaced (FRG-14). The secrets reach the filter through a pipe on its descriptor 3 only:
+# not on a command line, and not in the step's environment or descriptors. Returns the command's
+# status and sets _HO_REDACT_RC to the filter's.
 _ho_run() { # <log> <command…>
   local log="$1"
+  local -a st
   shift
   # shellcheck disable=SC2016 # "$@" is expanded by the inner bash, which runs the command
-  /usr/bin/script -q "$log" /bin/bash -c '"$@"' ho-step "$@"
+  /usr/bin/script -q /dev/null /bin/bash -c '"$@"' ho-step "$@" \
+    | /usr/bin/python3 -I "$HO_REDACT" "$log" 3< <(_ho_secret_lines)
+  st=("${PIPESTATUS[@]}")
+  _HO_REDACT_RC="${st[1]}"
+  return "${st[0]}"
+}
+
+# After a step: if the filter failed, its output may be incomplete and the log missing, so the run
+# ends FAILED (fail closed).
+_ho_check_redaction() { # <name>
+  if [[ "$_HO_REDACT_RC" != 0 ]]; then
+    _ho_fatal "live redaction failed in step $1 (filter status $_HO_REDACT_RC); its output may be incomplete"
+  fi
 }
 
 _ho_record() { # <PASS|FAIL|INFO> <name> <evidence>
@@ -203,6 +231,11 @@ ho_begin() { # <id>
   if [[ ! "$_HO_SCRIPT_SHA" =~ ^[0-9a-f]{64}$ || ! "$_HO_RUNTIME_SHA" =~ ^[0-9a-f]{64}$ ]]; then
     _ho_refuse "could not compute the sha256 of the script and runtime, so this run couldn't be verified."
   fi
+  local redact_sha
+  redact_sha="$(_ho_sha256 "$HO_REDACT" 2>/dev/null)" || redact_sha=""
+  if [[ -L "$HO_REDACT" || "$redact_sha" != "$HO_REDACT_SHA256" ]]; then
+    _ho_refuse "the redaction filter $HO_REDACT is missing or is not the reviewed one (sha256 ${redact_sha:-none}), so a step could show a secret."
+  fi
   # Only a script that `handoff ready` froze may run: META.json must say ready and record this
   # exact script. (A draft can't be run early and its result replayed after ready.)
   local st frozen
@@ -237,6 +270,7 @@ ho_check() { # <name> <command…> — PASS only if the command exits 0
   printf '\n▶ %s: %s\n' "$name" "$*"
   rm -f "$log"
   _ho_run "$log" "$@" || rc=$?
+  _ho_check_redaction "$name"
   _ho_redact_log "$log" || _ho_fatal "could not redact the log of step $name; it may hold a secret: $log"
   last="$(_ho_last_line "$log")"
   if [[ $rc -eq 0 ]]; then
@@ -260,6 +294,7 @@ ho_info() { # <name> <command…> — recorded, never fails
   printf '\n▶ %s: %s\n' "$name" "$*"
   rm -f "$log"
   _ho_run "$log" "$@" || rc=$?
+  _ho_check_redaction "$name"
   _ho_redact_log "$log" || _ho_fatal "could not redact the log of step $name; it may hold a secret: $log"
   last="$(_ho_last_line "$log")"
   if [[ $rc -ne 0 ]]; then last="exit $rc: $last"; fi
@@ -369,6 +404,71 @@ ho_secret_to_file() { # <name> <VAR> <absolute file> — hidden input, mode 600,
   fi
   _ho_record PASS "$name" "stored $var in $file (mode 600)"
   printf '  ✔ PASS (stored, not shown)\n'
+  return 0
+}
+
+ho_redact_file() { # <name> <absolute file> — hide the values stored in a gitignored secrets file
+  _ho_need_begun
+  local name="${1:-}" file="${2:-}"
+  _ho_new_name "$name"
+  printf '\n▶ %s: hide the values stored in %s\n' "$name" "$file"
+
+  local why="" dir
+  dir="$(dirname "$file")"
+  if [[ "$file" != /* ]]; then
+    why="the file must be an absolute path"
+  elif [[ -L "$file" || ( -e "$file" && ! -f "$file" ) ]]; then
+    why="$file is not a regular file"
+  elif [[ ! -e "$file" ]]; then
+    why="$file does not exist"
+  elif [[ ! -r "$file" ]]; then
+    why="$file is not readable"
+  elif ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    why="$file is not inside a git repository, so it cannot be proven gitignored"
+  elif git -C "$dir" ls-files --error-unmatch "$file" >/dev/null 2>&1; then
+    why="$file is tracked by git"
+  elif ! git -C "$dir" check-ignore -q "$file"; then
+    why="$file is not gitignored"
+  fi
+
+  # Every VAR=value line must hold a value that is safe to hide: at least 8 characters (a shorter
+  # one would blank out ordinary output) of the kind ho_secret_to_file stores. Blank lines and
+  # comments are skipped. Nothing is hidden unless the whole file qualifies, and no value is shown.
+  set +x # tracing is refused at startup; this only guards against a later change
+  local line="" value="" n=0 lineno=0
+  local -a values=()
+  if [[ -z "$why" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      lineno=$((lineno + 1))
+      if [[ -z "$line" || "$line" == \#* ]]; then continue; fi
+      value="${line#*=}"
+      if [[ ! "$line" =~ ^[A-Z_][A-Z0-9_]*= || ${#value} -lt 8 || ! "$value" =~ ^[A-Za-z0-9._+/=:@%,-]+$ ]]; then
+        why="line $lineno of $file holds a value that can't be hidden safely (not VAR=value, shorter than 8 characters, or characters ho_secret_to_file never stores)"
+        break
+      fi
+      values+=("$value")
+    done <"$file"
+  fi
+  line=""
+  value=""
+  if [[ -z "$why" && ${#values[@]} -eq 0 ]]; then why="no values in $file"; fi
+  if [[ -n "$why" ]]; then
+    values=()
+    _HO_FAILED=1
+    _ho_record FAIL "$name" "refused: $why"
+    printf '  ✘ FAIL (%s)\n' "$why"
+    return 1
+  fi
+  for value in "${values[@]}"; do
+    _ho_add_secret "$value"
+    n=$((n + 1))
+  done
+  values=()
+  value=""
+  local noun=values
+  [[ $n -ne 1 ]] || noun=value
+  _ho_record PASS "$name" "hiding $n $noun from $file"
+  printf '  ✔ PASS (hiding %s %s, not shown)\n' "$n" "$noun"
   return 0
 }
 

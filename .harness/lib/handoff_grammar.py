@@ -14,6 +14,8 @@ where every step line is one helper call made of plain words and quoted strings:
     ho_check|ho_info <name> <command word>... [|| ho_abort]
     ho_confirm <name> "<question>" [|| ho_abort]
     ho_secret_to_file <name> <VAR> </absolute/path> [|| ho_abort]
+    ho_redact_file <name> </absolute/path> [|| ho_abort]
+No step may name a file that a ho_secret_to_file or ho_redact_file step names (the secret file).
 No expansions ($, backticks), no operators other than a final "|| ho_abort", no redirection,
 no globbing, no function definitions. Words are checked after quote removal, so splitting a
 forbidden name across quotes ('RESULT''.''txt') does not hide it.
@@ -22,7 +24,7 @@ forbidden name across quotes ('RESULT''.''txt') does not hide it.
 import re
 import sys
 
-HELPERS = ("ho_check", "ho_info", "ho_confirm", "ho_secret_to_file")
+HELPERS = ("ho_check", "ho_info", "ho_confirm", "ho_secret_to_file", "ho_redact_file")
 NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 VAR = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 UNQUOTED_OK = re.compile(r"[A-Za-z0-9_@%+=:,./^-]")  # no ~: bash would expand it
@@ -91,7 +93,7 @@ def check_step(words, secret_files):
     if any(q is None for _, q in words):
         raise Bad("'||' may only appear once, before a final ho_abort")
     if not words or words[0][1] or words[0][0] not in HELPERS:
-        raise Bad("only ho_check, ho_info, ho_confirm and ho_secret_to_file steps are allowed here")
+        raise Bad("only ho_check, ho_info, ho_confirm, ho_secret_to_file and ho_redact_file steps are allowed here")
     helper = words[0][0]
     args = words[1:]
     if not args or args[0][1] or not NAME.match(args[0][0]):
@@ -109,6 +111,9 @@ def check_step(words, secret_files):
     elif helper == "ho_confirm":
         if len(rest) != 1 or not rest[0][1]:
             raise Bad("ho_confirm %s takes exactly one quoted question" % name)
+    elif helper == "ho_redact_file":
+        if len(rest) != 1 or not rest[0][0].startswith("/"):
+            raise Bad("ho_redact_file %s takes </absolute/path>" % name)
     else:
         if len(rest) != 2 or not VAR.match(rest[0][0]) or not rest[1][0].startswith("/"):
             raise Bad("ho_secret_to_file %s takes <VAR> </absolute/path>" % name)
@@ -136,6 +141,8 @@ def main(path, runtime, ident):
             continue
         if len(w) >= 4 and w[0] == ("ho_secret_to_file", False):
             secret_files.append(w[3][0])
+        elif len(w) >= 3 and w[0] == ("ho_redact_file", False):
+            secret_files.append(w[2][0])
     for no, raw in enumerate(lines, 1):
         line = raw.strip()
         if no == 1:

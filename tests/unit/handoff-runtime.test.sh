@@ -350,8 +350,10 @@ test_steps_run_from_the_root_folder() {
 test_unredactable_log_ends_the_run() {
   mk_harness
   # A step that prints the secret, then makes the log folder read-only so the log can't be replaced.
+  # It waits first, so the live filter has already created the log (if the folder were locked
+  # before that, the filter's own refusal would end the run instead).
   mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
-    "ho_check leak /bin/bash -c 'cat $H/.env; chmod 500 $H/work/owner/$ID/logs'" 'ho_check after /usr/bin/true'
+    "ho_check leak /bin/bash -c 'cat $H/.env; sleep 1; chmod 500 $H/work/owner/$ID/logs'" 'ho_check after /usr/bin/true'
   pty_run --answer 'Secret-77' -- bash "$SCRIPT"
   chmod 700 "$H/work/owner/$ID/logs"
   assert_exit 1 "$RC"
@@ -485,6 +487,236 @@ test_evidence_drops_osc_sequences() {
   assert_contains "$result" "check only: INFO (no output)"
   assert_contains "$result" "check cut: INFO cut ok"$'\n'
   assert_not_contains "$result" "11;?"
+}
+
+# --- Live redaction (FRG-14) ------------------------------------------------------------------
+# The secrets are made only of % @ +, which the screen, logs and RESULT.txt never hold otherwise
+# (as in FRG-23), so any piece of a secret anywhere is a leak. (Not ",": the screen prints
+# "(stored, not shown)".)
+SECRET='%@+%@@%+'
+SECRET2='@@%%++@%'
+
+no_secret_piece() { # <text> <where>
+  [[ "$1" != *[%@+]* ]] || _t_fail "$2 holds a piece of a secret (% @ or +): ${1:0:600}"
+}
+
+# pty_run_bg [--answer X]... -- <script>: like pty_run, in the background (BG = its pid).
+pty_run_bg() {
+  env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_SANDBOX_NETWORK_DISABLED \
+    PATH="$STUBS:$PATH" STUB_CLIPBOARD="$T_TMP/clipboard" \
+    python3 -I "$TESTLIB/ptyrun.py" "$@" >"$T_TMP/bg-out" 2>&1 &
+  BG=$!
+}
+
+wait_for_file() { # <file>: up to 10 s
+  local tries=100
+  while [[ $tries -gt 0 ]]; do
+    [[ -e "$1" ]] && return 0
+    sleep 0.1
+    tries=$((tries - 1))
+  done
+  return 1
+}
+
+test_live_secret_never_reaches_the_screen() {
+  mk_harness
+  [[ "$T_TMP" != *[%@+]* ]] || _t_fail "the test folder's path holds % @ or +"
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" "ho_info reveal /bin/cat $H/.env"
+  pty_run --answer "$SECRET" -- bash "$SCRIPT"
+  assert_contains "$OUT" "API_KEY=[REDACTED]" "screen"
+  no_secret_piece "$OUT" "the screen"
+  no_secret_piece "$(cat "$H/work/owner/$ID/logs/reveal.log")" "the log"
+  no_secret_piece "$(cat "$H/work/owner/$ID/RESULT.txt")" "RESULT.txt"
+}
+
+# script(1) buffers its log, so the step prints 200 kB after the secret: enough that, without live
+# redaction, the raw secret would already be in the log mid-step.
+test_live_log_never_holds_the_secret_mid_step() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
+    "ho_info reveal /bin/bash -c 'cat $H/.env; yes | head -c 200000; touch $T_TMP/printed; sleep 3'"
+  pty_run_bg --answer "$SECRET" -- bash "$SCRIPT"
+  wait_for_file "$T_TMP/printed" || _t_fail "the step never printed"
+  sleep 0.5
+  local log
+  log="$(cat "$H/work/owner/$ID/logs/reveal.log" 2>/dev/null)"
+  assert_contains "$log" "API_KEY=" "mid-step, the step's output is already in the log"
+  no_secret_piece "$log" "mid-step, the log"
+  wait "$BG"
+}
+
+test_live_log_of_a_killed_run_never_holds_the_secret() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
+    "ho_info reveal /bin/bash -c 'cat $H/.env; yes | head -c 200000; touch $T_TMP/printed; sleep 3'"
+  pty_run_bg --answer "$SECRET" -- bash "$SCRIPT"
+  wait_for_file "$T_TMP/printed" || _t_fail "the step never printed"
+  sleep 0.5
+  local owner
+  owner="$(pgrep -f "^bash $SCRIPT\$")"
+  [[ -n "$owner" ]] || _t_fail "could not find the owner's script to kill"
+  kill -KILL "$owner"
+  wait "$BG"
+  local log
+  log="$(cat "$H/work/owner/$ID/logs/reveal.log" 2>/dev/null)"
+  assert_contains "$log" "API_KEY=" "the step's output is in the log"
+  no_secret_piece "$log" "after the run was killed, the log"
+}
+
+test_live_secret_split_across_writes_is_redacted() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
+    "ho_info split /bin/bash -c 'v=\$(cut -d= -f2 $H/.env); echo -n \"\${v:0:4}\"; sleep 0.5; echo \"\${v:4}\"'"
+  pty_run --answer "$SECRET" -- bash "$SCRIPT"
+  assert_contains "$OUT" "[REDACTED]" "screen"
+  no_secret_piece "$OUT" "the screen"
+  no_secret_piece "$(cat "$H/work/owner/$ID/logs/split.log")" "the log"
+  assert_contains "$(cat "$H/work/owner/$ID/RESULT.txt")" "check split: INFO [REDACTED]"
+}
+
+test_live_overlapping_secrets_are_redacted_whole() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file short A $H/.env" "ho_secret_to_file long B $H/.env" \
+    "ho_info split /bin/bash -c 'v=\$(grep ^B= $H/.env | cut -d= -f2); echo -n \"\${v:0:3}\"; sleep 0.5; echo \"\${v:3}\"'"
+  # B starts with A: a short-first redaction would leave "+@+" of B on the screen.
+  pty_run --answer '%@%' --answer '%@%+@+' -- bash "$SCRIPT"
+  assert_contains "$OUT" "[REDACTED]" "screen"
+  no_secret_piece "$OUT" "the screen"
+  no_secret_piece "$(cat "$H/work/owner/$ID/logs/split.log")" "the log"
+}
+
+# The secrets reach the filter out-of-band: no process's command line and not the step's
+# environment holds one. (They come from a file here, not from typed answers: ptyrun's own
+# command line would hold an answer.)
+test_live_secrets_are_not_on_command_lines_or_in_the_environment() {
+  mk_harness
+  printf 'HELPER_TOKEN=%s\n' "$SECRET" >"$H/.env.helper"
+  mk_script "$ID" "ho_redact_file hide $H/.env.helper" \
+    "ho_info probe /bin/bash -c 'ps -A -ww -o command= >$T_TMP/ps.txt; env >$T_TMP/env.txt'"
+  pty_run -- bash "$SCRIPT"
+  # Other processes' command lines and the environment may hold % @ + for their own reasons, so
+  # these look for the secret and each half of it.
+  local where text
+  for where in ps env; do
+    text="$(cat "$T_TMP/$where.txt")"
+    assert_not_contains "$text" "$SECRET" "$where"
+    assert_not_contains "$text" "${SECRET:0:4}" "$where (first half)"
+    assert_not_contains "$text" "${SECRET:4}" "$where (second half)"
+  done
+  assert_contains "$(cat "$T_TMP/ps.txt")" "handoff_redact.py" "the filter was running during the step"
+}
+
+# The runtime runs only the reviewed filter: its sha256 is fixed in handoff.sh, so runtime-sha256
+# in the evidence covers it too.
+test_live_refuses_a_missing_or_changed_filter() {
+  mk_harness
+  mk_script "$ID" 'ho_check ok /usr/bin/true'
+  mv "$H/.harness/lib/handoff_redact.py" "$T_TMP/filter.py"
+  pty_run -- bash "$SCRIPT"
+  assert_exit 3 "$RC"
+  assert_contains "$OUT" "redaction filter"
+  { cat "$T_TMP/filter.py"; printf '# changed\n'; } >"$H/.harness/lib/handoff_redact.py"
+  pty_run -- bash "$SCRIPT"
+  assert_exit 3 "$RC"
+  assert_contains "$OUT" "redaction filter"
+  [[ ! -f "$H/work/owner/$ID/RESULT.txt" ]] || _t_fail "RESULT.txt written despite the refusal"
+}
+
+# The filter dies mid-step: the step's output is not shown raw, and the run ends FAILED.
+test_live_redaction_failure_ends_the_run_and_shows_nothing() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
+    "ho_info reveal /bin/bash -c 'pkill -TERM -f $H/.harness/lib/handoff_redact.py; sleep 0.5; cat $H/.env; sleep 0.5'" \
+    'ho_check after /usr/bin/true'
+  pty_run --answer "$SECRET" -- bash "$SCRIPT"
+  assert_exit 1 "$RC"
+  local result
+  result="$(cat "$H/work/owner/$ID/RESULT.txt")"
+  assert_contains "$result" "check _runtime: FAIL live redaction failed in step reveal"
+  assert_contains "$result" "result: FAILED"
+  assert_not_contains "$result" "check after"
+  no_secret_piece "$OUT" "the screen"
+}
+
+# Ctrl-C typed at a step's prompt reaches the step (script(1) keeps the terminal raw); the step
+# fails, and nothing it printed before shows the secret. The prompt is built at run time: the
+# runtime prints each step's command first, and a literal "[y/N] " there would be answered early.
+test_live_ctrl_c_mid_step_fails_it_and_shows_nothing() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
+    "ho_check stop /bin/bash -c 'cat $H/.env; p=\"[y/N\"; read -r -p \"Stop? \$p] \" a; sleep 5'"
+  pty_run --answer "$SECRET" --answer $'\003' -- bash "$SCRIPT"
+  assert_exit 1 "$RC"
+  local result
+  result="$(cat "$H/work/owner/$ID/RESULT.txt")"
+  assert_contains "$result" "check stop: FAIL"
+  assert_contains "$result" "result: FAILED"
+  no_secret_piece "$OUT" "the screen"
+  no_secret_piece "$(cat "$H/work/owner/$ID/logs/stop.log")" "the log"
+}
+
+test_live_step_prompt_without_newline_gets_its_answer() {
+  mk_harness
+  mk_script "$ID" "ho_secret_to_file key API_KEY $H/.env" \
+    "ho_check ask /bin/bash -c 'p=\"[y/N\"; read -r -p \"Go on? \$p] \" a; [ \"\$a\" = y ]'"
+  pty_run --answer "$SECRET" --answer y -- bash "$SCRIPT"
+  assert_exit 0 "$RC" "$OUT"
+  assert_contains "$OUT" "Go on? [y/N] "
+}
+
+test_live_screen_codes_and_plain_output_pass_through() {
+  mk_harness
+  mk_script "$ID" "ho_info color /usr/bin/printf '\\033[31mred\\033[0m\\n'" 'ho_info plain /bin/echo hello world'
+  pty_run -- bash "$SCRIPT"
+  assert_exit 0 "$RC" "$OUT"
+  assert_contains "$OUT" $'\033[31mred\033[0m'
+  assert_contains "$OUT" "hello world"
+  assert_contains "$(cat "$H/work/owner/$ID/logs/plain.log")" "hello world"
+}
+
+# --- ho_redact_file (FRG-14, Option A) --------------------------------------------------------
+
+test_redact_file_hides_stored_values() {
+  mk_harness
+  printf 'HELPER_TOKEN=%s\nOTHER=%s\n' "$SECRET" "$SECRET2" >"$H/.env.helper"
+  mk_script "$ID" "ho_redact_file hide $H/.env.helper" "ho_info reveal /bin/cat $H/.env.helper"
+  pty_run -- bash "$SCRIPT"
+  assert_exit 0 "$RC" "$OUT"
+  local result
+  result="$(cat "$H/work/owner/$ID/RESULT.txt")"
+  assert_contains "$result" "check hide: PASS hiding 2 values from $H/.env.helper"
+  assert_contains "$result" "check reveal: INFO OTHER=[REDACTED]"
+  assert_contains "$OUT" "HELPER_TOKEN=[REDACTED]"
+  no_secret_piece "$OUT" "the screen"
+  no_secret_piece "$result" "RESULT.txt"
+  no_secret_piece "$(cat "$H/work/owner/$ID/logs/reveal.log")" "the log"
+  no_secret_piece "$(cat "$T_TMP/clipboard")" "the clipboard"
+}
+
+expect_redact_file_refused() { # <file> <reason>
+  mk_script "$ID" "ho_redact_file hide $1" 'ho_check after /usr/bin/true'
+  pty_run -- bash "$SCRIPT"
+  assert_exit 1 "$RC"
+  local result
+  result="$(cat "$H/work/owner/$ID/RESULT.txt")"
+  assert_contains "$result" "check hide: FAIL refused: $2"
+  assert_contains "$result" "result: FAILED"
+  no_secret_piece "$OUT" "the screen"
+  no_secret_piece "$result" "RESULT.txt"
+}
+
+test_redact_file_refuses_unsafe_or_unusable_files() {
+  mk_harness
+  printf 'TOKEN=%s\n' "$SECRET" >"$H/plain.txt"
+  expect_redact_file_refused "$H/plain.txt" "$H/plain.txt is not gitignored"
+  expect_redact_file_refused "relative/.env" "the file must be an absolute path"
+  expect_redact_file_refused "$H/.env.missing" "$H/.env.missing does not exist"
+  ln -s "$H/plain.txt" "$H/.env.link"
+  expect_redact_file_refused "$H/.env.link" "$H/.env.link is not a regular file"
+  printf 'TOKEN=%s\nSHORT=abc\n' "$SECRET" >"$H/.env.short"
+  expect_redact_file_refused "$H/.env.short" "line 2 of $H/.env.short holds a value that can't be hidden safely"
+  printf '# no values\n' >"$H/.env.empty"
+  expect_redact_file_refused "$H/.env.empty" "no values in $H/.env.empty"
 }
 
 run_tests

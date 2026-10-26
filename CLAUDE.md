@@ -45,8 +45,9 @@ Whenever you are blocked on the owner (install, login, API key, credits, product
 web-UI click), **write a script, never instructions**:
 
 1. `.harness/bin/handoff new <slug> "<title>"`, then add steps using only `ho_check`,
-   `ho_info`, `ho_confirm` and `ho_secret_to_file`, with `|| ho_abort` before anything
-   irreversible.
+   `ho_info`, `ho_confirm`, `ho_secret_to_file` and `ho_redact_file`, with `|| ho_abort` before
+   anything irreversible. A step that uses a secret stored by an earlier handoff is preceded by
+   `ho_redact_file <name> <that file>`, so the value is hidden if printed.
 2. `.harness/bin/handoff ready <id>` (it lints and freezes the script).
 3. Give the owner **exactly two things**: `bash <full path>/OWNER-RUN.sh` and "paste back the
    HANDOFF-RESULT block". Nothing else.

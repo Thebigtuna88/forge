@@ -45,10 +45,10 @@ meta_set() { # <dir> <jq filter> [jq args…]
 # Lines that are not comments (first non-blank character is not '#').
 code_lines() { grep -v '^[[:space:]]*#' "$1" | grep -v '^[[:space:]]*$' || true; }
 
-# "<name> <kind>" for every declared step, kind = check|info|confirm|secret_to_file.
+# "<name> <kind>" for every declared step, kind = check|info|confirm|secret_to_file|redact_file.
 declared_steps() {
   code_lines "$1" \
-    | sed -n -E 's/^[[:space:]]*ho_(check|info|confirm|secret_to_file)[[:space:]]+([^[:space:]]+).*/\2 \1/p'
+    | sed -n -E 's/^[[:space:]]*ho_(check|info|confirm|secret_to_file|redact_file)[[:space:]]+([^[:space:]]+).*/\2 \1/p'
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -92,6 +92,7 @@ ho_begin "$id"
 #   ho_info <name> <command…>
 #   ho_confirm <name> "<question>" || ho_abort
 #   ho_secret_to_file <name> <VAR> <absolute gitignored file> || ho_abort
+#   ho_redact_file <name> <absolute gitignored file> || ho_abort
 
 ho_end
 EOF
@@ -166,7 +167,7 @@ lint_errors() { # prints one error per line; empty output = clean
   local steps names bad dup
   steps="$(declared_steps "$file")"
   if [[ -z "$steps" ]]; then
-    echo "no steps: add at least one ho_check, ho_info, ho_confirm or ho_secret_to_file"
+    echo "no steps: add at least one ho_check, ho_info, ho_confirm, ho_secret_to_file or ho_redact_file"
   else
     names="$(printf '%s\n' "$steps" | awk '{print $1}')"
     bad="$(printf '%s\n' "$names" | grep -vE '^[a-z0-9]+(-[a-z0-9]+)*$' || true)"
