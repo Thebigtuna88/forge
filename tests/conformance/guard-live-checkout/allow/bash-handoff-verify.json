@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "@ROOT@/.harness/bin/handoff verify @ROOT@/work/owner/2026-01-01-demo/PASTED-1.txt"
+  },
+  "cwd": "@ROOT@",
+  "forge_mode_key": "guard-live-checkout:bash"
+}

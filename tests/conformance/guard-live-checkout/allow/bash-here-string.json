@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cat <<< x"
+  },
+  "cwd": "@ROOT@",
+  "forge_mode_key": "guard-live-checkout:bash"
+}

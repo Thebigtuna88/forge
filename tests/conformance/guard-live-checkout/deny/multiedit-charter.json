@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "MultiEdit",
+  "tool_input": {
+    "file_path": "@ROOT@/CLAUDE.md"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "is never edited by hand"
+}

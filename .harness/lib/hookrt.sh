@@ -43,6 +43,24 @@ set -eEu -o pipefail # pipefail: a failure anywhere in a pipeline counts
 
 _HR_DECISION="" # "allow" only after hr_allow; anything else ends in exit 2
 _HR_TMPD=""     # private folder holding the "failed" mark
+# Two hooks fail open instead (FRG-5), known by their own file names (owner-only; conformance
+# checks that each is registered only for its event): capture-owner-paste, which records the
+# owner's pasted result and must never stop the owner's message reaching the agent (a paste it
+# fails to record is refused by handoff verify), and the Stop hook gate-owner-handoff-form (spec
+# 4.6: a Stop hook that blocked on its own errors would block every turn). For them a crash or an
+# input they can't judge allows, says so on stdout and logs FAILED-OPEN in .harness/observed.log;
+# an explicit hr_deny still denies.
+_HR_FAIL_OPEN=0
+case "${BASH_SOURCE[1]:-}" in
+  */.claude/hooks/capture-owner-paste.sh | */.claude/hooks/gate-owner-handoff-form.sh) _HR_FAIL_OPEN=1 ;;
+esac
+_hr_failed_open() { # <reason>: a fail-open hook couldn't do its job; say so and log it
+  printf 'FORGE hook %s failed open: %s\n' "${HR_HOOK:-?}" "${1//$'\n'/ }"
+  if [[ -n "${HR_ROOT:-}" ]]; then
+    printf '%s %s FAILED-OPEN %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)" "${HR_HOOK:-?}" \
+      "${1//$'\n'/ }" >>"$HR_ROOT/.harness/observed.log" 2>/dev/null || true
+  fi
+}
 _hr_on_exit() {
   local rc=$? failed=0
   set +eu
@@ -51,6 +69,10 @@ _hr_on_exit() {
     rm -rf "$_HR_TMPD"
   fi
   if [[ $failed == 0 && "${_HR_DECISION:-}" == allow && "$rc" == 0 ]]; then exit 0; fi
+  if [[ "${_HR_FAIL_OPEN:-0}" == 1 && "${_HR_DECISION:-}" != deny ]]; then
+    _hr_failed_open "a command failed or the hook ended without a decision (status $rc)"
+    exit 0
+  fi
   if [[ $failed == 1 && "${_HR_DECISION:-}" != deny ]]; then
     printf 'FORGE hook %s: a command failed (perhaps inside a command substitution), so it denies, fail closed.\n' "${HR_HOOK:-?}" >&2
   elif [[ "${_HR_DECISION:-}" != deny ]]; then
@@ -68,7 +90,7 @@ trap 'exit 2' HUP INT QUIT ILL TRAP ABRT EMT FPE BUS SEGV SYS PIPE ALRM TERM XCP
 
 if [[ "$-" != *p* ]]; then
   echo "FORGE hook runtime: the hook must start with #!/bin/bash -p (privileged mode, no inherited functions)" >&2
-  _HR_DECISION=deny
+  if [[ $_HR_FAIL_OPEN == 0 ]]; then _HR_DECISION=deny; fi
   exit 2
 fi
 IFS=$' \t\n'
@@ -221,6 +243,7 @@ _hr_mark_failed() { # so a deny inside a $(…) whose status is lost still denie
 }
 
 _hr_fatal() { # <reason>: deny in every mode, because the hook cannot judge the command
+  if [[ "${_HR_FAIL_OPEN:-0}" == 1 ]]; then hr_fail_open "$1"; fi
   printf "FORGE hook %s can't judge this command, so it denies: %s\n" "${HR_HOOK:-?}" "$1" >&2
   _hr_mark_failed
   _HR_DECISION=deny
@@ -228,6 +251,13 @@ _hr_fatal() { # <reason>: deny in every mode, because the hook cannot judge the 
 }
 
 hr_allow() {
+  _HR_DECISION=allow
+  exit 0
+}
+
+hr_fail_open() { # <reason>: a fail-open hook (above) allows, says why and logs FAILED-OPEN; any other hook denies
+  if [[ "${_HR_FAIL_OPEN:-0}" != 1 ]]; then _hr_fatal "$1"; fi
+  _hr_failed_open "$1"
   _HR_DECISION=allow
   exit 0
 }
@@ -1085,6 +1115,437 @@ json.load(open(sys.argv[1], encoding="utf-8"), parse_float=refuse, parse_constan
 '
 hr_plain_numbers() { # <file.json>: 0 if every number in it is written as plain digits
   python3 -I -c "$_HR_PY_PLAIN_NUMBERS" "$1" 2>/dev/null
+}
+
+# --- FRG-5: main-checkout guard, deploy and spend gates, handoff form, paste capture -------------
+
+# guard-live-checkout (spec 5.3). Arguments: file|bash, the main checkout, HOME, cwd, then the
+# file path (file tools) or the command (Bash). Prints the first reason and exits 1 if it would
+# write somewhere guarded, exits 0 if not. A path is judged both as written (with .. folded) and
+# with every link resolved, and names are compared as macOS compares them (Unicode-normalised,
+# case-folded, invisible format characters dropped), so a case change or a link can't move a
+# path out of the guard. Guarded:
+# - the main checkout, other than its scratch folders work/ and .harness/state/, and the same for
+#   each project main checkout under projects/<name>;
+# - in work/owner/<id>/ everything but a draft OWNER-RUN.sh (META.json state "draft"): results,
+#   pastes, VERIFIED.txt, META.json and logs are written only by the handoff tools, the owner's
+#   run and capture-owner-paste; and .harness/state/pastes.log, which only capture-owner-paste
+#   writes;
+# - Claude Code's settings.local.json in any .claude folder, and ~/.claude/settings*.json (they
+#   could switch the hooks off).
+# For Bash it is a best-effort look at output redirections (> >> >| &> <>) and at tee, cp (its
+# destination), mv, rm and sed -i; a word holding $ or a backtick is skipped (L6).
+# shellcheck disable=SC2016 # Python source; its $HOME is text for Python, not the shell
+_HR_PY_LIVE='
+import json, os, re, shlex, stat, sys, unicodedata
+
+mode, root, home, cwd, arg = sys.argv[1:6]
+
+
+def norm(p):
+    p = "".join(c for c in unicodedata.normalize("NFC", p) if unicodedata.category(c) != "Cf")
+    return unicodedata.normalize("NFC", p.casefold())
+
+
+ROOT = os.path.realpath(root)
+HOME_CLAUDE = norm(os.path.realpath(os.path.join(home, ".claude"))) if home else None
+
+
+def meta_state(base, hid):
+    path = os.path.join(base, "work", "owner", hid, "META.json")
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except Exception:
+        return None
+    return doc.get("state") if isinstance(doc, dict) else None
+
+
+def in_checkout(parts, base, what):
+    if len(parts) >= 3 and parts[0] == "projects":
+        return in_checkout(parts[2:], os.path.join(base, "projects", parts[1]),
+                           "the main checkout of project " + parts[1])
+    if len(parts) >= 3 and parts[:2] == [".harness", "state"]:
+        if parts[2:] == ["pastes.log"]:
+            return ("the paste record .harness/state/pastes.log is written only by the capture-owner-paste "
+                    "hook, from the owner\x27s own message")
+        return None
+    if len(parts) >= 2 and parts[0] == "work":
+        if parts[1] != "owner":
+            return None
+        if len(parts) == 4 and parts[3] == "owner-run.sh":
+            if meta_state(base, parts[2]) == "draft":
+                return None
+            return ("work/owner/%s/OWNER-RUN.sh is frozen (handoff ready ran) or has no draft META.json; "
+                    "a frozen handoff never changes, so write a new one" % parts[2])
+        return ("the handoff records in work/owner/ (results, pastes, VERIFIED.txt, META.json, logs) are "
+                "written only by the handoff tools, the owner\x27s run and the capture-owner-paste hook; in "
+                "work/owner/<id>/ only a draft OWNER-RUN.sh may be edited")
+    return ("%s is never edited by hand (rule 1); edit in the ticket\x27s worktree, or in its scratch "
+            "folders work/ and .harness/state/" % what)
+
+
+def classify(path):
+    n = norm(path)
+    head, _, base = n.rpartition("/")
+    if base == "settings.local.json" and head.endswith("/.claude"):
+        return "Claude Code\x27s local settings %s could switch the hooks off; only the owner changes them" % path
+    if HOME_CLAUDE and head == HOME_CLAUDE and re.fullmatch(r"settings.*\.json", base):
+        return "Claude Code\x27s user settings %s could switch the hooks off; only the owner changes them, by a handoff" % path
+    r = norm(ROOT)
+    if n == r or n.startswith(r + "/"):
+        return in_checkout(n[len(r) + 1:].split("/") if n != r else [], ROOT, "the main checkout " + ROOT)
+    return None
+
+
+def check(target):
+    if home and (target == "~" or target.startswith("~/")):
+        target = home + target[1:]
+    for var in ("$HOME", "${HOME}"):
+        if home and target.startswith(var + "/"):
+            target = home + target[len(var):]
+    if not os.path.isabs(target):
+        if not cwd:
+            return "can\x27t tell which folder %s is in (no cwd)" % target
+        target = os.path.join(cwd, target)
+    return classify(os.path.normpath(target)) or classify(os.path.realpath(target))
+
+
+def bash_targets(command):
+    lex = shlex.shlex(command.replace("\\\n", "").replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    toks = list(lex)
+    commands, cur, targets, i = [], [], [], 0
+    while i < len(toks):
+        t = toks[i]
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        if t and set(t) <= set("();<>|&"):
+            if ">" in t:
+                if not (t.endswith("&") and re.fullmatch(r"[0-9]+|-", nxt)):
+                    targets.append(nxt)
+                i += 2
+                continue
+            if "<" in t:
+                i += 2
+                continue
+            commands.append(cur)
+            cur = []
+            i += 1
+            continue
+        if t.isdigit() and nxt[:1] in ("<", ">"):
+            i += 1
+            continue
+        cur.append(t)
+        i += 1
+    commands.append(cur)
+    for words in commands:
+        while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0])
+                         or os.path.basename(words[0]) in ("sudo", "command", "nohup", "time", "env", "builtin", "exec", "nice")):
+            words = words[1:]
+        if not words:
+            continue
+        name = os.path.basename(words[0]).lower()
+        args, opts, ended = [], [], False
+        for w in words[1:]:
+            if not ended and w == "--":
+                ended = True
+            elif not ended and w.startswith("-") and w != "-":
+                opts.append(w)
+            else:
+                args.append(w)
+        if name in ("rm", "mv", "tee"):
+            targets.extend(args)
+        elif name == "cp":
+            targets.extend(args[-1:])
+        elif name == "sed" and any(o.startswith("-i") or o.startswith("--in-place") for o in opts):
+            files = [a for a in args if a]
+            if not any(o in ("-e", "-f") or o.startswith("--expression") or o.startswith("--file") for o in opts):
+                files = files[1:]
+            targets.extend(files)
+    return [t for t in targets if t and "$" not in t.replace("$HOME/", "").replace("${HOME}/", "") and "`" not in t]
+
+
+if mode == "file":
+    if not arg:
+        print("no file path in the tool call, so the guard can\x27t tell what it would change")
+        sys.exit(1)
+    reason = check(arg)
+else:
+    try:
+        targets = bash_targets(arg)
+    except ValueError:
+        sys.exit(0)
+    reason = next((r for r in map(check, targets) if r), None)
+if reason:
+    print(reason.replace("\n", " "))
+    sys.exit(1)
+'
+hr_live_check() { # <file|bash> <path or command>: 0 if it writes nowhere guarded, 1 if it does
+  # (the reason in $HR_TMP/live.out), anything else if it can't tell
+  python3 -I -c "$_HR_PY_LIVE" "$1" "$HR_ROOT" "${HOME:-}" "$HR_CWD" "$2" >"$HR_TMP/live.out" 2>&1
+}
+
+# gate-deploy-target (spec 5.3). Arguments: deploy-targets.json, then the command's words. Prints
+# "other" (not a deploy tool), "production", "preview" or "neither"; exits 3 if the file is
+# missing or malformed. An entry matches a command whose first word is the entry's first word and
+# which holds each of its other words (a word also matches itself followed by =value).
+# Production is compared ignoring case, so --PROD counts; preview only exactly.
+_HR_PY_DEPLOY='
+import json, sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    def lists(key):
+        v = cfg[key]
+        if not isinstance(v, list) or not all(isinstance(e, list) and e and all(isinstance(w, str) and w for w in e) for e in v):
+            raise ValueError(key)
+        return v
+    tools = cfg["tools"]
+    if not isinstance(tools, list) or not tools or not all(isinstance(t, str) and t.split() for t in tools):
+        raise ValueError("tools")
+    production, preview = lists("production"), lists("preview")
+except Exception:
+    print("missing, not JSON, or without lists of tools, production and preview")
+    sys.exit(3)
+words = sys.argv[2:]
+
+
+def match(entry, fold):
+    def has(word):
+        f = fold(word)
+        return any(fold(w) == f or fold(w).startswith(f + "=") for w in words[1:])
+    return fold(words[0]) == fold(entry[0]) and all(has(e) for e in entry[1:])
+
+
+if not words or not any([w.lower() for w in words[:len(t.split())]] == t.lower().split() for t in tools):
+    print("other")
+elif any(match(e, str.lower) for e in production):
+    print("production")
+elif any(match(e, str) for e in preview):
+    print("preview")
+else:
+    print("neither")
+'
+hr_deploy_class() { # judges HR_TOK (after hr_require_simple); the answer in $HR_TMP/deploy.out
+  python3 -I -c "$_HR_PY_DEPLOY" "$HR_ROOT/.harness/deploy-targets.json" ${HR_TOK[@]+"${HR_TOK[@]}"} >"$HR_TMP/deploy.out" 2>&1
+}
+
+# gate-spend (spec 5.3, 8.5). Arguments: spend-limits.json, the command. Every provider's hosts
+# and key_vars, the payments section's, and always_blocked are refused anywhere in the command,
+# as written and with quotes and backslashes removed, ignoring case; a key variable only as a
+# whole name. Prints the hits and exits 1, exits 0 if none, 3 if the file is missing or malformed.
+_HR_PY_SPEND='
+import json, re, sys
+
+def strings(v, key):
+    if v is None:
+        return []
+    if not isinstance(v, list) or not all(isinstance(s, str) and s for s in v):
+        raise ValueError(key)
+    return v
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    sections = list(cfg["providers"].values()) + [cfg.get("payments", {})]
+    if not all(isinstance(s, dict) for s in sections):
+        raise ValueError("providers")
+    hosts = [h for s in sections for h in strings(s.get("hosts"), "hosts")]
+    keys = [k for s in sections for k in strings(s.get("key_vars"), "key_vars")]
+    blocked = strings(cfg["always_blocked"], "always_blocked")
+    if not blocked:
+        raise ValueError("always_blocked")
+except Exception:
+    print("missing, not JSON, or without providers and always_blocked lists")
+    sys.exit(3)
+cmd = sys.argv[2]
+texts = [t.lower() for t in (cmd, re.sub(r"[\"\x27\\\\]", "", cmd))]
+hits = ["paid host " + h for h in hosts if any(h.lower() in t for t in texts)]
+for k in keys:
+    pattern = re.compile(r"(?<![a-z0-9_])" + re.escape(k.lower()) + r"(?![a-z0-9_])")
+    if any(pattern.search(t) for t in texts):
+        hits.append("key variable " + k)
+hits += ["blocked text " + b for b in blocked if any(b.lower() in t for t in texts)]
+if hits:
+    print("; ".join(hits))
+    sys.exit(1)
+'
+hr_spend_hits() { # judges HR_CMD; the hits in $HR_TMP/spend.out
+  python3 -I -c "$_HR_PY_SPEND" "$HR_ROOT/.harness/spend-limits.json" "$HR_CMD" >"$HR_TMP/spend.out" 2>&1
+}
+
+# gate-owner-handoff-form (spec 4.6), on the Stop input on stdin: exits 4 when Claude Code says
+# the Stop hook already sent the agent back (stop_hook_active), 3 when there is no
+# last_assistant_message to read (the hook then fails open), 1 with the reason when the turn's last
+# message gives the owner commands or terminal or web-UI instructions to carry out by hand and is
+# not an owner handoff (an OWNER-RUN.sh path and "HANDOFF-RESULT"), 0 otherwise. A text heuristic,
+# so it starts in observe mode (L6).
+_HR_PY_FORM='
+import json, re, sys
+
+try:
+    doc = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+except Exception:
+    print("the Stop input is not JSON")
+    sys.exit(3)
+if not isinstance(doc, dict):
+    sys.exit(3)
+if doc.get("stop_hook_active") is True:
+    sys.exit(4)
+msg = doc.get("last_assistant_message")
+if not isinstance(msg, str):
+    print("no last_assistant_message in the Stop input")
+    sys.exit(3)
+if "OWNER-RUN.sh" in msg and "HANDOFF-RESULT" in msg:
+    sys.exit(0)
+COMMAND = re.compile(r"^\s*(?:\$\s+)?(?:sudo\s|brew\s+(?:install|upgrade|reinstall|tap)\b|gh\s+auth\b"
+                     r"|npm\s+(?:i|install)\s+(?:-g|--global)\b|pnpm\s+(?:add|install)\s+(?:-g|--global)\b"
+                     r"|export\s+\w*(?:KEY|TOKEN|SECRET|PASSWORD)\w*=|curl\s.*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b"
+                     r"|xcode-select\s+--install|softwareupdate\b)", re.I)
+PHRASE = re.compile(r"run (?:this|these|the following)(?: commands?)? in (?:your|a|the) terminal"
+                    r"|in your terminal,? (?:run|type|paste)|paste (?:this|these|the following) into (?:your|a|the) terminal"
+                    r"|open (?:the )?terminal and|go to [^\n]{1,80}? and click|type (?:this|the following) (?:in|into)", re.I)
+fence = False
+for line in msg.split("\n"):
+    if line.lstrip().startswith(chr(96) * 3):
+        fence = not fence
+        continue
+    if COMMAND.match(line) or (fence and re.match(r"^\s*\$\s", line)):
+        print("a command for the owner to type: " + line.strip()[:80])
+        sys.exit(1)
+m = PHRASE.search(msg)
+if m:
+    print("instructions for the owner to follow by hand: " + m.group(0)[:80])
+    sys.exit(1)
+'
+hr_handoff_form() { # judges the Stop input; the reason in $HR_TMP/form.out
+  printf '%s' "$HR_INPUT" | python3 -I -c "$_HR_PY_FORM" >"$HR_TMP/form.out" 2>&1
+}
+
+# capture-owner-paste (spec 4.5, decision 2026-10-16-handoff-evidence-provenance). Reads the
+# UserPromptSubmit input on stdin, the main checkout as its argument. When the owner's message
+# holds exactly one HANDOFF-RESULT block (lines compared as handoff verify compares them: carriage
+# returns dropped, outer blanks trimmed), naming a <date>-<slug> handoff whose work/owner/<id>/
+# is a real folder (no links on the way) with a META.json in state "ready", it saves the block's
+# lines exactly as received, BEGIN to END, to work/owner/<id>/PASTED-<utc>.txt (a new file, never
+# replacing one, written in full before it gets its name) and appends
+# "<utc> <id> <file> <sha256>" to .harness/state/pastes.log in one write. It prints one line for
+# the agent (the hook's stdout is added to the conversation): what it saved, or why it saved
+# nothing. A message without a block gets no line. It never blocks the message.
+_HR_PY_CAPTURE='
+import hashlib, json, os, re, secrets, stat, sys, time
+
+BEGIN = "----- HANDOFF-RESULT BEGIN -----"
+END = "----- HANDOFF-RESULT END -----"
+ID_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9]+(-[a-z0-9]+)*")
+DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def say(text):
+    print("FORGE capture-owner-paste: " + text)
+
+
+def subdir(parent, name, create=False):
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+    return os.open(name, DIR, dir_fd=parent)
+
+
+def main(root):
+    try:
+        doc = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    except Exception:
+        say("not saved: the hook input is not JSON")
+        return
+    prompt = doc.get("prompt") if isinstance(doc, dict) else None
+    if not isinstance(prompt, str):
+        return
+    lines = prompt.split("\n")
+    norm = [line.replace("\r", "").strip(" \t\v\f") for line in lines]
+    begins = [i for i, line in enumerate(norm) if line == BEGIN]
+    ends = [i for i, line in enumerate(norm) if line == END]
+    if not begins and not ends:
+        return
+    if len(begins) != 1 or len(ends) != 1 or begins[0] > ends[0]:
+        say("not saved: a message must hold exactly one HANDOFF-RESULT block, from its BEGIN line to its END line")
+        return
+    b, e = begins[0], ends[0]
+    hid = norm[b + 1][4:] if b + 1 < e and norm[b + 1].startswith("id: ") else ""
+    if not ID_RE.fullmatch(hid):
+        say("not saved: the block names no handoff id of the form <date>-<slug>")
+        return
+    data = ("\n".join(lines[b:e + 1]) + "\n").encode("utf-8")
+    try:
+        top = os.open(root, DIR)
+        folder = subdir(subdir(subdir(top, "work"), "owner"), hid)
+    except OSError:
+        say("not saved: no handoff folder work/owner/%s (a real folder, not a link)" % hid)
+        return
+    try:
+        fd = os.open("META.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=folder)
+        with os.fdopen(fd, encoding="utf-8") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                raise ValueError("META.json")
+            state = json.load(fh).get("state")
+    except Exception:
+        say("not saved: handoff %s has no readable META.json" % hid)
+        return
+    if state != "ready":
+        shown = {"draft": "a draft (handoff ready never ran)", "verified": "already verified"}
+        say("not saved: handoff %s is %s" % (hid, shown.get(state, "not ready")))
+        return
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    tmp = ".PASTED-%s.tmp" % secrets.token_hex(8)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=folder)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        name = None
+        for n in range(1, 100):
+            candidate = "PASTED-%s%s.txt" % (stamp, "" if n == 1 else "-%d" % n)
+            try:
+                os.link(tmp, candidate, src_dir_fd=folder, dst_dir_fd=folder)
+            except FileExistsError:
+                continue
+            name = candidate
+            break
+    finally:
+        os.unlink(tmp, dir_fd=folder)
+    if name is None:
+        say("not saved: too many pastes this second")
+        return
+    rel = "work/owner/%s/%s" % (hid, name)
+    line = "%s %s %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), hid, rel, hashlib.sha256(data).hexdigest())
+    try:
+        state_dir = subdir(subdir(top, ".harness"), "state", create=True)
+        fd = os.open("pastes.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=state_dir)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode) or os.write(fd, line.encode("ascii")) != len(line):
+                raise OSError("pastes.log")
+        finally:
+            os.close(fd)
+    except OSError:
+        say("saved %s, but could not record it in .harness/state/pastes.log, so handoff verify will refuse it" % rel)
+        return
+    say("saved %s (sha256 %s). Verify it with: .harness/bin/handoff verify %s/%s" % (rel, line.split()[-1], root, rel))
+
+
+try:
+    main(sys.argv[1])
+except Exception as exc:
+    say("not saved: the capture failed (%s)" % type(exc).__name__)
+'
+hr_capture_paste() { # records the owner's pasted result block; prints its note for the agent
+  printf '%s' "$HR_INPUT" | python3 -I -c "$_HR_PY_CAPTURE" "$HR_ROOT"
 }
 
 HOOKRT_LOADED=1

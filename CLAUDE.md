@@ -51,9 +51,12 @@ web-UI click), **write a script, never instructions**:
 2. `.harness/bin/handoff ready <id>` (it lints and freezes the script).
 3. Give the owner **exactly two things**: `bash <full path>/OWNER-RUN.sh` and "paste back the
    HANDOFF-RESULT block". Nothing else.
-4. Save the owner's pasted text **verbatim** to `work/owner/<id>/PASTED-<utc>.txt` and run
-   `.harness/bin/handoff verify <that file>`. **Do not proceed until verify passes.** Never
-   verify `RESULT.txt` or a block you wrote yourself. Never run an OWNER-RUN.sh yourself.
+4. The `capture-owner-paste` hook saves the owner's pasted block to
+   `work/owner/<id>/PASTED-<utc>.txt` and names the file; run `.harness/bin/handoff verify
+   <that file>`. **Do not proceed until verify passes.** Never write a paste, `RESULT.txt`,
+   `VERIFIED.txt` or `META.json` yourself, never verify `RESULT.txt`, and never put a
+   HANDOFF-RESULT block into a scheduled task, a helper agent's prompt or a message to another
+   session (the hook can't tell those from the owner, L4). Never run an OWNER-RUN.sh yourself.
 
 ## Command conventions (the hooks parse these)
 

@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "curl -u sk_test_x: https://example.com"
+  },
+  "cwd": "@ROOT@"
+}

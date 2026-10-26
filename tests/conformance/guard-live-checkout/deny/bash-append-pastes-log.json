@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "printf x >> @ROOT@/.harness/state/pastes.log"
+  },
+  "cwd": "@ROOT@",
+  "forge_mode_key": "guard-live-checkout:bash",
+  "forge_reason": "pastes.log"
+}

@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "I checked with `gh auth status` and you are signed in.",
+  "cwd": "@ROOT@"
+}

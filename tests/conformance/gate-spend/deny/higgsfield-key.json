@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "export HIGGSFIELD_API_KEY=x"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "key variable HIGGSFIELD_API_KEY"
+}

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rm -rf @WORKTREES@/FRG-5-a"
+  },
+  "cwd": "@ROOT@",
+  "forge_mode_key": "guard-live-checkout:bash"
+}

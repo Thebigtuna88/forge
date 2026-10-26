@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "@WORKTREES@/FRG-5-a/.claude/settings.local.json",
+    "content": "x"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "could switch the hooks off"
+}

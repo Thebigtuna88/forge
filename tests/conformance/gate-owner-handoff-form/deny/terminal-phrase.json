@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "Please run this in your terminal and tell me what it prints.",
+  "cwd": "@ROOT@",
+  "forge_reason": "rewrite this as an owner handoff"
+}

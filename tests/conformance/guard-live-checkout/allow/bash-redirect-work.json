@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo x > @ROOT@/work/notes.txt"
+  },
+  "cwd": "@ROOT@",
+  "forge_mode_key": "guard-live-checkout:bash"
+}

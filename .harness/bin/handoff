@@ -396,6 +396,18 @@ cmd_verify() {
   done <<<"$checks"
   [[ "$l_result" == "result: OK" ]] || fail "6: result is not OK"
 
+  # 9. the paste was saved by the capture-owner-paste hook from the owner's own message (FRG-5,
+  # decision 2026-10-16-handoff-evidence-provenance): .harness/state/pastes.log in the main
+  # checkout names this file with its sha256 as it is now.
+  local plog rel
+  plog="$(dirname "$(dirname "$root")")/.harness/state/pastes.log"
+  rel="work/owner/$id/$(basename "$pasted")"
+  if [[ -L "$plog" || ! -f "$plog" ]]; then
+    fail "9: no paste record ($plog is missing or a link): the paste must be saved by the capture-owner-paste hook, from the owner's own message"
+  elif ! awk -v f="$rel" -v s="$(sha256 "$pasted")" '$3 == f && $4 == s { found = 1 } END { exit !found }' "$plog"; then
+    fail "9: $rel with its current sha256 is not in $plog: the paste must be saved by the capture-owner-paste hook, from the owner's own message, and not changed since"
+  fi
+
   # 7. the paste matches the RESULT.txt the runtime wrote on the owner's run
   local result_block
   if [[ ! -f "$dir/RESULT.txt" ]]; then

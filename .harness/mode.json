@@ -1,3 +1,6 @@
 {
-  "modes": {}
+  "modes": {
+    "gate-owner-handoff-form": "observe",
+    "guard-live-checkout:bash": "observe"
+  }
 }

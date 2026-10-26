@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "@TMP@/CODE/Forge/CLAUDE.md",
+    "content": "x"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "is never edited by hand"
+}
