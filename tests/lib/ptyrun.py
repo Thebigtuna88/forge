@@ -5,13 +5,16 @@ Usage: python3 -I ptyrun.py [--answer TEXT]... -- COMMAND [ARGS...]
 Each answer is typed when the next "[y/N] " or "(input hidden): " prompt appears.
 Prints everything the command wrote to the terminal and exits with the command's status.
 
-Cleanup: every descendant seen in a process snapshot (taken every POLL seconds) is killed when
-the run ends, if it still looks like the same process (pid and start time). Known limits
-(FRG-15), because macOS has no unprivileged containment and no race-free way to signal a
-process by identity: a process that double-forks, detaches and loses its parent between two
-snapshots is never seen; and the identity check is best-effort (ps start times have one-second
-precision, and a pid can be reused between the snapshot and the kill). The handoff tests start
-no daemons, so in practice cleanup only meets processes of the run itself.
+Cleanup: every descendant seen in a process snapshot (taken repeatedly while the command runs,
+before each wait of up to POLL seconds for output and while waiting for it to exit) is killed when
+the run ends, if it still looks like the same process (pid and start time). Known limits,
+accepted in docs/decisions/2026-10-25-pty-driver-cleanup-limit.md (stronger isolation: FRG-28):
+a process that detaches itself (forks, setsid, loses its parent) between two snapshots, whether
+to evade cleanup or as ordinary daemon start-up, can be missed and outlive the run, with its
+children and the permissions of the user running the tests; and the identity check is
+best-effort (ps start times have one-second precision, and a pid can be reused between the
+snapshot and the kill). This driver is not a security sandbox: it tidies up after FORGE's own
+reviewed tests, none of which starts a process meant to outlive the test.
 """
 
 import os
