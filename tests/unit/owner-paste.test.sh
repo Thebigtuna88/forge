@@ -213,6 +213,20 @@ test_guard_protects_settings_in_claude_config_dir() {
   assert_contains "$OUT" "could switch the hooks off"
 }
 
+# A link in the main checkout to a huge folder (here the disk's root) can't be listed in full, so
+# the guard refuses rather than guessing where a write lands (review round 5).
+test_guard_refuses_when_the_links_cant_be_listed() {
+  mk_hooks "$T_TMP/code/forge" guard-live-checkout
+  ln -s / "$H/everything"
+  OUT="$(cd "$H" && jq -n --arg f "$T_TMP/elsewhere.txt" --arg d "$H" \
+    '{hook_event_name: "PreToolUse", tool_name: "Write", tool_input: {file_path: $f, content: "x"}, cwd: $d}' |
+    env -i PATH="$PATH" HOME="$T_TMP/home" TMPDIR="$T_TMP" CLAUDE_PROJECT_DIR="$H" \
+      "$H/.claude/hooks/guard-live-checkout.sh" 2>&1)"
+  RC=$?
+  assert_exit 2 "$RC" "$OUT"
+  assert_contains "$OUT" "can't list the links in the main checkout"
+}
+
 # The deploy gate counts the runtime's own floor of tools even when the file leaves one out.
 test_deploy_gate_keeps_the_tool_floor() {
   mk_hooks "$T_TMP/code/forge" gate-deploy-target

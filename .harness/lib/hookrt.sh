@@ -1180,25 +1180,47 @@ def children(folder):
     return [os.path.join(folder, n) for n in os.listdir(folder)] if os.path.isdir(folder) else []
 
 
+LINK_WALK_LIMIT = 200000
+
+
 def checkout_links():
-    # [(real target, link)] for every link inside the main checkout (not under its scratch folders,
-    # work/owner/ excepted; not into .git or node_modules), so a guarded file or folder that is a
-    # link is guarded at its real location too.
-    found = []
-    for top, dirs, files in os.walk(ROOT):
-        rel = os.path.relpath(top, ROOT)
-        if rel == ".harness/state" or (rel.split("/")[0] == "work" and rel.split("/")[:2] != ["work", "owner"] and rel != "work"):
-            dirs[:] = []
+    # [(real target, link)] for every link reachable inside the main checkout, so a guarded file
+    # or folder that is a link is guarded at its real location too. Every entry is looked at,
+    # node_modules included, and linked folders are followed (each real folder once), except the
+    # scratch folders (work/ but its owner/, and .harness/state/) and the inside of .git. More
+    # than LINK_WALK_LIMIT entries means the checkout can\x27t be judged.
+    found, seen, count = [], set(), 0
+    todo = [(ROOT, ROOT, "")]
+    while todo:
+        real, logical, rel = todo.pop()
+        if real in seen:
             continue
-        dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
-        for name in dirs + files:
-            path = os.path.join(top, name)
+        seen.add(real)
+        try:
+            names = os.listdir(real)
+        except OSError:
+            continue
+        for name in names:
+            count += 1
+            if count > LINK_WALK_LIMIT:
+                raise RuntimeError("more than %d entries" % LINK_WALK_LIMIT)
+            path, sub = os.path.join(logical, name), (rel + "/" + name).lstrip("/")
             if os.path.islink(path):
                 found.append((norm(os.path.realpath(path)), path))
+            parts = sub.split("/")
+            if (sub == ".harness/state" or name == ".git"
+                    or (parts[0] == "work" and len(parts) >= 2 and parts[1] != "owner")):
+                continue
+            if os.path.isdir(path):
+                todo.append((os.path.realpath(path), path, sub))
     return found
 
 
-CHECKOUT_LINKS = checkout_links()
+try:
+    CHECKOUT_LINKS = checkout_links()
+except RuntimeError as exc:
+    print("can\x27t list the links in the main checkout (%s), so where a write lands can\x27t be judged" % exc)
+    sys.exit(3)
 
 
 SETTINGS_TARGETS = settings_targets()
@@ -1507,9 +1529,10 @@ hr_deploy_class() { # judges HR_TOK (after hr_require_simple); the answer in $HR
 # gate-spend (spec 5.3, 8.5). Arguments: spend-limits.json, the command. Every provider's hosts,
 # key_vars and commands, the payments section's, and always_blocked are refused anywhere in the
 # command, as written and with quotes and backslashes removed, ignoring case; a key variable only
-# as a whole name, and a command only where a program starts (past assignments and wrappers such
-# as env, npx, uvx or python -m; a path counts by its last part), or anywhere if the quoting
-# doesn't parse.
+# as a whole name. A provider command counts only where a program starts (past assignments and
+# wrappers such as env, npx, uvx or python -m; a path counts by its last part) in a plain command
+# (command_names); in any other command, with quoting, $, brackets, redirections, shell keywords
+# or wrapper options, it counts anywhere as a whole name (fail closed).
 # A provider's command-line tools are listed because they make paid calls with a key they read
 # from the environment, naming no host. Prints the hits and exits 1, exits 0 if none, 3 if the
 # file is missing or malformed: every provider but the free manual one, and the payments section,
@@ -1553,29 +1576,45 @@ def named(word, edge):
     return any(pattern.search(t) for t in texts)
 
 
-WRAPPERS = ("env", "sudo", "command", "nohup", "time", "exec", "nice", "xargs", "npx", "bunx", "uvx")
+WRAPPERS = ("env", "sudo", "command", "nohup", "exec", "nice", "xargs", "npx", "bunx", "uvx")
 PAIRS = (("pnpm", "dlx"), ("pnpm", "exec"), ("yarn", "dlx"), ("npm", "exec"), ("pipx", "run"), ("uv", "run"),
          ("python", "-m"), ("python3", "-m"))
+SHELL_WORDS = ("if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+               "function", "select", "time", "coproc", "!", "[[", "]]")
 
 
 def command_names():
-    # The names of the programs the command runs: the first word of each simple command, past
-    # assignments, options and wrappers that run another program (npx, uvx, python -m, ...).
-    lex = shlex.shlex(cmd.replace("\\\n", "").replace("\n", " ; "), posix=True, punctuation_chars=True)
+    # The programs a plain command runs, or None when it isn\x27t plain enough to tell. Plain:
+    # words joined only by | ; && || or line breaks, with no quotes, backslashes, $, backticks,
+    # brackets, braces or redirections, no shell keywords, and no option right after a wrapper
+    # (env, sudo, npx, uvx, python -m, ...). Then each simple command\x27s program is its first word
+    # past assignments and wrappers.
+    if re.search(r"[\"\x27\\\\$`(){}<>\[\]]", cmd):
+        return None
+    lex = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = ""
     names, words = [], []
     for tok in list(lex) + [";"]:
-        if not (tok and set(tok) <= set("();<>|&")):
+        if not (tok and set(tok) <= set(";&|")):
             words.append(tok)
             continue
         i = 0
         while i < len(words):
             w = words[i]
-            base = os.path.basename(w.strip("`")).lower()
-            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w) or w.startswith("-") or w.isdigit() or base in WRAPPERS:
+            base = os.path.basename(w).lower()
+            nxt = words[i + 1] if i + 1 < len(words) else ""
+            if w.lower() in SHELL_WORDS:
+                return None
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w):
                 i += 1
-            elif i + 1 < len(words) and (base, words[i + 1].lower()) in PAIRS:
+            elif base in WRAPPERS:
+                if nxt.startswith("-"):
+                    return None
+                i += 1
+            elif (base, nxt.lower()) in PAIRS:
+                if i + 2 < len(words) and words[i + 2].startswith("-"):
+                    return None
                 i += 2
             else:
                 names.append(base)
