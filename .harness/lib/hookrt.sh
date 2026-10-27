@@ -1186,9 +1186,9 @@ LINK_WALK_LIMIT = 200000
 def checkout_links():
     # [(real target, link)] for every link reachable inside the main checkout, so a guarded file
     # or folder that is a link is guarded at its real location too. Every entry is looked at,
-    # node_modules included, and linked folders are followed (each real folder once), except the
-    # scratch folders (work/ but its owner/, and .harness/state/) and the inside of .git. More
-    # than LINK_WALK_LIMIT entries means the checkout can\x27t be judged.
+    # node_modules and .git included, and linked folders are followed (each real folder once),
+    # except the scratch folders (work/ but its owner/, and .harness/state/). A folder that can\x27t
+    # be listed, or more than LINK_WALK_LIMIT entries, means the checkout can\x27t be judged.
     found, seen, count = [], set(), 0
     todo = [(ROOT, ROOT, "")]
     while todo:
@@ -1198,8 +1198,8 @@ def checkout_links():
         seen.add(real)
         try:
             names = os.listdir(real)
-        except OSError:
-            continue
+        except OSError as exc:
+            raise RuntimeError("%s can\x27t be listed: %s" % (logical, exc.strerror or exc))
         for name in names:
             count += 1
             if count > LINK_WALK_LIMIT:
@@ -1208,8 +1208,7 @@ def checkout_links():
             if os.path.islink(path):
                 found.append((norm(os.path.realpath(path)), path))
             parts = sub.split("/")
-            if (sub == ".harness/state" or name == ".git"
-                    or (parts[0] == "work" and len(parts) >= 2 and parts[1] != "owner")):
+            if sub == ".harness/state" or (parts[0] == "work" and len(parts) >= 2 and parts[1] != "owner"):
                 continue
             if os.path.isdir(path):
                 todo.append((os.path.realpath(path), path, sub))
@@ -1379,17 +1378,30 @@ def without_heredocs(command):
     return out
 
 
+def unquote(word):
+    # A word as the shell passes it (its quotes removed); kept as it is if its quoting is broken.
+    try:
+        parts = shlex.split(word, posix=True)
+    except ValueError:
+        return word
+    return parts[0] if len(parts) == 1 else word
+
+
 def bash_targets(command):
     # [(target, the folder it is relative to, or None if unknown)], in the order the shell runs them.
-    lex = shlex.shlex(" ; ".join(without_heredocs(command.replace("\\\n", ""))), posix=True, punctuation_chars=True)
+    # Words are split keeping their quotes, so a quoted > or ; is a word, not an operator; quotes
+    # are removed afterwards.
+    lex = shlex.shlex(" ; ".join(without_heredocs(command.replace("\\\n", ""))), posix=False, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = ""
-    toks = list(lex)
+    raw = list(lex)
+    ops = [bool(t) and set(t) <= set("();<>|&") for t in raw]
+    toks = [t if op else unquote(t) for t, op in zip(raw, ops)]
     commands, words, redirects, i = [], [], [], 0
     while i < len(toks):
         t = toks[i]
         nxt = toks[i + 1] if i + 1 < len(toks) else ""
-        if t and set(t) <= set("();<>|&"):
+        if ops[i]:
             if ">" in t:
                 if not (t.endswith("&") and re.fullmatch(r"[0-9]+|-", nxt)):
                     redirects.append(nxt)
@@ -1402,7 +1414,7 @@ def bash_targets(command):
             words, redirects = [], []
             i += 1
             continue
-        if t.isdigit() and nxt[:1] in ("<", ">"):
+        if t.isdigit() and i + 1 < len(toks) and ops[i + 1] and nxt[:1] in ("<", ">"):
             i += 1
             continue
         words.append(t)
@@ -1529,10 +1541,9 @@ hr_deploy_class() { # judges HR_TOK (after hr_require_simple); the answer in $HR
 # gate-spend (spec 5.3, 8.5). Arguments: spend-limits.json, the command. Every provider's hosts,
 # key_vars and commands, the payments section's, and always_blocked are refused anywhere in the
 # command, as written and with quotes and backslashes removed, ignoring case; a key variable only
-# as a whole name. A provider command counts only where a program starts (past assignments and
-# wrappers such as env, npx, uvx or python -m; a path counts by its last part) in a plain command
-# (command_names); in any other command, with quoting, $, brackets, redirections, shell keywords
-# or wrapper options, it counts anywhere as a whole name (fail closed).
+# as a whole name. A provider command counts anywhere as a whole name, except in a plain command
+# whose every program only reads (cat, grep, rg, ls, ...; only_reads), so a documentation read
+# that names a provider still works while any launcher (env, npx, poetry, python -m, ...) refuses.
 # A provider's command-line tools are listed because they make paid calls with a key they read
 # from the environment, naming no host. Prints the hits and exits 1, exits 0 if none, 3 if the
 # file is missing or malformed: every provider but the free manual one, and the payments section,
@@ -1576,63 +1587,38 @@ def named(word, edge):
     return any(pattern.search(t) for t in texts)
 
 
-WRAPPERS = ("env", "sudo", "command", "nohup", "exec", "nice", "xargs", "npx", "bunx", "uvx")
-PAIRS = (("pnpm", "dlx"), ("pnpm", "exec"), ("yarn", "dlx"), ("npm", "exec"), ("pipx", "run"), ("uv", "run"),
-         ("python", "-m"), ("python3", "-m"))
-SHELL_WORDS = ("if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
-               "function", "select", "time", "coproc", "!", "[[", "]]")
+READERS = ("cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ls", "wc", "file", "stat")
 
 
-def command_names():
-    # The programs a plain command runs, or None when it isn\x27t plain enough to tell. Plain:
-    # words joined only by | ; && || or line breaks, with no quotes, backslashes, $, backticks,
-    # brackets, braces or redirections, no shell keywords, and no option right after a wrapper
-    # (env, sudo, npx, uvx, python -m, ...). Then each simple command\x27s program is its first word
-    # past assignments and wrappers.
+def only_reads():
+    # True when the command is plain and every program in it only reads: words joined only by
+    # | ; && || or line breaks, with no quotes, backslashes, $, backticks, brackets, braces or
+    # redirections, and each simple command\x27s first word (past assignments) one of READERS.
     if re.search(r"[\"\x27\\\\$`(){}<>\[\]]", cmd):
-        return None
+        return False
     lex = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = ""
-    names, words = [], []
+    words = []
     for tok in list(lex) + [";"]:
         if not (tok and set(tok) <= set(";&|")):
             words.append(tok)
             continue
-        i = 0
-        while i < len(words):
-            w = words[i]
-            base = os.path.basename(w).lower()
-            nxt = words[i + 1] if i + 1 < len(words) else ""
-            if w.lower() in SHELL_WORDS:
-                return None
-            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w):
-                i += 1
-            elif base in WRAPPERS:
-                if nxt.startswith("-"):
-                    return None
-                i += 1
-            elif (base, nxt.lower()) in PAIRS:
-                if i + 2 < len(words) and words[i + 2].startswith("-"):
-                    return None
-                i += 2
-            else:
-                names.append(base)
-                break
+        programs = [w for w in words if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)][:1]
+        if programs and os.path.basename(programs[0]) not in READERS:
+            return False
         words = []
-    return names
+    return True
 
 
 try:
-    programs = command_names()
+    reads = only_reads()
 except ValueError:
-    programs = None
+    reads = False
 hits = ["paid host " + h for h in found["hosts"] if any(h.lower() in t for t in texts)]
 hits += ["key variable " + k for k in found["key_vars"] if named(k, "a-z0-9_")]
-if programs is None:
+if not reads:
     hits += ["provider command " + c for c in found["commands"] if named(c, "a-z0-9_.-")]
-else:
-    hits += ["provider command " + c for c in found["commands"] if c.lower() in programs]
 hits += ["blocked text " + b for b in blocked if any(b.lower() in t for t in texts)]
 if hits:
     print("; ".join(hits))

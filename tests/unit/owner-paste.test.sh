@@ -227,6 +227,24 @@ test_guard_refuses_when_the_links_cant_be_listed() {
   assert_contains "$OUT" "can't list the links in the main checkout"
 }
 
+# A folder in the main checkout that can be entered but not listed may hide a link, so the guard
+# refuses rather than allowing with an incomplete map (review round 6).
+test_guard_refuses_when_a_folder_cant_be_listed() {
+  mk_hooks "$T_TMP/code/forge" guard-live-checkout
+  printf 'x\n' >"$T_TMP/secret.txt"
+  mkdir "$H/private"
+  ln -s "$T_TMP/secret.txt" "$H/private/item"
+  chmod 311 "$H/private"
+  OUT="$(cd "$H" && jq -n --arg f "$T_TMP/secret.txt" --arg d "$H" \
+    '{hook_event_name: "PreToolUse", tool_name: "Write", tool_input: {file_path: $f, content: "x"}, cwd: $d}' |
+    env -i PATH="$PATH" HOME="$T_TMP/home" TMPDIR="$T_TMP" CLAUDE_PROJECT_DIR="$H" \
+      "$H/.claude/hooks/guard-live-checkout.sh" 2>&1)"
+  RC=$?
+  chmod 755 "$H/private"
+  assert_exit 2 "$RC" "$OUT"
+  assert_contains "$OUT" "can't be listed"
+}
+
 # The deploy gate counts the runtime's own floor of tools even when the file leaves one out.
 test_deploy_gate_keeps_the_tool_floor() {
   mk_hooks "$T_TMP/code/forge" gate-deploy-target

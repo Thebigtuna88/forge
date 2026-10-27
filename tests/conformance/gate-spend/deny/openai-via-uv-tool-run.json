@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "uv tool run openai api chat.completions.create"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "provider command openai"
+}
