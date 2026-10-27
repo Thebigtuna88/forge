@@ -1445,10 +1445,19 @@ def bash_targets(command):
                 where = dest
             elif where:
                 where = os.path.join(where, dest)
-        elif name in ("rm", "mv", "tee"):
+        elif name in ("rm", "tee"):
             out.extend((t, where) for t in args)
-        elif name == "cp":
-            out.extend((t, where) for t in args[-1:])
+        elif name in ("cp", "mv") and args:
+            # mv removes its sources; both write their destination, or each source\x27s name in it
+            # when it is a folder (named with a trailing / or existing as one).
+            dest, sources = args[-1], args[:-1]
+            if name == "mv":
+                out.extend((t, where) for t in sources)
+            full = expand(dest) if os.path.isabs(expand(dest)) or not where else os.path.join(where, expand(dest))
+            if sources and (dest.endswith("/") or os.path.isdir(full)):
+                out.extend((os.path.join(dest, os.path.basename(s.rstrip("/"))), where) for s in sources)
+            else:
+                out.append((dest, where))
         elif name == "sed" and any(o.startswith("-i") or o.startswith("--in-place") for o in opts):
             files = [a for a in args if a]
             if not any(o in ("-e", "-f") or o.startswith("--expression") or o.startswith("--file") for o in opts):
@@ -1542,7 +1551,7 @@ hr_deploy_class() { # judges HR_TOK (after hr_require_simple); the answer in $HR
 # key_vars and commands, the payments section's, and always_blocked are refused anywhere in the
 # command, as written and with quotes and backslashes removed, ignoring case; a key variable only
 # as a whole name. A provider command counts anywhere as a whole name, except in a plain command
-# whose every program only reads (cat, grep, rg, ls, ...; only_reads), so a documentation read
+# whose every program only reads (cat, grep, ls, ...; only_reads), so a documentation read
 # that names a provider still works while any launcher (env, npx, poetry, python -m, ...) refuses.
 # A provider's command-line tools are listed because they make paid calls with a key they read
 # from the environment, naming no host. Prints the hits and exits 1, exits 0 if none, 3 if the
@@ -1587,14 +1596,14 @@ def named(word, edge):
     return any(pattern.search(t) for t in texts)
 
 
-READERS = ("cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "ls", "wc", "file", "stat")
+# Programs with no option that runs another program (rg is not one: --pre and --hostname-bin).
+READERS = ("cat", "head", "tail", "grep", "egrep", "fgrep", "ls", "wc", "file", "stat")
 
 
 def only_reads():
     # True when the command is plain and every program in it only reads: words joined only by
     # | ; && || or line breaks, with no quotes, backslashes, $, backticks, brackets, braces or
-    # redirections, and each simple command\x27s first word (past assignments) one of READERS,
-    # never with an option that runs another program (rg --pre COMMAND).
+    # redirections, and each simple command\x27s first word (past assignments) one of READERS.
     if re.search(r"[\"\x27\\\\$`(){}<>\[\]]", cmd):
         return False
     lex = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
@@ -1607,8 +1616,6 @@ def only_reads():
             continue
         programs = [w for w in words if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)][:1]
         if programs and os.path.basename(programs[0]) not in READERS:
-            return False
-        if any(w.startswith("--pre") for w in words):
             return False
         words = []
     return True
