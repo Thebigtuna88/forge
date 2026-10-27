@@ -169,7 +169,7 @@ _HR_GUARDED_SEQS=("git push" "git commit" "git send pack" "git http push" "git r
 _HR_GIT_GUARDED_SUBS=" push commit send-pack http-push rebase filter-branch filter-repo replace "
 _HR_GIT_GUARDED_SUBS+="update-ref commit-tree am cherry-pick revert checkout switch branch worktree "
 _HR_GIT_GUARDED_SUBS+="reset merge pull fetch fast-import symbolic-ref "
-_HR_DEPLOY_FLOOR=("vercel" "fastlane" "eas" "xcrun altool")
+_HR_DEPLOY_FLOOR=("vercel" "vc" "fastlane" "eas" "xcrun altool") # vc: Vercel's own short name (FRG-5)
 # With `$` or a backtick the shell can build words the hook never sees, so any of these words
 # in such a command makes it guarded.
 _HR_DYNAMIC_WORDS=" push commit merge api repo workflow "
