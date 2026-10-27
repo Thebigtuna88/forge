@@ -1159,18 +1159,46 @@ SETTINGS_DIRS = [norm(os.path.realpath(d)) for d in (os.path.join(home, ".claude
 
 def settings_targets():
     # Where Claude Code settings files really are, whether the file or a folder on its way is a
-    # link: the user settings, and the project settings of this checkout, its projects and the
-    # worktrees beside it (also a file that does not exist yet).
+    # link (also a file that does not exist yet): the user settings (names compared ignoring
+    # case, as the disk does), the project settings of this checkout and its projects, and the
+    # local settings of the worktrees beside it. A worktree\x27s tracked settings.json stays
+    # editable: changing it is an owner-merged PR.
     names = []
     for d in (os.path.join(home, ".claude") if home else "", config_dir):
-        if d and os.path.isdir(d):
-            names += [os.path.join(d, n) for n in os.listdir(d) if re.fullmatch(r"settings.*\.json", n)]
-    folders = [ROOT]
-    for parent in (os.path.join(ROOT, "projects"), os.path.join(os.path.dirname(ROOT), "forge-worktrees")):
-        if os.path.isdir(parent):
-            folders += [os.path.join(parent, n) for n in os.listdir(parent)]
-    names += [os.path.join(f, ".claude", n) for f in folders for n in ("settings.json", "settings.local.json")]
+        if d:
+            names += [os.path.join(d, "settings.json"), os.path.join(d, "settings.local.json")]
+            if os.path.isdir(d):
+                names += [os.path.join(d, n) for n in os.listdir(d) if re.fullmatch(r"settings.*\.json", norm(n))]
+    for f in [ROOT] + children(os.path.join(ROOT, "projects")):
+        names += [os.path.join(f, ".claude", "settings.json"), os.path.join(f, ".claude", "settings.local.json")]
+    for f in children(os.path.join(os.path.dirname(ROOT), "forge-worktrees")):
+        names.append(os.path.join(f, ".claude", "settings.local.json"))
     return {norm(os.path.realpath(n)) for n in names}
+
+
+def children(folder):
+    return [os.path.join(folder, n) for n in os.listdir(folder)] if os.path.isdir(folder) else []
+
+
+def checkout_links():
+    # [(real target, link)] for every link inside the main checkout (not under its scratch folders,
+    # work/owner/ excepted; not into .git or node_modules), so a guarded file or folder that is a
+    # link is guarded at its real location too.
+    found = []
+    for top, dirs, files in os.walk(ROOT):
+        rel = os.path.relpath(top, ROOT)
+        if rel == ".harness/state" or (rel.split("/")[0] == "work" and rel.split("/")[:2] != ["work", "owner"] and rel != "work"):
+            dirs[:] = []
+            continue
+        dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
+        for name in dirs + files:
+            path = os.path.join(top, name)
+            if os.path.islink(path):
+                found.append((norm(os.path.realpath(path)), path))
+    return found
+
+
+CHECKOUT_LINKS = checkout_links()
 
 
 SETTINGS_TARGETS = settings_targets()
@@ -1244,9 +1272,16 @@ def check(target, where):
         if not where:
             return "can\x27t tell which folder %s is in" % target
         target = os.path.join(where, target)
-    reason = classify(os.path.normpath(target)) or classify(os.path.realpath(target))
+    real = os.path.realpath(target)
+    reason = classify(os.path.normpath(target)) or classify(real)
     if reason:
         return reason
+    n = norm(real)
+    for link_target, link in CHECKOUT_LINKS:
+        if n == link_target or n.startswith(link_target + "/"):
+            reason = classify(link + real[len(os.path.realpath(link)):])
+            if reason:
+                return "%s is reached through the link %s: %s" % (target, link, reason)
     try:
         st = os.stat(target)
     except OSError:
@@ -1471,15 +1506,17 @@ hr_deploy_class() { # judges HR_TOK (after hr_require_simple); the answer in $HR
 
 # gate-spend (spec 5.3, 8.5). Arguments: spend-limits.json, the command. Every provider's hosts,
 # key_vars and commands, the payments section's, and always_blocked are refused anywhere in the
-# command, as written and with quotes and backslashes removed, ignoring case; a key variable and a
-# command only as a whole name (a command also as the last part of a path: /usr/local/bin/openai).
+# command, as written and with quotes and backslashes removed, ignoring case; a key variable only
+# as a whole name, and a command only where a program starts (past assignments and wrappers such
+# as env, npx, uvx or python -m; a path counts by its last part), or anywhere if the quoting
+# doesn't parse.
 # A provider's command-line tools are listed because they make paid calls with a key they read
 # from the environment, naming no host. Prints the hits and exits 1, exits 0 if none, 3 if the
 # file is missing or malformed: every provider but the free manual one, and the payments section,
 # must hold all three lists (empty is fine, missing or null is not), and always_blocked must be a
 # non-empty list.
 _HR_PY_SPEND='
-import json, re, sys
+import json, os, re, shlex, sys
 
 LISTS = ("hosts", "key_vars", "commands")
 
@@ -1516,9 +1553,47 @@ def named(word, edge):
     return any(pattern.search(t) for t in texts)
 
 
+WRAPPERS = ("env", "sudo", "command", "nohup", "time", "exec", "nice", "xargs", "npx", "bunx", "uvx")
+PAIRS = (("pnpm", "dlx"), ("pnpm", "exec"), ("yarn", "dlx"), ("npm", "exec"), ("pipx", "run"), ("uv", "run"),
+         ("python", "-m"), ("python3", "-m"))
+
+
+def command_names():
+    # The names of the programs the command runs: the first word of each simple command, past
+    # assignments, options and wrappers that run another program (npx, uvx, python -m, ...).
+    lex = shlex.shlex(cmd.replace("\\\n", "").replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    names, words = [], []
+    for tok in list(lex) + [";"]:
+        if not (tok and set(tok) <= set("();<>|&")):
+            words.append(tok)
+            continue
+        i = 0
+        while i < len(words):
+            w = words[i]
+            base = os.path.basename(w.strip("`")).lower()
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w) or w.startswith("-") or w.isdigit() or base in WRAPPERS:
+                i += 1
+            elif i + 1 < len(words) and (base, words[i + 1].lower()) in PAIRS:
+                i += 2
+            else:
+                names.append(base)
+                break
+        words = []
+    return names
+
+
+try:
+    programs = command_names()
+except ValueError:
+    programs = None
 hits = ["paid host " + h for h in found["hosts"] if any(h.lower() in t for t in texts)]
 hits += ["key variable " + k for k in found["key_vars"] if named(k, "a-z0-9_")]
-hits += ["provider command " + c for c in found["commands"] if named(c, "a-z0-9_.-")]
+if programs is None:
+    hits += ["provider command " + c for c in found["commands"] if named(c, "a-z0-9_.-")]
+else:
+    hits += ["provider command " + c for c in found["commands"] if c.lower() in programs]
 hits += ["blocked text " + b for b in blocked if any(b.lower() in t for t in texts)]
 if hits:
     print("; ".join(hits))
@@ -1693,7 +1768,7 @@ def main(root):
         os.unlink(tmp, dir_fd=folder)
     if name is None:
         say("not saved: too many pastes this second")
-        return
+        return 5
     rel = "work/owner/%s/%s" % (hid, name)
     line = "%s %s %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), hid, rel, hashlib.sha256(data).hexdigest())
     try:
@@ -1703,10 +1778,10 @@ def main(root):
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
                 raise OSError("pastes.log")
-            # A record cut short by an earlier failure is left unfinished; verify ignores an
-            # unfinished last line, and this record starts on a line of its own.
+            # A record cut short by an earlier failure is closed with a fifth word, so it can
+            # never become a four-field record verify accepts; this record starts on its own line.
             if st.st_size and os.pread(fd, 1, st.st_size - 1) != b"\n":
-                line = "\n" + line
+                line = " unfinished\n" + line
             if os.write(fd, line.encode("ascii")) != len(line):
                 raise OSError("pastes.log")
         finally:

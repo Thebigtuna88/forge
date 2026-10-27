@@ -141,9 +141,39 @@ test_capture_starts_a_record_after_an_unfinished_line() {
   printf 'cut short' >"$H/.harness/state/pastes.log"
   hook capture-owner-paste "$(prompt "$(block "$DEMO")")"
   assert_exit 0 "$RC" "$ERR"
-  assert_eq "$(head -n 1 "$H/.harness/state/pastes.log")" "cut short"
+  assert_eq "$(head -n 1 "$H/.harness/state/pastes.log")" "cut short unfinished"
   [[ "$(sed -n 2p "$H/.harness/state/pastes.log")" =~ ^[0-9T:Z-]+\ $DEMO\ work/owner/$DEMO/PASTED-[0-9TZ-]+\.txt\ [0-9a-f]{64}$ ]] ||
     _t_fail "second line: $(cat "$H/.harness/state/pastes.log")"
+}
+
+# An unfinished line that already holds four fields is closed with a fifth, so the next record
+# can't turn it into one verify accepts (review round 4).
+test_capture_never_completes_an_unfinished_record() {
+  mk_hooks "$T_TMP/code/forge" capture-owner-paste
+  ready_handoff "$DEMO"
+  local old
+  old="2026-01-01T00:00:00Z $DEMO work/owner/$DEMO/PASTED-1.txt $(printf 'c%.0s' {1..64})"
+  printf '%s' "$old" >"$H/.harness/state/pastes.log"
+  hook capture-owner-paste "$(prompt "$(block "$DEMO")")"
+  assert_exit 0 "$RC" "$ERR"
+  assert_eq "$(head -n 1 "$H/.harness/state/pastes.log")" "$old unfinished"
+  assert_eq "$(awk 'NR == 1 { print NF }' "$H/.harness/state/pastes.log")" 5
+}
+
+# Running out of names for this second is a failed capture, logged FAILED-OPEN (review round 4).
+test_capture_logs_running_out_of_names() {
+  mk_hooks "$T_TMP/code/forge" capture-owner-paste
+  ready_handoff "$DEMO"
+  local s n stamp
+  for s in 0 1 2 3 4 5 6 7 8 9; do
+    stamp="$(date -u -v+"$s"S +%Y%m%dT%H%M%SZ)"
+    : >"$H/work/owner/$DEMO/PASTED-$stamp.txt"
+    for n in $(seq 2 99); do : >"$H/work/owner/$DEMO/PASTED-$stamp-$n.txt"; done
+  done
+  hook capture-owner-paste "$(prompt "$(block "$DEMO")")"
+  assert_exit 0 "$RC" "$ERR"
+  assert_contains "$OUT" "not saved: too many pastes this second"
+  assert_contains "$(cat "$H/.harness/observed.log")" "capture-owner-paste FAILED-OPEN"
 }
 
 # A record with a second hard link could be edited under its other name (review round 1).

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo ${HF_API_KEY_ID}"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "key variable HF_API_KEY_ID"
+}

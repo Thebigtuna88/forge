@@ -9,9 +9,13 @@
     "higgsfield": {
       "enabled": false,
       "monthly_cap_usd": 0,
-      "hosts": [],
+      "hosts": [
+        "api.higgsfield.ai"
+      ],
       "key_vars": [
-        "HIGGSFIELD_API_KEY"
+        "HIGGSFIELD_API_KEY",
+        "HF_API_KEY_ID",
+        "HF_API_KEY_SECRET"
       ],
       "commands": []
     },
