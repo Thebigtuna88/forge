@@ -1190,15 +1190,16 @@ LINK_WALK_LIMIT = 200000
 
 
 def checkout_links():
-    # [(real target, link)] for every link reachable inside the main checkout, so a guarded file
-    # or folder that is a link is guarded at its real location too. Every entry is looked at,
-    # node_modules and .git included, and linked folders are followed (each real folder once),
-    # except the scratch folders (work/ but its owner/, and .harness/state/). A folder that can\x27t
-    # be listed, or more than LINK_WALK_LIMIT entries, means the checkout can\x27t be judged.
+    # [(real target, link)] for every link reachable inside the main checkout: every entry,
+    # scratch folders, node_modules and .git included, following linked folders (each real folder
+    # once). A file tool may not change anything a link in the main checkout points to, whichever
+    # folder the link is in (FRG-5 review round 14: judging the link\x27s own folder, scratch or
+    # guarded, kept missing aliases). A folder that can\x27t be listed, or more than LINK_WALK_LIMIT
+    # entries, means the checkout can\x27t be judged.
     found, seen, count = [], set(), 0
-    todo = [(ROOT, ROOT, "")]
+    todo = [(ROOT, ROOT)]
     while todo:
-        real, logical, rel = todo.pop()
+        real, logical = todo.pop()
         if real in seen:
             continue
         seen.add(real)
@@ -1210,14 +1211,11 @@ def checkout_links():
             count += 1
             if count > LINK_WALK_LIMIT:
                 raise RuntimeError("more than %d entries" % LINK_WALK_LIMIT)
-            path, sub = os.path.join(logical, name), (rel + "/" + name).lstrip("/")
+            path = os.path.join(logical, name)
             if os.path.islink(path):
                 found.append((norm(os.path.realpath(path)), path))
-            parts = sub.split("/")
-            if sub == ".harness/state" or (parts[0] == "work" and len(parts) >= 2 and parts[1] != "owner"):
-                continue
             if os.path.isdir(path):
-                todo.append((os.path.realpath(path), path, sub))
+                todo.append((os.path.realpath(path), path))
     return found
 
 
@@ -1306,9 +1304,8 @@ def check(target, where):
     n = norm(real)
     for link_target, link in CHECKOUT_LINKS:
         if n == link_target or n.startswith(link_target + "/"):
-            reason = classify(link + real[len(os.path.realpath(link)):])
-            if reason:
-                return "%s is reached through the link %s: %s" % (target, link, reason)
+            return ("%s is reached through the link %s in the main checkout, so file tools may not "
+                    "change it" % (target, link))
     try:
         st = os.stat(target)
     except OSError:
