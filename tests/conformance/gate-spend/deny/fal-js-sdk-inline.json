@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "node -e \"require('@fal-ai/client').fal.subscribe('fal-ai/flux/dev', {input: {prompt: 'a cat'}}).then(console.log)\""
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "provider command @fal-ai/client"
+}

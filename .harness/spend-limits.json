@@ -38,7 +38,9 @@
       "commands": [
         "fal",
         "fal_client",
-        "fal-client"
+        "fal-client",
+        "@fal-ai/client",
+        "@fal-ai/serverless-client"
       ]
     },
     "replicate": {

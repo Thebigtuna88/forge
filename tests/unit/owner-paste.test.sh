@@ -245,6 +245,17 @@ test_guard_refuses_when_a_folder_cant_be_listed() {
   assert_contains "$OUT" "can't be listed"
 }
 
+# Since the owner's decision of 2026-10-27 the guard judges file tools only: a shell write into the
+# main checkout is not its business (spec 11, L14; a shell-write checker is FRG-32), so it neither
+# refuses nor logs one. The limit is open, not resolved.
+test_guard_does_not_judge_shell_commands() {
+  mk_hooks "$T_TMP/code/forge" guard-live-checkout
+  hook guard-live-checkout "$(jq -n --arg c "echo x > $T_TMP/code/forge/CLAUDE.md" --arg d "$T_TMP/code/forge" \
+    '{hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {command: $c}, cwd: $d}')"
+  assert_exit 0 "$RC" "$ERR"
+  [[ ! -e "$H/.harness/observed.log" ]] || _t_fail "the guard logged a shell command: $(cat "$H/.harness/observed.log")"
+}
+
 # The deploy gate counts the runtime's own floor of tools even when the file leaves one out.
 test_deploy_gate_keeps_the_tool_floor() {
   mk_hooks "$T_TMP/code/forge" gate-deploy-target

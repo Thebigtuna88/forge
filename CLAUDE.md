@@ -56,7 +56,9 @@ web-UI click), **write a script, never instructions**:
    <that file>`. **Do not proceed until verify passes.** Never write a paste, `RESULT.txt`,
    `VERIFIED.txt` or `META.json` yourself, never verify `RESULT.txt`, and never put a
    HANDOFF-RESULT block into a scheduled task, a helper agent's prompt or a message to another
-   session (the hook can't tell those from the owner, L4). Never run an OWNER-RUN.sh yourself.
+   session (the hook can't tell those from the owner, L4). The guard stops the file tools only;
+   never write those files or the main checkout from the shell either (L14). Never run an
+   OWNER-RUN.sh yourself.
 
 ## Command conventions (the hooks parse these)
 

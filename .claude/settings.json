@@ -54,12 +54,6 @@
           },
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-live-checkout.sh",
-            "onFailure": "block",
-            "timeout": 120
-          },
-          {
-            "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/gate-deploy-target.sh",
             "onFailure": "block",
             "timeout": 120

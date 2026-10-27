@@ -1122,9 +1122,9 @@ hr_plain_numbers() { # <file.json>: 0 if every number in it is written as plain 
 
 # --- FRG-5: main-checkout guard, deploy and spend gates, handoff form, paste capture -------------
 
-# guard-live-checkout (spec 5.3). Arguments: file|bash, the main checkout, HOME,
-# CLAUDE_CONFIG_DIR (or ""), cwd, then the file path (file tools) or the command (Bash). Prints
-# the first reason and exits 1 if it would write somewhere guarded, exits 0 if not. A path is
+# guard-live-checkout (spec 5.3). Arguments: the main checkout, HOME, CLAUDE_CONFIG_DIR (or ""),
+# cwd, then the file path a file tool would write. Prints the reason and exits 1 if the path is
+# guarded, exits 0 if not. It judges file tools only: shell writes are not prevented (L14). A path is
 # judged both as written (with .. folded) and with every link resolved, and names are compared as
 # macOS compares them (Unicode-normalised, case-folded, invisible format characters dropped), so a
 # case change or a link can't move a path out of the guard. A file with more than one hard link is
@@ -1138,15 +1138,11 @@ hr_plain_numbers() { # <file.json>: 0 if every number in it is written as plain 
 # - Claude Code's settings.local.json in any .claude folder, and settings*.json in ~/.claude and
 #   in CLAUDE_CONFIG_DIR (they could switch the hooks off), and the real file behind any of those,
 #   or behind the project settings of this checkout, its projects or the worktrees, that is a link.
-# For Bash it is a best-effort look at output redirections (> >> >| &> <>) and at tee, cp (its
-# destination), mv, rm and sed -i, following cd and pushd from one command to the next and
-# skipping comments and here-document bodies (shell_words reads quotes as the shell does); a word
-# holding $ or a backtick is skipped, and a quote that never closes refuses (L6).
 # shellcheck disable=SC2016 # Python source; its $HOME is text for Python, not the shell
 _HR_PY_LIVE='
 import json, os, re, shlex, stat, sys, unicodedata
 
-mode, root, home, config_dir, cwd, arg = sys.argv[1:7]
+root, home, config_dir, cwd, arg = sys.argv[1:6]
 
 
 def norm(p):
@@ -1314,207 +1310,17 @@ def check(target, where):
     return None
 
 
-def shell_words(command):
-    # [(token, is_operator)] for the command, read as the shell reads it: words with their quotes
-    # and backslashes removed (a word may mix quoted and plain parts), runs of unquoted ( ) ; < > |
-    # & as operators, an unquoted line break as ";", comments (an unquoted # starting a word, to
-    # the end of its line) dropped, and the bodies of here-documents skipped (a <<< here-string is
-    # an operator, not a here-document). Quotes carry across lines. Raises ValueError if a quote
-    # never closes.
-    out, word, has_word, quote, ends = [], "", False, None, []
-    for line in command.split("\n"):
-        if ends and quote is None:
-            if (line.lstrip("\t") if ends[0][1] else line) == ends[0][0]:
-                ends.pop(0)
-            continue
-        i = 0
-        while i < len(line):
-            c = line[i]
-            if quote == "\x27":
-                if c == "\x27":
-                    quote = None
-                else:
-                    word += c
-                i += 1
-                continue
-            if quote == "\"":
-                if c == "\\" and i + 1 < len(line) and line[i + 1] in "\"\\$`":
-                    word += line[i + 1]
-                    i += 2
-                    continue
-                if c == "\"":
-                    quote = None
-                else:
-                    word += c
-                i += 1
-                continue
-            if c in "\"\x27":
-                quote, has_word = c, True
-                i += 1
-            elif c == "\\":
-                if i + 1 < len(line):
-                    word, has_word = word + line[i + 1], True
-                i += 2
-            elif c in " \t":
-                if has_word:
-                    out.append((word, False))
-                    word, has_word = "", False
-                i += 1
-            elif c == "#" and not has_word:
-                break
-            elif c in "();<>|&":
-                if has_word:
-                    out.append((word, False))
-                    word, has_word = "", False
-                j = i
-                while j < len(line) and line[j] in "();<>|&":
-                    j += 1
-                op, i = line[i:j], j
-                out.append((op, True))
-                if op == "<<":
-                    # A here-document: the delimiter is the next word, quotes removed; the lines
-                    # after this one, up to the delimiter, are its body and are skipped.
-                    dash = line.startswith("-", i)
-                    i += dash
-                    while i < len(line) and line[i] in " \t":
-                        i += 1
-                    delim, dq = "", None
-                    while i < len(line):
-                        ch = line[i]
-                        if dq == "\"" and ch == "\\" and i + 1 < len(line) and line[i + 1] in "\"\\$`":
-                            i += 1
-                            delim += line[i]
-                        elif dq:
-                            if ch == dq:
-                                dq = None
-                            else:
-                                delim += ch
-                        elif ch in "\"\x27":
-                            dq = ch
-                        elif ch == "\\" and i + 1 < len(line):
-                            i += 1
-                            delim += line[i]
-                        elif ch in " \t;&|<>()":
-                            break
-                        else:
-                            delim += ch
-                        i += 1
-                    if delim:
-                        ends.append((delim, dash))
-                        out.append((delim, False))
-            else:
-                word, has_word = word + c, True
-                i += 1
-        if quote:
-            word += "\n"
-        else:
-            if has_word:
-                out.append((word, False))
-                word, has_word = "", False
-            out.append((";", True))
-    if quote:
-        raise ValueError("a quote never closes")
-    if has_word:
-        out.append((word, False))
-    return out
-
-
-def bash_targets(command):
-    # [(target, the folder it is relative to, or None if unknown)], in the order the shell runs them.
-    pairs = shell_words(command.replace("\\\n", ""))
-    toks = [w for w, _ in pairs]
-    ops = [op for _, op in pairs]
-    commands, words, redirects, i = [], [], [], 0
-    while i < len(toks):
-        t = toks[i]
-        nxt = toks[i + 1] if i + 1 < len(toks) else ""
-        if ops[i]:
-            if ">" in t:
-                if not (t.endswith("&") and re.fullmatch(r"[0-9]+|-", nxt)):
-                    redirects.append(nxt)
-                i += 2
-                continue
-            if "<" in t:
-                i += 2
-                continue
-            commands.append((words, redirects))
-            words, redirects = [], []
-            i += 1
-            continue
-        if t.isdigit() and i + 1 < len(toks) and ops[i + 1] and nxt[:1] in ("<", ">"):
-            i += 1
-            continue
-        words.append(t)
-        i += 1
-    commands.append((words, redirects))
-    out, where = [], cwd or None
-    for words, redirects in commands:
-        out.extend((t, where) for t in redirects)
-        # Past assignments, shell keywords (if then do { ! ...) and wrappers, to the program.
-        while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0])
-                         or words[0] in ("if", "then", "else", "elif", "while", "until", "do", "!", "{", "}",
-                                         "fi", "done", "esac")
-                         or os.path.basename(words[0]) in ("sudo", "command", "nohup", "time", "env", "builtin", "exec", "nice")):
-            words = words[1:]
-        if not words:
-            continue
-        name = os.path.basename(words[0]).lower()
-        args, opts, ended = [], [], False
-        for w in words[1:]:
-            if not ended and w == "--":
-                ended = True
-            elif not ended and w.startswith("-") and w != "-":
-                opts.append(w)
-            else:
-                args.append(w)
-        if name in ("cd", "pushd", "popd"):
-            dest = expand(args[0]) if args else home
-            if name == "popd" or not dest or dest == "-" or "$" in dest or "`" in dest:
-                where = None
-            elif os.path.isabs(dest):
-                where = dest
-            elif where:
-                where = os.path.join(where, dest)
-        elif name in ("rm", "tee"):
-            out.extend((t, where) for t in args)
-        elif name in ("cp", "mv") and args:
-            # mv removes its sources; both write their destination, or each source\x27s name in it
-            # when it is a folder (named with a trailing / or existing as one).
-            dest, sources = args[-1], args[:-1]
-            if name == "mv":
-                out.extend((t, where) for t in sources)
-            full = expand(dest) if os.path.isabs(expand(dest)) or not where else os.path.join(where, expand(dest))
-            if sources and (dest.endswith("/") or os.path.isdir(full)):
-                out.extend((os.path.join(dest, os.path.basename(s.rstrip("/"))), where) for s in sources)
-            else:
-                out.append((dest, where))
-        elif name == "sed" and any(o.startswith("-i") or o.startswith("--in-place") for o in opts):
-            files = [a for a in args if a]
-            if not any(o in ("-e", "-f") or o.startswith("--expression") or o.startswith("--file") for o in opts):
-                files = files[1:]
-            out.extend((t, where) for t in files)
-    return [(t, w) for t, w in out if t and "$" not in t.replace("$HOME/", "").replace("${HOME}/", "") and "`" not in t]
-
-
-if mode == "file":
-    if not arg:
-        print("no file path in the tool call, so the guard can\x27t tell what it would change")
-        sys.exit(1)
-    reason = check(arg, cwd)
-else:
-    try:
-        targets = bash_targets(arg)
-    except ValueError:
-        print("the command\x27s quoting never closes, so where it writes can\x27t be judged")
-        sys.exit(1)
-    reason = next((r for r in (check(t, w) for t, w in targets) if r), None)
+if not arg:
+    print("no file path in the tool call, so the guard can\x27t tell what it would change")
+    sys.exit(1)
+reason = check(arg, cwd)
 if reason:
     print(reason.replace("\n", " "))
     sys.exit(1)
 '
-hr_live_check() { # <file|bash> <path or command>: 0 if it writes nowhere guarded, 1 if it does
-  # (the reason in $HR_TMP/live.out), anything else if it can't tell
-  python3 -I -c "$_HR_PY_LIVE" "$1" "$HR_ROOT" "${HOME:-}" "$_HR_CLAUDE_CONFIG_DIR" "$HR_CWD" "$2" >"$HR_TMP/live.out" 2>&1
+hr_live_check() { # <file path>: 0 if a file tool may write it, 1 if not (the reason in
+  # $HR_TMP/live.out), anything else if it can't tell
+  python3 -I -c "$_HR_PY_LIVE" "$HR_ROOT" "${HOME:-}" "$_HR_CLAUDE_CONFIG_DIR" "$HR_CWD" "$1" >"$HR_TMP/live.out" 2>&1
 }
 
 # gate-deploy-target (spec 5.3). Arguments: deploy-targets.json, the number of floor tools, the
