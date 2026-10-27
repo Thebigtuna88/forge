@@ -1587,13 +1587,14 @@ def named(word, edge):
     return any(pattern.search(t) for t in texts)
 
 
-READERS = ("cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ls", "wc", "file", "stat")
+READERS = ("cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "ls", "wc", "file", "stat")
 
 
 def only_reads():
     # True when the command is plain and every program in it only reads: words joined only by
     # | ; && || or line breaks, with no quotes, backslashes, $, backticks, brackets, braces or
-    # redirections, and each simple command\x27s first word (past assignments) one of READERS.
+    # redirections, and each simple command\x27s first word (past assignments) one of READERS,
+    # never with an option that runs another program (rg --pre COMMAND).
     if re.search(r"[\"\x27\\\\$`(){}<>\[\]]", cmd):
         return False
     lex = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
@@ -1606,6 +1607,8 @@ def only_reads():
             continue
         programs = [w for w in words if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)][:1]
         if programs and os.path.basename(programs[0]) not in READERS:
+            return False
+        if any(w.startswith("--pre") for w in words):
             return False
         words = []
     return True
