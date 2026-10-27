@@ -1154,8 +1154,13 @@ import json, os, re, shlex, stat, sys, unicodedata
 root, home, config_dir, cwd, arg = sys.argv[1:6]
 
 
-def norm(p):
-    p = "".join(c for c in unicodedata.normalize("NFC", p) if unicodedata.category(c) != "Cf")
+def norm(p, strip=True):
+    # NFC and case-folded, as macOS compares names; with strip, invisible format characters
+    # dropped too. macOS keeps some of those (U+0600), so a stripped name may be a different real
+    # folder: every path is judged both ways and either refusal wins, so stripping only ever adds
+    # refusals and never makes a look-alike a scratch folder (FRG-5 review round 16).
+    if strip:
+        p = "".join(c for c in unicodedata.normalize("NFC", p) if unicodedata.category(c) != "Cf")
     return unicodedata.normalize("NFC", p.casefold())
 
 
@@ -1266,13 +1271,17 @@ def in_checkout(parts, base, what):
 
 
 def classify(path):
-    n = norm(path)
+    return judge(path, True) or judge(path, False)
+
+
+def judge(path, strip):
+    n = norm(path, strip)
     head, _, base = n.rpartition("/")
     if base == "settings.local.json" and head.endswith("/.claude"):
         return "Claude Code\x27s local settings %s could switch the hooks off; only the owner changes them" % path
     if head in SETTINGS_DIRS and re.fullmatch(r"settings.*\.json", base):
         return "Claude Code\x27s user settings %s could switch the hooks off; only the owner changes them, by a handoff" % path
-    r = norm(ROOT)
+    r = norm(ROOT, strip)
     if n == r or n.startswith(r + "/"):
         reason = in_checkout(n[len(r) + 1:].split("/") if n != r else [], ROOT, "the main checkout " + ROOT)
         if reason:
