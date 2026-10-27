@@ -1,10 +1,11 @@
 {
-  "description": "Deploy tools and which of their commands are production or preview (spec 5.3, owner-only). An entry is a list of words: it matches a command whose first word is the entry's first word and which contains each of the entry's other words (a word also matches itself followed by =value). Production is checked first; a deploy-tool command matching neither list is denied (gate-deploy-target, FRG-5).",
+  "description": "Deploy tools and which of their commands are production or preview (spec 5.3, owner-only). An entry is a list of words: it matches a command whose first word is the entry's first word and which contains each of the entry's other words (a word also matches itself followed by =value). Production is checked first; a deploy-tool command matching neither list is denied (gate-deploy-target, FRG-5). No preview is listed for now: Vercel's docs (checked 2026-10-27) say a new project's first deployment, and every --temporary one, goes to production whatever the command says, so no command form is known to stay a preview. Every deploy is an owner script until FRG-9 or FRG-12 proves one.",
   "tools": ["vercel", "fastlane", "eas", "xcrun altool"],
   "production": [
     ["vercel", "--prod"],
     ["vercel", "--target=production"],
     ["vercel", "production"],
+    ["vercel", "--temporary"],
     ["vercel", "promote"],
     ["vercel", "rollback"],
     ["vercel", "alias"],
@@ -19,7 +20,5 @@
     ["fastlane", "upload_to_testflight"],
     ["eas", "submit"]
   ],
-  "preview": [
-    ["vercel", "deploy"]
-  ]
+  "preview": []
 }

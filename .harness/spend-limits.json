@@ -30,7 +30,9 @@
         "FAL_KEY"
       ],
       "commands": [
-        "fal"
+        "fal",
+        "fal_client",
+        "fal-client"
       ]
     },
     "replicate": {

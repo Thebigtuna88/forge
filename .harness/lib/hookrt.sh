@@ -1140,7 +1140,8 @@ hr_plain_numbers() { # <file.json>: 0 if every number in it is written as plain 
 #   or behind the project settings of this checkout, its projects or the worktrees, that is a link.
 # For Bash it is a best-effort look at output redirections (> >> >| &> <>) and at tee, cp (its
 # destination), mv, rm and sed -i, following cd and pushd from one command to the next and
-# skipping here-document bodies; a word holding $ or a backtick is skipped (L6).
+# skipping comments and here-document bodies (shell_words reads quotes as the shell does); a word
+# holding $ or a backtick is skipped, and a quote that never closes refuses (L6).
 # shellcheck disable=SC2016 # Python source; its $HOME is text for Python, not the shell
 _HR_PY_LIVE='
 import json, os, re, shlex, stat, sys, unicodedata
@@ -1313,96 +1314,113 @@ def check(target, where):
     return None
 
 
-def heredoc_ends(line):
-    # ([(delimiter, strip leading tabs)] for each << on the line outside quotes and comments, where
-    # the line\x27s comment starts or its length). A delimiter is its word with quotes and backslashes
-    # removed, as the shell compares it; a <<< here-string is skipped whole.
-    found, i, quote = [], 0, None
-    while i < len(line):
-        c = line[i]
-        if quote:
-            if c == "\\" and quote == "\"":
-                i += 2
-                continue
-            if c == quote:
-                quote = None
-            i += 1
-            continue
-        if c in "\"\x27":
-            quote = c
-        elif c == "\\":
-            i += 1
-        elif c == "#" and (i == 0 or line[i - 1] in " \t;&|()"):
-            return found, i
-        elif line.startswith("<<<", i):
-            i += 3
-            continue
-        elif line.startswith("<<", i):
-            j = i + 2
-            dash = line.startswith("-", j)
-            j += dash
-            while j < len(line) and line[j] in " \t":
-                j += 1
-            word, wq = "", None
-            while j < len(line):
-                ch = line[j]
-                if wq:
-                    if ch == wq:
-                        wq = None
-                    else:
-                        word += ch
-                elif ch in "\"\x27":
-                    wq = ch
-                elif ch == "\\" and j + 1 < len(line):
-                    j += 1
-                    word += line[j]
-                elif ch in " \t;&|<>()":
-                    break
-                else:
-                    word += ch
-                j += 1
-            if word:
-                found.append((word, dash))
-            i = j
-            continue
-        i += 1
-    return found, len(line)
-
-
-def without_heredocs(command):
-    # The command lines, minus their comments and the bodies of here-documents (text, not
-    # commands).
-    out, ends = [], []
+def shell_words(command):
+    # [(token, is_operator)] for the command, read as the shell reads it: words with their quotes
+    # and backslashes removed (a word may mix quoted and plain parts), runs of unquoted ( ) ; < > |
+    # & as operators, an unquoted line break as ";", comments (an unquoted # starting a word, to
+    # the end of its line) dropped, and the bodies of here-documents skipped (a <<< here-string is
+    # an operator, not a here-document). Quotes carry across lines. Raises ValueError if a quote
+    # never closes.
+    out, word, has_word, quote, ends = [], "", False, None, []
     for line in command.split("\n"):
-        if ends:
+        if ends and quote is None:
             if (line.lstrip("\t") if ends[0][1] else line) == ends[0][0]:
                 ends.pop(0)
             continue
-        found, cut = heredoc_ends(line)
-        out.append(line[:cut])
-        ends += found
+        i = 0
+        while i < len(line):
+            c = line[i]
+            if quote == "\x27":
+                if c == "\x27":
+                    quote = None
+                else:
+                    word += c
+                i += 1
+                continue
+            if quote == "\"":
+                if c == "\\" and i + 1 < len(line) and line[i + 1] in "\"\\$`":
+                    word += line[i + 1]
+                    i += 2
+                    continue
+                if c == "\"":
+                    quote = None
+                else:
+                    word += c
+                i += 1
+                continue
+            if c in "\"\x27":
+                quote, has_word = c, True
+                i += 1
+            elif c == "\\":
+                if i + 1 < len(line):
+                    word, has_word = word + line[i + 1], True
+                i += 2
+            elif c in " \t":
+                if has_word:
+                    out.append((word, False))
+                    word, has_word = "", False
+                i += 1
+            elif c == "#" and not has_word:
+                break
+            elif c in "();<>|&":
+                if has_word:
+                    out.append((word, False))
+                    word, has_word = "", False
+                j = i
+                while j < len(line) and line[j] in "();<>|&":
+                    j += 1
+                op, i = line[i:j], j
+                out.append((op, True))
+                if op == "<<":
+                    # A here-document: the delimiter is the next word, quotes removed; the lines
+                    # after this one, up to the delimiter, are its body and are skipped.
+                    dash = line.startswith("-", i)
+                    i += dash
+                    while i < len(line) and line[i] in " \t":
+                        i += 1
+                    delim, dq = "", None
+                    while i < len(line):
+                        ch = line[i]
+                        if dq:
+                            if ch == dq:
+                                dq = None
+                            else:
+                                delim += ch
+                        elif ch in "\"\x27":
+                            dq = ch
+                        elif ch == "\\" and i + 1 < len(line):
+                            i += 1
+                            delim += line[i]
+                        elif ch in " \t;&|<>()":
+                            break
+                        else:
+                            delim += ch
+                        i += 1
+                    if delim:
+                        ends.append((delim, dash))
+                        out.append((delim, False))
+            else:
+                word, has_word = word + c, True
+                i += 1
+        if quote:
+            word += "\n"
+        else:
+            if has_word:
+                out.append((word, False))
+                word, has_word = "", False
+            out.append((";", True))
+    if quote:
+        raise ValueError("a quote never closes")
+    if has_word:
+        out.append((word, False))
     return out
-
-
-def unquote(word):
-    # A word as the shell passes it (its quotes removed); kept as it is if its quoting is broken.
-    try:
-        parts = shlex.split(word, posix=True)
-    except ValueError:
-        return word
-    return parts[0] if len(parts) == 1 else word
 
 
 def bash_targets(command):
     # [(target, the folder it is relative to, or None if unknown)], in the order the shell runs them.
-    # Words are split keeping their quotes, so a quoted > or ; is a word, not an operator; quotes
-    # are removed afterwards.
-    lex = shlex.shlex(" ; ".join(without_heredocs(command.replace("\\\n", ""))), posix=False, punctuation_chars=True)
-    lex.whitespace_split = True
-    lex.commenters = ""
-    raw = list(lex)
-    ops = [bool(t) and set(t) <= set("();<>|&") for t in raw]
-    toks = [t if op else unquote(t) for t, op in zip(raw, ops)]
+    pairs = shell_words(command.replace("\\\n", ""))
+    toks = [w for w, _ in pairs]
+    ops = [op for _, op in pairs]
     commands, words, redirects, i = [], [], [], 0
     while i < len(toks):
         t = toks[i]
@@ -1481,7 +1499,8 @@ else:
     try:
         targets = bash_targets(arg)
     except ValueError:
-        sys.exit(0)
+        print("the command\x27s quoting never closes, so where it writes can\x27t be judged")
+        sys.exit(1)
     reason = next((r for r in (check(t, w) for t, w in targets) if r), None)
 if reason:
     print(reason.replace("\n", " "))
