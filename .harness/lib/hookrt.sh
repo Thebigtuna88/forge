@@ -1441,13 +1441,19 @@ except Exception:
     sys.exit(3)
 cmd = sys.argv[2]
 texts = [t.lower() for t in (cmd, re.sub(r"[\"\x27\\\\]", "", cmd))]
-# An interpreter takes its module attached to -m (python3 -mopenai): judged split as well.
-texts += [re.sub(r"(^|[\s;&|(])-m(?=[a-z@_])", r"\1-m ", t) for t in texts]
 
 
 def named(word, before, after):
     # The word as a whole name: no character of [before] right before it, none of [after] after.
     pattern = re.compile(r"(?<![" + before + r"])" + re.escape(word.lower()) + r"(?![" + after + r"])")
+    return any(pattern.search(t) for t in texts)
+
+
+def named_after_option(word, after):
+    # The word run straight into an option: a short-option bundle (python3 -mopenai, -umopenai) or
+    # a long option given it as its value (--module=openai), as interpreters accept.
+    pattern = re.compile(r"(?:^|[\s;&|(=,])(?:-[a-z]*|--[a-z][a-z0-9-]*=)" + re.escape(word.lower())
+                         + r"(?![" + after + r"])")
     return any(pattern.search(t) for t in texts)
 
 
@@ -1485,7 +1491,8 @@ hits += ["key variable " + k for k in found["key_vars"] if named(k, "a-z0-9_", "
 if not reads:
     # A package followed by a dot is still the package (import stripe.checkout); one after a dot
     # is part of another name (api.openai.com is judged as a host).
-    hits += ["provider command " + c for c in found["commands"] if named(c, "a-z0-9_.-", "a-z0-9_-")]
+    hits += ["provider command " + c for c in found["commands"]
+             if named(c, "a-z0-9_.-", "a-z0-9_-") or named_after_option(c, "a-z0-9_-")]
 hits += ["blocked text " + b for b in blocked if any(b.lower() in t for t in texts)]
 if hits:
     print("; ".join(hits))
