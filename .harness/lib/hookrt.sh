@@ -1314,8 +1314,9 @@ def check(target, where):
 
 
 def heredoc_ends(line):
-    # [(delimiter, strip leading tabs)] for each << on the line outside quotes and comments; the
-    # delimiter is its word with quotes and backslashes removed, as the shell compares it.
+    # ([(delimiter, strip leading tabs)] for each << on the line outside quotes and comments, where
+    # the line\x27s comment starts or its length). A delimiter is its word with quotes and backslashes
+    # removed, as the shell compares it; a <<< here-string is skipped whole.
     found, i, quote = [], 0, None
     while i < len(line):
         c = line[i]
@@ -1332,8 +1333,11 @@ def heredoc_ends(line):
         elif c == "\\":
             i += 1
         elif c == "#" and (i == 0 or line[i - 1] in " \t;&|()"):
-            break
-        elif line.startswith("<<", i) and not line.startswith("<<<", i):
+            return found, i
+        elif line.startswith("<<<", i):
+            i += 3
+            continue
+        elif line.startswith("<<", i):
             j = i + 2
             dash = line.startswith("-", j)
             j += dash
@@ -1362,19 +1366,21 @@ def heredoc_ends(line):
             i = j
             continue
         i += 1
-    return found
+    return found, len(line)
 
 
 def without_heredocs(command):
-    # The command lines, minus the bodies of here-documents (text, not commands).
+    # The command lines, minus their comments and the bodies of here-documents (text, not
+    # commands).
     out, ends = [], []
     for line in command.split("\n"):
         if ends:
             if (line.lstrip("\t") if ends[0][1] else line) == ends[0][0]:
                 ends.pop(0)
             continue
-        out.append(line)
-        ends += heredoc_ends(line)
+        found, cut = heredoc_ends(line)
+        out.append(line[:cut])
+        ends += found
     return out
 
 
