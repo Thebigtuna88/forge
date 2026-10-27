@@ -1381,7 +1381,10 @@ def shell_words(command):
                     delim, dq = "", None
                     while i < len(line):
                         ch = line[i]
-                        if dq:
+                        if dq == "\"" and ch == "\\" and i + 1 < len(line) and line[i + 1] in "\"\\$`":
+                            i += 1
+                            delim += line[i]
+                        elif dq:
                             if ch == dq:
                                 dq = None
                             else:
@@ -1447,7 +1450,10 @@ def bash_targets(command):
     out, where = [], cwd or None
     for words, redirects in commands:
         out.extend((t, where) for t in redirects)
+        # Past assignments, shell keywords (if then do { ! ...) and wrappers, to the program.
         while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0])
+                         or words[0] in ("if", "then", "else", "elif", "while", "until", "do", "!", "{", "}",
+                                         "fi", "done", "esac")
                          or os.path.basename(words[0]) in ("sudo", "command", "nohup", "time", "env", "builtin", "exec", "nice")):
             words = words[1:]
         if not words:

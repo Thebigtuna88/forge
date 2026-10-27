@@ -15,9 +15,15 @@
       "key_vars": [
         "HIGGSFIELD_API_KEY",
         "HF_API_KEY_ID",
-        "HF_API_KEY_SECRET"
+        "HF_API_KEY_SECRET",
+        "HF_KEY",
+        "HF_API_KEY",
+        "HF_API_SECRET"
       ],
-      "commands": []
+      "commands": [
+        "higgsfield_client",
+        "higgsfield-client"
+      ]
     },
     "fal": {
       "enabled": false,
