@@ -1432,6 +1432,8 @@ except Exception:
     sys.exit(3)
 cmd = sys.argv[2]
 texts = [t.lower() for t in (cmd, re.sub(r"[\"\x27\\\\]", "", cmd))]
+# An interpreter takes its module attached to -m (python3 -mopenai): judged split as well.
+texts += [re.sub(r"(^|[\s;&|(])-m(?=[a-z@_])", r"\1-m ", t) for t in texts]
 
 
 def named(word, before, after):
