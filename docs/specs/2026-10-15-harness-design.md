@@ -551,6 +551,11 @@ source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&
 [ "${HOOKRT_LOADED:-}" = 1 ] || { echo "hookrt not loaded" >&2; exit 2; }
 ```
 
+The two hooks that fail open (5.1: `capture-owner-paste` and `gate-owner-handoff-form`) use the
+same lines with `exit 0` in place of `exit 2`, and an `echo "FORGE hook failed open: …"` on standard
+output, so even a runtime that can't load never blocks the owner's message or every turn.
+Conformance requires those lines for these two hooks and refuses them in any other (FRG-5).
+
 The runtime is found relative to the hook's own file, never through an environment variable.
 It provides:
 
