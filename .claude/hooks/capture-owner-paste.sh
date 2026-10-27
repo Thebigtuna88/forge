@@ -3,8 +3,10 @@
 # UserPromptSubmit hook. When the owner's message holds a HANDOFF-RESULT block for a frozen handoff,
 # it saves the block itself to work/owner/<id>/PASTED-<utc>.txt and records the file's sha256 in
 # .harness/state/pastes.log; handoff verify accepts only a paste recorded there, and
-# guard-live-checkout keeps the agent from writing either. Its note (what it saved, or why not)
-# reaches the agent as added context. It never blocks the owner's message: it is registered without
+# guard-live-checkout keeps the agent's file tools from writing either. Shell writes to them are
+# not prevented (spec 11, L14, open until permission-based protection is implemented and tested).
+# Its note (what it saved, or why not) reaches the agent as added context. It never blocks the
+# owner's message: it is registered without
 # "onFailure": "block" and fails open (hookrt; it even exits 0 if the runtime can't load), so a
 # failure only means the paste isn't recorded, which verify then refuses. Claude Code also runs
 # this hook on turns it starts itself (a scheduled task, a background agent reporting back,

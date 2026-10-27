@@ -151,7 +151,7 @@ esac
 unset _hr_lib
 
 # All state is set here, so nothing inherited from the environment can steer the runtime.
-HR_HOOK="" HR_MODE=enforce HR_INPUT="" HR_EVENT="" HR_TOOL="" HR_CMD="" HR_FILE="" HR_CWD=""
+HR_HOOK="" HR_MODE=enforce HR_INPUT="" HR_EVENT="" HR_TOOL="" HR_CMD="" HR_FILE="" HR_CWD="" HR_FILE_CONFLICT=0
 HR_TOK=() HR_GIT_ARGS=()
 HR_GIT_SUB="?" HR_GIT_DIR="" HR_GIT_VIA_ALIAS=0
 _HR_LOADED="" _HR_TOOLS=() _HR_GIT_CMDS="" _HR_SUBI=-1 _HR_UNKNOWABLE=0 _HR_CDS=()
@@ -316,9 +316,18 @@ hr_init() { # <hook-name>; reads the hook JSON on stdin
   _hr_field HR_EVENT '.hook_event_name' || _hr_fatal "bad hook_event_name in the hook input"
   _hr_field HR_TOOL '.tool_name' || _hr_fatal "bad tool_name in the hook input"
   _hr_field HR_CMD '.tool_input.command' || _hr_fatal "bad tool_input.command in the hook input"
+  # The file the tool writes: NotebookEdit's notebook_path, every other tool's file_path. A
+  # NotebookEdit naming a different file_path too sets HR_FILE_CONFLICT, so a guard can refuse it
+  # (FRG-5 review round 13).
+  local nb=""
   _hr_field HR_FILE '.tool_input.file_path' || _hr_fatal "bad tool_input.file_path in the hook input"
-  [[ -n "$HR_FILE" ]] || _hr_field HR_FILE '.tool_input.notebook_path' ||
-    _hr_fatal "bad tool_input.notebook_path in the hook input"
+  _hr_field nb '.tool_input.notebook_path' || _hr_fatal "bad tool_input.notebook_path in the hook input"
+  if [[ "$HR_TOOL" == NotebookEdit ]]; then
+    if [[ -n "$HR_FILE" && "$HR_FILE" != "$nb" ]]; then HR_FILE_CONFLICT=1; fi
+    HR_FILE="$nb"
+  elif [[ -z "$HR_FILE" ]]; then
+    HR_FILE="$nb"
+  fi
   _hr_field HR_CWD '.cwd' || _hr_fatal "bad cwd in the hook input"
   HR_MODE="$(_hr_mode "$HR_HOOK")"
 }
@@ -1428,8 +1437,9 @@ cmd = sys.argv[2]
 texts = [t.lower() for t in (cmd, re.sub(r"[\"\x27\\\\]", "", cmd))]
 
 
-def named(word, edge):
-    pattern = re.compile(r"(?<![" + edge + r"])" + re.escape(word.lower()) + r"(?![" + edge + r"])")
+def named(word, before, after):
+    # The word as a whole name: no character of [before] right before it, none of [after] after.
+    pattern = re.compile(r"(?<![" + before + r"])" + re.escape(word.lower()) + r"(?![" + after + r"])")
     return any(pattern.search(t) for t in texts)
 
 
@@ -1463,9 +1473,11 @@ try:
 except ValueError:
     reads = False
 hits = ["paid host " + h for h in found["hosts"] if any(h.lower() in t for t in texts)]
-hits += ["key variable " + k for k in found["key_vars"] if named(k, "a-z0-9_")]
+hits += ["key variable " + k for k in found["key_vars"] if named(k, "a-z0-9_", "a-z0-9_")]
 if not reads:
-    hits += ["provider command " + c for c in found["commands"] if named(c, "a-z0-9_.-")]
+    # A package followed by a dot is still the package (import stripe.checkout); one after a dot
+    # is part of another name (api.openai.com is judged as a host).
+    hits += ["provider command " + c for c in found["commands"] if named(c, "a-z0-9_.-", "a-z0-9_-")]
 hits += ["blocked text " + b for b in blocked if any(b.lower() in t for t in texts)]
 if hits:
     print("; ".join(hits))

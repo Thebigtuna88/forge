@@ -21,6 +21,8 @@ case "$HR_TOOL" in
   Edit | Write | MultiEdit | NotebookEdit) ;;
   *) hr_allow ;;
 esac
+[[ $HR_FILE_CONFLICT == 0 ]] ||
+  hr_deny "NotebookEdit names two different files (file_path and notebook_path), so the guard can't tell which it writes"
 
 rc=0
 hr_live_check "$HR_FILE" || rc=$?
