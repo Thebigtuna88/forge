@@ -1,0 +1,99 @@
+# FORGE harness CI (FRG-6, spec 10.2): the whole test suite, shellcheck and gitleaks on GitHub's
+# standard macOS runner (free for public repositories).
+#
+# NOT A REQUIRED CHECK YET. Until FRG-34 (#34, after the FRG-26 checkpoint) makes it one, a failing
+# run here does not technically block merging into dev or main: nothing on GitHub requires it
+# (spec 11, L15). And a green run never replaces `bash tests/run.sh` -> ALL PASS on the owner's
+# Mac: GitHub Actions has no Claude Code, so conformance skips its version check here.
+#
+# Owner-only file (.harness/self-modification-paths.json). tests/unit/ci-workflow.test.sh reads it
+# as text, so keep this plain layout: no anchors, no other jobs, comments only on their own line or
+# after a space.
+name: ci
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# The hooks' own PATH (.harness/lib/hookrt.sh): /bin/bash 3.2, Apple's python3, jq and git, then
+# the two tools installed below, as on the owner's Mac.
+env:
+  PATH: /usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
+
+defaults:
+  run:
+    shell: /bin/bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  ci:
+    name: ci
+    runs-on: macos-26
+    # The suite took 2254 s (about 38 min) on the owner's Mac (dev at 24fce9f, 2026-10-27); the
+    # runner has 3 cores, so allow about four times that.
+    timeout-minutes: 150
+    steps:
+      - name: Check out the code (full history, no stored credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The owner's Mac's versions, from each project's GitHub release. The sha256 values match
+      # GitHub's recorded digest for each file and, for gitleaks, its published checksums file.
+      - name: Install shellcheck 0.11.0 and gitleaks 8.30.1 (sha256 checked)
+        run: |
+          dl="$RUNNER_TEMP/dl"
+          mkdir -p "$dl"
+          cd "$dl"
+          curl -fsSL --proto =https --proto-redir =https -o shellcheck.tar.xz \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.darwin.aarch64.tar.xz
+          curl -fsSL --proto =https --proto-redir =https -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_darwin_arm64.tar.gz
+          shasum -a 256 -c - <<'SUMS'
+          56affdd8de5527894dca6dc3d7e0a99a873b0f004d7aabc30ae407d3f48b0a79  shellcheck.tar.xz
+          b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5  gitleaks.tar.gz
+          SUMS
+          tar -xJf shellcheck.tar.xz shellcheck-v0.11.0/shellcheck
+          tar -xzf gitleaks.tar.gz gitleaks
+          rm -f /opt/homebrew/bin/shellcheck /opt/homebrew/bin/gitleaks
+          install -m 0755 shellcheck-v0.11.0/shellcheck /opt/homebrew/bin/shellcheck
+          install -m 0755 gitleaks /opt/homebrew/bin/gitleaks
+
+      - name: Show the tools the tests will use
+        run: |
+          for t in bash python3 jq git shellcheck gitleaks; do
+            printf '%-10s %s\n' "$t" "$(command -v "$t")"
+          done
+          printf 'bash       %s\n' "$BASH_VERSION"
+          python3 --version
+          jq --version
+          git --version
+          shellcheck --version
+          gitleaks version
+          [[ "$(command -v bash)" == /bin/bash ]]
+          [[ "$(command -v python3)" == /usr/bin/python3 ]]
+          [[ "$(command -v shellcheck)" == /opt/homebrew/bin/shellcheck ]]
+          [[ "$(command -v gitleaks)" == /opt/homebrew/bin/gitleaks ]]
+          [[ "$(shellcheck --version)" == *"version: 0.11.0"* ]]
+          [[ "$(gitleaks version)" == 8.30.1 ]]
+
+      - name: Run the whole test suite (must end with ALL PASS)
+        run: |
+          /bin/bash tests/run.sh 2>&1 | tee "$RUNNER_TEMP/run.txt"
+          [[ "$(tail -n 1 "$RUNNER_TEMP/run.txt")" == "ALL PASS" ]]
+
+      # The whole history GitHub sent, with FORGE's rules only (no ignore file), secrets redacted
+      # in this public log.
+      - name: Scan the git history for secrets
+        run: |
+          gitleaks git --config .harness/gitleaks.toml --gitleaks-ignore-path "$RUNNER_TEMP/no-ignore" \
+            --redact --no-banner --exit-code 1 .

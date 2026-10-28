@@ -197,7 +197,10 @@ The local hooks run on the owner's Mac. GitHub branch protection is the second, 
 layer. On each governed repo:
 
 - `main`: changes only through a PR; no force-push; no deletion; applies to admins too.
-- `dev`: changes only through a PR; the CI check must pass; no force-push; no deletion.
+- `dev`: changes only through a PR; no force-push; no deletion.
+- **CI is not required yet** (L15). Harness CI (FRG-6) runs on every PR into `dev` or `main`,
+  but a failing run doesn't technically block a merge until FRG-34 (after the FRG-26
+  checkpoint) makes passing CI and the owner's approval required on both branches.
 
 **Limit:** the agent uses the owner's own `gh` login, so GitHub can't tell agent and owner
 apart. Server-side protection stops direct pushes and force-pushes, but only the local hooks stop
@@ -1140,8 +1143,12 @@ or 1.
   (`tests/lib/ptyrun.py`, which also types the answers) with all four agent markers removed.
   That the test suite can do this is exactly why section 4.8 calls the TTY check a speed bump.
 - **Platform:** scripts target macOS (the owner's machine) and use small helpers
-  (`hr_md5`, `hr_sha256`) instead of tool-specific flags. Harness CI runs on GitHub's
-  **macOS** runners, which are free for public repos.
+  (`hr_md5`, `hr_sha256`) instead of tool-specific flags. Harness CI
+  (`.github/workflows/ci.yml`, FRG-6) runs on GitHub's standard **macOS** runner `macos-26`,
+  which is free for public repos (checked 2026-10-27), with the hooks' PATH, so the suite gets
+  `/bin/bash` 3.2 and Apple's tools there too. It isn't a required check until FRG-34 (L15), and a
+  green run doesn't replace the local `ALL PASS`: conformance skips the Claude Code version check
+  on GitHub Actions.
 
 The pty driver kills, when a run ends, every descendant it saw in its process snapshots, after a
 best-effort check that each is still the same process. A process that detaches itself (fork,
@@ -1203,6 +1210,7 @@ its mitigation and, where one exists, a stronger option the owner can adopt late
 | L12 | **Evidence the agent writes can be forged or swapped by the agent** (FRG-4 review round 1). The merge gate re-checks `review.md` and the reply files (binding, recomputed diff, hashes, read-proof), which proves which code they describe, not that a reviewer wrote them: the agent could write CLEAN replies and a matching `review.md` itself. Likewise a second command running at the same moment could replace a `--body-file` between the scan and `gh` sending it. | Agent, reviewer runner and files share one macOS user; nothing on disk is beyond the agent's reach. | The gates stop mistakes and shortcuts, not a deliberately dishonest agent (as L1, L4); every PR touching an owner-only path is merged by the owner; review summaries are posted on the PR; charter rules 3, 6 and 9. **Decided 2026-10-18** (owner): accepted as a known limit. | Agent (and codex) run as separate macOS users, or a GitHub machine account whose merges need the owner's approval (L2). |
 | L14 | **Shell writes to the main checkout are not prevented** (FRG-5, owner decision 2026-10-27). `guard-live-checkout` judges only the agent's file tools (Edit, Write, MultiEdit, NotebookEdit). A shell command (`echo x > CLAUDE.md`, `cp`, `mv`, `rm`, `sed -i`, or a script) can still change the main checkout, its handoff evidence, `pastes.log` or settings files. **Open: not resolved** until permission-based protection is implemented and tested. | A shell-write checker reads shell syntax, and FRG-5 review rounds 1-12 kept finding ordinary forms it misread. | Charter rule 1 (the main checkout is never edited by hand); `deny-commit-on-shared-checkout` stops commits there; verify's paste record (4.5); the file-tool guard. | FRG-26: the agent runs as a macOS user that can't write the main checkout, tested. FRG-32 (after the FRG-26 checkpoint) decides whether a shell-write checker is still needed. |
 | L13 | **Commands deliberately disguised from the gates** (FRG-4 review rounds 6-10). A command built to hide that it runs `gh`, `git` or a deploy tool (its name or words spelled so the text check doesn't recognise them) may not be judged as that tool. Accepted risk, not fixed: round 10's SEC-1, deferred to FRG-26. | The hooks read a command's text; what the shell makes of it can't be fully predicted, and each patch was followed by a new spelling. | The gates recognise ordinary commands and mistakes (conformance proves each listed case); the round 2-9 checks stay; charter rule 9; GitHub branch protection on `main` and `dev`. Against a deliberate attempt, nothing technical holds while the agent uses the owner's admin login (L2). **Decided 2026-10-19** (owner): `docs/decisions/2026-10-19-disguised-commands-known-limit.md`. | FRG-26: define what the agent's own GitHub credentials and macOS user must be unable to do, and test each restriction. A separate account alone isn't enough. |
+| L15 | **A failing CI run doesn't block a merge** (FRG-6, owner decision 2026-10-27). Harness CI runs on every PR into `dev` or `main`, but no protection rule requires its check, so a red PR can still be merged. And a green run isn't a full pass: GitHub's runners have no Claude Code, so conformance skips its version check there. | Requiring the check changes FORGE's branch protection, which waits for the FRG-26 checkpoint. | The owner merges every PR touching an owner-only path; each owner-merge handoff checks the CI result for the exact head and stops if it isn't green; `bash tests/run.sh` → `ALL PASS` on the owner's Mac before any merge. Practice and scripts, not GitHub rules. `docs/decisions/2026-10-27-ci-not-required-until-frg-34.md`. | FRG-34 (#34): passing CI and the owner's approval required on `dev` and `main`, every existing rule kept, after the FRG-26 checkpoint. |
 | L5 | **Read-proof proves access, not diligence.** A reviewer can hash the diff and still review it badly. | — | Adversarial prompt, structured findings, multiple lenses, stall rule, owner merges `main`. | Owner skims `review.md` for risky PRs. |
 | L6 | **Heuristic hooks.** The Stop hook `gate-owner-handoff-form` guesses from text. | Natural language is open-ended. | It starts in observe; the owner promotes it by PR after reviewing `observed.log`. | — |
 | L7 | **Local-only evidence.** `work/` and the spend ledger live on one Mac. | Gitignored by design (may hold logs/screens). | PR comment summary of every review; prepaid wallets as the real spend cap; deleting the ledger doesn't remove a provider's own limits. | Back up `work/` with Time Machine. |

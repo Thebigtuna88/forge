@@ -12,4 +12,7 @@ owner into a script the owner runs and whose output they paste back.
 
 Branches: `feature/FRG-<n>-<slug>` → `dev` (reviewed PRs) → `main` (owner only).
 
+CI (`.github/workflows/ci.yml`) runs the tests on every PR, but until FRG-34 a failing run does
+not technically block merging (spec 11, L15).
+
 Resume a session by starting Claude Code in this folder and typing `CONTINUE FORGE`.
