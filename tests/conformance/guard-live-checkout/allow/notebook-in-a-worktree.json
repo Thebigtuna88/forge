@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "NotebookEdit",
+  "tool_input": {
+    "notebook_path": "@WORKTREES@/FRG-5-a/report.ipynb",
+    "new_source": "x"
+  },
+  "cwd": "@ROOT@"
+}

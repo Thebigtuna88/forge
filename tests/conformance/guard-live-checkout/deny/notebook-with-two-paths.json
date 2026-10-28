@@ -1,0 +1,13 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "NotebookEdit",
+  "tool_input": {
+    "file_path": "@TMP@/benign.ipynb",
+    "notebook_path": "@ROOT@/report.ipynb",
+    "new_source": "changed",
+    "cell_type": "code",
+    "edit_mode": "insert"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "two different files"
+}

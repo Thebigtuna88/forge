@@ -10,7 +10,10 @@
 #    tests/conformance: no hidden or stray files, and no symlinks there or in the hook, runtime and
 #    config paths. A registration holds only type, command, onFailure and timeout (in a group of
 #    matcher and hooks), and blocks when its hook fails: "onFailure": "block" and a whole-number
-#    "timeout" of 1 to 120 seconds (except on events where Claude Code ignores onFailure). Every
+#    "timeout" of 1 to 120 seconds (except on events where Claude Code ignores onFailure). The two
+#    hooks hookrt lets fail open are registered only for their own event: capture-owner-paste for
+#    UserPromptSubmit, with a timeout and without "onFailure": "block" (a failure must never stop
+#    the owner's message), and gate-owner-handoff-form for Stop (FRG-5). Every
 #    installed claude (PATH, ~/.local/bin, ~/.claude/local) reports 2.1.295 or later, the first to
 #    honour it, read in a no-write sandbox with a time limit (FRG-20). That version check prints
 #    SKIP on GitHub Actions (CI and GITHUB_ACTIONS both true), which doesn't run Claude Code, and
@@ -33,7 +36,9 @@
 #    enforce: deny → exit 2 with the runtime's "BLOCKED by FORGE hook <key>:" decision on stderr
 #    (a crash also exits 2, but doesn't count), allow → exit 0. observe: deny → exit 0 plus a new
 #    "<key> WOULD-DENY" line. An optional "forge_reason" must appear in that decision. No allow case may log WOULD-DENY. Afterwards the sandbox copies must
-#    still match the live files.
+#    still match the live files. capture-owner-paste only records, so it has allow cases only; a
+#    case with "forge_records": true must add exactly one line to the sandbox's
+#    .harness/state/pastes.log, and every other case none.
 # 3. With a missing, a malformed and an unknown-value mode.json, every deny case exits 2.
 # 4. Hooks are not switched off: no disableAllHooks and no allowManagedHooksOnly in the user
 #    settings (~/.claude and $CLAUDE_CONFIG_DIR), the project and local settings (of this
@@ -156,6 +161,12 @@ fi
 registered=() regs=()
 # Events where Claude Code ignores onFailure (its exit code 2 sends the agent back to work).
 no_onfailure_events=(Stop SubagentStop TaskCompleted TeammateIdle)
+# The hooks hookrt lets fail open (FRG-5), each with the one event it may be registered for.
+# capture-owner-paste also may not have "onFailure": "block": a failure must never stop the
+# owner's message reaching the agent (verify refuses a paste it didn't record). It only records,
+# so it has allow cases only, and a case's "forge_records" says whether it records a paste.
+fail_open_hooks=("capture-owner-paste UserPromptSubmit" "gate-owner-handoff-form Stop")
+record_hook=capture-owner-paste
 # shellcheck disable=SC2016 # the literal text "$CLAUDE_PROJECT_DIR" that settings.json must contain
 reg_re='^"\$CLAUDE_PROJECT_DIR"/\.claude/hooks/([A-Za-z0-9._-]+)\.sh$'
 # A value is checked as it is, never through a default (`// ""` would turn false into a missing,
@@ -193,8 +204,20 @@ if reg="$(jq -r '
       else
         fail "$h.sh ($event) registration has keys FORGE does not allow (${extra#* }): only type, command, onFailure and timeout, in a group of matcher and hooks (async, asyncRewake or if can keep a gate from running or from blocking)"
       fi
+      fo_event=""
+      for fo in "${fail_open_hooks[@]}"; do
+        [[ "${fo% *}" == "$h" ]] && fo_event="${fo#* }"
+      done
+      if [[ -n "$fo_event" && "$event" != "$fo_event" ]]; then
+        fail "$h.sh may be registered only for $fo_event (it fails open), not $event"
+      fi
       # Without onFailure, a hook that can't start, times out or is killed lets the call through.
-      if ! in_list "$event" "${no_onfailure_events[@]}"; then
+      if [[ "$h" == "$record_hook" && "$event" == UserPromptSubmit ]]; then
+        [[ "$onfail" == null ]] ||
+          fail "$h.sh ($event) must not have \"onFailure\": \"block\" (has $onfail): a failure would stop the owner's message reaching the agent"
+        [[ "$timeout" == ok ]] ||
+          fail "$h.sh ($event) needs a \"timeout\" of 1 to 120 seconds, a whole number (has $timeout)"
+      elif ! in_list "$event" "${no_onfailure_events[@]}"; then
         [[ "$onfail" == '"block"' ]] ||
           fail "$h.sh ($event) lacks \"onFailure\": \"block\" (has $onfail): if it can't start, times out or is killed, Claude Code runs the command anyway"
         [[ "$timeout" == ok ]] ||
@@ -325,8 +348,11 @@ fi
 # shellcheck disable=SC2016 # Python source; its $ signs are for Python, not the shell
 SOURCE_CHECK_PY='
 import re, shlex, sys
-# The standard header lines are the only place a hook may use $(dirname …), unset or source.
+# The standard header lines are the only place a hook may use $(dirname …), unset or source. A
+# fail-open hook loads the runtime with the header line in argv 4, which exits 0, not 2.
 headers = {sys.argv[2], sys.argv[3], "unset HOOKRT_LOADED"}
+if len(sys.argv) > 4 and sys.argv[4]:
+    headers = {sys.argv[2], sys.argv[4], "unset HOOKRT_LOADED"}
 raw_lines = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read().split("\n")
 assign = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\"\$\(.*\)\"$")
 LIST_OPS = ("&&", "||", "|", "|&", "!")
@@ -614,7 +640,21 @@ for b in dict.fromkeys(bad):
 HEADER_LINE='here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
 # shellcheck disable=SC2016 # the literal header text
 HEADER_SOURCE='source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&2; exit 2; }'
+# The two fail-open hooks (FRG-5) load the runtime this way instead, so even a runtime that can't
+# load never blocks the owner's message or every turn; they must, and no other hook may.
+# shellcheck disable=SC2016 # the literal header text
+HEADER_SOURCE_FAIL_OPEN='source "$here/../../.harness/lib/hookrt.sh" || { echo "FORGE hook failed open: hookrt failed to load"; exit 0; }'
+# shellcheck disable=SC2016 # the literal header text
+HEADER_LOADED_FAIL_OPEN='[ "${HOOKRT_LOADED:-}" = 1 ] || { echo "FORGE hook failed open: hookrt not loaded"; exit 0; }'
 for h in ${hooks[@]+"${hooks[@]}"}; do
+  alt=""
+  for fo in "${fail_open_hooks[@]}"; do
+    [[ "${fo% *}" == "$h" ]] && alt="$HEADER_SOURCE_FAIL_OPEN"
+  done
+  if [[ -n "$alt" ]] && ! { grep -qxF "$HEADER_SOURCE_FAIL_OPEN" "$HOOKS_DIR/$h.sh" &&
+    grep -qxF "$HEADER_LOADED_FAIL_OPEN" "$HOOKS_DIR/$h.sh"; }; then
+    fail "$h.sh fails open, so it must load the runtime with the fail-open header lines (exit 0 if hookrt can't load)"
+  fi
   while IFS= read -r n; do
     if [[ "$n" == E* ]]; then
       fail "$h.sh line ${n#E}: a hook may not run eval, source, ., command, builtin, exec, env, trap, set, shopt, enable, unset or a shell (they run or change code the source check can't see)"
@@ -641,7 +681,7 @@ for h in ${hooks[@]+"${hooks[@]}"}; do
       continue
     fi
     fail "$h.sh line $n: a command substitution may only be the whole value of a plain assignment (name=\"\$(…)\", one per line, not nested); backticks and <( >( aren't allowed, so a failure inside can't be hidden"
-  done < <(python3 -I -c "$SOURCE_CHECK_PY" "$HOOKS_DIR/$h.sh" "$HEADER_LINE" "$HEADER_SOURCE" || echo "G0")
+  done < <(python3 -I -c "$SOURCE_CHECK_PY" "$HOOKS_DIR/$h.sh" "$HEADER_LINE" "$HEADER_SOURCE" "$alt" || echo "G0")
 done
 
 if [[ -e "$CASES_DIR" || -L "$CASES_DIR" ]]; then
@@ -757,6 +797,14 @@ logged() { # <key>: number of "<key> WOULD-DENY" lines in the sandbox's observed
   awk -v k="$1" '$2 == k && $3 == "WOULD-DENY" {n++} END {print n + 0}' "$SBX/.harness/observed.log"
 }
 
+pastes_recorded() { # lines in the sandbox's .harness/state/pastes.log (capture-owner-paste's record)
+  [[ -f "$SBX/.harness/state/pastes.log" ]] || {
+    echo 0
+    return 0
+  }
+  wc -l <"$SBX/.harness/state/pastes.log" | tr -d ' '
+}
+
 case_key() { # <hook> <case.json>: the mode.json key the case runs under ("" if unreadable)
   jq -r --arg h "$1" '(.forge_mode_key // $h) | strings' "$2" 2>/dev/null || true
 }
@@ -765,7 +813,7 @@ case_key() { # <hook> <case.json>: the mode.json key the case runs under ("" if 
 # Sets CASE_RC, CASE_NEW (new WOULD-DENY lines under the case's key), CASE_DIFF and CASE_ERR.
 run_case() {
   local hook="$1" json="$2" variant="$3" key event tool setup skip="" before
-  CASE_RC="" CASE_NEW=0 CASE_NEW_ANY=0 CASE_DIFF="" CASE_ERR=""
+  CASE_RC="" CASE_NEW=0 CASE_NEW_ANY=0 CASE_DIFF="" CASE_ERR="" CASE_PASTES_NEW=0
   key="$(case_key "$hook" "$json")"
   event="$(jq -r '.hook_event_name | strings' "$json" 2>/dev/null)" || event=""
   tool="$(jq -r '.tool_name // "" | strings' "$json" 2>/dev/null)" || tool=""
@@ -778,11 +826,13 @@ run_case() {
       (.hook_event_name | type) == "string"
       and ((.tool_input | type) as $t | $t == "null" or $t == "object")
       and (.forge_reason == null or (.forge_reason | type) == "string")
+      and (.forge_records == null or (.forge_records | type) == "boolean")
+      and (.stop_hook_active == null or (.stop_hook_active | type) == "boolean")
       and ([.hook_event_name, .tool_name, .cwd, .tool_input.command?, .tool_input.file_path?,
-          .tool_input.notebook_path?]
+          .tool_input.notebook_path?, .prompt, .last_assistant_message]
         | all(. == null or (type == "string" and (any(explode[]; . == 0) | not)))))' \
     "$json" >/dev/null 2>&1; then
-    CASE_ERR="not valid hook input (one JSON object; event, tool, command, file path and cwd must be strings)"
+    CASE_ERR="not valid hook input (one JSON object; event, tool, command, file path, cwd, prompt and message must be strings, forge_records and stop_hook_active booleans)"
     return 0
   fi
   if [[ "$event" == *ToolUse* && -z "$tool" ]]; then
@@ -848,6 +898,7 @@ run_case() {
     return 0
   }
   before="$(logged "$key")"
+  CASE_PASTES_BEFORE="$(pastes_recorded)"
   CASE_LOG_BEFORE=0
   if [[ -f "$SBX/.harness/observed.log" ]]; then
     CASE_LOG_BEFORE="$(wc -l <"$SBX/.harness/observed.log" | tr -d ' ')"
@@ -856,6 +907,7 @@ run_case() {
     sandbox-exec -D BASE="$BASE" -p "$HOOK_PROFILE" "$SBX/.claude/hooks/$hook.sh" \
     <"$RUN/input.json" >"$RUN/stdout" 2>"$RUN/stderr")
   CASE_RC=$?
+  CASE_PASTES_NEW=$(($(pastes_recorded) - CASE_PASTES_BEFORE))
   CASE_NEW=$(($(logged "$key") - before))
   CASE_NEW_ANY=0
   if [[ -f "$SBX/.harness/observed.log" ]]; then
@@ -906,7 +958,11 @@ for h in ${hooks[@]+"${hooks[@]}"}; do
   for f in "$CASES_DIR/$h"/deny/[!.]*.json; do [[ -f "$f" && ! -L "$f" ]] && denies+=("$f"); done
   for f in "$CASES_DIR/$h"/allow/[!.]*.json; do [[ -f "$f" && ! -L "$f" ]] && allows+=("$f"); done
   before=$failures
-  [[ ${#denies[@]} -gt 0 ]] || fail "$h: no deny cases in tests/conformance/$h/deny/"
+  if [[ "$h" == "$record_hook" ]]; then
+    [[ ${#denies[@]} -eq 0 ]] || fail "$h never denies (it only records the owner's paste), so it has allow cases only"
+  else
+    [[ ${#denies[@]} -gt 0 ]] || fail "$h: no deny cases in tests/conformance/$h/deny/"
+  fi
   [[ ${#allows[@]} -gt 0 ]] || fail "$h: no allow cases in tests/conformance/$h/allow/"
 
   for f in ${denies[@]+"${denies[@]}"} ${allows[@]+"${allows[@]}"}; do
@@ -921,6 +977,12 @@ for h in ${hooks[@]+"${hooks[@]}"}; do
     [[ -z "$CASE_DIFF" ]] || fail "$label: the sandbox copy of $CASE_DIFF differs from the live file"
     mode="$(mode_of "$(case_key "$h" "$f")")"
     [[ " $modes " == *" $mode "* ]] || modes="$modes $mode"
+    records="$(jq -r '.forge_records // "" | tostring' "$f" 2>/dev/null)" || records=""
+    if [[ "$records" == true && "$CASE_PASTES_NEW" != 1 ]]; then
+      fail "$label: expected the paste to be recorded in .harness/state/pastes.log (got $CASE_PASTES_NEW new lines): $(head -c 300 "$RUN/stdout")"
+    elif [[ "$records" != true && "$CASE_PASTES_NEW" != 0 ]]; then
+      fail "$label: expected no paste record, got $CASE_PASTES_NEW new lines in .harness/state/pastes.log"
+    fi
     if [[ "$kind" == allow ]]; then
       [[ "$CASE_RC" == 0 ]] || fail "$label: expected exit 0 (allow), got $CASE_RC: $(head -c 300 "$RUN/stderr")"
       [[ "$CASE_NEW_ANY" == 0 ]] || fail "$label: an allow case wrote a WOULD-DENY line"

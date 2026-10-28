@@ -42,6 +42,15 @@ mk_script() {
   SCRIPT="$dir/OWNER-RUN.sh"
 }
 
+# record_paste <file>: what capture-owner-paste adds for a paste it saved (FRG-5): a line in the
+# harness's .harness/state/pastes.log naming the file and its sha256.
+record_paste() {
+  local file="$1"
+  mkdir -p "$H/.harness/state"
+  printf '2026-01-01T00:00:00Z %s %s %s\n' "$(basename "$(dirname "$file")")" "${file#"$H"/}" \
+    "$(shasum -a 256 "$file" | awk '{print $1}')" >>"$H/.harness/state/pastes.log"
+}
+
 # pty_run [--answer X]... -- <script>: run as the owner would, in a terminal, outside the agent.
 # Sets OUT (terminal output) and RC (exit status).
 pty_run() {

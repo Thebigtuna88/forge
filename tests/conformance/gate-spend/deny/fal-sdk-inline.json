@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "python -c \"import fal_client; fal_client.subscribe('fal-ai/flux/dev', arguments={'prompt': 'a cat'})\""
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "provider command fal_client"
+}

@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "yes, approve the plan",
+  "cwd": "@ROOT@",
+  "forge_records": false
+}

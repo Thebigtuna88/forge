@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "@ROOT@/work/owner/2026-01-01-demo/RESULT.txt",
+    "content": "x"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "handoff records in work/owner/"
+}

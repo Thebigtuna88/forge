@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "```\nbash /Users/x/code/forge/work/owner/2026-01-01-demo/OWNER-RUN.sh\n```\npaste back the HANDOFF-RESULT block\n\nBut first:\n```bash\nbrew install jq\n```",
+  "cwd": "@ROOT@",
+  "forge_reason": "rewrite this as an owner handoff"
+}

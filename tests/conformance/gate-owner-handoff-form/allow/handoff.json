@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "Ready:\n\n```\nbash /Users/x/code/forge/work/owner/2026-01-01-demo/OWNER-RUN.sh\n```\npaste back the HANDOFF-RESULT block\n",
+  "cwd": "@ROOT@"
+}

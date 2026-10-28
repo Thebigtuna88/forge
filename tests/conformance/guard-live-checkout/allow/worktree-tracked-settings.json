@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "@WORKTREES@/FRG-5-a/.claude/settings.json",
+    "content": "x"
+  },
+  "cwd": "@ROOT@"
+}

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rg --pre=stripe pattern README.md"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "provider command stripe"
+}

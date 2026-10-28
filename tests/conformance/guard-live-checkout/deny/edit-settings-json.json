@@ -1,0 +1,11 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "@ROOT@/.claude/settings.json",
+    "old_string": "a",
+    "new_string": "b"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "is never edited by hand"
+}

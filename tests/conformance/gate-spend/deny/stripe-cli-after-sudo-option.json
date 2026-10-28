@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "sudo -u atl stripe balance retrieve"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "provider command stripe"
+}

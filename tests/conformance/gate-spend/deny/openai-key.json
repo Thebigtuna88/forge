@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "env OPENAI_API_KEY=x ./run.sh"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "key variable OPENAI_API_KEY"
+}

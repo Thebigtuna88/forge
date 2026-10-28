@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "curl https://api.open\"\"ai.com/v1/models"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "paid host api.openai.com"
+}

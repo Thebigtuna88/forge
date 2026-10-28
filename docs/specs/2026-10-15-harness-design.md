@@ -241,7 +241,7 @@ agent → owner, exactly two lines:
 owner: runs it in a normal Terminal window (not inside Claude Code)
 runtime: writes RESULT.txt, copies the block to the clipboard
 owner: pastes the block into chat
-agent: saves the paste verbatim → work/owner/<id>/PASTED-<utc>.txt
+hook:  capture-owner-paste saves it verbatim → work/owner/<id>/PASTED-<utc>.txt (+ pastes.log)
 agent: handoff verify work/owner/<id>/PASTED-<utc>.txt → VERIFIED.txt on success
 agent: proceeds only after verify passes
 ```
@@ -425,10 +425,25 @@ Passes only if **all** of these hold:
    leading and trailing whitespace.
 8. The pasted file lives at `work/owner/<id>/PASTED-*.txt` and is its own regular file (not a
    symlink or hard link). Verify refuses to take `RESULT.txt` itself as input.
+9. `.harness/state/pastes.log` in the main checkout (a regular file with one link, in folders
+   that are not links) has a finished line (ending in a line break) of four fields naming
+   `work/owner/<id>/PASTED-*.txt` with the paste's sha256 (FRG-5).
+
+Verify reads the paste once: checks 1 to 9 all use that one copy, so the bytes it checks are the
+bytes whose hash must be recorded.
 
 **From FRG-5 on** (owner decision 2026-10-16-handoff-evidence-provenance), the paste file is
-written by the `capture-owner-paste` UserPromptSubmit hook, not by the agent, and verify also
-requires the paste's sha256 to be recorded in `.harness/state/pastes.log` by that hook.
+written by the `capture-owner-paste` UserPromptSubmit hook, not by the agent, and verify's check 9
+requires the paste's sha256 to be recorded in `.harness/state/pastes.log` by that hook. The hook
+gets the owner's message in full (a collapsed paste arrives expanded, between `<pasted_content>`
+lines). When the message holds exactly one block (lines compared as verify compares them) for a
+`<date>-<slug>` handoff whose `work/owner/<id>/` is a real folder with a `META.json` in state
+`ready`, it saves the block's lines exactly as received to a new `PASTED-<utc>.txt` (never
+replacing a file, never through a link) and appends `<utc> <id> <file> <sha256>` to
+`pastes.log`. Its one-line note (what it saved, or why not) reaches the agent as added context. It
+never blocks the message: it is registered without `onFailure` and fails open (5.1), so a failure
+only means verify refuses the paste. `guard-live-checkout` keeps the agent's file tools away from
+both files (5.3).
 
 On success, it writes `VERIFIED.txt` (the block + verify time) in one step (temp file, then
 rename). `VERIFIED.txt` alone is the record that a handoff is verified; `META.json`'s state
@@ -440,15 +455,19 @@ fails by design. The fix is a fresh handoff, not a patched verify.
 
 ### 4.6 Stop hook: `gate-owner-handoff-form`
 
-Runs when the agent finishes a turn. It reads the last assistant message from the transcript.
+Runs when the agent finishes a turn. It reads the turn's last message from the input's
+`last_assistant_message` (FRG-5: Claude Code's docs say the transcript file may lag behind).
 - **Blocks** (exit 2, with "rewrite this as an owner handoff") when the message gives the owner
-  prose run-instructions, i.e. it contains a shell block or `$ ` lines aimed at the owner
-  (`brew install`, `gh auth`, `npm i -g`, `export *_KEY=`, `curl … | sh`, etc.) or phrases like
-  "run this in your terminal", "go to … and click", **and** it doesn't also contain an
-  `OWNER-RUN.sh` path and "HANDOFF-RESULT".
+  prose run-instructions, i.e. it contains a block marked as shell, `$ ` lines, or a setup command
+  at the start of a line or list item, aimed at the owner (`brew install`, `gh auth`, `npm i -g`,
+  `export *_KEY=`, `curl … | sh`, etc.), or phrases like "run this in your terminal", "go to … and
+  click". Only an owner handoff's own lines are exempt: `bash <…>/work/owner/<id>/OWNER-RUN.sh`
+  (alone, or in a block of such lines) and "paste back the HANDOFF-RESULT block". The rest of a
+  message that also holds a handoff is still checked (FRG-5 review round 2).
 - **Never blocks twice in a row.** When Claude Code reports `stop_hook_active: true`, it allows.
-- **Fails open.** If the transcript is missing or unreadable, it allows and logs to
-  `.harness/observed.log`. A Stop hook that fails closed would block every turn.
+- **Fails open.** If the message is missing or unreadable, or the hook itself fails, it allows
+  and logs `FAILED-OPEN` to `.harness/observed.log` (hookrt, 5.1). A Stop hook that fails closed
+  would block every turn.
 - Starts in **observe** mode, because it is a text heuristic. The owner promotes it to enforce
   by PR once the observed log shows few false positives.
 
@@ -491,7 +510,14 @@ one that times out, unless it is registered with `"onFailure": "block"` (Claude 
 later). Then any failure blocks, as exit 2 does. **Every FORGE hook is registered that way, with
 a timeout of at most 120 seconds**, except on the events where Claude Code ignores the field
 (`Stop`, `SubagentStop`, `TaskCompleted`, `TeammateIdle`), which is why the Stop hook below has
-neither and fails open (4.6) (FRG-20, `docs/decisions/2026-10-18-failed-hooks-block.md`).
+neither and fails open (4.6) (FRG-20, `docs/decisions/2026-10-18-failed-hooks-block.md`). The one
+other exception is `capture-owner-paste` (UserPromptSubmit, FRG-5), registered with a timeout but
+without `onFailure`, on purpose: there a blocking failure would stop the owner's message reaching
+the agent, and fail-closed is kept at verify instead (4.5). The runtime lets exactly these two
+hooks fail open, known by their file names: a crash or an input they can't judge allows and logs
+`FAILED-OPEN`, while an explicit deny still denies. They load the runtime with header lines that
+exit 0, not 2, if it can't load. Conformance checks that each is registered only for its own
+event, and that they, and only they, use those header lines.
 
 Registration is project-scoped, in the committed `.claude/settings.json` (never `~/.claude`):
 
@@ -524,6 +550,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&2; exit 2; }
 [ "${HOOKRT_LOADED:-}" = 1 ] || { echo "hookrt not loaded" >&2; exit 2; }
 ```
+
+The two hooks that fail open (5.1: `capture-owner-paste` and `gate-owner-handoff-form`) use the
+same lines with `exit 0` in place of `exit 2`, and an `echo "FORGE hook failed open: …"` on standard
+output, so even a runtime that can't load never blocks the owner's message or every turn.
+Conformance requires those lines for these two hooks and refuses them in any other (FRG-5).
 
 The runtime is found relative to the hook's own file, never through an environment variable.
 It provides:
@@ -576,14 +607,15 @@ It provides:
 | `secret-scan` | Pre / Bash | `git commit` if `gitleaks git --staged` finds a secret, or gitleaks is missing; also any `git commit` using `-m`, `-a`, `--no-verify` or without `-F <file>` | enforce |
 | `gate-merge-on-review` | Pre / Bash | `gh pr merge` in any form but `gh pr merge <n> --repo Thebigtuna88/forge --squash --match-head-commit <40-character sha>` (so no `--auto`, `--admin`, `--delete-branch`, `--rebase`, `--merge`, `--subject`, `--body`), and that form unless all hold (FRG-4): GitHub says the PR is open, its base is `dev`, its head is a ticket branch of this repository (not a fork) at exactly that sha, its merge base with `dev` is the one recomputed locally, and `dev` requires no merge queue (where `gh pr merge` could turn on auto-merge); every answer and file it reads is exactly one JSON value; `work/<KEY>-<n>-<slug>/review.md` (6.6) is bound to that repository, branch, PR, head **and** merge base, and the diff recomputed now has its md5 and byte count; every lens listed is CLEAN, run by `codex` or `subagent` (`code` only by `codex`; `author`, `inline`, `self` refused), and its reply file still has the recorded sha256 and is itself a CLEAN reply for this lens and this diff's md5 and bytes; `code` and `security` are present; every deferred finding cites an issue open now; and gitleaks finds no secret in what the squash commit would hold (the PR's title, body, commit messages and authors). The hook recomputes everything; it trusts none of review.md's text. Merges through the API are refused by `deny-repo-admin` | enforce |
 | `gate-self-modification` | Pre / Bash | `gh pr merge` when the PR touches any path in `self-modification-paths.json`, the live list or the one at the PR's merge base (or a project's own owner-only list in `projects.json`) → "owner must merge this". The changed paths come from the recomputed diff, not GitHub's file list (which stops at 100); names are compared case-folded and Unicode-normalised, a rename counts as both paths, and any symlink or submodule in the diff counts as owner-only. A missing or malformed list refuses | enforce |
-| `guard-live-checkout` (added) | Pre / Edit, Write, MultiEdit, NotebookEdit **and** Bash | Edits inside the main checkout `~/code/forge` or `~/code/forge/projects/<name>` other than gitignored scratch areas (`work/`, `.harness/state/`); any write to `.claude/settings.local.json` or `~/.claude/settings*.json` (these could switch hooks off). For Bash, a best-effort check for write operators (`>`, `tee`, `sed -i`, `cp`, `mv`, `rm`) aimed at those paths | enforce (Edit/Write); **observe** (Bash part) |
+| `guard-live-checkout` (added) | Pre / Edit, Write, MultiEdit, NotebookEdit | The agent's file-tool edits (the path the tool writes: `file_path`, or `NotebookEdit`'s `notebook_path`; a `NotebookEdit` naming a different `file_path` too is refused) inside the main checkout (the one the hook sits in, so it follows FORGE if it moves) or a project's main checkout under `projects/<name>`, other than gitignored scratch areas (`work/`, `.harness/state/`); in `work/owner/<id>/` anything but a draft `OWNER-RUN.sh` (results, pastes, `VERIFIED.txt`, `META.json`, logs), and `.harness/state/pastes.log` (FRG-5, 4.5); any write to a `.claude/settings.local.json` or `~/.claude/settings*.json` (these could switch hooks off). Paths are judged as written and with links resolved, compared as macOS compares names, and a file with more than one hard link is refused wherever it is; settings files in `CLAUDE_CONFIG_DIR` count as `~/.claude`'s (names compared ignoring case), and a settings file's real location is guarded too when the file, or a folder on its way, is a link (in a worktree only `settings.local.json`: its tracked `settings.json` changes by owner-merged PR). Anything a link inside the main checkout points to is refused too, whichever folder the link sits in (every link reachable in it is found, in scratch folders, linked folders, `node_modules` and `.git` too; a checkout too large to list, or with a folder that can't be listed, means every file-tool write is refused). **Shell commands that write there are not prevented** (L14): the planned Bash part moved to FRG-32, after the FRG-26 checkpoint (owner decision 2026-10-27) | enforce |
 | `deny-repo-admin` (added) | Pre / Bash | Every `gh` command not on its allowlist (FRG-4): the read-only commands; `gh auth status` (no `--show-token`); `gh api <path>` as a GET only (no `-X`/`--method` but GET, no `-f`/`-F`/`--field`/`--raw-field`/`--input`, no `-H`, `--hostname` or `graphql`); `gh issue create/edit/comment/close/reopen` and `gh pr create/edit/comment/close/ready` with listed options only (a PR only into `dev` from a ticket branch, its base never edited); and the one merge form. So `gh repo edit`/`delete`/`rename`/`archive`/…, rulesets, secrets, variables, `gh auth login/logout/refresh/token/setup-git`, `gh config`, `gh alias`, `gh extension`, `gh workflow run` and anything a newer `gh` adds are refused. Text reaches GitHub only through `--title` and `--body-file`, and the whole command, each of its words as the shell passes them, and every body file are scanned by gitleaks first. (`git config` writes to `alias.*` or `core.hooksPath` are refused by `deny-history-rewrite`, FRG-3) | enforce |
 | `deny-history-rewrite` (added) | Pre / Bash | `git rebase`, `git commit --amend`, `git filter-branch`, `git filter-repo`, `git replace`, `git update-ref -d`, `git push` of rewritten history (already caught by the force rules) | enforce |
-| `gate-deploy-target` | Pre / Bash | Any command that matches a **production** pattern in `deploy-targets.json` (`vercel --prod`, `vercel deploy --prod`, `vercel promote`, `vercel alias`, `vercel domains`, `vercel dns`, `xcrun altool --upload*`, `fastlane` upload lanes, `eas submit`, `gh workflow run <production workflow>`); **any deploy tool command matching neither list** (fail closed). Preview patterns are allowed | enforce |
-| `gate-spend` | Pre / Bash | Commands that mention a paid-API host (`api.openai.com`, `fal.run`, `api.replicate.com`, the Higgsfield API host, `api.stripe.com`, …) or a provider key variable (`FAL_KEY`, `REPLICATE_API_TOKEN`, …) unless the command is the project's budget wrapper. The hosts and variables are listed in `spend-limits.json`, so they're owner-only. Also any `sk_live_` Stripe key in a command | enforce |
+| `gate-deploy-target` | Pre / Bash | Any command that matches a **production** pattern in `deploy-targets.json` (`vercel --prod`, `vercel deploy --prod`, `vercel promote`, `vercel alias`, `vercel domains`, `vercel dns`, `vercel env`, `xcrun altool --upload*`, `fastlane` upload lanes, `eas submit`), compared ignoring case; **any deploy tool command matching neither list** (fail closed). Preview patterns are allowed, but none is listed for now: Vercel's docs (2026-10-27) say a new project's first deployment, and every `--temporary` one, goes to production whatever the command says, so every deploy stays an owner script until a preview-only form is proven (FRG-9 or FRG-12). A deploy command must already be one plain command starting with the tool itself (5.2); `gh workflow run` is refused by `deny-repo-admin` | enforce |
+| `gate-spend` | Pre / Bash | Commands that mention a paid-API host (`api.openai.com`, `fal.run`, `api.replicate.com`, the Higgsfield API host, `api.stripe.com`, …), a provider key variable (`FAL_KEY`, `REPLICATE_API_TOKEN`, …) or names a provider's command-line tool or main Python/JavaScript SDK package (`openai`, `replicate`, `stripe`, `fal_client`, `@fal-ai/client`, …, also followed by a dot as in `stripe.checkout`, which read a key from the environment; others are added with the provider in FRG-11, and code calling a paid API under another name is L1), anywhere, except in a plain command (words joined by `|` `;` `&&` `||`, with no quoting, `$`, brackets or redirections) whose every program only reads and can run no other program (`cat`, `grep`, `ls`, `head`, …; not `rg`, whose `--pre` runs one), unless the command is the project's budget wrapper (from FRG-11; until then nothing is exempt). The hosts and variables are listed in `spend-limits.json` (8.5), so they're owner-only. It recognises the listed hosts, key variables, commands and libraries only, **not every possible paid API call** (L1). Also any live Stripe key prefix (`sk_live_`, `rk_live_`) in a command. Matched ignoring case, as written and with quotes removed; a missing or malformed list refuses | enforce |
 | `enforce-branch-format` | Pre / Bash | Creating a branch (`git checkout -b`, `git switch -c`, `git branch <new>`, `git worktree add -b`) or pushing one whose name isn't `feature/<KEY>-<n>-<slug>` (`^feature/[A-Z]{3}-[0-9]+-[a-z0-9]+(-[a-z0-9]+)*$`) with a known key (FRG or one in `projects.json`) | enforce |
 | `deny-commit-on-shared-checkout` | Pre / Bash | `git commit` whose repo toplevel (cwd or `-C`) is the main checkout of FORGE or of any project, rather than a worktree under `~/code/forge-worktrees/`, or whose current branch isn't a `feature/…` branch | enforce |
 | `gate-owner-handoff-form` | Stop | Prose run-instructions to the owner (section 4.6). Never blocks twice; fails open | **observe** |
+| `capture-owner-paste` (FRG-5) | UserPromptSubmit | Nothing: it records the owner's pasted HANDOFF-RESULT block and never blocks (4.5); registered without `onFailure`, fails open | — (records only) |
 
 The owner moves an observe hook to enforce by a PR that changes `mode.json`, which only the
 owner can merge.
@@ -955,16 +987,23 @@ Prompts are stored only as hashes. The prompt text lives in the image's sidecar 
   "providers": {
     "manual":     { "enabled": true,  "monthly_cap_usd": 0 },
     "higgsfield": { "enabled": false, "monthly_cap_usd": 0,
-                    "hosts": ["<api host, filled in when added>"], "key_vars": ["HIGGSFIELD_API_KEY"] },
+                    "hosts": ["api.higgsfield.ai"],
+                    "key_vars": ["HIGGSFIELD_API_KEY", "HF_API_KEY_ID", "HF_API_KEY_SECRET"],
+                    "commands": [] },
     "fal":        { "enabled": false, "monthly_cap_usd": 0,
-                    "hosts": ["fal.run", "queue.fal.run"], "key_vars": ["FAL_KEY"] }
+                    "hosts": ["fal.run", "queue.fal.run"], "key_vars": ["FAL_KEY"], "commands": ["fal"] }
   },
-  "always_blocked": ["sk_live_"]
+  "payments": { "hosts": ["api.stripe.com"], "key_vars": ["STRIPE_SECRET_KEY"], "commands": ["stripe"] },
+  "always_blocked": ["sk_live_", "rk_live_"]
 }
 ```
 
-`gate-spend` (section 5) reads `hosts`, `key_vars` and `always_blocked` from this file, so a
-paid host is blocked outside the wrapper even while the provider is disabled.
+`gate-spend` (section 5) reads every provider's `hosts`, `key_vars` and `commands` (its
+command-line tools), the `payments` section's (8.7) and `always_blocked` from this file, so a paid
+host is blocked outside the wrapper even while the provider is disabled. Every provider but
+`manual`, and `payments`, must hold all three lists (empty is fine, missing is malformed and
+refuses everything). FRG-5's file also lists `replicate` and `openai` (disabled), so their
+hosts and keys are blocked too.
 
 ### 8.6 Turning on a paid provider later
 
@@ -1159,12 +1198,13 @@ its mitigation and, where one exists, a stronger option the owner can adopt late
 | L1 | **Indirect commands.** A guarded action inside a script file (`bash x.sh` containing `git push origin main`), or a Node/Python program calling a paid API, isn't seen by the command-matching hooks. | Hooks see the command line, not what a program does. | GitHub branch protection (public repos); no paid key exists while Tier C is in force; `spend` and `security` lenses; charter rule 9. | Run the agent under a separate OS user with no access to keys. |
 | L2 | **Same GitHub identity.** The agent uses the owner's `gh` login, so GitHub can't tell agent from owner; only the local hook stops a `dev`→`main` merge. | Personal accounts can't use bypass lists or required reviewers against yourself. | `gate-merge-on-review` (base must be `dev`, API merges denied), `deny-repo-admin`. | A separate free **machine account** for the agent with write access, with `main` requiring the owner's approving review. |
 | L3 | **Handoff runtime checks are a speed bump.** The TTY and `CLAUDECODE` checks can be faked (the test suite does it). | Any program with a shell can fake a terminal. | Evidence = the owner's paste matching `RESULT.txt`, frozen script sha, unchanged runtime; `handoff lint`. | — (the owner's paste is the real control) |
-| L4 | **The paste file is written by the agent** (until FRG-5). The agent saves the owner's pasted text to disk; a dishonest agent could write something else, with a matching `RESULT.txt` (FRG-1 review S1). | Claude Code has no "owner-signed" input. | The paste is visible in the chat transcript; verify cross-checks `RESULT.txt`; charter. **Decided 2026-10-16:** FRG-5 adds a UserPromptSubmit hook that captures the paste and a guard on evidence files. | Agent runs as a separate macOS user. |
+| L4 | **The paste file is recorded from any prompt-shaped input.** Since FRG-5 the `capture-owner-paste` hook, not the agent, saves the paste, verify accepts only a recorded one, and the agent's file tools can't write the paste, its record or the other evidence files (FRG-1 review S1, decision 2026-10-16). But Claude Code also runs UserPromptSubmit hooks on turns it starts itself (a scheduled task, a background agent reporting back, another session's message) and doesn't say who wrote the text, so an agent that sent a forged block through one of those would get it recorded. And a shell command can still write the files (L14). | Claude Code has no "owner-signed" input, and its hook input names no sender. | The paste and each of those channels are visible in the chat transcript; verify cross-checks `RESULT.txt`; the charter forbids putting a block into those channels. Forgery takes a deliberate act, not a slip. | Agent runs as a separate macOS user (FRG-26), with evidence it can't write. |
 | L11 | **Handoff steps run arbitrary programs.** The grammar limits shell syntax, but an allowed step (`python3 -c …`) can do anything the owner can: forge evidence, or deliberately get a known secret past live redaction (write to the terminal device directly, split it with screen codes, encode it) (FRG-1 review S15, C3, S18). | The agent writes the scripts the owner runs. | Allowlist grammar; secret-file rule; live redaction of the screen and logs and redaction of evidence (FRG-14, for secrets printed by accident); owner sees each step's command on screen. | FRG-30: reject inline interpreters, with runtime replacements (after FRG-26's checkpoint). |
 | L12 | **Evidence the agent writes can be forged or swapped by the agent** (FRG-4 review round 1). The merge gate re-checks `review.md` and the reply files (binding, recomputed diff, hashes, read-proof), which proves which code they describe, not that a reviewer wrote them: the agent could write CLEAN replies and a matching `review.md` itself. Likewise a second command running at the same moment could replace a `--body-file` between the scan and `gh` sending it. | Agent, reviewer runner and files share one macOS user; nothing on disk is beyond the agent's reach. | The gates stop mistakes and shortcuts, not a deliberately dishonest agent (as L1, L4); every PR touching an owner-only path is merged by the owner; review summaries are posted on the PR; charter rules 3, 6 and 9. **Decided 2026-10-18** (owner): accepted as a known limit. | Agent (and codex) run as separate macOS users, or a GitHub machine account whose merges need the owner's approval (L2). |
+| L14 | **Shell writes to the main checkout are not prevented** (FRG-5, owner decision 2026-10-27). `guard-live-checkout` judges only the agent's file tools (Edit, Write, MultiEdit, NotebookEdit). A shell command (`echo x > CLAUDE.md`, `cp`, `mv`, `rm`, `sed -i`, or a script) can still change the main checkout, its handoff evidence, `pastes.log` or settings files. **Open: not resolved** until permission-based protection is implemented and tested. | A shell-write checker reads shell syntax, and FRG-5 review rounds 1-12 kept finding ordinary forms it misread. | Charter rule 1 (the main checkout is never edited by hand); `deny-commit-on-shared-checkout` stops commits there; verify's paste record (4.5); the file-tool guard. | FRG-26: the agent runs as a macOS user that can't write the main checkout, tested. FRG-32 (after the FRG-26 checkpoint) decides whether a shell-write checker is still needed. |
 | L13 | **Commands deliberately disguised from the gates** (FRG-4 review rounds 6-10). A command built to hide that it runs `gh`, `git` or a deploy tool (its name or words spelled so the text check doesn't recognise them) may not be judged as that tool. Accepted risk, not fixed: round 10's SEC-1, deferred to FRG-26. | The hooks read a command's text; what the shell makes of it can't be fully predicted, and each patch was followed by a new spelling. | The gates recognise ordinary commands and mistakes (conformance proves each listed case); the round 2-9 checks stay; charter rule 9; GitHub branch protection on `main` and `dev`. Against a deliberate attempt, nothing technical holds while the agent uses the owner's admin login (L2). **Decided 2026-10-19** (owner): `docs/decisions/2026-10-19-disguised-commands-known-limit.md`. | FRG-26: define what the agent's own GitHub credentials and macOS user must be unable to do, and test each restriction. A separate account alone isn't enough. |
 | L5 | **Read-proof proves access, not diligence.** A reviewer can hash the diff and still review it badly. | — | Adversarial prompt, structured findings, multiple lenses, stall rule, owner merges `main`. | Owner skims `review.md` for risky PRs. |
-| L6 | **Heuristic hooks.** The Stop hook and the Bash part of `guard-live-checkout` guess from text. | Natural language and shell are open-ended. | They start in observe; the owner promotes them by PR after reviewing `observed.log`. | — |
+| L6 | **Heuristic hooks.** The Stop hook `gate-owner-handoff-form` guesses from text. | Natural language is open-ended. | It starts in observe; the owner promotes it by PR after reviewing `observed.log`. | — |
 | L7 | **Local-only evidence.** `work/` and the spend ledger live on one Mac. | Gitignored by design (may hold logs/screens). | PR comment summary of every review; prepaid wallets as the real spend cap; deleting the ledger doesn't remove a provider's own limits. | Back up `work/` with Time Machine. |
 | L8 | **Private projects on GitHub Free** have no server-side protection. | Plan limit (section 3.2). | Recorded as `local-only`, shown by `status`. | GitHub Pro. |
 | L9 | **Claude Code or tool updates** can change hook input formats or CLI flags. | External software. | Conformance runs on every `tests/run.sh` and in CI, so breakage shows as FAILED. | — |

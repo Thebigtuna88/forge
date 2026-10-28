@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "NotebookEdit",
+  "tool_input": {
+    "notebook_path": "@ROOT@/docs/x.ipynb"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "is never edited by hand"
+}
