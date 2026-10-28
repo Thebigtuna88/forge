@@ -311,6 +311,23 @@ test_hook_cannot_write_the_live_checkout() {
   assert_eq "$(cat "$H/CLAUDE.md")" "charter" "the hook's write was refused"
 }
 
+# xcrun's lookup cache lives in the user's temp folder, outside every sandbox; a hook that could
+# write it would leave a change behind (FRG-6 review round 4). The test names a file of the
+# cache's temporary form (xcrun_db-<letters>), never the cache itself, and removes it if made.
+test_hook_cannot_write_the_xcrun_cache() {
+  mk_conf_harness sample-gate toucher
+  local ut f
+  ut="$(getconf DARWIN_USER_TEMP_DIR)"
+  f="${ut%/}/xcrun_db-forgetest$$"
+  case_json toucher deny main 'git push origin main'
+  mkdir -p "$H/tests/conformance/toucher/allow"
+  jq -n --arg f "$f" '{hook_event_name: "PreToolUse", tool_name: "Bash",
+    tool_input: {command: "ls", file_path: $f}, cwd: "@ROOT@"}' >"$H/tests/conformance/toucher/allow/touch.json"
+  expect_fail "toucher allow/touch.json: expected exit 0"
+  [[ ! -e "$f" ]] || _t_fail "the hook wrote $f"
+  rm -f "$f"
+}
+
 
 test_fails_when_observe_log_was_seeded() {
   mk_conf_harness sample-gate always-allow
