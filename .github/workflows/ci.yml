@@ -86,6 +86,46 @@ jobs:
           [[ "$(shellcheck --version)" == *"version: 0.11.0"* ]]
           [[ "$(gitleaks version)" == 8.30.1 ]]
 
+      # TEMPORARY (FRG-6 diagnosis, reverted in the next commit): shows what python3 and the
+      # gate-spend hook print under conformance's sandbox here, then stops the job.
+      - name: TEMPORARY diagnosis, reverted next commit
+        run: |
+          xcode-select -p || true
+          xcrun --find python3 || true
+          ls -la "$(getconf DARWIN_USER_TEMP_DIR)" || true
+          b="$RUNNER_TEMP/diag"
+          mkdir -p "$b/home" "$b/tmp"
+          p='(version 1) (allow default) (deny file-write*) (allow file-write* (subpath (param "BASE")) (literal "/dev/null") (literal "/dev/tty"))'
+          for i in 1 2; do
+            echo "== python3 in the sandbox, try $i"
+            rc=0
+            env -i PATH="$PATH" HOME="$b/home" TMPDIR="$b/tmp" sandbox-exec -D BASE="$b" -p "$p" \
+              /usr/bin/python3 -I -c 'print("stdout-ok")' >"$b/out" 2>"$b/err" || rc=$?
+            echo "rc=$rc"; echo "-- stdout"; cat "$b/out"; echo "-- stderr"; cat "$b/err"
+          done
+          echo "== python3 with env -i, no sandbox"
+          rc=0
+          env -i PATH="$PATH" HOME="$b/home" TMPDIR="$b/tmp" /usr/bin/python3 -I -c 'print("stdout-ok")' >"$b/out" 2>"$b/err" || rc=$?
+          echo "rc=$rc"; echo "-- stdout"; cat "$b/out"; echo "-- stderr"; cat "$b/err"
+          jq -n --arg c "$PWD" '{hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: {command: "stripe charges list"}, cwd: $c}' >"$b/case.json"
+          echo "== gate-spend in the sandbox"
+          rc=0
+          env -i PATH="$PATH" HOME="$b/home" TMPDIR="$b/tmp" CLAUDE_PROJECT_DIR="$PWD" sandbox-exec -D BASE="$b" -p "$p" \
+            .claude/hooks/gate-spend.sh <"$b/case.json" >"$b/out" 2>"$b/err" || rc=$?
+          echo "rc=$rc"; echo "-- stdout"; cat "$b/out"; echo "-- stderr"; cat "$b/err"
+          echo "== gate-spend without the sandbox"
+          rc=0
+          env -i PATH="$PATH" HOME="$b/home" TMPDIR="$b/tmp" CLAUDE_PROJECT_DIR="$PWD" \
+            .claude/hooks/gate-spend.sh <"$b/case.json" >"$b/out" 2>"$b/err" || rc=$?
+          echo "rc=$rc"; echo "-- stdout"; cat "$b/out"; echo "-- stderr"; cat "$b/err"
+          echo "== git history"
+          rc=0
+          git history -h >"$b/out" 2>&1 || rc=$?
+          echo "rc=$rc"; head -n 5 "$b/out"
+          echo "== files written under the sandbox folder"
+          find "$b" -type f
+          exit 1
+
       - name: Run the whole test suite (must end with ALL PASS)
         run: |
           /bin/bash tests/run.sh 2>&1 | tee "$RUNNER_TEMP/run.txt"
