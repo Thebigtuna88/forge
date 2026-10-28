@@ -311,6 +311,28 @@ test_hook_cannot_write_the_live_checkout() {
   assert_eq "$(cat "$H/CLAUDE.md")" "charter" "the hook's write was refused"
 }
 
+# xcrun's lookup cache lives in the user's temp folder, outside every sandbox; a hook that could
+# write it would leave a change behind (FRG-6 review round 4). The test names a file of the
+# cache's temporary form (xcrun_db-<letters>), never the cache itself, and removes it if made.
+# Without the real temp folder the test would probe some other path, so it fails instead.
+test_hook_cannot_write_the_xcrun_cache() {
+  mk_conf_harness sample-gate toucher
+  local ut="" f
+  ut="$(getconf DARWIN_USER_TEMP_DIR)" || ut=""
+  [[ "$ut" == /?*/ && -d "$ut" && -w "$ut" ]] || {
+    _t_fail "can't find the user's temp folder (getconf DARWIN_USER_TEMP_DIR gave [$ut])"
+    return 0
+  }
+  f="${ut}xcrun_db-forgetest$$"
+  case_json toucher deny main 'git push origin main'
+  mkdir -p "$H/tests/conformance/toucher/allow"
+  jq -n --arg f "$f" '{hook_event_name: "PreToolUse", tool_name: "Bash",
+    tool_input: {command: "ls", file_path: $f}, cwd: "@ROOT@"}' >"$H/tests/conformance/toucher/allow/touch.json"
+  expect_fail "toucher allow/touch.json: expected exit 0"
+  [[ ! -e "$f" ]] || _t_fail "the hook wrote $f"
+  rm -f "$f"
+}
+
 
 test_fails_when_observe_log_was_seeded() {
   mk_conf_harness sample-gate always-allow
@@ -351,8 +373,9 @@ test_placeholders_survive_odd_temp_paths() {
   case_json cwd-gate deny in-main 'ls' '@ROOT@'
   case_json cwd-gate allow in-worktree 'ls' '@WORKTREES@/FRG-2-x'
   mkdir -p "$T_TMP/a&b|c\\d"
-  OUT="$(cd "$H" && env HOME="$T_TMP/home" TMPDIR="$T_TMP/a&b|c\\d" "$H/.harness/bin/conformance" 2>&1)"
-  RC=$?
+  # Through conform, with its fake claude: run directly, this needed a real Claude Code, and passed
+  # on GitHub's runner only while GITHUB_ACTIONS leaked into the unit tests (FRG-6, run 40652702756).
+  conform TMPDIR="$T_TMP/a&b|c\\d"
   assert_exit 0 "$RC" "$OUT"
 }
 

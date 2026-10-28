@@ -22,7 +22,7 @@ after the repo exists and **before any PR**. The agent checks that issue #n is t
 | FRG-3 | Git hooks: push, secret-scan, branch format, shared checkout, history rewrite | 2 | owner |
 | FRG-4 | GitHub hooks: merge-on-review, self-modification, repo-admin | 2 | owner |
 | FRG-5 | Other hooks: live checkout, deploy target, spend, owner-handoff form | 2 | owner |
-| FRG-6 | Harness CI (macOS) + required check on dev | 2 | owner |
+| FRG-6 | Harness CI (macOS); the required check moved to FRG-34 (2026-10-27) | 2 | owner |
 | FRG-7 | Review runner, reply schema, lens checklists | 3 | owner |
 | FRG-8 | status, ticket, worktree, pr.sh, CONTINUE protocol | 4 | agent (if no owner-only paths) |
 | FRG-9 | templates/web with all frontend gates and CI | 5 | owner (contains workflows) |
@@ -104,7 +104,8 @@ Runs from the worktree's runtime (bootstrap, spec 4.9).
   commits and rebase merges disabled.
 - Branch protection on `main` and `dev` via `gh api -X PUT …/protection` with a JSON file:
   require a PR (0 approvals), `enforce_admins: true`, no force-push, no deletion. **No required
-  status check yet.** CI arrives in FRG-6, which adds it through its own handoff.
+  status check yet.** CI arrives in FRG-6; FRG-34 makes it required, after the FRG-26
+  checkpoint (owner decision 2026-10-27).
 - `ho_check` each step, plus `gh api …/protection` reads that confirm the settings.
 
 ### 1.9 Issues (agent)
@@ -151,7 +152,9 @@ Runs from the worktree's runtime (bootstrap, spec 4.9).
 - **FRG-5:** `guard-live-checkout`, `gate-deploy-target`, `gate-spend` (reading a minimal
   `spend-limits.json`), `gate-owner-handoff-form` (observe).
 - **FRG-6:** `.github/workflows/ci.yml` (macOS: `tests/run.sh`, shellcheck, gitleaks).
-  Handoff: add `ci` as a required status check on `dev` and `main`.
+  Making `ci` a required check (with the owner's approval) on `dev` and `main` moved to FRG-34
+  (#34), after the FRG-26 checkpoint; until then a failing run doesn't block a merge (spec 11,
+  L15).
 - After FRG-2 merges, the owner restarts Claude Code so the hooks load. Each later merge of
   hooks also needs a restart.
 - **Exit:** conformance PASS; each enforce hook shown denying a real attempt in a live

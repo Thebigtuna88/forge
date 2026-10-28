@@ -724,6 +724,10 @@ done
 
 # The hook under test runs sandboxed too: it (and any program git starts for it, say a
 # core.fsmonitor a setup configured) may write only inside its sandbox, and may not send signals.
+# There is no exception for xcrun's lookup cache in the user's temp folder, which Apple's
+# /usr/bin/python3 and git launchers update: a hook could leave that cache changed. Refused, the
+# launcher only warns on stderr (as on a fresh GitHub runner, FRG-6 CI run 40635053591), and
+# hookrt keeps python3's warnings after its answer (_hr_python).
 HOOK_PROFILE='(version 1) (allow default) (deny file-write*)
   (allow file-write* (subpath (param "BASE")) (literal "/dev/null") (literal "/dev/tty"))
   (deny signal)'

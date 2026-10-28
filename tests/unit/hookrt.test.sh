@@ -200,6 +200,15 @@ test_inherited_path_cannot_replace_tools() {
   assert_contains "$ERR" "push to main"
 }
 
+# Apple's /usr/bin/python3 launcher can warn on stderr before python runs (FRG-6); the answer a
+# hook reads with head -n 1 must still be python's own first line.
+test_python_answer_comes_before_its_warnings() {
+  mk_hook_harness
+  probe python ls
+  assert_exit 0 "$RC" "$ERR"
+  assert_contains "$OUT" "rc=1 first=answer all=answer|warning|"
+}
+
 test_raw_nul_byte_in_input_denies() {
   mk_hook_harness
   local rc=0

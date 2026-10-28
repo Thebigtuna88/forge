@@ -337,6 +337,19 @@ hr_part() { # <part>: from here on the hook runs under the mode key "<hook>:<par
   HR_MODE="$(_hr_mode "$HR_HOOK")"
 }
 
+# _hr_python <answer file> <python3 arguments…>: runs python3 with its answer (stdout) first in
+# the file and anything printed on stderr after it, so a hook reading the first line gets the
+# answer even when Apple's /usr/bin/python3 launcher warns first (in conformance's sandbox it
+# can't update xcrun's cache in the user's temp folder: FRG-6, CI run 40635053591), and a crash's
+# message is still there when there is no answer. Returns python3's status.
+_hr_python() {
+  local out="$1" rc=0
+  shift
+  python3 "$@" >"$out" 2>"$out.err" || rc=$?
+  cat "$out.err" >>"$out"
+  return "$rc"
+}
+
 # --- words -------------------------------------------------------------------------------------
 
 hr_tokens() { # <text> [punct]: shell words of <text> into HR_TOK; returns 1 if quoting is broken
@@ -1081,7 +1094,7 @@ for h in hits:
 sys.exit(1 if hits else 0)
 '
 hr_owner_hits() { # <raw> <list…>: prints the hits into "$HR_TMP/owner.hits"; status as above
-  python3 -I -c "$_HR_PY_OWNER" "$@" >"$HR_TMP/owner.hits" 2>&1
+  _hr_python "$HR_TMP/owner.hits" -I -c "$_HR_PY_OWNER" "$@"
 }
 
 hr_gh_reads() { # <index of gh in HR_TOK>: 0 if that gh invocation is one of the read-only commands
@@ -1335,7 +1348,7 @@ if reason:
 '
 hr_live_check() { # <file path>: 0 if a file tool may write it, 1 if not (the reason in
   # $HR_TMP/live.out), anything else if it can't tell
-  python3 -I -c "$_HR_PY_LIVE" "$HR_ROOT" "${HOME:-}" "$_HR_CLAUDE_CONFIG_DIR" "$HR_CWD" "$1" >"$HR_TMP/live.out" 2>&1
+  _hr_python "$HR_TMP/live.out" -I -c "$_HR_PY_LIVE" "$HR_ROOT" "${HOME:-}" "$_HR_CLAUDE_CONFIG_DIR" "$HR_CWD" "$1"
 }
 
 # gate-deploy-target (spec 5.3). Arguments: deploy-targets.json, the number of floor tools, the
@@ -1395,8 +1408,8 @@ else:
     print("neither")
 '
 hr_deploy_class() { # judges HR_TOK (after hr_require_simple); the answer in $HR_TMP/deploy.out
-  python3 -I -c "$_HR_PY_DEPLOY" "$HR_ROOT/.harness/deploy-targets.json" "${#_HR_DEPLOY_FLOOR[@]}" \
-    "${_HR_DEPLOY_FLOOR[@]}" ${HR_TOK[@]+"${HR_TOK[@]}"} >"$HR_TMP/deploy.out" 2>&1
+  _hr_python "$HR_TMP/deploy.out" -I -c "$_HR_PY_DEPLOY" "$HR_ROOT/.harness/deploy-targets.json" \
+    "${#_HR_DEPLOY_FLOOR[@]}" "${_HR_DEPLOY_FLOOR[@]}" ${HR_TOK[@]+"${HR_TOK[@]}"}
 }
 
 # gate-spend (spec 5.3, 8.5). Arguments: spend-limits.json, the command. Every provider's hosts,
@@ -1499,7 +1512,7 @@ if hits:
     sys.exit(1)
 '
 hr_spend_hits() { # judges HR_CMD; the hits in $HR_TMP/spend.out
-  python3 -I -c "$_HR_PY_SPEND" "$HR_ROOT/.harness/spend-limits.json" "$HR_CMD" >"$HR_TMP/spend.out" 2>&1
+  _hr_python "$HR_TMP/spend.out" -I -c "$_HR_PY_SPEND" "$HR_ROOT/.harness/spend-limits.json" "$HR_CMD"
 }
 
 # gate-owner-handoff-form (spec 4.6), on the Stop input on stdin: exits 4 when Claude Code says
@@ -1564,7 +1577,7 @@ if m:
     sys.exit(1)
 '
 hr_handoff_form() { # judges the Stop input; the reason in $HR_TMP/form.out
-  printf '%s' "$HR_INPUT" | python3 -I -c "$_HR_PY_FORM" >"$HR_TMP/form.out" 2>&1
+  printf '%s' "$HR_INPUT" | _hr_python "$HR_TMP/form.out" -I -c "$_HR_PY_FORM"
 }
 
 # capture-owner-paste (spec 4.5, decision 2026-10-16-handoff-evidence-provenance). Reads the

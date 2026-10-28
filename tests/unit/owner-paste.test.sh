@@ -164,11 +164,20 @@ test_capture_never_completes_an_unfinished_record() {
 test_capture_logs_running_out_of_names() {
   mk_hooks "$T_TMP/code/forge" capture-owner-paste
   ready_handoff "$DEMO"
-  local s n stamp
-  for s in 0 1 2 3 4 5 6 7 8 9; do
-    stamp="$(date -u -v+"$s"S +%Y%m%dT%H%M%SZ)"
-    : >"$H/work/owner/$DEMO/PASTED-$stamp.txt"
-    for n in $(seq 2 99); do : >"$H/work/owner/$DEMO/PASTED-$stamp-$n.txt"; done
+  # Every name the hook could pick (PASTED-<second>.txt, then -2 … -99) is taken from now until 60 s
+  # past the moment the filling ends: on a slow machine (a GitHub runner, FRG-6) a fixed ten-second
+  # window ran out before the hook read the clock.
+  local d="$H/work/owner/$DEMO" start t stamp
+  start="$(date -u +%s)"
+  t="$start"
+  while [[ $t -lt $(($(date -u +%s) + 60)) ]]; do
+    if [[ $(date -u +%s) -gt $((start + 300)) ]]; then
+      _t_fail "taking the names fell behind the clock for 5 minutes"
+      return
+    fi
+    stamp="$(date -u -r "$t" +%Y%m%dT%H%M%SZ)"
+    touch "$d/PASTED-$stamp.txt" "$d/PASTED-$stamp-"{2..99}".txt"
+    t=$((t + 1))
   done
   hook capture-owner-paste "$(prompt "$(block "$DEMO")")"
   assert_exit 0 "$RC" "$ERR"
