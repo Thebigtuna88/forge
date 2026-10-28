@@ -86,14 +86,17 @@ jobs:
           [[ "$(shellcheck --version)" == *"version: 0.11.0"* ]]
           [[ "$(gitleaks version)" == 8.30.1 ]]
 
+      # The whole history GitHub sent, with FORGE's rules only (no ignore file, and no
+      # gitleaks:allow comment counts, as in the commit scan), secrets redacted in this public log.
+      # It runs before the suite: no code from the repository has run yet, so none can have
+      # planted an ignore file or replaced the scanner (review round 2).
+      - name: Scan the git history for secrets
+        run: |
+          [[ ! -e "$RUNNER_TEMP/no-ignore" ]]
+          gitleaks git --config .harness/gitleaks.toml --gitleaks-ignore-path "$RUNNER_TEMP/no-ignore" \
+            --ignore-gitleaks-allow --redact --no-banner --exit-code 1 .
+
       - name: Run the whole test suite (must end with ALL PASS)
         run: |
           /bin/bash tests/run.sh 2>&1 | tee "$RUNNER_TEMP/run.txt"
           [[ "$(tail -n 1 "$RUNNER_TEMP/run.txt")" == "ALL PASS" ]]
-
-      # The whole history GitHub sent, with FORGE's rules only (no ignore file, and no
-      # gitleaks:allow comment counts, as in the commit scan), secrets redacted in this public log.
-      - name: Scan the git history for secrets
-        run: |
-          gitleaks git --config .harness/gitleaks.toml --gitleaks-ignore-path "$RUNNER_TEMP/no-ignore" \
-            --ignore-gitleaks-allow --redact --no-banner --exit-code 1 .

@@ -74,14 +74,15 @@ jobs:
           [[ "$(command -v gitleaks)" == /opt/homebrew/bin/gitleaks ]]
           [[ "$(shellcheck --version)" == *"version: 0.11.0"* ]]
           [[ "$(gitleaks version)" == 8.30.1 ]]
+      - name: Scan the git history for secrets
+        run: |
+          [[ ! -e "$RUNNER_TEMP/no-ignore" ]]
+          gitleaks git --config .harness/gitleaks.toml --gitleaks-ignore-path "$RUNNER_TEMP/no-ignore" \
+            --ignore-gitleaks-allow --redact --no-banner --exit-code 1 .
       - name: Run the whole test suite (must end with ALL PASS)
         run: |
           /bin/bash tests/run.sh 2>&1 | tee "$RUNNER_TEMP/run.txt"
           [[ "$(tail -n 1 "$RUNNER_TEMP/run.txt")" == "ALL PASS" ]]
-      - name: Scan the git history for secrets
-        run: |
-          gitleaks git --config .harness/gitleaks.toml --gitleaks-ignore-path "$RUNNER_TEMP/no-ignore" \
-            --ignore-gitleaks-allow --redact --no-banner --exit-code 1 .
 JOB
 }
 
@@ -104,6 +105,8 @@ test_the_job_comparison_catches_bypasses() {
   [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "gitleaks:allow comments allowed again, not caught"
   sed 's|^          /bin/bash tests/run.sh.*$|          echo "a #b"; exit 0|' "$real" >"$m"
   [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "a command hidden after a quoted # not caught"
+  grep -vF '[[ ! -e "$RUNNER_TEMP/no-ignore" ]]' "$real" >"$m"
+  [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "a planted ignore file allowed, not caught"
   { cat "$real"; printf '      - name: extra\n        run: echo hi\n'; } >"$m"
   [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "an added step not caught"
   WF="$real"
@@ -207,6 +210,13 @@ test_scans_the_history_with_forge_rules_and_redacts() {
   assert_contains "$b" "gitleaks git --config .harness/gitleaks.toml"
   assert_contains "$b" "--gitleaks-ignore-path"
   assert_contains "$b" "--ignore-gitleaks-allow" # round 1: no source-controlled exemptions
+  # Round 2: before the suite, so no repository code has run, and with no ignore file present.
+  assert_contains "$b" '[[ ! -e "$RUNNER_TEMP/no-ignore" ]]'
+  local scan suite
+  scan="$(printf '%s\n' "$b" | grep -n -- '- name: Scan the git history' | cut -d: -f1)"
+  suite="$(printf '%s\n' "$b" | grep -n -- '- name: Run the whole test suite' | cut -d: -f1)"
+  [[ -n "$scan" && -n "$suite" && "$scan" -lt "$suite" ]] ||
+    _t_fail "the history scan must come before the suite (scan line [$scan], suite line [$suite])"
   assert_contains "$b" "--redact"
   assert_contains "$b" "--exit-code 1"
 }
