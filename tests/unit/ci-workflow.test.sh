@@ -18,16 +18,32 @@ block() { # <key>
   body | awk -v k="$1:" '$0 == k {on = 1; print; next} on && /^[^ ]/ {exit} on && NF {print}'
 }
 
-# The job as written, from "jobs:" to the end of the file: every line but blank lines and
-# whole-line comments, trailing comments kept (a "#" inside a quoted string could otherwise hide
-# the rest of a line from the comparison).
-raw_jobs() { awk '/^jobs:$/ {on = 1} on && !/^[[:space:]]*(#|$)/ {print}' "$WF" 2>/dev/null; }
+# The whole workflow as written: every line but blank lines and whole-line comments, trailing
+# comments kept (a "#" inside a quoted string could otherwise hide the rest of a line).
+raw_workflow() { awk '!/^[[:space:]]*(#|$)/ {print}' "$WF" 2>/dev/null; }
 
-# The reviewed job. Any change to a step, an added step or anything after the job must change this
-# text too, so it gets reviewed (round 1: an `exit 0` before the suite or the scan passed every
-# check that only looked for strings).
-expected_jobs() {
+# The reviewed workflow. Any change outside a whole-line comment must change this text too, so it
+# gets reviewed: round 1 found an `exit 0` before the suite or the scan passing every check that
+# only looked for strings, round 3 a folded `shell: >-` in defaults: that ran /usr/bin/true for
+# every step while the expected words were still there.
+expected_workflow() {
   cat <<'JOB'
+name: ci
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  PATH: /usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
+defaults:
+  run:
+    shell: /bin/bash --noprofile --norc -euo pipefail {0}
 jobs:
   ci:
     name: ci
@@ -86,29 +102,35 @@ jobs:
 JOB
 }
 
-test_the_job_is_exactly_the_reviewed_one() {
+test_the_workflow_is_exactly_the_reviewed_one() {
   [[ -s "$WF" ]] || _t_fail "missing $WF"
-  assert_eq "$(raw_jobs)" "$(expected_jobs)" "the jobs: block"
+  assert_eq "$(raw_workflow)" "$(expected_workflow)" "the whole workflow"
 }
 
-# The comparison itself must catch a skipped suite or scan, a weaker scan and an added step.
-test_the_job_comparison_catches_bypasses() {
+# The comparison itself must catch a skipped suite or scan, a weaker scan, an added step and a
+# replaced default shell.
+test_the_workflow_comparison_catches_bypasses() {
   [[ -s "$WF" ]] || _t_fail "missing $WF"
   local real="$WF" m
   m="$T_TMP/mutated.yml"
   awk 'index($0, "/bin/bash tests/run.sh") {print "          exit 0"} {print}' "$real" >"$m"
   WF="$m"
-  [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "exit 0 before the suite not caught"
+  [[ "$(raw_workflow)" != "$(expected_workflow)" ]] || _t_fail "exit 0 before the suite not caught"
   awk 'index($0, "gitleaks git --config") {print "          exit 0"} {print}' "$real" >"$m"
-  [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "exit 0 before the scan not caught"
+  [[ "$(raw_workflow)" != "$(expected_workflow)" ]] || _t_fail "exit 0 before the scan not caught"
   sed 's/--ignore-gitleaks-allow //' "$real" >"$m"
-  [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "gitleaks:allow comments allowed again, not caught"
+  [[ "$(raw_workflow)" != "$(expected_workflow)" ]] || _t_fail "gitleaks:allow comments allowed again, not caught"
   sed 's|^          /bin/bash tests/run.sh.*$|          echo "a #b"; exit 0|' "$real" >"$m"
-  [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "a command hidden after a quoted # not caught"
+  [[ "$(raw_workflow)" != "$(expected_workflow)" ]] || _t_fail "a command hidden after a quoted # not caught"
   grep -vF '[[ ! -e "$RUNNER_TEMP/no-ignore" ]]' "$real" >"$m"
-  [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "a planted ignore file allowed, not caught"
+  [[ "$(raw_workflow)" != "$(expected_workflow)" ]] || _t_fail "a planted ignore file allowed, not caught"
   { cat "$real"; printf '      - name: extra\n        run: echo hi\n'; } >"$m"
-  [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "an added step not caught"
+  [[ "$(raw_workflow)" != "$(expected_workflow)" ]] || _t_fail "an added step not caught"
+  # Round 3: a folded default shell that runs /usr/bin/true, the expected words still present.
+  awk '/^    shell: / {print "    shell: >-"; print "      /usr/bin/true"; print "  " $0; next} {print}' \
+    "$real" >"$m"
+  [[ "$(raw_workflow)" != "$(expected_workflow)" ]] || _t_fail "a folded default shell not caught"
+  assert_contains "$(body)" "shell: /bin/bash --noprofile --norc -euo pipefail {0}" "the mutation keeps the words"
   WF="$real"
 }
 
