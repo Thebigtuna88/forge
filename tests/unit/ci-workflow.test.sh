@@ -18,6 +18,97 @@ block() { # <key>
   body | awk -v k="$1:" '$0 == k {on = 1; print; next} on && /^[^ ]/ {exit} on && NF {print}'
 }
 
+# The job as written, from "jobs:" to the end of the file: every line but blank lines and
+# whole-line comments, trailing comments kept (a "#" inside a quoted string could otherwise hide
+# the rest of a line from the comparison).
+raw_jobs() { awk '/^jobs:$/ {on = 1} on && !/^[[:space:]]*(#|$)/ {print}' "$WF" 2>/dev/null; }
+
+# The reviewed job. Any change to a step, an added step or anything after the job must change this
+# text too, so it gets reviewed (round 1: an `exit 0` before the suite or the scan passed every
+# check that only looked for strings).
+expected_jobs() {
+  cat <<'JOB'
+jobs:
+  ci:
+    name: ci
+    runs-on: macos-26
+    timeout-minutes: 240
+    steps:
+      - name: Check out the code (full history, no stored credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install shellcheck 0.11.0 and gitleaks 8.30.1 (sha256 checked)
+        run: |
+          dl="$RUNNER_TEMP/dl"
+          mkdir -p "$dl"
+          cd "$dl"
+          curl -fsSL --proto =https --proto-redir =https -o shellcheck.tar.xz \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.darwin.aarch64.tar.xz
+          curl -fsSL --proto =https --proto-redir =https -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_darwin_arm64.tar.gz
+          shasum -a 256 -c - <<'SUMS'
+          56affdd8de5527894dca6dc3d7e0a99a873b0f004d7aabc30ae407d3f48b0a79  shellcheck.tar.xz
+          b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5  gitleaks.tar.gz
+          SUMS
+          tar -xJf shellcheck.tar.xz shellcheck-v0.11.0/shellcheck
+          tar -xzf gitleaks.tar.gz gitleaks
+          rm -f /opt/homebrew/bin/shellcheck /opt/homebrew/bin/gitleaks
+          install -m 0755 shellcheck-v0.11.0/shellcheck /opt/homebrew/bin/shellcheck
+          install -m 0755 gitleaks /opt/homebrew/bin/gitleaks
+      - name: Show the tools the tests will use
+        run: |
+          for t in bash python3 jq git shellcheck gitleaks; do
+            printf '%-10s %s\n' "$t" "$(command -v "$t")"
+          done
+          printf 'bash       %s\n' "$BASH_VERSION"
+          python3 --version
+          jq --version
+          git --version
+          shellcheck --version
+          gitleaks version
+          [[ "$(command -v bash)" == /bin/bash ]]
+          [[ "$(command -v python3)" == /usr/bin/python3 ]]
+          [[ "$(command -v shellcheck)" == /opt/homebrew/bin/shellcheck ]]
+          [[ "$(command -v gitleaks)" == /opt/homebrew/bin/gitleaks ]]
+          [[ "$(shellcheck --version)" == *"version: 0.11.0"* ]]
+          [[ "$(gitleaks version)" == 8.30.1 ]]
+      - name: Run the whole test suite (must end with ALL PASS)
+        run: |
+          /bin/bash tests/run.sh 2>&1 | tee "$RUNNER_TEMP/run.txt"
+          [[ "$(tail -n 1 "$RUNNER_TEMP/run.txt")" == "ALL PASS" ]]
+      - name: Scan the git history for secrets
+        run: |
+          gitleaks git --config .harness/gitleaks.toml --gitleaks-ignore-path "$RUNNER_TEMP/no-ignore" \
+            --ignore-gitleaks-allow --redact --no-banner --exit-code 1 .
+JOB
+}
+
+test_the_job_is_exactly_the_reviewed_one() {
+  [[ -s "$WF" ]] || _t_fail "missing $WF"
+  assert_eq "$(raw_jobs)" "$(expected_jobs)" "the jobs: block"
+}
+
+# The comparison itself must catch a skipped suite or scan, a weaker scan and an added step.
+test_the_job_comparison_catches_bypasses() {
+  [[ -s "$WF" ]] || _t_fail "missing $WF"
+  local real="$WF" m
+  m="$T_TMP/mutated.yml"
+  awk 'index($0, "/bin/bash tests/run.sh") {print "          exit 0"} {print}' "$real" >"$m"
+  WF="$m"
+  [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "exit 0 before the suite not caught"
+  awk 'index($0, "gitleaks git --config") {print "          exit 0"} {print}' "$real" >"$m"
+  [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "exit 0 before the scan not caught"
+  sed 's/--ignore-gitleaks-allow //' "$real" >"$m"
+  [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "gitleaks:allow comments allowed again, not caught"
+  sed 's|^          /bin/bash tests/run.sh.*$|          echo "a #b"; exit 0|' "$real" >"$m"
+  [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "a command hidden after a quoted # not caught"
+  { cat "$real"; printf '      - name: extra\n        run: echo hi\n'; } >"$m"
+  [[ "$(raw_jobs)" != "$(expected_jobs)" ]] || _t_fail "an added step not caught"
+  WF="$real"
+}
+
 test_workflow_exists() {
   [[ -f "$WF" ]] || _t_fail "missing $WF"
 }
@@ -115,6 +206,7 @@ test_scans_the_history_with_forge_rules_and_redacts() {
   b="$(body)"
   assert_contains "$b" "gitleaks git --config .harness/gitleaks.toml"
   assert_contains "$b" "--gitleaks-ignore-path"
+  assert_contains "$b" "--ignore-gitleaks-allow" # round 1: no source-controlled exemptions
   assert_contains "$b" "--redact"
   assert_contains "$b" "--exit-code 1"
 }

@@ -91,9 +91,9 @@ jobs:
           /bin/bash tests/run.sh 2>&1 | tee "$RUNNER_TEMP/run.txt"
           [[ "$(tail -n 1 "$RUNNER_TEMP/run.txt")" == "ALL PASS" ]]
 
-      # The whole history GitHub sent, with FORGE's rules only (no ignore file), secrets redacted
-      # in this public log.
+      # The whole history GitHub sent, with FORGE's rules only (no ignore file, and no
+      # gitleaks:allow comment counts, as in the commit scan), secrets redacted in this public log.
       - name: Scan the git history for secrets
         run: |
           gitleaks git --config .harness/gitleaks.toml --gitleaks-ignore-path "$RUNNER_TEMP/no-ignore" \
-            --redact --no-banner --exit-code 1 .
+            --ignore-gitleaks-allow --redact --no-banner --exit-code 1 .
