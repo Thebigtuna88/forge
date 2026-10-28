@@ -33,9 +33,16 @@ fi
 
 # --- 2. unit tests -----------------------------------------------------------------------------
 stage "unit tests"
+# The unit tests run hooks with this environment, and the hooks rightly refuse gh while a GH_*,
+# GITHUB_*, BROWSER or PAGER variable is set (hookrt.sh). GitHub Actions sets GITHUB_* (FRG-6), so
+# the tests start without them; each test that needs one sets it itself.
+unit_env=(env)
+for v in $(compgen -e); do
+  case "$v" in GH_* | GITHUB_* | BROWSER | PAGER) unit_env+=(-u "$v") ;; esac
+done
 for t in tests/unit/*.test.sh; do
   rc=0
-  out="$(bash "$t" 2>&1)" || rc=$?
+  out="$("${unit_env[@]}" bash "$t" 2>&1)" || rc=$?
   printf '%s\n' "$out"
   n="$(printf '%s\n' "$out" | grep -c '^not ok ' || true)"
   if [[ $rc -ne 0 && $n -eq 0 ]]; then

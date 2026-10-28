@@ -724,8 +724,17 @@ done
 
 # The hook under test runs sandboxed too: it (and any program git starts for it, say a
 # core.fsmonitor a setup configured) may write only inside its sandbox, and may not send signals.
+# One exception: Apple's /usr/bin/python3 and the other xcrun launchers may update xcrun's lookup
+# cache, xcrun_db (through a temporary xcrun_db-<random>), in the user's own temp folder. Claude
+# Code runs hooks unconfined, so that write works there; refused here, the launcher prints
+# "couldn't create cache file" ahead of the hook's answer, as on a fresh GitHub runner (FRG-6,
+# CI run 40635053591). A temp folder with any other characters in its path gets no exception.
+XCRUN_TMP="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)" || XCRUN_TMP=""
+if [[ -n "$XCRUN_TMP" ]]; then XCRUN_TMP="$(cd "$XCRUN_TMP" 2>/dev/null && pwd -P)/" || XCRUN_TMP=""; fi
+[[ "$XCRUN_TMP" =~ ^/[A-Za-z0-9_/-]+/$ ]] || XCRUN_TMP=/nonexistent-forge-xcrun/
 HOOK_PROFILE='(version 1) (allow default) (deny file-write*)
   (allow file-write* (subpath (param "BASE")) (literal "/dev/null") (literal "/dev/tty"))
+  (allow file-write* (regex (string-append "^" (param "XCRUN_TMP") "xcrun_db(-[A-Za-z0-9]+)?$")))
   (deny signal)'
 # Setup scripts (and anything they leave running) may write only inside their own sandbox, never
 # to the copied hooks, runtime and config or the folders holding them, and may not send signals
@@ -904,7 +913,7 @@ run_case() {
     CASE_LOG_BEFORE="$(wc -l <"$SBX/.harness/observed.log" | tr -d ' ')"
   fi
   (cd "$SBX" && env -i PATH="$PATH" HOME="$BASE/home" TMPDIR="$BASE/tmp" CLAUDE_PROJECT_DIR="$SBX" \
-    sandbox-exec -D BASE="$BASE" -p "$HOOK_PROFILE" "$SBX/.claude/hooks/$hook.sh" \
+    sandbox-exec -D BASE="$BASE" -D XCRUN_TMP="$XCRUN_TMP" -p "$HOOK_PROFILE" "$SBX/.claude/hooks/$hook.sh" \
     <"$RUN/input.json" >"$RUN/stdout" 2>"$RUN/stderr")
   CASE_RC=$?
   CASE_PASTES_NEW=$(($(pastes_recorded) - CASE_PASTES_BEFORE))

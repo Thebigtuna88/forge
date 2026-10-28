@@ -6,6 +6,18 @@ source "$(dirname "$0")/../lib/assert.sh"
 # shellcheck source=tests/lib/fixture.sh
 source "$(dirname "$0")/../lib/fixture.sh"
 
+# bash's `read -s -p` prints its prompt before it turns echo off, so an answer typed the moment
+# the prompt shows would be echoed back on a slow machine (CI run 40635053591). The pause here
+# stands in for that delay; the driver must wait for echo to go off.
+test_hidden_answer_waits_until_echo_is_off() {
+  local out
+  # shellcheck disable=SC2016 # $v is expanded by the inner bash
+  out="$(python3 -I "$TESTLIB/ptyrun.py" --answer 'NotOnScreen42' -- /bin/bash -c \
+    'printf "Enter key (input hidden): "; sleep 0.5; IFS= read -r -s v; echo; echo "got ${#v}"')"
+  assert_contains "$out" "got 13"
+  assert_not_contains "$out" "NotOnScreen42" "screen"
+}
+
 # The child ignores hang-ups (as nohup does), so only killing the whole group ends it.
 test_timeout_kills_background_children() {
   local out pid

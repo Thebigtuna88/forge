@@ -37,9 +37,9 @@ jobs:
   ci:
     name: ci
     runs-on: macos-26
-    # The suite took 2254 s (about 38 min) on the owner's Mac (dev at 24fce9f, 2026-10-27); the
-    # runner has 3 cores, so allow about four times that.
-    timeout-minutes: 150
+    # The suite takes about 38 min on the owner's Mac; the first run here took 113 min (run
+    # 40635053591, 2026-10-28), so allow about twice that.
+    timeout-minutes: 240
     steps:
       - name: Check out the code (full history, no stored credentials)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

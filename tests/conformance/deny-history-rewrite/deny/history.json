@@ -4,6 +4,5 @@
   "tool_input": {
     "command": "git history split HEAD -- notes.txt"
   },
-  "cwd": "@ROOT@",
-  "forge_reason": "is not on FORGE's list"
+  "cwd": "@ROOT@"
 }
