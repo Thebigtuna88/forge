@@ -314,11 +314,16 @@ test_hook_cannot_write_the_live_checkout() {
 # xcrun's lookup cache lives in the user's temp folder, outside every sandbox; a hook that could
 # write it would leave a change behind (FRG-6 review round 4). The test names a file of the
 # cache's temporary form (xcrun_db-<letters>), never the cache itself, and removes it if made.
+# Without the real temp folder the test would probe some other path, so it fails instead.
 test_hook_cannot_write_the_xcrun_cache() {
   mk_conf_harness sample-gate toucher
-  local ut f
-  ut="$(getconf DARWIN_USER_TEMP_DIR)"
-  f="${ut%/}/xcrun_db-forgetest$$"
+  local ut="" f
+  ut="$(getconf DARWIN_USER_TEMP_DIR)" || ut=""
+  [[ "$ut" == /?*/ && -d "$ut" && -w "$ut" ]] || {
+    _t_fail "can't find the user's temp folder (getconf DARWIN_USER_TEMP_DIR gave [$ut])"
+    return 0
+  }
+  f="${ut}xcrun_db-forgetest$$"
   case_json toucher deny main 'git push origin main'
   mkdir -p "$H/tests/conformance/toucher/allow"
   jq -n --arg f "$f" '{hook_event_name: "PreToolUse", tool_name: "Bash",
