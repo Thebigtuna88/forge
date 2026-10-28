@@ -351,8 +351,9 @@ test_placeholders_survive_odd_temp_paths() {
   case_json cwd-gate deny in-main 'ls' '@ROOT@'
   case_json cwd-gate allow in-worktree 'ls' '@WORKTREES@/FRG-2-x'
   mkdir -p "$T_TMP/a&b|c\\d"
-  OUT="$(cd "$H" && env HOME="$T_TMP/home" TMPDIR="$T_TMP/a&b|c\\d" "$H/.harness/bin/conformance" 2>&1)"
-  RC=$?
+  # Through conform, with its fake claude: run directly, this needed a real Claude Code, and passed
+  # on GitHub's runner only while GITHUB_ACTIONS leaked into the unit tests (FRG-6, run 40652702756).
+  conform TMPDIR="$T_TMP/a&b|c\\d"
   assert_exit 0 "$RC" "$OUT"
 }
 
