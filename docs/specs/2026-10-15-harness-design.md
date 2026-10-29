@@ -808,11 +808,13 @@ codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules -
   `diff.patch`, `charter.md`, `evidence.txt` and every file of the copy, changed or not, are
   scanned by gitleaks with FORGE's rules (never a repository's own config, `.gitleaksignore` or
   `gitleaks:allow` comments) before codex runs. A detection, a missing gitleaks or rules file, or
-  a scan that fails stops the run. The prompt and the review files are also each scanned again
-  with a fake token added at their end, which gitleaks must report (as the hooks'
-  `hr_scan_text`), so a file it skipped as binary can't pass; the copy's files aren't, and
-  gitleaks skips what it takes for binary there, but their changes are in `diff.patch`, which is
-  checked as text. A refused run leaves no prompt in the round. What gitleaks doesn't know as a
+  a scan that fails stops the run. gitleaks skips archives and files it takes for binary and
+  still reports success, so each file is also scanned with a fake token added at its end, which
+  it must report (as the hooks' `hr_scan_text`): the prompt and the review files one by one (one
+  it can't read stops the run), the copy's files in one run. A file of the copy gitleaks can't
+  read is **left out of the copy**, and the prompt names it; its changes, if any, are in
+  `diff.patch`, which is scanned as text (FRG-7 review round 5). A refused run leaves no prompt
+  in the round. What gitleaks doesn't know as a
   secret still goes out, and so does any file codex opens outside the copy (L16); the scan
   narrows rule 10's risk, it doesn't remove it.
 - **What remains: text in the reviewed files.** The reviewer reads the PR's own files, and any of

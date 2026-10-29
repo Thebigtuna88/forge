@@ -950,6 +950,21 @@ test_init_never_makes_a_round_it_cant_read() { # code C3
   [[ ! -e "$WORK/rounds/1000000000" ]] || _t_fail "no round folder the other commands would refuse"
 }
 
+# --- round 5 of FRG-7's own review ---------------------------------------------------------------
+
+test_files_gitleaks_cant_read_are_left_out_of_the_copy() { # security SEC-1, code C1
+  # gitleaks skips a file that starts like a PDF and still reports success; this one holds a token
+  # in plain text, in a file the PR didn't change.
+  RV_BASE_FILE=manual.pdf RV_BASE_CONTENT="%PDF-1.4"$'\n'"token = \"$(fake_token)\""$'\n' mk_rv
+  rv init "$TICKET" "$PR"
+  rv codex "$TICKET" code
+  assert_exit 0 "$RC" "codex: $OUT"
+  assert_not_contains "$(last_tree)" "manual.pdf" "a file gitleaks couldn't read isn't in codex's copy"
+  assert_contains "$(last_tree)" "sample.txt" "the rest of the commit is"
+  assert_contains "$(last_prompt)" "manual.pdf" "the prompt names what was left out"
+  assert_not_contains "$(last_prompt)" "$(fake_token)" "and not its content"
+}
+
 # --- the real gate on the real runner's review ---------------------------------------------------
 
 # mk_gate: the hooks' side of the sandbox: the merge gate, its runtime and config in M, and the

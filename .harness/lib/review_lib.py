@@ -16,6 +16,13 @@
 #       planted object can't show codex other content. A symbolic link, a submodule, a path that
 #       could leave the folder, or two paths that differ only in case (one file on macOS) is an
 #       error. Git runs with no system or global settings.
+#   canary-copy <copy> <out folder> <fake token>
+#       writes every file of <copy> under <out folder> with a line holding the fake token added at
+#       its end, for gitleaks to show which files it really reads (FRG-7 review round 5).
+#   drop-unread <copy> <canary copy> <gitleaks report.json>
+#       removes from <copy> every file gitleaks reported nothing in, in the canary copy: a file it
+#       skipped (an archive, or one it takes for binary) and so couldn't scan for secrets. Prints
+#       their paths, one per line.
 #   instruction-files <folder> <codex home>
 #       lists every file or folder that could hand codex instructions (spec 6.3, FRG-7 step 2):
 #       AGENTS.md, AGENTS.override.md, .agents/ or .codex/ anywhere in the worktree; AGENTS.md,
@@ -271,6 +278,47 @@ def snapshot(git_dir, commit, out):
     return 0
 
 
+def copy_files(top):
+    # every file under <top>, as a path relative to it
+    out = []
+    for d, _, files in os.walk(top, onerror=lambda e: sys.exit("can't read %s: %s" % (e.filename, e.strerror))):
+        for name in files:
+            out.append(os.path.relpath(os.path.join(d, name), top))
+    return sorted(out)
+
+
+def canary_copy(copy, out, token):
+    if not re.fullmatch(r"ghp_[A-Za-z0-9]{36}", token):
+        sys.exit("the fake token must look like a GitHub token")
+    os.mkdir(out, 0o700)
+    for rel in copy_files(copy):
+        target = os.path.join(out, rel)
+        os.makedirs(os.path.dirname(target), 0o700, exist_ok=True)
+        with open(os.path.join(copy, rel), "rb") as src, open(target, "xb") as dst:
+            dst.write(src.read() + b'\ntoken = "' + token.encode("ascii") + b'"\n')
+    return 0
+
+
+def drop_unread(copy, canary, report_file):
+    try:
+        report = json.loads(open(report_file, "rb").read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        sys.exit("gitleaks' report can't be read (%s)" % e)
+    if not isinstance(report, list) or not all(isinstance(f, dict) and isinstance(f.get("File"), str) for f in report):
+        sys.exit("gitleaks' report is not a list of findings")
+    top = os.path.realpath(canary)
+    read = set()
+    for f in report:
+        p = os.path.realpath(f["File"] if os.path.isabs(f["File"]) else os.path.join(canary, f["File"]))
+        if p.startswith(top + os.sep):
+            read.add(os.path.relpath(p, top))
+    for rel in copy_files(copy):
+        if rel not in read:
+            os.remove(os.path.join(copy, rel))
+            print(rel)
+    return 0
+
+
 # --- instruction files (spec 6.3) ------------------------------------------------------------------
 
 DOC_NAMES = {"agents.md", "agents.override.md"}
@@ -329,9 +377,13 @@ def main(argv):
         return check_reply_main(argv[2], argv[3], argv[4], argv[5])
     if len(argv) == 5 and argv[1] == "snapshot":
         return snapshot(argv[2], argv[3], argv[4])
+    if len(argv) == 5 and argv[1] == "canary-copy":
+        return canary_copy(argv[2], argv[3], argv[4])
+    if len(argv) == 5 and argv[1] == "drop-unread":
+        return drop_unread(argv[2], argv[3], argv[4])
     if len(argv) == 4 and argv[1] == "instruction-files":
         return instruction_files(argv[2], argv[3])
-    sys.stderr.write("usage: review_lib.py lenses <type> <raw> | check-reply <reply> <lens> <diff> <evidence|-> | snapshot <git dir> <commit> <out> | instruction-files <folder> <codex home>\n")
+    sys.stderr.write("usage: review_lib.py lenses <type> <raw> | check-reply <reply> <lens> <diff> <evidence|-> | snapshot <git dir> <commit> <out> | canary-copy <copy> <out> <token> | drop-unread <copy> <canary> <report> | instruction-files <folder> <codex home>\n")
     return 2
 
 

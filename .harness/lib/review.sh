@@ -384,9 +384,34 @@ rv_init() { # <ticket> <pr#>
 
 # --- codex -----------------------------------------------------------------------------------------
 
+rv_canary() { printf '%s%s%s' 'ghp_' 'Zq7Lw2Xn9Rb4Tk6Vm1Pc' '8Hd3Jf5Gs0Ay2QeU'; } # a fake token, built at run time
+
+# rv_readable <folder>: leaves in codex's copy only the files gitleaks really reads. gitleaks skips
+# archives and what it takes for binary and still reports success, so every file is scanned
+# again, in one run, with the fake token added at its end; a file it reports nothing in wasn't
+# read, and is removed from the copy (FRG-7 review round 5). Their names go in
+# $RV_TMP/left-out, for the prompt. Their changes, if any, are in diff.patch, scanned as text.
+rv_readable() {
+  local rc=0 conf="$RV_INSTALL/.harness/gitleaks.toml" c="$RV_TMP/canary-copy"
+  type -P gitleaks >/dev/null || rv_die 1 "gitleaks is not installed, so what codex would read can't be checked for secrets (rule 10)"
+  rv_plain "$conf" ".harness/gitleaks.toml"
+  mkdir -p "$RV_TMP/no-ignore" || rv_die 1 "can't make a scratch folder for gitleaks"
+  python3 -I "$RV_PY" canary-copy "$1" "$c" "$(rv_canary)" 2>"$RV_TMP/canary.err" ||
+    rv_die 1 "can't prepare the copy's scan: $(head -c 200 "$RV_TMP/canary.err")"
+  gitleaks dir --config "$conf" --gitleaks-ignore-path "$RV_TMP/no-ignore" --ignore-gitleaks-allow \
+    --no-banner --no-color --redact --exit-code 1 --report-format json --report-path "$c.json" "$c" \
+    >"$c.out" 2>&1 || rc=$?
+  if ! { [[ $rc == 0 || $rc == 1 ]] && jq -e 'type == "array"' "$c.json" >/dev/null 2>&1; }; then
+    rv_die 1 "gitleaks couldn't scan the commit's files (status $rc), so nothing was sent to codex: $(tail -n 2 "$c.out" | tr '\n' ' ')"
+  fi
+  python3 -I "$RV_PY" drop-unread "$1" "$c" "$c.json" >"$RV_TMP/left-out" 2>"$RV_TMP/canary.err" ||
+    rv_die 1 "can't sort out which files gitleaks read: $(head -c 200 "$RV_TMP/canary.err")"
+}
+
 # rv_scan_tree <folder>: refuses unless gitleaks, with FORGE's rules, finds nothing in the files of
 # codex's copy of the commit (FRG-7 review round 4). Unchanged files are scanned too, not only
-# the diff. Only the file names of a finding are printed.
+# the diff; rv_readable has already removed what gitleaks can't read. Only the file names of a
+# finding are printed.
 rv_scan_tree() {
   local rc=0 conf="$RV_INSTALL/.harness/gitleaks.toml" r="$RV_TMP/tree-scan"
   type -P gitleaks >/dev/null || rv_die 1 "gitleaks is not installed, so what codex would read can't be checked for secrets (rule 10)"
@@ -411,10 +436,10 @@ rv_scan_tree() {
 # review round 3).
 rv_scan() {
   local f n=0 rc d conf="$RV_INSTALL/.harness/gitleaks.toml" canary
+  canary="$(rv_canary)"
   type -P gitleaks >/dev/null || rv_die 1 "gitleaks is not installed, so what codex would read can't be checked for secrets (rule 10)"
   rv_plain "$conf" ".harness/gitleaks.toml"
   mkdir -p "$RV_TMP/no-ignore" || rv_die 1 "can't make a scratch folder for gitleaks"
-  canary="$(printf '%s%s%s' 'ghp_' 'Zq7Lw2Xn9Rb4Tk6Vm1Pc' '8Hd3Jf5Gs0Ay2QeU')"
   for f in "$@"; do
     n=$((n + 1))
     d="$RV_TMP/scan-$n"
@@ -490,6 +515,15 @@ EOF
     "$RV_TMP/deferred.prompt" || rv_die 1 "can't list the deferred findings"
   printf '\n## Found and fixed in earlier rounds, as the author describes it (check each fix holds; report a regression)\n\n'
   rv_text "$RV_WORK/fixes.md" "(none)"
+  printf '\n## Left out of the copy\n\n'
+  printf 'gitleaks could not read these files of the commit as text (archives, or files it takes for\n'
+  printf 'binary), so they were not scanned for secrets and are not in the copy. Their changes, if any,\n'
+  printf 'are in the diff file. Do not look for them anywhere else.\n\n'
+  if [[ -s "$RV_TMP/left-out" ]]; then
+    sed 's/^/- /' "$RV_TMP/left-out" || return 1
+  else
+    printf '(none)\n'
+  fi
   cat <<EOF
 
 Report every problem you find, including nits, each with file, line (or null), a short title,
@@ -530,6 +564,7 @@ rv_codex() { # <ticket> <lens>
   python3 -I "$RV_PY" instruction-files "$copy" "$HOME/.codex" >"$RV_TMP/instr" 2>&1 || rc=$?
   [[ $rc == 0 ]] ||
     rv_die 1 "codex could take instructions from these files, so the review can't run (spec 6.3): $(tr '\n' ' ' <"$RV_TMP/instr")"
+  rv_readable "$copy"
   rv_scan_tree "$copy"
   # Built aside and moved in whole: a prompt in the round means codex was started (rv_attempted).
   rv_prompt "$RV_R" "$lens" "$copy" >"$RV_TMP/prompt.md" || rv_die 1 "can't build the prompt"
