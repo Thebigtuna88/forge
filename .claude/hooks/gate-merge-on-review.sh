@@ -9,10 +9,11 @@
 # - work/<KEY>-<n>-<slug>/review.md holds the fields of spec 6.6 in one ```json forge-review
 #   block. Its repository, branch, PR number, head and merge base must be this PR's, and the diff
 #   review-diff.sh recomputes now must have the recorded md5 and byte count.
-# - Every lens listed is known, run by codex or subagent (never author, inline or self; code only
-#   by codex) and CLEAN, and its reply file rounds/<r>/reply-<lens>.json still has the recorded
-#   sha256 and is itself a CLEAN reply, with no findings, for this lens and this diff's md5 and
-#   bytes (read-proof, rule 4). code and security are required (FRG-7 adds the rest of spec 6.2).
+# - Every lens listed is known, run by codex (never a subagent, author, inline or self: codex only,
+#   owner decision 2026-10-28) and CLEAN, and its reply file rounds/<r>/reply-<lens>.json still
+#   has the recorded sha256 and is itself a CLEAN reply, with no findings, for this lens and this
+#   diff's md5 and bytes (read-proof, rule 4: the reply names exactly this diff). Every lens the
+#   recomputed diff requires (spec 6.2, review_lib.py, as the runner computes it) is listed.
 # - Every deferred finding cites an issue that is open on GitHub now.
 # - What GitHub may write into the squash commit (the PR's title and body as they are now, its
 #   commit messages and authors) holds no secret, by gitleaks with FORGE's rules (rule 10).
@@ -75,13 +76,15 @@ while IFS=$'\x1f' read -r lens mech verdict reply rsha rounds; do
   [[ "$seen" != *" $lens "* ]] || hr_deny "work/$ticket/review.md lists the $lens lens twice"
   seen+="$lens "
   case "$mech" in
-    codex | subagent) ;;
+    codex) ;;
+    subagent)
+      hr_deny "the $lens lens was run by a subagent; every lens is run by codex (owner decision 2026-10-28, FRG-7)"
+      ;;
     author | inline | self)
       hr_deny "the $lens lens was run by '$mech', a mechanism FORGE refuses (rule 3): the author never reviews its own diff"
       ;;
-    *) hr_deny "the $lens lens names an unknown mechanism '$mech' (only codex or subagent)" ;;
+    *) hr_deny "the $lens lens names an unknown mechanism '$mech' (only codex)" ;;
   esac
-  [[ "$lens" != code || "$mech" == codex ]] || hr_deny "the code lens must be run by codex (rule 3), not $mech"
   [[ "$verdict" == CLEAN ]] || hr_deny "the $lens lens is $verdict, not CLEAN; fix and review again until it is"
   # The reply is the last round's, and no later round exists for the lens: a summary left behind
   # by a newer round (perhaps with findings) is stale (review round 2).
@@ -114,9 +117,14 @@ while IFS=$'\x1f' read -r lens mech verdict reply rsha rounds; do
   jq -se --arg l "$lens" --arg m "$md5" --argjson b "$bytes" 'length == 1 and (.[0] | type == "object" and .lens == $l and .verdict == "CLEAN" and .findings == [] and .diff_md5 == $m and .diff_bytes == $b)' "$rfile" >/dev/null 2>&1 ||
     hr_deny "the $lens lens's reply work/$ticket/$reply is not a CLEAN reply for this diff: it must be one JSON object that names the $lens lens, lists no findings, and reports the diff's md5 $md5 and $bytes bytes as the reviewer computed them (read-proof, rule 4)"
 done <"$HR_TMP/lenses"
-for lens in code security; do
-  [[ "$seen" == *" $lens "* ]] || hr_deny "work/$ticket/review.md has no $lens lens; code and security are required for every PR (rule 3)"
-done
+# The lenses this diff requires are worked out here, from the diff recomputed above, whatever
+# review.md lists (spec 6.2).
+hr_required_lenses "$HR_PR_DIR/raw" "$HR_PR_DIR/diff.patch" ||
+  hr_deny "can't work out which lenses PR #$HR_PR's diff requires (spec 6.2); review_lib.py failed"
+while IFS= read -r lens; do
+  [[ "$seen" == *" $lens "* ]] ||
+    hr_deny "work/$ticket/review.md has no $lens lens, and PR #$HR_PR's diff requires it (spec 6.2: required lenses are computed, not chosen)"
+done <"$HR_TMP/lenses.req"
 
 jq -r "$HR_JQ_FIELDS"'.deferred[] | [.finding, (.issue | tostring)] | fields' "$HR_TMP/review.json" \
   >"$HR_TMP/deferred" 2>/dev/null ||

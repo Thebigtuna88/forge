@@ -159,6 +159,13 @@ sc_review_edit() { # <jq filter> [jq options…]: change review.json and rewrite
   scene_review_md
 }
 
+scene_add_lens() { # <lens>: a CLEAN reply for one more lens in round 1, listed in review.md
+  sc_reply "$1" >"$SC_WORK/rounds/1/reply-$1.json"
+  # shellcheck disable=SC2016 # a jq filter
+  sc_review_edit '.lenses += [{lens: $l, mechanism: "codex", model: "gpt-5-codex", rounds: 1, verdict: "CLEAN",
+    reply: "rounds/1/reply-\($l).json", reply_sha256: $s}]' --arg l "$1" --arg s "$(sc_sha "$SC_WORK/rounds/1/reply-$1.json")"
+}
+
 sc_secret() { printf '%s%s' "ghp_" "4Vq9TzLm2Rk8XwPn6YbJc3HdF7GsA1KeUoNi"; } # a fake token, built at run time
 
 sc_issue() { jq -n --arg s "$2" '{state: $s}' >"$SC_GH/issue-view-$1.out"; } # <n> <state>
