@@ -16,7 +16,8 @@
 #   rounds/<r>/meta.json        repo, PR, branch, head, dev, merge base, required lenses,
 #                               fingerprints (md5 and bytes) of diff.patch and evidence.txt
 #   rounds/<r>/diff.patch, raw, merge-base   review-diff.sh's output, the code-only diff
-#   rounds/<r>/evidence.txt     work/<ticket>/evidence/* joined, when there are any (spec 6.3)
+#   rounds/<r>/evidence.txt     work/<ticket>/evidence/* joined, when there are any (spec 6.3);
+#                               a hidden file there is refused, never left out
 #   rounds/<r>/prompt-<lens>.md, stdout-<lens>.log, model-<lens>.txt, reply-<lens>.json
 #   rounds/<r>/verified-<lens>.json   verify's result
 #   rounds.log                  <utc> <lens> <head> <CLEAN|FINDINGS|INVALID> <findings-hash|->
@@ -24,7 +25,9 @@
 #   deferred.json, deferred.md  findings deferred to open issues
 #   STALL.md, review.md, pr-comment.md
 # The agent posts pr-comment.md itself, with a plain gh pr comment --body-file, so the hooks scan
-# it for secrets like every other text sent to GitHub (spec 6.6).
+# it for secrets like every other text sent to GitHub (spec 6.6). What codex reads (the prompt,
+# the diff, the charter and the evidence) is scanned by gitleaks first, and nothing is sent if it
+# finds anything or can't run (rule 10).
 #
 # Known limit L12 stays open until FRG-27: the runner, its files and the agent share one macOS
 # user, so these files show which code was reviewed, not that the agent couldn't have forged them.
@@ -113,17 +116,35 @@ rv_plain() { # <file> [what]: refuse a link or anything but a plain file
   [[ -f "$1" && ! -L "$1" ]] || rv_die 1 "${2:-$1} is missing, or not a plain file"
 }
 
+# rv_git: git in the ticket's worktree with no system or global settings and no file-system
+# monitor. A setting can name a program git runs (core.fsmonitor, a filter's clean or process
+# command), and this runs before codex's sandbox does (FRG-7 review round 3). The repository's own
+# filters can't be switched off by name, so rv_worktree refuses any.
+rv_git() {
+  env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 \
+    GIT_ATTR_NOSYSTEM=1 git -c core.fsmonitor=false -C "$RV_WT" "$@"
+}
+
 rv_worktree() { # the ticket's worktree: of this repository, on its branch, clean; sets RV_HEAD
-  local c st br
+  local c st br rc=0
   [[ -d "$RV_WT" && ! -L "$RV_WT" ]] || rv_die 1 "no worktree at $RV_WT"
-  c="$(git -C "$RV_WT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+  c="$(rv_git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
     rv_die 1 "$RV_WT is not a git worktree"
   [[ "$(cd "$c" 2>/dev/null && pwd -P)" == "$RV_MAIN/.git" ]] || rv_die 1 "$RV_WT is not a worktree of $RV_MAIN"
-  br="$(git -C "$RV_WT" symbolic-ref --quiet HEAD 2>/dev/null)" || br=""
+  br="$(rv_git symbolic-ref --quiet HEAD 2>/dev/null)" || br=""
   [[ "$br" == "refs/heads/$RV_BRANCH" ]] || rv_die 1 "$RV_WT is not on $RV_BRANCH"
-  st="$(git -C "$RV_WT" status --porcelain=v1 --untracked-files=all 2>&1)" || rv_die 1 "git status failed in $RV_WT: $st"
+  rv_git config --get-regexp '^filter\.' >"$RV_TMP/filters" 2>&1 || rc=$?
+  case "$rc" in
+    0) rv_die 1 "the repository's git settings name a filter ($(cut -d ' ' -f 1 "$RV_TMP/filters" | tr '\n' ' ')), a program git status would run; remove it first" ;;
+    1) ;;
+    *) rv_die 1 "can't read the repository's git settings: $(head -c 200 "$RV_TMP/filters")" ;;
+  esac
+  # A submodule is a repository of its own, with settings this doesn't check.
+  rv_git ls-files --stage >"$RV_TMP/index" 2>/dev/null || rv_die 1 "can't read the worktree's index"
+  ! grep -q '^160000 ' "$RV_TMP/index" || rv_die 1 "the worktree has a submodule; the review runner doesn't review submodules"
+  st="$(rv_git status --porcelain=v1 --untracked-files=all 2>&1)" || rv_die 1 "git status failed in $RV_WT: $st"
   [[ -z "$st" ]] || rv_die 1 "the worktree $RV_WT has uncommitted changes; commit and push them first"
-  RV_HEAD="$(git -C "$RV_WT" rev-parse HEAD 2>/dev/null)" || RV_HEAD=""
+  RV_HEAD="$(rv_git rev-parse HEAD 2>/dev/null)" || RV_HEAD=""
   [[ "$RV_HEAD" =~ $RV_SHA_RE ]] || rv_die 1 "can't read the worktree's HEAD"
 }
 
@@ -175,16 +196,18 @@ rv_freeze() { # <out folder>: review-diff.sh for dev and the PR's head, checked 
     rv_die 1 "GitHub's merge base of dev and the PR ($RV_GHMB) is not the one recomputed here ($(cat "$1/merge-base")); run git fetch origin"
 }
 
-rv_required() { # <freeze folder> <out file>: the lenses spec 6.2 requires, one per line
-  local l n=0
-  python3 -I "$RV_PY" lenses "$RV_PROJECT_TYPE" "$1/raw" "$1/diff.patch" "$RV_INSTALL/.harness/spend-limits.json" \
-    >"$2" 2>"$RV_TMP/lenses.err" ||
+rv_required() { # <freeze folder> <out file>: the lenses spec 6.2 requires, one per line. Code,
+  # security and spend review every PR (owner decision 2026-10-29): a list without one is refused.
+  local l seen=" "
+  python3 -I "$RV_PY" lenses "$RV_PROJECT_TYPE" "$1/raw" >"$2" 2>"$RV_TMP/lenses.err" ||
     rv_die 1 "can't work out the required lenses: $(head -c 200 "$RV_TMP/lenses.err")"
   while IFS= read -r l; do
     [[ "$RV_KNOWN" == *" $l "* ]] || rv_die 1 "unexpected lens '$l' from review_lib.py"
-    n=$((n + 1))
+    seen+="$l "
   done <"$2"
-  [[ $n -ge 2 ]] || rv_die 1 "review_lib.py named fewer than two lenses"
+  for l in code security spend; do
+    [[ "$seen" == *" $l "* ]] || rv_die 1 "review_lib.py left out the $l lens, which every PR needs (spec 6.2)"
+  done
 }
 
 rv_rounds() { # sets RV_LIST (round numbers, ascending) and RV_R (the last, 0 if none)
@@ -305,6 +328,13 @@ rv_init() { # <ticket> <pr#>
       rv_plain "$f" "work/$RV_T/evidence/${f##*/}"
       names+=("$f")
     done
+    # * leaves out names that start with a dot: refused, so no evidence goes missing unseen (FRG-7
+    # review round 3).
+    for f in "$ev"/.*; do
+      case "${f##*/}" in . | ..) continue ;; esac
+      [[ -e "$f" || -L "$f" ]] || continue
+      rv_die 1 "work/$RV_T/evidence/${f##*/} is hidden (its name starts with a dot); rename it so it is joined with the rest, or remove it"
+    done
   fi
   if [[ ${#names[@]} -gt 0 ]]; then
     # Each read is checked: a file that can't be read stops init, so no round freezes partial
@@ -347,6 +377,44 @@ rv_init() { # <ticket> <pr#>
 }
 
 # --- codex -----------------------------------------------------------------------------------------
+
+# rv_scan <file>…: refuses unless gitleaks, with FORGE's rules (never a repository's own config,
+# .gitleaksignore or gitleaks:allow comments), finds nothing in any of the files and really read
+# each one: it is scanned again with a fake token (built here, at run time) added at its end,
+# which gitleaks must report, as hookrt's hr_scan_text does. Its report tells a finding from a
+# failed scan. What codex reads leaves the Mac, so nothing is sent unscanned (rule 10, FRG-7
+# review round 3).
+rv_scan() {
+  local f n=0 rc d conf="$RV_INSTALL/.harness/gitleaks.toml" canary
+  type -P gitleaks >/dev/null || rv_die 1 "gitleaks is not installed, so what codex would read can't be checked for secrets (rule 10)"
+  rv_plain "$conf" ".harness/gitleaks.toml"
+  mkdir -p "$RV_TMP/no-ignore" || rv_die 1 "can't make a scratch folder for gitleaks"
+  canary="$(printf '%s%s%s' 'ghp_' 'Zq7Lw2Xn9Rb4Tk6Vm1Pc' '8Hd3Jf5Gs0Ay2QeU')"
+  for f in "$@"; do
+    n=$((n + 1))
+    d="$RV_TMP/scan-$n"
+    mkdir "$d" "$d.canary" || rv_die 1 "can't make a scratch folder for gitleaks"
+    cp "$f" "$d/check" || rv_die 1 "can't read ${f##*/} to scan it"
+    { cat "$f" && printf '\ntoken = "%s"\n' "$canary"; } >"$d.canary/check" || rv_die 1 "can't read ${f##*/} to scan it"
+    rc=0
+    gitleaks dir --config "$conf" --gitleaks-ignore-path "$RV_TMP/no-ignore" --ignore-gitleaks-allow \
+      --no-banner --no-color --redact --exit-code 1 --report-format json --report-path "$d.json" "$d" \
+      >"$d.out" 2>&1 || rc=$?
+    if [[ $rc == 1 ]] && jq -e 'type == "array" and length > 0' "$d.json" >/dev/null 2>&1; then
+      rv_die 1 "gitleaks found what looks like a secret in ${f##*/}, so nothing was sent to codex (rule 10); remove it and start a new round"
+    fi
+    if ! { [[ $rc == 0 ]] && jq -e '. == []' "$d.json" >/dev/null 2>&1; }; then
+      rv_die 1 "gitleaks couldn't scan ${f##*/} (status $rc), so nothing was sent to codex: $(tail -n 2 "$d.out" | tr '\n' ' ')"
+    fi
+    rc=0
+    gitleaks dir --config "$conf" --gitleaks-ignore-path "$RV_TMP/no-ignore" --ignore-gitleaks-allow \
+      --no-banner --no-color --redact --exit-code 1 --report-format json --report-path "$d.canary.json" \
+      "$d.canary" >"$d.canary.out" 2>&1 || rc=$?
+    if ! { [[ $rc == 1 ]] && jq -e 'type == "array" and length > 0' "$d.canary.json" >/dev/null 2>&1; }; then
+      rv_die 1 "gitleaks didn't read ${f##*/} (it takes it for a binary or archive format, or failed), so it can't be checked for secrets and nothing was sent to codex"
+    fi
+  done
+}
 
 rv_prompt() { # <round> <lens>: the prompt, on stdout
   local lens="$2" dir="$RV_ROUNDS/$1" ev
@@ -432,6 +500,11 @@ rv_codex() { # <ticket> <lens>
     rv_die 1 "codex could take instructions from these files, so the review can't run (spec 6.3): $(tr '\n' ' ' <"$RV_TMP/instr")"
   # Built aside and moved in whole: a prompt in the round means codex was started (rv_attempted).
   rv_prompt "$RV_R" "$lens" >"$RV_TMP/prompt.md" || rv_die 1 "can't build the prompt"
+  # Everything the prompt sends or points codex to, scanned for secrets first.
+  local -a scan=("$RV_TMP/prompt.md" "$dir/diff.patch" "$dir/charter.md")
+  v="$(rv_evidence_arg "$dir")"
+  [[ "$v" == - ]] || scan+=("$v")
+  rv_scan "${scan[@]}"
   mv "$RV_TMP/prompt.md" "$dir/prompt-$lens.md" || rv_die 1 "can't write the prompt"
   rc=0
   env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TMPDIR="${TMPDIR:-/tmp}" PATH="$PATH" \

@@ -1,6 +1,10 @@
 ## Lens: spend
 
-Paid APIs, image generation and payments (spec 8). Check:
+Paid APIs, image generation and payments (spec 8). This lens reviews every PR, whatever it
+touches (owner decision 2026-10-29), so start by asking what in the change could spend money:
+a new call to a paid API, a provider's SDK or command-line tool, a new provider, a script or
+program that calls one indirectly, or a change to what the spend gate or the budget wrapper allow.
+If nothing could, the reply is CLEAN. Check:
 - Every paid call goes through the budget wrapper; nothing calls a provider directly.
 - Caps are read from `.harness/spend-limits.json` (owner-only); a missing or malformed file, or a
   disabled provider, refuses the call.

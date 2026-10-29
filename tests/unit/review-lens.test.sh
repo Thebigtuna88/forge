@@ -31,7 +31,7 @@ mk_rv() {
   cp "$FORGE_SRC/.harness/lib/review.sh" "$FORGE_SRC/.harness/lib/review_lib.py" \
     "$FORGE_SRC/.harness/lib/review-diff.sh" "$M/.harness/lib/" 2>/dev/null
   cp "$FORGE_SRC"/.harness/lenses/* "$M/.harness/lenses/" 2>/dev/null
-  cp "$FORGE_SRC/.harness/spend-limits.json" "$M/.harness/"
+  cp "$FORGE_SRC/.harness/gitleaks.toml" "$M/.harness/"
   cp "$FORGE_SRC/tests/stubs/gh" "$FORGE_SRC/tests/stubs/codex" "$B/stubs/"
   git init -q -b dev "$M"
   printf 'base\n' >"$M/README.md"
@@ -141,8 +141,7 @@ lenses_for() { # <project type> <path> <content>: the lenses review_lib.py requi
   rm -rf "$d"
   mkdir "$d"
   bash "$FORGE_SRC/.harness/lib/review-diff.sh" "$M" "$DEV" "$HEAD" "$d" >/dev/null 2>&1 || echo "review-diff failed"
-  python3 -I "$FORGE_SRC/.harness/lib/review_lib.py" lenses "$1" "$d/raw" "$d/diff.patch" \
-    "${SPEND_LIST:-$FORGE_SRC/.harness/spend-limits.json}" 2>&1 | tr '\n' ' '
+  python3 -I "$FORGE_SRC/.harness/lib/review_lib.py" lenses "$1" "$d/raw" 2>&1 | tr '\n' ' '
 }
 
 # --- init ----------------------------------------------------------------------------------------
@@ -157,7 +156,7 @@ test_init_freezes_the_diff_and_works_out_the_lenses() {
   assert_eq "$(jq -r .dev "$m")" "$DEV" "dev"
   assert_eq "$(jq -r .pr "$m")" "$PR" "pr"
   assert_eq "$(jq -r .branch "$m")" "$BRANCH" "branch"
-  assert_eq "$(jq -r '.required | join(" ")' "$m")" "code security" "required lenses"
+  assert_eq "$(jq -r '.required | join(" ")' "$m")" "code security spend" "required lenses"
   assert_eq "$(jq -r .diff_md5 "$m")" "$(md5 -q "$WORK/rounds/1/diff.patch")" "diff md5"
   assert_eq "$(jq -r .diff_bytes "$m")" "$(wc -c <"$WORK/rounds/1/diff.patch" | tr -d ' ')" "diff bytes"
   assert_eq "$(jq -r .evidence_md5 "$m")" null "no evidence"
@@ -525,7 +524,7 @@ test_finalize_writes_the_review_the_gate_reads() {
   printf 'green run\n' >"$WORK/evidence/green.txt"
   rv init "$TICKET" "$PR"
   with_findings code "$(finding C1 minor)"
-  round code security
+  round code security spend
   rv finalize "$TICKET" "$PR"
   assert_exit 1 "$RC" "code has findings: $OUT"
   rv init "$TICKET" "$PR"
@@ -545,7 +544,7 @@ open(sys.argv[2], "w").write("\n".join(lines[i + 1:j]))
     "1 $REPO $BRANCH $PR $HEAD $DEV" "bound to the PR"
   assert_eq "$(jq -r .diff_md5 "$j")" "$(md5 -q "$WORK/rounds/1/diff.patch")" "diff md5"
   assert_eq "$(jq -r '[.lenses[] | "\(.lens):\(.mechanism):\(.rounds):\(.verdict):\(.reply)"] | join(" ")' "$j")" \
-    "code:codex:2:CLEAN:rounds/2/reply-code.json security:codex:1:CLEAN:rounds/1/reply-security.json" "lenses"
+    "code:codex:2:CLEAN:rounds/2/reply-code.json security:codex:1:CLEAN:rounds/1/reply-security.json spend:codex:1:CLEAN:rounds/1/reply-spend.json" "lenses"
   assert_eq "$(jq -r '.lenses[0].reply_sha256' "$j")" "$(shasum -a 256 "$WORK/rounds/2/reply-code.json" | cut -d ' ' -f 1)" "reply sha256"
   assert_eq "$(jq -r '.lenses[0].model' "$j")" fake-model "model"
   assert_contains "$(cat "$WORK/review.md")" "L12" "the known limit is stated"
@@ -559,7 +558,7 @@ test_finalize_refuses_an_incomplete_or_stale_review() {
   rv finalize "$TICKET" "$PR"
   assert_exit 1 "$RC" "security never ran"
   assert_contains "$OUT" "security"
-  round security
+  round security spend
   rv codex "$TICKET" code 2>/dev/null
   rv init "$TICKET" "$PR"
   rv codex "$TICKET" code
@@ -575,7 +574,7 @@ test_finalize_refuses_an_incomplete_or_stale_review() {
 test_finalize_refuses_a_moved_merge_base() {
   mk_rv
   rv init "$TICKET" "$PR"
-  round code security
+  round code security spend
   printf 'dev moved\n' >"$M/later.txt"
   mg add later.txt
   mg commit -q -m later
@@ -593,12 +592,12 @@ test_finalize_refuses_a_closed_deferral() {
   mk_rv
   rv init "$TICKET" "$PR"
   with_findings security "$(finding S1 minor 'later' 'later')"
-  round code security
+  round code security spend
   gh_issue 31 OPEN
   rv defer "$TICKET" security S1 31
   rv init "$TICKET" "$PR"
   clean_reply security
-  round code security
+  round code security spend
   gh_issue 31 CLOSED
   rv finalize "$TICKET" "$PR"
   assert_exit 1 "$RC" "deferred issue closed"
@@ -610,54 +609,38 @@ test_finalize_refuses_a_closed_deferral() {
 
 # --- required lenses (spec 6.2) ------------------------------------------------------------------
 
-test_required_lenses() {
-  assert_eq "$(lenses_for harness src/a.sh $'echo hi\n')" "code security " "plain change"
+test_required_lenses() { # spend on every PR: owner decision 2026-10-29 (FRG-7 review round 3)
+  assert_eq "$(lenses_for harness src/a.sh $'echo hi\n')" "code security spend " "plain change"
+  assert_eq "$(lenses_for harness docs/plans/x.md $'A plan.\n')" "code security spend " "a plan document"
   assert_eq "$(lenses_for harness .harness/spend-limits.json $'{}\n')" "code security spend " "spend limits"
-  assert_eq "$(lenses_for harness .claude/hooks/gate-spend.sh $'x\n')" "code security spend " "spend gate"
-  assert_eq "$(lenses_for harness src/budget/wrap.ts $'x\n')" "code security spend " "budget wrapper"
-  assert_eq "$(lenses_for harness src/providers/manual.ts $'x\n')" "code security spend " "provider adapter"
-  assert_eq "$(lenses_for harness lib/payments.ts $'x\n')" "code security spend " "payments code"
-  assert_eq "$(lenses_for harness src/a.sh $'curl https://api.openai.com/v1/images\n')" "code security spend " "paid-API host"
-  assert_eq "$(lenses_for harness src/a.sh $'key=$STRIPE_SECRET_KEY\n')" "code security spend " "key variable"
-  assert_eq "$(lenses_for web components/Button.tsx $'x\n')" "code security frontend " "web UI"
-  assert_eq "$(lenses_for web app/page.css $'x\n')" "code security frontend " "web styles"
-  assert_eq "$(lenses_for web lib/util.ts $'x\n')" "code security " "web, not UI"
-  assert_eq "$(lenses_for harness components/Button.tsx $'x\n')" "code security " "UI paths outside a web project"
-  assert_eq "$(lenses_for ios Sources/App.swift $'x\n')" "code security ios " "iOS project"
+  assert_eq "$(lenses_for harness src/chat.py $'import anthropic\nanthropic.Anthropic().messages.create()\n')" \
+    "code security spend " "the Anthropic SDK (round 3, spend SPEND-1)"
+  assert_eq "$(lenses_for web components/Button.tsx $'x\n')" "code security spend frontend " "web UI"
+  assert_eq "$(lenses_for web app/page.css $'x\n')" "code security spend frontend " "web styles"
+  assert_eq "$(lenses_for web lib/util.ts $'x\n')" "code security spend " "web, not UI"
+  assert_eq "$(lenses_for harness components/Button.tsx $'x\n')" "code security spend " "UI paths outside a web project"
+  assert_eq "$(lenses_for ios Sources/App.swift $'x\n')" "code security spend ios " "iOS project"
   assert_contains "$(lenses_for other src/a.sh $'x\n')" "unknown project type" "unknown project type"
 }
 
 # --- round 1 of FRG-7's own review ---------------------------------------------------------------
 
-test_spend_lens_from_the_spend_limits_list() { # SPEND-1, SEC-3, C2
-  assert_eq "$(lenses_for harness src/chat.py $'from openai import OpenAI\nOpenAI().responses.create()\n')" \
-    "code security spend " "an SDK import with default credentials"
-  assert_eq "$(lenses_for harness src/run.py $'import replicate\nreplicate.run("o/m")\n')" "code security spend " "replicate SDK"
-  assert_eq "$(lenses_for harness src/gen.sh $'curl https://api.higgsfield.ai/v1/generate\n')" "code security spend " "Higgsfield host"
-  assert_eq "$(lenses_for harness src/gen.py $'token = os.environ["HF_API_KEY"]\n')" "code security spend " "Higgsfield key"
-  assert_eq "$(lenses_for harness src/pay.ts $'import Stripe from "stripe"\n')" "code security spend " "payments SDK"
-  assert_eq "$(lenses_for harness src/a.sh $'echo the stripes and the openaiish words\n')" "code security " "not a word match"
-  assert_contains "$(SPEND_LIST="$T_TMP/none.json" lenses_for harness src/a.sh $'x\n')" "spend-limits" "a missing list refuses"
-  printf '{"providers": 5}\n' >"$T_TMP/bad.json"
-  assert_contains "$(SPEND_LIST="$T_TMP/bad.json" lenses_for harness src/a.sh $'x\n')" "spend-limits" "a malformed list refuses"
-}
-
 test_a_lens_not_required_can_run_and_then_counts() { # SPEND-2
   mk_rv
   rv init "$TICKET" "$PR"
-  with_findings spend "$(finding P1 minor 'a cost' 'it costs')"
-  round spend
-  assert_exit 0 "$RC" "spend runs although only code and security are required: $OUT"
-  round code security
-  rv finalize "$TICKET" "$PR"
-  assert_exit 1 "$RC" "a lens that ran with findings must be CLEAN too"
-  assert_contains "$OUT" "spend"
-  rv init "$TICKET" "$PR"
-  clean_reply spend
+  with_findings frontend "$(finding F1 minor 'a layout' 'it shifts')"
+  round frontend
+  assert_exit 0 "$RC" "frontend runs although a harness change doesn't require it: $OUT"
   round code security spend
   rv finalize "$TICKET" "$PR"
+  assert_exit 1 "$RC" "a lens that ran with findings must be CLEAN too"
+  assert_contains "$OUT" "frontend"
+  rv init "$TICKET" "$PR"
+  clean_reply frontend
+  round code security spend frontend
+  rv finalize "$TICKET" "$PR"
   assert_exit 0 "$RC" "every lens that ran is CLEAN: $OUT"
-  assert_contains "$(cat "$WORK/review.md")" '"lens": "spend"'
+  assert_contains "$(cat "$WORK/review.md")" '"lens": "frontend"'
 }
 
 test_an_odd_tmpdir_runs_nothing() { # SEC-1, C5
@@ -723,23 +706,10 @@ test_codex_needs_its_checklist() { # C4
 
 # --- round 2 of FRG-7's own review ---------------------------------------------------------------
 
-test_spend_list_shape_is_the_spend_gates() { # spend SPEND-1, code C3, security SEC-2
-  local d="$T_TMP/lists" c
-  mkdir -p "$d"
-  printf '{"providers": {"manual": {"enabled": true}, "x": {"enabled": false, "hosts": [], "key_vars": [], "commands": []}}, "payments": {"hosts": [], "key_vars": [], "commands": []}, "always_blocked": ["sk_live_"]}\n' >"$d/ok.json"
-  printf '{"providers": {"x": {"enabled": false, "monthly_cap_usd": 0}}, "payments": {"hosts": [], "key_vars": [], "commands": []}, "always_blocked": ["sk_live_"]}\n' >"$d/no-lists.json"
-  printf '{"providers": {"x": {"hosts": [], "key_vars": [], "commands": []}}, "always_blocked": ["sk_live_"]}\n' >"$d/no-payments.json"
-  printf '{"providers": {"x": {"hosts": [], "key_vars": [], "commands": []}}, "payments": {"hosts": [], "key_vars": [], "commands": []}, "always_blocked": []}\n' >"$d/no-blocked.json"
-  assert_eq "$(SPEND_LIST="$d/ok.json" lenses_for harness src/a.sh $'x\n')" "code security " "manual needs no lists"
-  for c in no-lists no-payments no-blocked; do
-    assert_contains "$(SPEND_LIST="$d/$c.json" lenses_for harness src/a.sh $'x\n')" "spend-limits" "$c refuses"
-  done
-}
-
 test_a_newer_attempt_hides_no_older_clean() { # code C1
   mk_rv
   rv init "$TICKET" "$PR"
-  round code security
+  round code security spend
   rv init "$TICKET" "$PR"
   printf '1\n' >"$B/codex/rc"
   rv codex "$TICKET" code
@@ -757,7 +727,7 @@ test_a_newer_attempt_hides_no_older_clean() { # code C1
 test_a_failed_voluntary_lens_still_counts() { # security SEC-3
   mk_rv
   rv init "$TICKET" "$PR"
-  round code security
+  round code security spend
   printf '1\n' >"$B/codex/rc"
   rv codex "$TICKET" ios
   rm "$B/codex/rc"
@@ -804,6 +774,114 @@ test_deferrals_must_match_a_verified_finding() { # security SEC-1
   assert_contains "$(last_prompt)" "checked against"
 }
 
+# --- round 3 of FRG-7's own review ---------------------------------------------------------------
+
+test_git_settings_run_no_program() { # security SEC-1
+  mk_rv
+  mg config core.fsmonitor "touch '$T_TMP/FSMONITOR'; false"
+  printf '[core]\n\tfsmonitor = touch %s/GLOBAL; false\n' "$T_TMP" >"$T_TMP/home/.gitconfig"
+  rv init "$TICKET" "$PR"
+  assert_exit 0 "$RC" "init: $OUT"
+  rv codex "$TICKET" code
+  assert_exit 0 "$RC" "codex: $OUT"
+  [[ ! -e "$T_TMP/FSMONITOR" ]] || _t_fail "the repository's core.fsmonitor ran"
+  [[ ! -e "$T_TMP/GLOBAL" ]] || _t_fail "the global core.fsmonitor ran"
+  mg config filter.x.clean "touch '$T_TMP/FILTER'; cat"
+  rv init "$TICKET" "$PR"
+  assert_exit 1 "$RC" "a configured clean filter: $OUT"
+  assert_contains "$OUT" "filter"
+  [[ ! -e "$T_TMP/FILTER" ]] || _t_fail "the clean filter ran"
+  mg config --unset filter.x.clean
+  mg config filter.y.process "touch '$T_TMP/FILTER'"
+  rv codex "$TICKET" security
+  assert_exit 1 "$RC" "a configured filter process: $OUT"
+  assert_contains "$OUT" "filter"
+  [[ ! -e "$WORK/rounds/1/prompt-security.md" ]] || _t_fail "codex started with a filter configured"
+}
+
+test_a_submodule_is_refused() { # security SEC-1: a submodule's own settings aren't checked
+  mk_rv
+  local sub
+  sub="$(mg rev-parse HEAD)"
+  wg update-index --add --cacheinfo "160000,$sub,vendor/x"
+  wg commit -q -m "FRG-9: a submodule"
+  HEAD="$(wg rev-parse HEAD)"
+  gh_pr
+  gh_compare
+  rv init "$TICKET" "$PR"
+  assert_exit 1 "$RC" "a worktree with a submodule: $OUT"
+  assert_contains "$OUT" "submodule"
+}
+
+fake_token() { printf '%s%s' "ghp_" "4Vq9TzLm2Rk8XwPn6YbJc3HdF7GsA1KeUoNi"; } # built at run time
+
+test_secrets_never_reach_codex() { # security SEC-2
+  local where tok
+  tok="$(fake_token)"
+  for where in evidence context fixes diff; do
+    rm -rf "$B"
+    if [[ $where == diff ]]; then mk_rv sample.txt "token = \"$tok\""$'\n'; else mk_rv; fi
+    mkdir -p "$WORK/evidence"
+    case "$where" in
+      evidence) printf 'token = "%s"\n' "$tok" >"$WORK/evidence/log.txt" ;;
+      context) printf 'token = "%s"\n' "$tok" >"$WORK/context.md" ;;
+      fixes) printf 'token = "%s"\n' "$tok" >"$WORK/fixes.md" ;;
+    esac
+    rv init "$TICKET" "$PR"
+    rv codex "$TICKET" code
+    assert_exit 1 "$RC" "a token in the $where: $OUT"
+    assert_contains "$OUT" "secret" "reason for the $where"
+    assert_not_contains "$OUT" "$tok" "the token isn't printed ($where)"
+    ! exec_ran || _t_fail "codex ran with a token in the $where"
+    [[ ! -e "$WORK/rounds/1/prompt-code.md" ]] || _t_fail "a refused prompt is not kept as an attempt ($where)"
+  done
+  rm -rf "$B"
+  mk_rv
+  rv init "$TICKET" "$PR"
+  printf 'not [[[ toml\n' >"$M/.harness/gitleaks.toml"
+  rv codex "$TICKET" code
+  assert_exit 1 "$RC" "gitleaks can't run: $OUT"
+  ! exec_ran || _t_fail "codex ran without a secret scan"
+  rm "$M/.harness/gitleaks.toml"
+  rv codex "$TICKET" code
+  assert_exit 1 "$RC" "no gitleaks rules: $OUT"
+  ! exec_ran || _t_fail "codex ran without FORGE's gitleaks rules"
+}
+
+test_instruction_scan_fails_closed() { # code C1
+  local py="$FORGE_SRC/.harness/lib/review_lib.py" up="$T_TMP/up" rc
+  mkdir -p "$up/wt/locked" "$T_TMP/codexhome"
+  rc=0
+  python3 -I "$py" instruction-files "$up/wt" "$T_TMP/no-such-home" >/dev/null 2>&1 || rc=$?
+  assert_exit 0 "$rc" "nothing to find, and no codex home"
+  chmod 000 "$up/wt/locked"
+  rc=0
+  OUT="$(python3 -I "$py" instruction-files "$up/wt" "$T_TMP/codexhome" 2>&1)" || rc=$?
+  chmod 755 "$up/wt/locked"
+  assert_exit 1 "$rc" "an unreadable folder in the worktree: $OUT"
+  assert_contains "$OUT" "locked"
+  chmod 100 "$up"
+  rc=0
+  OUT="$(python3 -I "$py" instruction-files "$up/wt" "$T_TMP/codexhome" 2>&1)" || rc=$?
+  chmod 755 "$up"
+  assert_exit 1 "$rc" "a folder above the worktree that can't be listed: $OUT"
+  chmod 000 "$T_TMP/codexhome"
+  rc=0
+  OUT="$(python3 -I "$py" instruction-files "$up/wt" "$T_TMP/codexhome" 2>&1)" || rc=$?
+  chmod 755 "$T_TMP/codexhome"
+  assert_exit 1 "$rc" "a codex home that can't be listed: $OUT"
+}
+
+test_hidden_evidence_files_are_refused() { # code C2
+  mk_rv
+  mkdir -p "$WORK/evidence"
+  printf 'all tests pass\n' >"$WORK/evidence/.test-results.log"
+  rv init "$TICKET" "$PR"
+  assert_exit 1 "$RC" "a hidden evidence file: $OUT"
+  assert_contains "$OUT" ".test-results.log"
+  [[ ! -e "$WORK/rounds/1" ]] || _t_fail "no round when evidence would be left out"
+}
+
 # --- the real gate on the real runner's review ---------------------------------------------------
 
 # mk_gate: the hooks' side of the sandbox: the merge gate, its runtime and config in M, and the
@@ -831,7 +909,7 @@ test_gate_accepts_the_runners_review() {
   mk_rv
   mk_gate
   rv init "$TICKET" "$PR"
-  round code security
+  round code security spend
   rv finalize "$TICKET" "$PR"
   assert_exit 0 "$RC" "finalize: $OUT"
   merge
@@ -850,16 +928,7 @@ test_gate_accepts_the_runners_review() {
   assert_exit 0 "$RC" "the gate again without them: $OUT"
 }
 
-test_gate_requires_the_computed_lenses() {
-  mk_rv .harness/spend-limits.json $'{"providers": {}}\n'
-  mk_gate
-  rv init "$TICKET" "$PR"
-  round code security spend
-  rv finalize "$TICKET" "$PR"
-  assert_exit 0 "$RC" "finalize with spend: $OUT"
-  merge
-  assert_exit 0 "$RC" "the gate with code, security and spend: $OUT"
-  # The same review without its spend lens: review.md's own text no longer matters to the gate.
+drop_from_review() { # <lens>: review.md's forge-review block without that lens
   # shellcheck disable=SC2016 # Python source
   python3 -I -c '
 import json, sys
@@ -868,11 +937,80 @@ text = open(p).read()
 i = text.index("```json forge-review\n") + len("```json forge-review\n")
 j = text.index("```", i)
 block = json.loads(text[i:j])
-block["lenses"] = [l for l in block["lenses"] if l["lens"] != "spend"]
+block["lenses"] = [l for l in block["lenses"] if l["lens"] != sys.argv[2]]
 open(p, "w").write(text[:i] + json.dumps(block, indent=2) + "\n" + text[j:])
-' "$WORK/review.md"
+' "$WORK/review.md" "$1"
+}
+
+# A review_lib.py whose lens list leaves spend out (as an edit to it might), the rest unchanged.
+lenses_without_spend() {
+  mv "$M/.harness/lib/review_lib.py" "$M/.harness/lib/review_lib_real.py"
+  cat >"$M/.harness/lib/review_lib.py" <<'EOF'
+import os, runpy, sys
+if sys.argv[1:2] == ["lenses"]:
+    print("code")
+    print("security")
+    sys.exit(0)
+runpy.run_path(os.path.join(os.path.dirname(sys.argv[0]), "review_lib_real.py"), run_name="__main__")
+EOF
+}
+
+test_gate_requires_the_spend_lens_on_every_pr() { # owner decision 2026-10-29
+  mk_rv docs/plan.md $'A plan.\n'
+  mk_gate
+  rv init "$TICKET" "$PR"
+  round code security spend
+  rv finalize "$TICKET" "$PR"
+  assert_exit 0 "$RC" "finalize with spend: $OUT"
+  merge
+  assert_exit 0 "$RC" "the gate with code, security and spend: $OUT"
+  # The same review without its spend lens: a plan document still needs it.
+  drop_from_review spend
+  rm "$WORK/rounds/1/reply-spend.json" "$WORK/rounds/1/prompt-spend.md"
   merge
   assert_exit 2 "$RC" "the gate without the spend lens"
+  assert_contains "$OUT" "has no spend lens"
+}
+
+test_finalize_requires_the_spend_lens_on_every_pr() { # owner decision 2026-10-29
+  mk_rv docs/plan.md $'A plan.\n'
+  rv init "$TICKET" "$PR"
+  round code security
+  rv finalize "$TICKET" "$PR"
+  assert_exit 1 "$RC" "finalize without spend: $OUT"
+  assert_contains "$OUT" "spend"
+  [[ ! -e "$WORK/review.md" ]] || _t_fail "no review.md without spend"
+  with_findings spend "$(finding P1 minor 'a cost' 'it costs')"
+  round spend
+  rv finalize "$TICKET" "$PR"
+  assert_exit 1 "$RC" "finalize with spend FINDINGS: $OUT"
+  rv init "$TICKET" "$PR"
+  clean_reply spend
+  round code security spend
+  rv finalize "$TICKET" "$PR"
+  assert_exit 0 "$RC" "finalize with spend CLEAN: $OUT"
+}
+
+test_a_lens_list_without_spend_is_refused() { # owner decision 2026-10-29: no way round it
+  mk_rv
+  mk_gate
+  rv init "$TICKET" "$PR"
+  round code security spend
+  rv finalize "$TICKET" "$PR"
+  assert_exit 0 "$RC" "finalize: $OUT"
+  lenses_without_spend
+  merge
+  assert_exit 2 "$RC" "the gate when review_lib.py leaves spend out: $OUT"
+  assert_contains "$OUT" "spend"
+  drop_from_review spend
+  rm "$WORK/rounds/1/reply-spend.json" "$WORK/rounds/1/prompt-spend.md"
+  merge
+  assert_exit 2 "$RC" "the gate when review_lib.py and review.md both leave spend out: $OUT"
+  rv init "$TICKET" "$PR"
+  assert_exit 1 "$RC" "init when review_lib.py leaves spend out: $OUT"
+  assert_contains "$OUT" "spend"
+  rv finalize "$TICKET" "$PR"
+  assert_exit 1 "$RC" "finalize when review_lib.py leaves spend out: $OUT"
   assert_contains "$OUT" "spend"
 }
 

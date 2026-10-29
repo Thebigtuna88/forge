@@ -1,12 +1,11 @@
 # review_lib.py (FRG-7, spec 6): the review runner's checks that are easier to get exactly right
 # in Python than in bash. Run with python3 -I (no user site, no environment, no current folder on
 # the import path). Python 3.9 (Apple's /usr/bin/python3).
-#   lenses <project type> <raw> <diff.patch> <spend-limits.json>
-#       the lenses spec 6.2 requires for a frozen diff (review-diff.sh's raw and diff.patch), one
-#       per line. The runner and the merge gate both call this, so they can't disagree. The spend
-#       rule also reads every provider's and payments' hosts, key variables and commands (tools
-#       and SDK packages), and the always-blocked texts, from spend-limits.json; a missing or
-#       malformed list is an error, never an empty one.
+#   lenses <project type> <raw>
+#       the lenses spec 6.2 requires for a frozen diff (review-diff.sh's raw), one per line:
+#       code, security and spend on every PR, then frontend or ios by project. The runner and the
+#       merge gate both call this, so they can't disagree, and both refuse a list without code,
+#       security and spend.
 #   check-reply <reply.json> <lens> <diff.patch> <evidence.txt or ->
 #       prints one JSON object: status VALID or INVALID, reason, verdict, findings, hash.
 #       Exit 0 if VALID, 3 if INVALID.
@@ -15,7 +14,7 @@
 #       AGENTS.md, AGENTS.override.md, .agents/ or .codex/ anywhere in the worktree; AGENTS.md,
 #       AGENTS.override.md or .agents/ in any folder above it; AGENTS.md or AGENTS.override.md
 #       in codex's home. Names are compared without case, as macOS's file system does. Exit 0 if
-#       there are none, 1 if there are (one path per line).
+#       there are none, 1 if there are (one path per line) or if a folder can't be looked into.
 import hashlib
 import json
 import os
@@ -32,24 +31,10 @@ FINDING_KEYS = ["id", "severity", "file", "line", "title", "detail", "evidence"]
 # --- required lenses (spec 6.2) --------------------------------------------------------------------
 
 PROJECT_TYPES = ["harness", "web", "ios"]
-# spend: the spend limits, the spend gate, a budget wrapper, ledger, image generation, provider
-# adapter or payments code, or a paid-API host, key variable, tool or SDK package anywhere in the
-# diff's text: these lists, and spend-limits.json's (spend_words). The rule is a floor: any known
-# lens can also be run when it isn't required, and then counts like a required one.
-SPEND_PATHS = [
-    re.compile(r"(^|/)spend-limits\.json$", re.I),
-    re.compile(r"^\.claude/hooks/gate-spend\.sh$"),
-    re.compile(r"(^|/)[^/]*(budget|ledger|imagegen|payment|billing|stripe|checkout)[^/]*(/|$)", re.I),
-    re.compile(r"(^|/)providers?(/|$)", re.I),
-]
-SPEND_TEXT = [
-    re.compile(r"\b(api\.openai\.com|api\.anthropic\.com|api\.stripe\.com|generativelanguage\.googleapis\.com|"
-               r"api\.replicate\.com|fal\.run|api\.stability\.ai|api\.elevenlabs\.io|api\.ideogram\.ai|"
-               r"api\.bfl\.ml|api\.together\.xyz|api\.mistral\.ai|api\.x\.ai)\b", re.I),
-    re.compile(r"\b[A-Z0-9_]*(OPENAI|ANTHROPIC|STRIPE|REPLICATE|FAL|STABILITY|ELEVENLABS|GEMINI|"
-               r"IDEOGRAM|BFL|TOGETHER|MISTRAL|XAI)[A-Z0-9_]*_(API_KEY|KEY|TOKEN|SECRET)\b"),
-    re.compile(r"\b(sk|pk|rk)_(live|test)_"),
-]
+# code, security and spend review every PR. Spend was once required only for a diff that looked
+# like it touched paid APIs; three review rounds in a row found a provider or SDK that guess
+# missed, so the owner made it required on every PR (decision 2026-10-29, FRG-7 review round 3).
+EVERY_PR = ["code", "security", "spend"]
 # frontend (web projects only): the UI paths of spec 6.2.
 FRONTEND_PATHS = [
     re.compile(r"(^|/)(app|components|public)/"),
@@ -71,56 +56,15 @@ def raw_paths(raw):
     return paths
 
 
-def spend_words(spend_file):
-    # (texts matched anywhere, ignoring case; commands matched as whole words) from
-    # spend-limits.json: hosts, key_vars and commands of every provider but manual and of
-    # payments, and always_blocked. The shape is the one gate-spend requires (hookrt.sh): a
-    # providers object, a payments object, all three lists on each of those sections (empty is
-    # fine) and a non-empty always_blocked; anything else is an error (FRG-7 review round 2).
-    def strings(section, key, where):
-        if key not in section:
-            raise ValueError("%s has no %s list" % (where, key))
-        v = section[key]
-        if not isinstance(v, list) or not all(isinstance(s, str) and s for s in v):
-            raise ValueError("%s.%s is not a list of texts" % (where, key))
-        return v
-    try:
-        doc = json.loads(open(spend_file, "rb").read().decode("utf-8"))
-        if not isinstance(doc, dict) or not isinstance(doc.get("providers"), dict):
-            raise ValueError("no providers object")
-        if not isinstance(doc.get("payments"), dict):
-            raise ValueError("no payments object")
-        sections = [(n, p) for n, p in doc["providers"].items() if n != "manual"] + [("payments", doc["payments"])]
-        texts = list(strings(doc, "always_blocked", "the file"))
-        if not texts:
-            raise ValueError("always_blocked is empty")
-        commands = []
-        for name, p in sections:
-            if not isinstance(p, dict):
-                raise ValueError("%s is not an object" % name)
-            texts += strings(p, "hosts", name) + strings(p, "key_vars", name)
-            commands += strings(p, "commands", name)
-    except (OSError, UnicodeDecodeError, ValueError) as e:
-        sys.exit("spend-limits.json can't be read (%s), so the spend lens can't be worked out" % e)
-    return texts, commands
-
-
-def lenses(project, raw_file, patch_file, spend_file):
+def lenses(project, raw_file):
     if project not in PROJECT_TYPES:
         sys.exit("unknown project type: %s (%s)" % (project, ", ".join(PROJECT_TYPES)))
-    texts, commands = spend_words(spend_file)
     paths = raw_paths(open(raw_file, "rb").read())
-    text = open(patch_file, "rb").read().decode("utf-8", "replace")
-    low = text.lower()
-    need = ["code", "security"]
+    need = list(EVERY_PR)
     if project == "web" and any(r.search(p) for p in paths for r in FRONTEND_PATHS):
         need.append("frontend")
     if project == "ios":
         need.append("ios")
-    if (any(r.search(p) for p in paths for r in SPEND_PATHS) or any(r.search(text) for r in SPEND_TEXT)
-            or any(t.lower() in low for t in texts)
-            or any(re.search(r"(?<![A-Za-z0-9_-])" + re.escape(c) + r"(?![A-Za-z0-9_-])", text) for c in commands)):
-        need.append("spend")
     for lens in need:
         print(lens)
 
@@ -264,9 +208,15 @@ TREE_DIRS = {".agents", ".codex"}
 
 
 def instruction_files(worktree, codex_home):
-    hits = []
+    # Every folder must be looked into: one that can't be is reported, and counts like a hit, so
+    # an incomplete look never lets codex run (FRG-7 review round 3). Only a codex home that
+    # doesn't exist is fine.
+    hits, unread = [], []
+
+    def cant(e):
+        unread.append("%s (%s)" % (e.filename, e.strerror))
     wt = os.path.realpath(worktree)
-    for top, dirs, files in os.walk(wt, followlinks=False):
+    for top, dirs, files in os.walk(wt, onerror=cant, followlinks=False):
         for name in list(dirs) + files:
             low = name.lower()
             if low in DOC_NAMES or low in TREE_DIRS:
@@ -277,7 +227,8 @@ def instruction_files(worktree, codex_home):
     while True:
         try:
             names = os.listdir(up)
-        except OSError:
+        except OSError as e:
+            cant(e)
             names = []
         for name in names:
             if name.lower() in DOC_NAMES or name.lower() == ".agents":
@@ -289,22 +240,26 @@ def instruction_files(worktree, codex_home):
         for name in os.listdir(codex_home):
             if name.lower() in DOC_NAMES:
                 hits.append(os.path.join(codex_home, name))
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as e:
+        cant(e)
     for h in sorted(set(hits)):
         print(h)
-    return 1 if hits else 0
+    for u in unread:
+        print("can't look into %s" % u)
+    return 1 if hits or unread else 0
 
 
 def main(argv):
-    if len(argv) == 6 and argv[1] == "lenses":
-        lenses(argv[2], argv[3], argv[4], argv[5])
+    if len(argv) == 4 and argv[1] == "lenses":
+        lenses(argv[2], argv[3])
         return 0
     if len(argv) == 6 and argv[1] == "check-reply":
         return check_reply_main(argv[2], argv[3], argv[4], argv[5])
     if len(argv) == 4 and argv[1] == "instruction-files":
         return instruction_files(argv[2], argv[3])
-    sys.stderr.write("usage: review_lib.py lenses <type> <raw> <patch> <spend-limits.json> | check-reply <reply> <lens> <diff> <evidence|-> | instruction-files <worktree> <codex home>\n")
+    sys.stderr.write("usage: review_lib.py lenses <type> <raw> | check-reply <reply> <lens> <diff> <evidence|-> | instruction-files <worktree> <codex home>\n")
     return 2
 
 

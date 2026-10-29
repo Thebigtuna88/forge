@@ -16,7 +16,7 @@ a time**, with a recommendation.
 2. **`main` is human-only.** Never push or merge to `main`. `dev` is reached only by a reviewed PR.
 3. **Review before merge, every time.** Never review your own diff inline. Required lenses:
    `code` (codex, mandatory, adversarial), `security` (every PR), `frontend` (UI in a web
-   project), `ios` (iOS project), `spend` (paid APIs, image gen, payments, `spend-limits.json`).
+   project), `ios` (iOS project), `spend` (every PR).
    Every lens is run by codex, with `.harness/bin/review-lens`; mechanisms `subagent`,
    `author`, `inline` and `self` are refused.
 4. **Read-proof.** A lens reply counts only if the reviewer itself computed and reported the

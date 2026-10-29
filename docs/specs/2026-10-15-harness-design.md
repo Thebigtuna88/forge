@@ -177,7 +177,7 @@ governed project. "Enforced by" says what actually stops a violation. Where it o
 |---|---|---|
 | 1 | **One ticket, one branch, one worktree.** A ticket is a GitHub Issue on the repo it concerns, titled `<KEY>-<n>`. Branch `feature/<KEY>-<n>-<slug>` → `dev` → `main`. | `enforce-branch-format`, `deny-commit-on-shared-checkout`, `ticket`/`worktree` commands |
 | 2 | **`main` is human-only.** The agent never pushes to or merges into `main`. `dev` is reached only by a reviewed PR, which the agent may merge. | `deny-push-to-protected`, `gate-merge-on-review` (only `--base dev`), GitHub branch protection (3.2) |
-| 3 | **Review before merge, every time.** Never review your own diff inline. Required lenses: `code` (codex, mandatory, adversarial), `security` (every PR), `frontend` (UI in a web project), `ios` (iOS project), `spend` (paid APIs, image gen, payments, `spend-limits.json`). Every lens is run by codex (FRG-7); mechanisms `subagent`, `author`, `inline`, `self` are refused. | `review-lens` runner, `gate-merge-on-review` |
+| 3 | **Review before merge, every time.** Never review your own diff inline. Required lenses: `code` (codex, mandatory, adversarial), `security` (every PR), `frontend` (UI in a web project), `ios` (iOS project), `spend` (every PR, owner decision 2026-10-29). Every lens is run by codex (FRG-7); mechanisms `subagent`, `author`, `inline`, `self` are refused. | `review-lens` runner, `gate-merge-on-review` |
 | 4 | **Read-proof.** A lens reply counts only if the reviewer itself computed and reported the diff's md5 and byte count, and they match the runner's own computation (and the evidence file's, when there is one, FRG-7). Matching fingerprints show the reply refers to exactly those files; they don't prove the reviewer read or understood them (6.3). | `review-lens verify`, `gate-merge-on-review` |
 | 5 | **Rounds are uncapped; the only circuit breaker is a stall.** Fix and re-run until every required lens is CLEAN. Each round is logged to `rounds.log` as `<utc> <lens> <head-sha> <verdict> <findings-hash>`. Two consecutive identical findings-hashes for a lens = stall → stop and hand the decision to the owner. Every deferred finding becomes a ticket **before** merge. | `review-lens`, `gate-merge-on-review` (checks deferred findings have issue numbers) |
 | 6 | **A finding clears only when the fix is demonstrated**: a test that fails without the fix, command output, or `file:line`. The same standard applies to every claim the agent makes to the owner. | review checklist; next round re-checks |
@@ -720,12 +720,21 @@ STALL.md           written when a stall stops the loop
 open into `dev` from the ticket's branch (not a fork), the worktree is on that branch and clean,
 and its HEAD is the PR's head on GitHub.
 
+**Git in the worktree runs no program** (FRG-7 review round 3). Checking the worktree runs before
+codex's sandbox does, and a git setting can name a program git runs (`core.fsmonitor`, a filter's
+`clean` or `process` command). The runner's git in the worktree reads no system or global
+settings and has `core.fsmonitor` off; the repository's own filters can't be switched off by name,
+so `init` and `codex` refuse a repository whose settings name any filter, and a worktree with a
+submodule (a repository with settings of its own).
+
 ### 6.2 Required lenses (computed, not chosen)
 
 `review_lib.py lenses` computes the set from the frozen diff and the project type (FORGE itself is
 `harness`; projects get theirs from `projects.json`, FRG-10). The runner and `gate-merge-on-review`
 call the same code on the same diff, so the agent can't drop a lens: the gate refuses a review
-that lacks one the recomputed diff requires, whatever `review.md` lists.
+that lacks one the recomputed diff requires, whatever `review.md` lists. Both also refuse a
+computed list that leaves out `code`, `security` or `spend`, so an edit to the computation can't
+drop one of them either.
 
 | Lens | Required when |
 |---|---|
@@ -733,7 +742,14 @@ that lacks one the recomputed diff requires, whatever `review.md` lists.
 | `security` | always |
 | `frontend` | web project **and** the diff touches UI (`app/`, `components/`, `public/`, `*.tsx`, `*.jsx`, `*.css`, `*.scss`, design-token files) |
 | `ios` | iOS project (any diff) |
-| `spend` | the diff touches `spend-limits.json`, the spend gate, a budget wrapper, ledger, image generation, provider adapter or payments code, or its text names a paid-API host, a provider key variable or a Stripe key prefix, or any host, key variable or always-blocked text in `spend-limits.json` (any case), or any of its commands, the providers' tools and SDK packages, as a whole word (FRG-7 review round 1); a `spend-limits.json` that is missing or not in the shape `gate-spend` requires (every provider but `manual`, and payments, with all three lists, and a non-empty `always_blocked`) refuses (round 2) |
+| `spend` | always (owner decision 2026-10-29) |
+
+**Why `spend` reviews every PR.** It was first required only when the diff looked like it touched
+paid APIs: spend paths, provider hosts, key variables, tools and SDK packages, from fixed lists and
+`spend-limits.json`. Three review rounds in a row (FRG-7 rounds 1 to 3) found a provider or SDK
+that guess missed, and each fix closed only that one case; a list can't know every provider. The
+owner chose to drop the guess and require a CLEAN `spend` review on every PR: one more codex run
+per round, run alongside the others.
 
 These lists are a floor: a lens can't be skipped when required. Any known lens may also be run
 when it isn't required; once it has run, it must be CLEAN at the final head like a required one,
@@ -771,7 +787,17 @@ codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules -
   home holds an `AGENTS.md` or `AGENTS.override.md` (names compared without case). It also
   refuses any codex version but the tested one; a new version means re-running those tests and
   changing the pinned version through a PR the owner merges. What the tests showed is codex's own
-  report of what it was given, not a copy of the request.
+  report of what it was given, not a copy of the request. A folder this check can't look into
+  (in the worktree, above it, or codex's home when it exists) counts as a hit, so an incomplete
+  look never lets codex run (FRG-7 review round 3).
+- **Nothing unscanned leaves the Mac** (rule 10, FRG-7 review round 3). The prompt (with
+  `context.md`, `fixes.md` and the deferred findings in it), `diff.patch`, `charter.md` and
+  `evidence.txt` are scanned by gitleaks with FORGE's rules (never a repository's own config,
+  `.gitleaksignore` or `gitleaks:allow` comments) before codex runs. A detection, a missing
+  gitleaks or rules file, or a scan that fails stops the run, and so does a file gitleaks didn't
+  really read: each is scanned again with a fake token added at its end, which it must report (as
+  the hooks' `hr_scan_text`). A refused run leaves no prompt in the round. What a scan doesn't
+  know as a secret still goes out; the scan narrows rule 10's risk, it doesn't remove it.
 - **What remains: text in the reviewed files.** The reviewer reads the PR's own files, and any of
   them (code, comments, docs, the PR's copy of `CLAUDE.md`, the evidence) can address it, as a
   planted instruction would (prompt injection). The prompt names the charter as it was at the
@@ -797,7 +823,8 @@ codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules -
 go in `work/<T>/evidence/`; `init` joins them into the round's `evidence.txt`, a separate file
 next to `diff.patch`, which stays the code-only diff the merge gate recomputes. The reply reports
 a fingerprint (md5) and byte count for each file; `evidence_md5` and `evidence_bytes` are null
-when the round has no evidence.
+when the round has no evidence. A hidden file (its name starts with a dot) in `evidence/` stops
+`init`, so no attached evidence is left out unseen (FRG-7 review round 3).
 
 **What the fingerprints show.** Matching md5s and byte counts show that the reply refers to
 exactly these files: consistency. They don't prove the reviewer read or understood the contents.
@@ -902,7 +929,7 @@ with no fraction or exponent (`1`, not `1e0` or `1.0`).
 | `security` | secrets, injection (shell/SQL/HTML), auth and access, unsafe defaults, dependency risk, input validation, logging of sensitive data, hook bypasses, evidence the agent controls |
 | `frontend` | screenshots at 390px and 1440px: layout, overflow, contrast and a11y, empty/loading/error states, design-token use, keyboard navigation |
 | `ios` | SwiftUI state handling, Dynamic Type, VoiceOver labels, contrast, memory/threading, simulator screenshots |
-| `spend` | every paid call goes through the budget wrapper, caps read from `spend-limits.json`, ledger entries written, no live keys, test mode for payments, retries can't multiply cost |
+| `spend` | (every PR) anything that could start spending: a new paid call, SDK, tool or provider, wherever it is; every paid call goes through the budget wrapper, caps read from `spend-limits.json`, ledger entries written, no live keys, test mode for payments, retries can't multiply cost |
 
 The checklists are general; what is particular to a PR goes in `context.md`.
 
@@ -1264,7 +1291,7 @@ a known limit, with cleanup steps and when to revisit it, in
 | `handoff verify` | fails on each of checks 1–8 in 4.5, one test each; passes on a genuine run |
 | `hookrt.sh` | missing, malformed, unknown-value and missing-key `mode.json` all mean enforce; load failure denies |
 | each hook | deny and allow fixtures (conformance), including quoting tricks, `-C`, aliases, chained commands |
-| `review-lens` | read-proof mismatch means INVALID, for the diff and the evidence file (missing or mismatched evidence fields too); CLEAN with findings is rejected; refused mechanisms; findings-hash normalisation; stall after two identical rounds; required-lens computation; a new commit invalidates CLEAN; finalize refuses an incomplete set; codex runs isolated (its arguments and environment) and refuses instruction files and an untested codex version; the merge gate accepts what `finalize` writes (FRG-7) |
+| `review-lens` | read-proof mismatch means INVALID, for the diff and the evidence file (missing or mismatched evidence fields too); CLEAN with findings is rejected; refused mechanisms; findings-hash normalisation; stall after two identical rounds; required-lens computation (spend on every PR, and a computed list without code, security or spend refused by the runner and the gate); a new commit invalidates CLEAN; finalize refuses an incomplete set; codex runs isolated (its arguments and environment) and refuses instruction files, a folder it can't look into, and an untested codex version; nothing reaches codex that gitleaks finds a secret in or can't scan; git settings run no program, and filters and submodules are refused; hidden evidence files are refused; the merge gate accepts what `finalize` writes (FRG-7) |
 | `gate-merge-on-review` | edited `review.md` text, a stale sha, a moved merge-base or `--auto` all deny |
 | `review-diff.sh` | the same bytes whatever the repository, global or environment settings; binary files shown as text; a missing commit, two merge bases or a forged object refused |
 | `status` | a failing `gh` prints `UNKNOWN`, never an empty list |

@@ -121,8 +121,10 @@ while IFS=$'\x1f' read -r lens mech verdict reply rsha rounds; do
 done <"$HR_TMP/lenses"
 # The lenses this diff requires are worked out here, from the diff recomputed above, whatever
 # review.md lists (spec 6.2).
-hr_required_lenses "$HR_PR_DIR/raw" "$HR_PR_DIR/diff.patch" ||
-  hr_deny "can't work out which lenses PR #$HR_PR's diff requires (spec 6.2); review_lib.py failed"
+if ! hr_required_lenses "$HR_PR_DIR/raw"; then
+  why="$(head -c 200 "$HR_TMP/lenses.err")"
+  hr_deny "can't work out which lenses PR #$HR_PR's diff requires (spec 6.2): ${why//$'\n'/ }"
+fi
 while IFS= read -r lens; do
   [[ "$seen" == *" $lens "* ]] ||
     hr_deny "work/$ticket/review.md has no $lens lens, and PR #$HR_PR's diff requires it (spec 6.2: required lenses are computed, not chosen)"
