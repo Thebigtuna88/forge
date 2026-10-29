@@ -408,6 +408,8 @@ test_verify_rejects_bad_replies() {
   invalid_case "an id defer can't take" "{$ok, \"verdict\": \"FINDINGS\", \"findings\": [$(finding 'C 1' minor)]}" id
   invalid_case "two objects" "{$ok, \"verdict\": \"CLEAN\", \"findings\": []} {}"
   invalid_case "not JSON" "CLEAN"
+  local sur='{"id": "C1", "severity": "minor", "file": "x", "line": 1, "title": "t", "detail": "x\ud800y", "evidence": "e"}'
+  invalid_case "a lone surrogate in a finding (round 7, code C2)" "{$ok, \"verdict\": \"FINDINGS\", \"findings\": [$sur]}" UTF-8
   invalid_case "evidence claimed without evidence" '{"lens": "code", "diff_md5": "@DIFF_MD5@", "diff_bytes": @DIFF_BYTES@, "evidence_md5": "0123456789abcdef0123456789abcdef", "evidence_bytes": 5, "verdict": "CLEAN", "findings": []}' evidence
 }
 
@@ -923,6 +925,7 @@ test_the_copy_is_scanned_for_secrets() { # security SEC-1, code C1: unchanged fi
   rv codex "$TICKET" code
   assert_exit 1 "$RC" "a token in a file the PR didn't change: $OUT"
   assert_contains "$OUT" "secret"
+  assert_not_contains "$OUT" "config.txt" "no file name in the message (round 7)"
   assert_not_contains "$OUT" "$(fake_token)" "the token isn't printed"
   ! exec_ran || _t_fail "codex ran with a token in the copy"
   [[ ! -e "$WORK/rounds/1/prompt-code.md" ]] || _t_fail "a refused run leaves no prompt"
@@ -1019,6 +1022,41 @@ test_codex_gets_only_the_scanned_folder() { # code C1: the reply schema too
   for f in "diff file" "charter file" "file names"; do
     assert_contains "$(last_prompt)" "  $f: $folder/" "the $f is in the folder"
   done
+}
+
+# --- round 7 of FRG-7's own review ---------------------------------------------------------------
+
+test_names_gitleaks_cant_read_stop_the_run() { # security SEC-1
+  # A file named like a PDF's first line sorts first, and gitleaks then skips the whole list of
+  # names as a PDF (seen 2026-10-29 with gitleaks 8.30.1). The token is in a name and in a file.
+  RV_BASE_FILE="notes/$(fake_token).txt" RV_BASE_CONTENT="token = \"$(fake_token)\""$'\n' \
+    mk_rv '%PDF-1.4 notes.txt' $'notes\n'
+  rv init "$TICKET" "$PR"
+  rv codex "$TICKET" code
+  assert_exit 1 "$RC" "a list of names gitleaks skips: $OUT"
+  assert_not_contains "$OUT" "$(fake_token)" "no secret printed"
+  ! exec_ran || _t_fail "codex ran"
+}
+
+test_a_lens_runs_one_at_a_time() { # code C1
+  mk_rv
+  rv init "$TICKET" "$PR"
+  mkdir "$WORK/rounds/1/running-code"
+  rv codex "$TICKET" code
+  assert_exit 1 "$RC" "codex while another code run holds the round: $OUT"
+  assert_contains "$OUT" "running"
+  ! exec_ran || _t_fail "codex ran beside another run"
+  rmdir "$WORK/rounds/1/running-code"
+  rv codex "$TICKET" code
+  assert_exit 0 "$RC" "codex: $OUT"
+  [[ ! -e "$WORK/rounds/1/running-code" ]] || _t_fail "the run's lock is removed when it ends"
+  mkdir "$WORK/rounds/1/running-code"
+  rv verify "$TICKET" code
+  assert_exit 1 "$RC" "verify while a code run holds the round: $OUT"
+  [[ ! -e "$WORK/rounds/1/verified-code.json" ]] || _t_fail "nothing verified beside another run"
+  rmdir "$WORK/rounds/1/running-code"
+  rv verify "$TICKET" code
+  assert_exit 0 "$RC" "verify: $OUT"
 }
 
 # --- the real gate on the real runner's review ---------------------------------------------------

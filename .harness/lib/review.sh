@@ -86,9 +86,10 @@ rv_setup() {
     RV_CODEX="$(type -P codex || true)"
   fi
   RV_TMP="$(mktemp -d "${TMPDIR:-/tmp}/review-lens.XXXXXX")" || rv_die 1 "can't make a scratch folder"
+  RV_LOCK=""
   # Expanded when the trap runs, never pasted into its text: a quote in TMPDIR can't become code
-  # (FRG-7 review round 1).
-  trap 'rm -rf "$RV_TMP"' EXIT
+  # (FRG-7 review round 1). It also gives back the lens's lock (rv_lock).
+  trap 'rm -rf "$RV_TMP"; if [[ -n "$RV_LOCK" ]]; then rmdir "$RV_LOCK"; fi' EXIT
 }
 
 rv_gh() {
@@ -288,6 +289,13 @@ rv_deferrals() { # <out file>: work/<ticket>/deferred.json, every entry checked 
   cp "$list" "$1" || rv_die 1 "can't read work/$RV_T/deferred.json"
 }
 
+rv_lock() { # <round> <lens>: one codex or verify at a time per lens and round (FRG-7 review round 7)
+  [[ -z "$RV_LOCK" ]] || rv_die 1 "a lock is already held"
+  mkdir "$RV_ROUNDS/$1/running-$2" 2>/dev/null ||
+    rv_die 1 "the $2 lens is running in round $1 (work/$RV_T/rounds/$1/running-$2); wait for it to end. If no review-lens command is running, it was stopped midway: start a new round with review-lens init $RV_T <pr#>"
+  RV_LOCK="$RV_ROUNDS/$1/running-$2"
+}
+
 rv_attempted() { # <round> <lens>: 0 if codex was started for the lens in that round: its prompt,
   # its reply or a failed run's reply is there (a link counts). FRG-7 review round 2.
   local d="$RV_ROUNDS/$1" f
@@ -417,10 +425,15 @@ rv_canary_read() {
 # holds the list of file names, so names are scanned too, and no name is printed when that list
 # has a finding.
 rv_scan_folder() {
-  local rc r="$RV_TMP/folder-scan.json" n="$RV_TMP/names" real
-  # The names first, on their own: a finding there is reported without printing any name.
+  local rc r="$RV_TMP/folder-scan.json" n="$RV_TMP/names"
+  # The names first, on their own, and gitleaks must show it read them (a file named like a PDF's
+  # first line makes it skip the whole list, FRG-7 review round 7). No name is printed until
+  # they have passed.
   mkdir -p "$n" || rv_die 1 "can't make a scratch folder for gitleaks"
   cp "$1/files.txt" "$n/files.txt" || rv_die 1 "can't copy the file names to scan them"
+  rv_canary_read "$n" unread >"$RV_TMP/unread"
+  [[ ! -s "$RV_TMP/unread" ]] ||
+    rv_die 1 "gitleaks didn't read the list of the commit's file names (it took it for a binary or archive format; a name may start like one), so the names can't be checked for secrets and nothing was sent to codex"
   rc="$(rv_gitleaks "$n" "$n.json")"
   if [[ $rc == 1 ]] && jq -e 'type == "array" and length > 0' "$n.json" >/dev/null 2>&1; then
     rv_die 1 "gitleaks found what looks like a secret in a file name of the commit, so nothing was sent to codex (rule 10)"
@@ -428,10 +441,10 @@ rv_scan_folder() {
   if ! { [[ $rc == 0 ]] && jq -e '. == []' "$n.json" >/dev/null 2>&1; }; then
     rv_die 1 "gitleaks couldn't scan the commit's file names (status $rc), so nothing was sent to codex"
   fi
+  # Then the whole folder. A finding names gitleaks' rule, never the file (round 7).
   rc="$(rv_gitleaks "$1" "$r")"
   if [[ $rc == 1 ]] && jq -e 'type == "array" and length > 0' "$r" >/dev/null 2>&1; then
-    real="$(cd "$1" && pwd -P)" || real="$1"
-    rv_die 1 "gitleaks found what looks like a secret in codex's input ($(jq -r --arg a "$1/" --arg b "$real/" '[.[].File | tostring | ltrimstr($a) | ltrimstr($b)] | unique | join(", ")' "$r" 2>/dev/null | head -c 300)), so nothing was sent to codex (rule 10)"
+    rv_die 1 "gitleaks found what looks like a secret in codex's input ($(jq -r '[.[].RuleID | tostring] | unique | join(", ")' "$r" 2>/dev/null | head -c 200)), so nothing was sent to codex (rule 10); run gitleaks on the commit to see where"
   fi
   if ! { [[ $rc == 0 ]] && jq -e '. == []' "$r" >/dev/null 2>&1; }; then
     rv_die 1 "gitleaks couldn't scan codex's input (status $rc), so nothing was sent to codex: $(tail -n 2 "$r.out" | tr '\n' ' ')"
@@ -517,6 +530,7 @@ rv_codex() { # <ticket> <lens>
   [[ $RV_R -gt 0 ]] || rv_die 1 "work/$RV_T has no round yet; run review-lens init $RV_T <pr#> first"
   dir="$RV_ROUNDS/$RV_R"
   rv_meta "$RV_R"
+  rv_lock "$RV_R" "$lens"
   # Any known lens may run, required or not (spec 6.2: the rule is a floor); once it has run, it
   # must be CLEAN too before finalize (FRG-7 review round 1).
   reply="$dir/reply-$lens.json"
@@ -605,6 +619,7 @@ rv_verify() { # <ticket> <lens>
   [[ $RV_R -gt 0 ]] || rv_die 1 "work/$RV_T has no round yet"
   dir="$RV_ROUNDS/$RV_R"
   rv_meta "$RV_R"
+  rv_lock "$RV_R" "$lens"
   reply="$dir/reply-$lens.json"
   [[ -e "$reply" || -L "$reply" ]] || rv_die 1 "the $lens lens hasn't run in round $RV_R; run review-lens codex $RV_T $lens"
   [[ ! -e "$dir/verified-$lens.json" && ! -L "$dir/verified-$lens.json" ]] ||

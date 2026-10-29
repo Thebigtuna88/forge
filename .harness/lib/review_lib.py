@@ -142,6 +142,12 @@ def check_reply(reply_file, lens, diff_file, evidence_file):
     except (OSError, UnicodeDecodeError, ValueError) as e:
         raise Invalid("the reply is not one JSON object (%s)" % str(e).split("\n")[0][:120])
     exact_keys(reply, REPLY_KEYS, "the reply")
+    # JSON can escape a lone surrogate (\\ud800), which no UTF-8 text holds: refused here, so the
+    # findings-hash never fails on it (FRG-7 review round 7).
+    try:
+        json.dumps(reply, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        raise Invalid("the reply holds text that isn't valid UTF-8 (an escaped lone surrogate)")
     if reply["lens"] != lens:
         raise Invalid("the reply is for lens %r, not %s" % (reply["lens"], lens))
     if not isinstance(reply["diff_md5"], str) or not is_int(reply["diff_bytes"]):
@@ -244,6 +250,9 @@ def snapshot(git_dir, commit, out, names_file):
         meta, path = item.split(b"\t", 1)
         mode, kind, oid = meta.decode("ascii").split(" ")
         name = path.decode("utf-8", "surrogateescape")
+        if any(ord(c) < 32 or ord(c) == 127 for c in name):
+            # Not printed: names are scanned for secrets only after this (FRG-7 review round 7).
+            sys.exit("the commit has a path with a control character, which the review runner doesn't take")
         parts = name.split("/")
         if name.startswith("/") or any(p in ("", ".", "..") or p.lower() == ".git" for p in parts):
             sys.exit("the commit has a path codex's copy can't hold: %r" % name)

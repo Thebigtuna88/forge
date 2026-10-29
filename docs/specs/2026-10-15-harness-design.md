@@ -777,6 +777,10 @@ codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules -
   (the installed schema) and `prompt.md`, scans it as a whole (below), and hands codex nothing
   else: its working folder, its schema, its prompt and every path the prompt names are in it. The
   round keeps its own copies; the folder is removed when the run ends.
+- **One run per lens at a time** (FRG-7 review round 7). `codex` and `verify` hold a lock
+  (`rounds/<r>/running-<lens>/`) for their lens and round, given back when they end, so two runs
+  can't overwrite each other's reply. A command stopped midway leaves it behind; the lens then
+  runs in a new round.
 - **Codex runs on the owner's ChatGPT plan only** (decision 2026-10-16; FRG-7 review round 6).
   `codex login status` must say `Logged in using ChatGPT`; a login with an API key, billed per
   use outside the spend limits, or none, stops the run.
@@ -818,8 +822,11 @@ codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules -
   file in it (the prompt with `context.md`, `fixes.md` and the deferred findings, the review
   files, the schema, the list of file names, and every file of the copy, changed or not) is
   scanned by gitleaks with FORGE's rules (never a repository's own config, `.gitleaksignore` or
-  `gitleaks:allow` comments) before codex runs. The names are scanned first, on their own, and a
-  finding there is reported without printing any name. A detection, a missing gitleaks or rules
+  `gitleaks:allow` comments) before codex runs. The names are scanned first, on their own: gitleaks
+  must show it read the list (a file named like a PDF's first line makes it skip the whole list,
+  round 7), and a finding there is reported without printing any name. A path with a control
+  character is refused without being printed. A finding in the folder names gitleaks' rule,
+  never the file. A detection, a missing gitleaks or rules
   file, or a scan that fails stops the run. gitleaks skips archives and files it takes for binary
   and still reports success, so every file is also scanned once more with a fake token added at
   its end, which it must report (as the hooks' `hr_scan_text`). A file of the copy gitleaks
