@@ -335,7 +335,9 @@ rv_init() { # <ticket> <pr#>
     [[ -d "$ev" && ! -L "$ev" ]] || rv_die 1 "work/$RV_T/evidence must be a folder"
     for f in "$ev"/*; do
       [[ -e "$f" || -L "$f" ]] || continue
-      rv_plain "$f" "work/$RV_T/evidence/${f##*/}"
+      # Evidence names are scanned only with the rest of codex's input, so no message prints one
+      # (FRG-7 review round 8).
+      rv_plain "$f" "a file in work/$RV_T/evidence (its name is not printed)"
       names+=("$f")
     done
     # * leaves out names that start with a dot: refused, so no evidence goes missing unseen (FRG-7
@@ -343,7 +345,7 @@ rv_init() { # <ticket> <pr#>
     for f in "$ev"/.*; do
       case "${f##*/}" in . | ..) continue ;; esac
       [[ -e "$f" || -L "$f" ]] || continue
-      rv_die 1 "work/$RV_T/evidence/${f##*/} is hidden (its name starts with a dot); rename it so it is joined with the rest, or remove it"
+      rv_die 1 "work/$RV_T/evidence holds a hidden file (its name starts with a dot, and is not printed); rename it so it is joined with the rest, or remove it"
     done
   fi
   if [[ ${#names[@]} -gt 0 ]]; then
@@ -351,11 +353,11 @@ rv_init() { # <ticket> <pr#>
     # evidence (FRG-7 review round 2).
     : >"$fz/evidence.txt" || rv_die 1 "can't start the evidence file"
     for f in "${names[@]}"; do
-      size="$(wc -c <"$f" | tr -d ' ')" || rv_die 1 "can't read work/$RV_T/evidence/${f##*/}"
-      [[ "$size" =~ ^[0-9]+$ ]] || rv_die 1 "can't read work/$RV_T/evidence/${f##*/}"
+      size="$(wc -c <"$f" | tr -d ' ')" || rv_die 1 "can't read a file in work/$RV_T/evidence (its name is not printed)"
+      [[ "$size" =~ ^[0-9]+$ ]] || rv_die 1 "can't read a file in work/$RV_T/evidence (its name is not printed)"
       if ! { printf '===== EVIDENCE FILE: %s (%s bytes) =====\n' "${f##*/}" "$size" >>"$fz/evidence.txt" &&
         cat "$f" >>"$fz/evidence.txt" && printf '\n' >>"$fz/evidence.txt"; }; then
-        rv_die 1 "can't read work/$RV_T/evidence/${f##*/}"
+        rv_die 1 "can't read a file in work/$RV_T/evidence (its name is not printed)"
       fi
     done
     emd5="\"$(md5 -q "$fz/evidence.txt")\""
@@ -582,8 +584,11 @@ rv_codex() { # <ticket> <lens>
   # Kept in the round: a prompt there means codex was started (rv_attempted).
   cp "$b/prompt.md" "$dir/prompt-$lens.md" || rv_die 1 "can't write the prompt"
   rc=0
-  env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TMPDIR="${TMPDIR:-/tmp}" PATH="$PATH" \
-    LANG=en_US.UTF-8 TERM=dumb NO_COLOR=1 \
+  # Codex's environment, all of it: HOME (where its ChatGPT login is kept), review-lens's fixed PATH,
+  # a fresh TMPDIR inside the run's scratch folder, and fixed LANG, TERM and NO_COLOR. Nothing else
+  # from the caller (FRG-7 review round 8).
+  mkdir "$RV_TMP/codex-tmp" || rv_die 1 "can't make codex's scratch folder"
+  env -i HOME="$HOME" TMPDIR="$RV_TMP/codex-tmp" PATH="$PATH" LANG=en_US.UTF-8 TERM=dumb NO_COLOR=1 \
     "$RV_CODEX" exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules --color never \
     -c project_doc_max_bytes=0 -c skills.include_instructions=false -c 'web_search="disabled"' \
     -c memories.use_memories=false \

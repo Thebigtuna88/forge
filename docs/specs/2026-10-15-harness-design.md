@@ -776,7 +776,10 @@ codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules -
   commit), `diff.patch`, `charter.md`, `evidence.txt` when there is one, `reply.schema.json`
   (the installed schema) and `prompt.md`, scans it as a whole (below), and hands codex nothing
   else: its working folder, its schema, its prompt and every path the prompt names are in it. The
-  round keeps its own copies; the folder is removed when the run ends.
+  round keeps its own copies; the folder is removed when the run ends. Its environment is all
+  accounted for: `HOME` (where its ChatGPT login is kept), review-lens's fixed `PATH`, a fresh
+  `TMPDIR` inside the run's scratch folder, and fixed `LANG`, `TERM` and `NO_COLOR`; nothing else
+  from the caller (round 8).
 - **One run per lens at a time** (FRG-7 review round 7). `codex` and `verify` hold a lock
   (`rounds/<r>/running-<lens>/`) for their lens and round, given back when they end, so two runs
   can't overwrite each other's reply. A command stopped midway leaves it behind; the lens then
@@ -867,7 +870,9 @@ go in `work/<T>/evidence/`; `init` joins them into the round's `evidence.txt`, a
 next to `diff.patch`, which stays the code-only diff the merge gate recomputes. The reply reports
 a fingerprint (md5) and byte count for each file; `evidence_md5` and `evidence_bytes` are null
 when the round has no evidence. A hidden file (its name starts with a dot) in `evidence/` stops
-`init`, so no attached evidence is left out unseen (FRG-7 review round 3).
+`init`, so no attached evidence is left out unseen (FRG-7 review round 3). Evidence file names are
+scanned for secrets only with the rest of codex's input, so `init`'s messages never print one
+(round 8).
 
 **What the fingerprints show.** Matching md5s and byte counts show that the reply refers to
 exactly these files: consistency. They don't prove the reviewer read or understood the contents.
@@ -895,6 +900,8 @@ the round; there is no separate prompt step to edit it between the two.
    `diff.patch`. When the round has evidence, `evidence_md5` and `evidence_bytes` must be there
    and equal the runner's for `evidence.txt`; when it has none, they must be null. Any mismatch
    or missing value makes the round `INVALID` (logged), and the lens runs again in a new round.
+   So does anything else that stops the check (text that isn't UTF-8, nesting too deep to parse),
+   never a crash (FRG-7 review rounds 7 and 8).
 4. It appends to `rounds.log`: `<utc> <lens> <head-sha> <CLEAN|FINDINGS|INVALID> <findings-hash>`.
 5. **Findings-hash:** each finding becomes `file|title|detail`, lower-cased, with line numbers
    masked (`:123` → `:N`, `line 123` → `line N`), whitespace collapsed; then sorted,

@@ -248,10 +248,13 @@ test_codex_runs_read_only_and_isolated() {
   local v
   while IFS='=' read -r v _; do
     case "$v" in
-      HOME | PATH | USER | LOGNAME | TMPDIR | LANG | LC_ALL | TERM | NO_COLOR | PWD | SHLVL | _ | OLDPWD) ;;
+      HOME | PATH | TMPDIR | LANG | TERM | NO_COLOR | PWD | SHLVL | _ | OLDPWD) ;;
       *) _t_fail "codex got environment variable $v" ;;
     esac
   done < <(last_env)
+  local tmp
+  tmp="$(sed -n 's/^TMPDIR=//p' <(last_env))"
+  [[ "$tmp" == "$T_TMP"/review-lens.*/codex-tmp ]] || _t_fail "codex's TMPDIR is a fresh folder of the run: $tmp"
   assert_eq "$(cat "$WORK/rounds/1/model-code.txt")" fake-model "model recorded from codex's header"
   [[ -f "$WORK/rounds/1/prompt-code.md" && -f "$WORK/rounds/1/stdout-code.log" ]] ||
     _t_fail "prompt and output kept in the round"
@@ -410,6 +413,9 @@ test_verify_rejects_bad_replies() {
   invalid_case "not JSON" "CLEAN"
   local sur='{"id": "C1", "severity": "minor", "file": "x", "line": 1, "title": "t", "detail": "x\ud800y", "evidence": "e"}'
   invalid_case "a lone surrogate in a finding (round 7, code C2)" "{$ok, \"verdict\": \"FINDINGS\", \"findings\": [$sur]}" UTF-8
+  local deep
+  deep="$(printf '[%.0s' {1..3000})0$(printf ']%.0s' {1..3000})"
+  invalid_case "nested 3000 deep (round 8, code C1)" "$deep"
   invalid_case "evidence claimed without evidence" '{"lens": "code", "diff_md5": "@DIFF_MD5@", "diff_bytes": @DIFF_BYTES@, "evidence_md5": "0123456789abcdef0123456789abcdef", "evidence_bytes": 5, "verdict": "CLEAN", "findings": []}' evidence
 }
 
@@ -891,7 +897,7 @@ test_hidden_evidence_files_are_refused() { # code C2
   printf 'all tests pass\n' >"$WORK/evidence/.test-results.log"
   rv init "$TICKET" "$PR"
   assert_exit 1 "$RC" "a hidden evidence file: $OUT"
-  assert_contains "$OUT" ".test-results.log"
+  assert_contains "$OUT" "hidden"
   [[ ! -e "$WORK/rounds/1" ]] || _t_fail "no round when evidence would be left out"
 }
 
@@ -1057,6 +1063,34 @@ test_a_lens_runs_one_at_a_time() { # code C1
   rmdir "$WORK/rounds/1/running-code"
   rv verify "$TICKET" code
   assert_exit 0 "$RC" "verify: $OUT"
+}
+
+# --- round 8 of FRG-7's own review ---------------------------------------------------------------
+
+test_refused_evidence_names_are_not_printed() { # security SEC-1
+  local tok
+  tok="$(fake_token)"
+  mk_rv
+  mkdir -p "$WORK/evidence"
+  printf 'log\n' >"$WORK/evidence/.$tok"
+  rv init "$TICKET" "$PR"
+  assert_exit 1 "$RC" "a hidden evidence file: $OUT"
+  assert_not_contains "$OUT" "$tok" "its name isn't printed"
+  rm "$WORK/evidence/.$tok"
+  mkdir "$WORK/evidence/$tok"
+  rv init "$TICKET" "$PR"
+  assert_exit 1 "$RC" "a folder in the evidence: $OUT"
+  assert_not_contains "$OUT" "$tok" "its name isn't printed"
+}
+
+test_codex_gets_no_caller_environment() { # security SEC-2
+  mk_rv
+  rv init "$TICKET" "$PR"
+  RC=0
+  OUT="$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin HOME="$T_TMP/home" TMPDIR="$T_TMP" \
+    USER="$(fake_token)" LOGNAME="$(fake_token)" /bin/bash "$M/.harness/bin/review-lens" codex "$TICKET" code 2>&1)" || RC=$?
+  assert_exit 0 "$RC" "codex: $OUT"
+  assert_not_contains "$(last_env)" "$(fake_token)" "nothing from the caller's USER or LOGNAME"
 }
 
 # --- the real gate on the real runner's review ---------------------------------------------------

@@ -216,14 +216,22 @@ def findings_hash(findings):
 
 
 def check_reply_main(reply_file, lens, diff_file, evidence_file):
+    # Any failure while checking a reply makes it INVALID, logged like any other, never a crash
+    # (FRG-7 review rounds 7 and 8: a lone surrogate, then nesting too deep for the parser).
     try:
         reply = check_reply(reply_file, lens, diff_file, evidence_file)
+        result = {"status": "VALID", "reason": "", "verdict": reply["verdict"],
+                  "findings": reply["findings"], "hash": findings_hash(reply["findings"])}
+        out = json.dumps(result)
     except Invalid as e:
-        print(json.dumps({"status": "INVALID", "reason": str(e), "verdict": None, "findings": [], "hash": None}))
-        return 3
-    print(json.dumps({"status": "VALID", "reason": "", "verdict": reply["verdict"],
-                      "findings": reply["findings"], "hash": findings_hash(reply["findings"])}))
-    return 0
+        reason = str(e)
+    except Exception as e:  # noqa: BLE001 - every other failure is INVALID too
+        reason = "the reply can't be checked (%s)" % type(e).__name__
+    else:
+        print(out)
+        return 0
+    print(json.dumps({"status": "INVALID", "reason": reason, "verdict": None, "findings": [], "hash": None}))
+    return 3
 
 
 # --- the copy codex reviews (spec 6.3) ------------------------------------------------------------
