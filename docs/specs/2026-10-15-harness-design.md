@@ -766,13 +766,24 @@ codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules -
   -c memories.use_memories=false --disable hooks --disable plugins --disable apps \
   --disable skill_search --disable multi_agent --disable browser_use --disable computer_use \
   --disable image_generation --disable in_app_browser \
-  --skip-git-repo-check -C <copy of the commit> --output-schema .harness/lenses/reply.schema.json \
-  -o work/<T>/rounds/<r>/reply-<lens>.json - < prompt-<lens>.md
+  --skip-git-repo-check -C <folder>/tree --output-schema <folder>/reply.schema.json \
+  -o work/<T>/rounds/<r>/reply-<lens>.json - < <folder>/prompt.md
 ```
 
+- **Codex's whole input is one folder** (owner decision 2026-10-29, after review rounds 3 to 6
+  each found one more input outside the secret scan). For each run the runner builds a scratch
+  folder holding `tree/` (the copy of the commit, below), `files.txt` (every file name of the
+  commit), `diff.patch`, `charter.md`, `evidence.txt` when there is one, `reply.schema.json`
+  (the installed schema) and `prompt.md`, scans it as a whole (below), and hands codex nothing
+  else: its working folder, its schema, its prompt and every path the prompt names are in it. The
+  round keeps its own copies; the folder is removed when the run ends.
+- **Codex runs on the owner's ChatGPT plan only** (decision 2026-10-16; FRG-7 review round 6).
+  `codex login status` must say `Logged in using ChatGPT`; a login with an API key, billed per
+  use outside the spend limits, or none, stops the run.
+
 - **Codex reviews a copy of the commit, not the worktree** (FRG-7 review round 4). For each run,
-  `review_lib.py snapshot` writes the frozen head's files, and nothing else, into a fresh scratch
-  folder outside any git checkout, re-hashing every blob against its object id; it refuses a
+  `review_lib.py snapshot` writes the frozen head's files, and nothing else, into the folder's
+  `tree/`, outside any git checkout, re-hashing every blob against its object id; it refuses a
   symbolic link (which could lead anywhere), a submodule, and two paths that differ only in case.
   So an untracked or ignored file (a `.env`) isn't there, and neither is a change git status
   can't see (`assume-unchanged`, `skip-worktree`): codex reads exactly the committed files the
@@ -803,20 +814,26 @@ codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules -
   report of what it was given, not a copy of the request. A folder this check can't look into
   (in the worktree, above it, or codex's home when it exists) counts as a hit, so an incomplete
   look never lets codex run (FRG-7 review round 3).
-- **What the runner gives codex is scanned for secrets first** (rule 10, FRG-7 review rounds 3
-  and 4). The prompt (with `context.md`, `fixes.md` and the deferred findings in it),
-  `diff.patch`, `charter.md`, `evidence.txt` and every file of the copy, changed or not, are
+- **The whole folder is scanned for secrets first** (rule 10, FRG-7 review rounds 3 to 6). Every
+  file in it (the prompt with `context.md`, `fixes.md` and the deferred findings, the review
+  files, the schema, the list of file names, and every file of the copy, changed or not) is
   scanned by gitleaks with FORGE's rules (never a repository's own config, `.gitleaksignore` or
-  `gitleaks:allow` comments) before codex runs. A detection, a missing gitleaks or rules file, or
-  a scan that fails stops the run. gitleaks skips archives and files it takes for binary and
-  still reports success, so each file is also scanned with a fake token added at its end, which
-  it must report (as the hooks' `hr_scan_text`): the prompt and the review files one by one (one
-  it can't read stops the run), the copy's files in one run. A file of the copy gitleaks can't
-  read is **left out of the copy**, and the prompt names it; its changes, if any, are in
-  `diff.patch`, which is scanned as text (FRG-7 review round 5). A refused run leaves no prompt
-  in the round. What gitleaks doesn't know as a
-  secret still goes out, and so does any file codex opens outside the copy (L16); the scan
-  narrows rule 10's risk, it doesn't remove it.
+  `gitleaks:allow` comments) before codex runs. The names are scanned first, on their own, and a
+  finding there is reported without printing any name. A detection, a missing gitleaks or rules
+  file, or a scan that fails stops the run. gitleaks skips archives and files it takes for binary
+  and still reports success, so every file is also scanned once more with a fake token added at
+  its end, which it must report (as the hooks' `hr_scan_text`). A file of the copy gitleaks
+  can't read is **left out of the copy** first, and the prompt names it; its changes, if any, are
+  in `diff.patch` (round 5). Any other file it can't read stops the run. A refused run leaves no
+  prompt in the round. What gitleaks doesn't know as a secret still goes out, and so does any
+  file codex opens outside the folder (L16); the scan narrows rule 10's risk, it doesn't remove
+  it.
+- **Not reviewable yet: a diff gitleaks can't read as text.** The diff shows every file as text
+  (`--text`), so a PR adding or changing a binary file (an image) puts its bytes in
+  `diff.patch`; if gitleaks takes that for binary, the run stops. FORGE commits no binary files
+  today. Before a project commits images (FRG-9, FRG-11), the review must handle them (for
+  example a diff that names binary files instead of showing their bytes), through a PR the owner
+  merges.
 - **What remains: text in the reviewed files.** The reviewer reads the PR's own files, and any of
   them (code, comments, docs, the PR's copy of `CLAUDE.md`, the evidence) can address it, as a
   planted instruction would (prompt injection). The prompt names the charter as it was at the
@@ -1167,9 +1184,11 @@ It takes one ticket and one owner handoff:
 - **Payments (Stripe/Shopify)** charge customers, not the owner, so they aren't routed through
   the budget wrapper. Rule 8 keeps them in **test mode**: only `sk_test_`/test-store
   credentials, `sk_live_` is blocked everywhere, and switching to live is an owner-run script.
-- **Codex review:** with a ChatGPT plan it costs a flat subscription. If the owner chooses an
-  OpenAI API key instead, the Phase 1 login handoff also sets a **monthly usage limit in the
-  OpenAI dashboard** (`ho_confirm`), because codex calls can't go through the project's wrapper.
+- **Codex review:** with a ChatGPT plan it costs a flat subscription. The owner chose the plan
+  (2026-10-16), and since FRG-7 the review runner refuses to run codex logged in any other way
+  (6.3). Switching to an OpenAI API key would mean changing the runner through a PR the owner
+  merges, with a **monthly usage limit in the OpenAI dashboard** set by a handoff (`ho_confirm`),
+  because codex calls can't go through the project's wrapper.
 - **Hosting (Vercel), GitHub, Apple:** subscriptions bought only by owner scripts.
 
 ---
@@ -1312,7 +1331,7 @@ a known limit, with cleanup steps and when to revisit it, in
 | `handoff verify` | fails on each of checks 1–8 in 4.5, one test each; passes on a genuine run |
 | `hookrt.sh` | missing, malformed, unknown-value and missing-key `mode.json` all mean enforce; load failure denies |
 | each hook | deny and allow fixtures (conformance), including quoting tricks, `-C`, aliases, chained commands |
-| `review-lens` | read-proof mismatch means INVALID, for the diff and the evidence file (missing or mismatched evidence fields too); CLEAN with findings is rejected; refused mechanisms; findings-hash normalisation; stall after two identical rounds; required-lens computation (spend on every PR, and a computed list without code, security or spend refused by the runner and the gate); a new commit invalidates CLEAN; finalize refuses an incomplete set; codex runs isolated (its arguments and environment) and refuses instruction files, a folder it can't look into, and an untested codex version; nothing reaches codex that gitleaks finds a secret in or can't scan, including unchanged files; codex reviews a copy of the commit (no ignored files, no edits git status hides, no links); git settings run no program, and filters and submodules are refused; hidden evidence files are refused; init never makes a round number the other commands refuse; the merge gate accepts what `finalize` writes (FRG-7) |
+| `review-lens` | read-proof mismatch means INVALID, for the diff and the evidence file (missing or mismatched evidence fields too); CLEAN with findings is rejected; refused mechanisms; findings-hash normalisation; stall after two identical rounds; required-lens computation (spend on every PR, and a computed list without code, security or spend refused by the runner and the gate); a new commit invalidates CLEAN; finalize refuses an incomplete set; codex runs isolated (its arguments and environment) and refuses instruction files, a folder it can't look into, and an untested codex version; codex runs only on the ChatGPT login; codex's whole input is one folder, and nothing reaches it that gitleaks finds a secret in (file names included) or can't scan, including unchanged files and the reply schema; codex reviews a copy of the commit (no ignored files, no edits git status hides, no links); git settings run no program, and filters and submodules are refused; hidden evidence files are refused; init never makes a round number the other commands refuse; the merge gate accepts what `finalize` writes (FRG-7) |
 | `gate-merge-on-review` | edited `review.md` text, a stale sha, a moved merge-base or `--auto` all deny |
 | `review-diff.sh` | the same bytes whatever the repository, global or environment settings; binary files shown as text; a missing commit, two merge bases or a forged object refused |
 | `status` | a failing `gh` prints `UNKNOWN`, never an empty list |

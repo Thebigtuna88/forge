@@ -9,6 +9,8 @@
 #                      (default: a CLEAN reply with the right values)
 #   model              the model its header names (default: fake-model); "none" leaves the line out
 #   rc                 the exit status of `exec` (default 0)
+#   login              what `codex login status` prints, on stderr as codex does (default: Logged in
+#                      using ChatGPT)
 # It records, for call n: its arguments, one per line, in call-<n>.args, its environment in
 # call-<n>.env, the prompt it read on stdin in call-<n>.prompt and, for exec, every file in its -C
 # folder with its md5 in call-<n>.tree ("<path relative to the folder> <md5>", sorted).
@@ -25,8 +27,12 @@ if [[ "${1:-}" == --version ]]; then
   if [[ -f "$dir/version" ]]; then cat "$dir/version"; else echo "codex-cli 0.163.0"; fi
   exit 0
 fi
+if [[ "${1:-}" == login && "${2:-}" == status ]]; then
+  if [[ -f "$dir/login" ]]; then cat "$dir/login" >&2; else echo "Logged in using ChatGPT" >&2; fi
+  exit 0
+fi
 [[ "${1:-}" == exec ]] || {
-  echo "stub codex: only --version and exec are faked" >&2
+  echo "stub codex: only --version, login status and exec are faked" >&2
   exit 1
 }
 out="" cd=""

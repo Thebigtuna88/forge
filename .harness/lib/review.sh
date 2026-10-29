@@ -25,11 +25,11 @@
 #   deferred.json, deferred.md  findings deferred to open issues
 #   STALL.md, review.md, pr-comment.md
 # The agent posts pr-comment.md itself, with a plain gh pr comment --body-file, so the hooks scan
-# it for secrets like every other text sent to GitHub (spec 6.6). Codex reviews a copy of the
-# commit's files, never the worktree, and what the runner gives it (the prompt, the diff, the
-# charter, the evidence and the copy) is scanned by gitleaks first; nothing is sent if it finds
-# anything or can't run (rule 10). Codex can still read other files of this macOS user by their
-# full path (L16, open until FRG-27).
+# it for secrets like every other text sent to GitHub (spec 6.6). Codex gets its whole input from
+# one folder: a copy of the commit's files (never the worktree), their names, the diff, the
+# charter, the evidence, the reply schema and the prompt, all scanned by gitleaks first; nothing
+# is sent if it finds anything, can't run or can't read a file (rule 10). Codex can still read
+# other files of this macOS user by their full path (L16, open until FRG-27).
 #
 # Known limit L12 stays open until FRG-27: the runner, its files and the agent share one macOS
 # user, so these files show which code was reviewed, not that the agent couldn't have forged them.
@@ -386,104 +386,79 @@ rv_init() { # <ticket> <pr#>
 
 rv_canary() { printf '%s%s%s' 'ghp_' 'Zq7Lw2Xn9Rb4Tk6Vm1Pc' '8Hd3Jf5Gs0Ay2QeU'; } # a fake token, built at run time
 
-# rv_readable <folder>: leaves in codex's copy only the files gitleaks really reads. gitleaks skips
-# archives and what it takes for binary and still reports success, so every file is scanned
-# again, in one run, with the fake token added at its end; a file it reports nothing in wasn't
-# read, and is removed from the copy (FRG-7 review round 5). Their names go in
-# $RV_TMP/left-out, for the prompt. Their changes, if any, are in diff.patch, scanned as text.
-rv_readable() {
-  local rc=0 conf="$RV_INSTALL/.harness/gitleaks.toml" c="$RV_TMP/canary-copy"
-  type -P gitleaks >/dev/null || rv_die 1 "gitleaks is not installed, so what codex would read can't be checked for secrets (rule 10)"
-  rv_plain "$conf" ".harness/gitleaks.toml"
-  mkdir -p "$RV_TMP/no-ignore" || rv_die 1 "can't make a scratch folder for gitleaks"
+rv_gitleaks() { # <folder> <report.json>: gitleaks dir with FORGE's rules only; prints its status
+  local rc=0
+  gitleaks dir --config "$RV_INSTALL/.harness/gitleaks.toml" --gitleaks-ignore-path "$RV_TMP/no-ignore" \
+    --ignore-gitleaks-allow --no-banner --no-color --redact --exit-code 1 --report-format json \
+    --report-path "$2" "$1" >"$2.out" 2>&1 || rc=$?
+  printf '%s\n' "$rc"
+}
+
+# rv_canary_read <folder> <drop-unread|unread>: scans a copy of every file of <folder> with the
+# fake token added at its end, in one gitleaks run. gitleaks skips archives and what it takes for
+# binary and still reports success, so a file it reports nothing in wasn't read; their paths go
+# to stdout (drop-unread also removes them from <folder>).
+rv_canary_read() {
+  local c="$RV_TMP/canary.$RANDOM$RANDOM" rc
   python3 -I "$RV_PY" canary-copy "$1" "$c" "$(rv_canary)" 2>"$RV_TMP/canary.err" ||
-    rv_die 1 "can't prepare the copy's scan: $(head -c 200 "$RV_TMP/canary.err")"
-  gitleaks dir --config "$conf" --gitleaks-ignore-path "$RV_TMP/no-ignore" --ignore-gitleaks-allow \
-    --no-banner --no-color --redact --exit-code 1 --report-format json --report-path "$c.json" "$c" \
-    >"$c.out" 2>&1 || rc=$?
+    rv_die 1 "can't prepare the scan of codex's folder: $(head -c 200 "$RV_TMP/canary.err")"
+  rc="$(rv_gitleaks "$c" "$c.json")"
   if ! { [[ $rc == 0 || $rc == 1 ]] && jq -e 'type == "array"' "$c.json" >/dev/null 2>&1; }; then
-    rv_die 1 "gitleaks couldn't scan the commit's files (status $rc), so nothing was sent to codex: $(tail -n 2 "$c.out" | tr '\n' ' ')"
+    rv_die 1 "gitleaks couldn't scan codex's folder (status $rc), so nothing was sent to codex: $(tail -n 2 "$c.json.out" | tr '\n' ' ')"
   fi
-  python3 -I "$RV_PY" drop-unread "$1" "$c" "$c.json" >"$RV_TMP/left-out" 2>"$RV_TMP/canary.err" ||
+  python3 -I "$RV_PY" "$2" "$1" "$c" "$c.json" 2>"$RV_TMP/canary.err" ||
     rv_die 1 "can't sort out which files gitleaks read: $(head -c 200 "$RV_TMP/canary.err")"
 }
 
-# rv_scan_tree <folder>: refuses unless gitleaks, with FORGE's rules, finds nothing in the files of
-# codex's copy of the commit (FRG-7 review round 4). Unchanged files are scanned too, not only
-# the diff; rv_readable has already removed what gitleaks can't read. Only the file names of a
-# finding are printed.
-rv_scan_tree() {
-  local rc=0 conf="$RV_INSTALL/.harness/gitleaks.toml" r="$RV_TMP/tree-scan"
-  type -P gitleaks >/dev/null || rv_die 1 "gitleaks is not installed, so what codex would read can't be checked for secrets (rule 10)"
-  rv_plain "$conf" ".harness/gitleaks.toml"
-  mkdir -p "$RV_TMP/no-ignore" || rv_die 1 "can't make a scratch folder for gitleaks"
-  gitleaks dir --config "$conf" --gitleaks-ignore-path "$RV_TMP/no-ignore" --ignore-gitleaks-allow \
-    --no-banner --no-color --redact --exit-code 1 --report-format json --report-path "$r.json" "$1" \
-    >"$r.out" 2>&1 || rc=$?
-  if [[ $rc == 1 ]] && jq -e 'type == "array" and length > 0' "$r.json" >/dev/null 2>&1; then
-    rv_die 1 "gitleaks found what looks like a secret in the commit's files ($(jq -r --arg p "$1/" '[.[].File | tostring | ltrimstr($p)] | unique | join(", ")' "$r.json" 2>/dev/null | head -c 300)), so nothing was sent to codex (rule 10)"
+# rv_scan_folder <folder>: codex gets its whole input from this one folder, and nothing reaches it
+# unless gitleaks, with FORGE's rules (never a repository's own config, .gitleaksignore or
+# gitleaks:allow comments), read every file in it and found nothing (rule 10; owner decision
+# 2026-10-29, after review rounds 3 to 6 each found one more input outside the scan). The folder
+# holds the list of file names, so names are scanned too, and no name is printed when that list
+# has a finding.
+rv_scan_folder() {
+  local rc r="$RV_TMP/folder-scan.json" n="$RV_TMP/names" real
+  # The names first, on their own: a finding there is reported without printing any name.
+  mkdir -p "$n" || rv_die 1 "can't make a scratch folder for gitleaks"
+  cp "$1/files.txt" "$n/files.txt" || rv_die 1 "can't copy the file names to scan them"
+  rc="$(rv_gitleaks "$n" "$n.json")"
+  if [[ $rc == 1 ]] && jq -e 'type == "array" and length > 0' "$n.json" >/dev/null 2>&1; then
+    rv_die 1 "gitleaks found what looks like a secret in a file name of the commit, so nothing was sent to codex (rule 10)"
   fi
-  if ! { [[ $rc == 0 ]] && jq -e '. == []' "$r.json" >/dev/null 2>&1; }; then
-    rv_die 1 "gitleaks couldn't scan the commit's files (status $rc), so nothing was sent to codex: $(tail -n 2 "$r.out" | tr '\n' ' ')"
+  if ! { [[ $rc == 0 ]] && jq -e '. == []' "$n.json" >/dev/null 2>&1; }; then
+    rv_die 1 "gitleaks couldn't scan the commit's file names (status $rc), so nothing was sent to codex"
   fi
+  rc="$(rv_gitleaks "$1" "$r")"
+  if [[ $rc == 1 ]] && jq -e 'type == "array" and length > 0' "$r" >/dev/null 2>&1; then
+    real="$(cd "$1" && pwd -P)" || real="$1"
+    rv_die 1 "gitleaks found what looks like a secret in codex's input ($(jq -r --arg a "$1/" --arg b "$real/" '[.[].File | tostring | ltrimstr($a) | ltrimstr($b)] | unique | join(", ")' "$r" 2>/dev/null | head -c 300)), so nothing was sent to codex (rule 10)"
+  fi
+  if ! { [[ $rc == 0 ]] && jq -e '. == []' "$r" >/dev/null 2>&1; }; then
+    rv_die 1 "gitleaks couldn't scan codex's input (status $rc), so nothing was sent to codex: $(tail -n 2 "$r.out" | tr '\n' ' ')"
+  fi
+  rv_canary_read "$1" unread >"$RV_TMP/unread"
+  [[ ! -s "$RV_TMP/unread" ]] ||
+    rv_die 1 "gitleaks didn't read $(tr '\n' ' ' <"$RV_TMP/unread" | head -c 300)(it takes it for a binary or archive format), so it can't be checked for secrets and nothing was sent to codex"
 }
 
-# rv_scan <file>…: refuses unless gitleaks, with FORGE's rules (never a repository's own config,
-# .gitleaksignore or gitleaks:allow comments), finds nothing in any of the files and really read
-# each one: it is scanned again with a fake token (built here, at run time) added at its end,
-# which gitleaks must report, as hookrt's hr_scan_text does. Its report tells a finding from a
-# failed scan. What codex reads leaves the Mac, so nothing is sent unscanned (rule 10, FRG-7
-# review round 3).
-rv_scan() {
-  local f n=0 rc d conf="$RV_INSTALL/.harness/gitleaks.toml" canary
-  canary="$(rv_canary)"
-  type -P gitleaks >/dev/null || rv_die 1 "gitleaks is not installed, so what codex would read can't be checked for secrets (rule 10)"
-  rv_plain "$conf" ".harness/gitleaks.toml"
-  mkdir -p "$RV_TMP/no-ignore" || rv_die 1 "can't make a scratch folder for gitleaks"
-  for f in "$@"; do
-    n=$((n + 1))
-    d="$RV_TMP/scan-$n"
-    mkdir "$d" "$d.canary" || rv_die 1 "can't make a scratch folder for gitleaks"
-    cp "$f" "$d/check" || rv_die 1 "can't read ${f##*/} to scan it"
-    { cat "$f" && printf '\ntoken = "%s"\n' "$canary"; } >"$d.canary/check" || rv_die 1 "can't read ${f##*/} to scan it"
-    rc=0
-    gitleaks dir --config "$conf" --gitleaks-ignore-path "$RV_TMP/no-ignore" --ignore-gitleaks-allow \
-      --no-banner --no-color --redact --exit-code 1 --report-format json --report-path "$d.json" "$d" \
-      >"$d.out" 2>&1 || rc=$?
-    if [[ $rc == 1 ]] && jq -e 'type == "array" and length > 0' "$d.json" >/dev/null 2>&1; then
-      rv_die 1 "gitleaks found what looks like a secret in ${f##*/}, so nothing was sent to codex (rule 10); remove it and start a new round"
-    fi
-    if ! { [[ $rc == 0 ]] && jq -e '. == []' "$d.json" >/dev/null 2>&1; }; then
-      rv_die 1 "gitleaks couldn't scan ${f##*/} (status $rc), so nothing was sent to codex: $(tail -n 2 "$d.out" | tr '\n' ' ')"
-    fi
-    rc=0
-    gitleaks dir --config "$conf" --gitleaks-ignore-path "$RV_TMP/no-ignore" --ignore-gitleaks-allow \
-      --no-banner --no-color --redact --exit-code 1 --report-format json --report-path "$d.canary.json" \
-      "$d.canary" >"$d.canary.out" 2>&1 || rc=$?
-    if ! { [[ $rc == 1 ]] && jq -e 'type == "array" and length > 0' "$d.canary.json" >/dev/null 2>&1; }; then
-      rv_die 1 "gitleaks didn't read ${f##*/} (it takes it for a binary or archive format, or failed), so it can't be checked for secrets and nothing was sent to codex"
-    fi
-  done
-}
-
-rv_prompt() { # <round> <lens> <copy>: the prompt, on stdout
-  local lens="$2" dir="$RV_ROUNDS/$1" ev
-  ev="$(rv_evidence_arg "$dir")"
-  [[ "$ev" != - ]] || ev=none
+rv_prompt() { # <lens> <folder>: the prompt, on stdout; the review files are in <folder>
+  local lens="$1" b="$2" ev=none
+  [[ ! -e "$b/evidence.txt" ]] || ev="$b/evidence.txt"
   cat <<EOF
 You are an adversarial reviewer. Your job is to find what is wrong, not to approve.
 
 Repository: $RV_REPO, branch $RV_BRANCH, PR #$(jq -r .pr "$RV_META") into dev, at commit
 $(jq -r .head "$RV_META"). That commit's files, and nothing else, are copied to
-  $3
-(not a git checkout): the code under review. Read the files there and the review files below
-only; do not read other files on this computer, and do not contact GitHub or any other network
+  $b/tree
+(not a git checkout): the code under review. Read only the files in $b;
+do not read other files on this computer, and do not contact GitHub or any other network
 service. You may run read-only commands.
 
 The review input:
-  diff file: $dir/diff.patch
+  diff file: $b/diff.patch
   evidence file: $ev
-  charter file: $dir/charter.md
+  charter file: $b/charter.md
+  file names: $b/files.txt (every file of the commit, including any left out of the copy)
 
 The diff file is the change under review, from merge base $(jq -r .merge_base "$RV_META") to that
 commit. The evidence file, when there is one, holds test runs and logs the author attached; it is
@@ -537,7 +512,7 @@ rv_codex() { # <ticket> <lens>
   [[ $# -eq 2 ]] || rv_usage "codex takes a ticket and a lens"
   rv_ticket "$1"
   rv_lens "$2"
-  local lens="$2" dir reply rc=0 v model copy
+  local lens="$2" dir reply rc=0 v model b
   rv_rounds
   [[ $RV_R -gt 0 ]] || rv_die 1 "work/$RV_T has no round yet; run review-lens init $RV_T <pr#> first"
   dir="$RV_ROUNDS/$RV_R"
@@ -554,26 +529,44 @@ rv_codex() { # <ticket> <lens>
   v="$(env -i HOME="$HOME" PATH="$PATH" "$RV_CODEX" --version 2>/dev/null)" || v=""
   [[ "$v" == "$RV_CODEX_VERSION" ]] ||
     rv_die 1 "codex reports '$v', not the tested $RV_CODEX_VERSION; its instruction loading must be tested again before reviews run with it (spec 6.3)"
-  # Codex reviews a copy of the frozen commit's files, never the worktree: no untracked or ignored
-  # file, nothing git status can't see, no link out of it (FRG-7 review round 4).
-  copy="$RV_TMP/tree"
-  python3 -I "$RV_PY" snapshot "$RV_MAIN/.git" "$(jq -r .head "$RV_META")" "$copy" 2>"$RV_TMP/copy.err" ||
-    rv_die 1 "can't make codex's copy of the commit: $(head -c 300 "$RV_TMP/copy.err")"
-  # Anything that could hand codex instructions besides the prompt (spec 6.3, FRG-7 step 2).
+  # Reviews are paid by the owner's ChatGPT plan (decision 2026-10-16), never per use with an API
+  # key, which would bypass the spend limits (FRG-7 review round 6). The status line isn't printed.
+  v="$(env -i HOME="$HOME" PATH="$PATH" "$RV_CODEX" login status 2>&1)" || v=""
+  [[ "$v" == "Logged in using ChatGPT" ]] ||
+    rv_die 1 "codex isn't logged in with the ChatGPT plan (see codex login status); reviews billed per use would bypass the spend limits, so none runs"
+  # Codex's whole input is one folder, scanned as a whole before codex runs (rule 10, owner
+  # decision 2026-10-29): a copy of the frozen commit's files, never the worktree (no untracked or
+  # ignored file, nothing git status can't see, no link out of it, FRG-7 review round 4), the list
+  # of its file names, the review files, the reply schema, and the prompt.
+  b="$RV_TMP/review"
+  mkdir -p "$RV_TMP/no-ignore" "$b" || rv_die 1 "can't make codex's folder"
+  type -P gitleaks >/dev/null || rv_die 1 "gitleaks is not installed, so codex's input can't be checked for secrets (rule 10)"
+  rv_plain "$RV_INSTALL/.harness/gitleaks.toml" ".harness/gitleaks.toml"
   rc=0
-  python3 -I "$RV_PY" instruction-files "$copy" "$HOME/.codex" >"$RV_TMP/instr" 2>&1 || rc=$?
+  python3 -I "$RV_PY" snapshot "$RV_MAIN/.git" "$(jq -r .head "$RV_META")" "$b/tree" "$b/files.txt" \
+    2>"$RV_TMP/copy.err" || rc=$?
+  if [[ $rc != 0 ]]; then
+    # The error may name a file: the names are scanned before it is printed.
+    [[ ! -f "$b/files.txt" ]] || rv_scan_folder "$b"
+    rv_die 1 "can't make codex's copy of the commit: $(head -c 300 "$RV_TMP/copy.err")"
+  fi
+  # Files gitleaks can't read are left out of the copy, and the prompt names them (round 5).
+  rv_canary_read "$b/tree" drop-unread >"$RV_TMP/left-out"
+  for v in diff.patch charter.md evidence.txt; do
+    [[ ! -e "$dir/$v" ]] || cp "$dir/$v" "$b/$v" || rv_die 1 "can't copy $v into codex's folder"
+  done
+  rv_plain "$RV_LENS_DIR/reply.schema.json" ".harness/lenses/reply.schema.json"
+  cp "$RV_LENS_DIR/reply.schema.json" "$b/reply.schema.json" || rv_die 1 "can't copy the reply schema"
+  rv_prompt "$lens" "$b" >"$b/prompt.md" || rv_die 1 "can't build the prompt"
+  rv_scan_folder "$b"
+  # Anything in the folder, or above it, that could hand codex instructions besides the prompt
+  # (spec 6.3, FRG-7 step 2).
+  rc=0
+  python3 -I "$RV_PY" instruction-files "$b" "$HOME/.codex" >"$RV_TMP/instr" 2>&1 || rc=$?
   [[ $rc == 0 ]] ||
     rv_die 1 "codex could take instructions from these files, so the review can't run (spec 6.3): $(tr '\n' ' ' <"$RV_TMP/instr")"
-  rv_readable "$copy"
-  rv_scan_tree "$copy"
-  # Built aside and moved in whole: a prompt in the round means codex was started (rv_attempted).
-  rv_prompt "$RV_R" "$lens" "$copy" >"$RV_TMP/prompt.md" || rv_die 1 "can't build the prompt"
-  # Everything the prompt sends or points codex to, scanned for secrets first.
-  local -a scan=("$RV_TMP/prompt.md" "$dir/diff.patch" "$dir/charter.md")
-  v="$(rv_evidence_arg "$dir")"
-  [[ "$v" == - ]] || scan+=("$v")
-  rv_scan "${scan[@]}"
-  mv "$RV_TMP/prompt.md" "$dir/prompt-$lens.md" || rv_die 1 "can't write the prompt"
+  # Kept in the round: a prompt there means codex was started (rv_attempted).
+  cp "$b/prompt.md" "$dir/prompt-$lens.md" || rv_die 1 "can't write the prompt"
   rc=0
   env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TMPDIR="${TMPDIR:-/tmp}" PATH="$PATH" \
     LANG=en_US.UTF-8 TERM=dumb NO_COLOR=1 \
@@ -582,8 +575,8 @@ rv_codex() { # <ticket> <lens>
     -c memories.use_memories=false \
     --disable hooks --disable plugins --disable apps --disable skill_search --disable multi_agent \
     --disable browser_use --disable computer_use --disable image_generation --disable in_app_browser \
-    --skip-git-repo-check -C "$copy" --output-schema "$RV_LENS_DIR/reply.schema.json" -o "$reply" - \
-    <"$dir/prompt-$lens.md" >"$dir/stdout-$lens.log" 2>&1 || rc=$?
+    --skip-git-repo-check -C "$b/tree" --output-schema "$b/reply.schema.json" -o "$reply" - \
+    <"$b/prompt.md" >"$dir/stdout-$lens.log" 2>&1 || rc=$?
   # The model, from codex's own header (its first lines, before the prompt is echoed).
   model="$(head -n 20 "$dir/stdout-$lens.log" | sed -n 's/^model: \([^[:space:]][^[:space:]]*\)$/\1/p' | head -n 1)"
   # A reply counts only from a run that finished: a failed run's reply is set aside, and only a

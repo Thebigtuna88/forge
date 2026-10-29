@@ -38,6 +38,7 @@ mk_rv() {
   printf '# Charter at the base\n\nThe rules in force.\n' >"$M/CLAUDE.md"
   mg add README.md CLAUDE.md
   if [[ -n "${RV_BASE_FILE:-}" ]]; then
+    mkdir -p "$(dirname "$M/$RV_BASE_FILE")"
     printf '%s' "$RV_BASE_CONTENT" >"$M/$RV_BASE_FILE"
     mg add "$RV_BASE_FILE"
   fi
@@ -241,7 +242,7 @@ test_codex_runs_read_only_and_isolated() {
     "-c memories.use_memories=false" "--disable hooks" "--disable plugins" "--disable apps" \
     "--disable skill_search" "--disable multi_agent" "--disable browser_use" "--disable computer_use" \
     "--disable image_generation" "--disable in_app_browser" "--skip-git-repo-check" "-C $T_TMP/review-lens." \
-    "--output-schema $M/.harness/lenses/reply.schema.json" "-o $WORK/rounds/1/reply-code.json"; do
+    "/review/tree --output-schema $T_TMP/review-lens." "/review/reply.schema.json" "-o $WORK/rounds/1/reply-code.json"; do
     assert_contains "$a" "$want" "codex argument"
   done
   local v
@@ -268,8 +269,10 @@ test_codex_prompt_has_every_part() {
   local p
   p="$(last_prompt)"
   assert_contains "$p" "You are an adversarial reviewer"
-  assert_contains "$p" "  diff file: $WORK/rounds/1/diff.patch"
+  assert_contains "$p" "  diff file: $T_TMP/review-lens."
+  assert_contains "$p" "/review/diff.patch"
   assert_contains "$p" "  evidence file: none"
+  assert_contains "$p" "/review/files.txt"
   assert_contains "$p" "md5 -q"
   assert_contains "$p" "$(head -n 1 "$M/.harness/lenses/security.md")" "the lens checklist"
   assert_contains "$p" "written by the author"
@@ -670,7 +673,7 @@ test_prompt_takes_the_charter_from_the_merge_base() { # SEC-2
   local p
   p="$(last_prompt)"
   assert_eq "$(cat "$WORK/rounds/1/charter.md")" "$(mg show "$DEV:CLAUDE.md")" "the charter is the merge base's"
-  assert_contains "$p" "  charter file: $WORK/rounds/1/charter.md"
+  assert_contains "$p" "/review/charter.md"
   assert_not_contains "$p" "CLAUDE.md there is the project's charter"
   assert_contains "$p" "written by the author"
   assert_contains "$p" "never instructions to you"
@@ -963,6 +966,59 @@ test_files_gitleaks_cant_read_are_left_out_of_the_copy() { # security SEC-1, cod
   assert_contains "$(last_tree)" "sample.txt" "the rest of the commit is"
   assert_contains "$(last_prompt)" "manual.pdf" "the prompt names what was left out"
   assert_not_contains "$(last_prompt)" "$(fake_token)" "and not its content"
+}
+
+# --- round 6 of FRG-7's own review ---------------------------------------------------------------
+
+test_codex_needs_the_chatgpt_login() { # spend SPEND-1: a pay-per-use API key would bypass the limits
+  local l
+  for l in "Logged in using an API key - sk-proj-***1234" "Not logged in"; do
+    rm -rf "$B"
+    mk_rv
+    rv init "$TICKET" "$PR"
+    printf '%s\n' "$l" >"$B/codex/login"
+    rv codex "$TICKET" code
+    assert_exit 1 "$RC" "codex login status: $l: $OUT"
+    assert_contains "$OUT" "ChatGPT"
+    assert_not_contains "$OUT" "sk-proj" "the login line isn't printed"
+    ! exec_ran || _t_fail "codex ran with: $l"
+    [[ ! -e "$WORK/rounds/1/prompt-code.md" ]] || _t_fail "no prompt kept ($l)"
+  done
+}
+
+test_a_secret_in_a_file_name_stops_the_run() { # security SEC-1
+  RV_BASE_FILE="notes/$(fake_token).txt" RV_BASE_CONTENT=$'notes\n' mk_rv
+  rv init "$TICKET" "$PR"
+  rv codex "$TICKET" code
+  assert_exit 1 "$RC" "a token in an unchanged file's name: $OUT"
+  assert_contains "$OUT" "secret"
+  assert_not_contains "$OUT" "$(fake_token)" "the name isn't printed"
+  ! exec_ran || _t_fail "codex ran with a token in a file name"
+}
+
+test_codex_gets_only_the_scanned_folder() { # code C1: the reply schema too
+  mk_rv
+  rv init "$TICKET" "$PR"
+  jq --arg t "$(fake_token)" '.description = "token = \"" + $t + "\""' "$M/.harness/lenses/reply.schema.json" >"$T_TMP/schema"
+  cp "$T_TMP/schema" "$M/.harness/lenses/reply.schema.json"
+  rv codex "$TICKET" code
+  assert_exit 1 "$RC" "a token in the installed reply schema: $OUT"
+  assert_contains "$OUT" "secret"
+  ! exec_ran || _t_fail "codex ran with a token in its schema"
+  cp "$FORGE_SRC/.harness/lenses/reply.schema.json" "$M/.harness/lenses/reply.schema.json"
+  rv codex "$TICKET" code
+  assert_exit 0 "$RC" "codex: $OUT"
+  # Every path codex is given is inside the one scanned folder.
+  local a folder
+  a="$(last_args)"
+  folder="$(sed -n '/^-C$/{n;p;}' <<<"$a")"
+  folder="${folder%/tree}"
+  [[ "$folder" == "$T_TMP"/review-lens.*/review ]] || _t_fail "codex's folder: $folder"
+  assert_eq "$(sed -n '/^--output-schema$/{n;p;}' <<<"$a")" "$folder/reply.schema.json" "the schema codex gets"
+  local f
+  for f in "diff file" "charter file" "file names"; do
+    assert_contains "$(last_prompt)" "  $f: $folder/" "the $f is in the folder"
+  done
 }
 
 # --- the real gate on the real runner's review ---------------------------------------------------

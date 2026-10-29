@@ -9,13 +9,15 @@
 #   check-reply <reply.json> <lens> <diff.patch> <evidence.txt or ->
 #       prints one JSON object: status VALID or INVALID, reason, verdict, findings, hash.
 #       Exit 0 if VALID, 3 if INVALID.
-#   snapshot <git dir> <commit> <out folder>
+#   snapshot <git dir> <commit> <out folder> <names file>
 #       writes the commit's files, and nothing else, into <out folder> (which must not exist), for
 #       codex to review instead of the worktree (FRG-7 review round 4): no untracked or ignored
 #       file, nothing git status can't see. Each blob is re-hashed against its object id, so a
 #       planted object can't show codex other content. A symbolic link, a submodule, a path that
 #       could leave the folder, or two paths that differ only in case (one file on macOS) is an
-#       error. Git runs with no system or global settings.
+#       error. Git runs with no system or global settings. Every path is first written to <names
+#       file>, one per line, so the names can be scanned for secrets before anything prints one
+#       (FRG-7 review round 6).
 #   canary-copy <copy> <out folder> <fake token>
 #       writes every file of <copy> under <out folder> with a line holding the fake token added at
 #       its end, for gitleaks to show which files it really reads (FRG-7 review round 5).
@@ -23,6 +25,8 @@
 #       removes from <copy> every file gitleaks reported nothing in, in the canary copy: a file it
 #       skipped (an archive, or one it takes for binary) and so couldn't scan for secrets. Prints
 #       their paths, one per line.
+#   unread <copy> <canary copy> <gitleaks report.json>
+#       the same, but only prints them.
 #   instruction-files <folder> <codex home>
 #       lists every file or folder that could hand codex instructions (spec 6.3, FRG-7 step 2):
 #       AGENTS.md, AGENTS.override.md, .agents/ or .codex/ anywhere in the worktree; AGENTS.md,
@@ -228,13 +232,15 @@ def git(git_dir, args, stdin=None):
     return r.stdout
 
 
-def snapshot(git_dir, commit, out):
+def snapshot(git_dir, commit, out, names_file):
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         sys.exit("%s is not a commit id" % commit)
+    items = [i for i in git(git_dir, ["ls-tree", "-r", "-z", "--full-tree", commit]).split(b"\0") if i]
+    with open(names_file, "xb") as f:
+        for item in items:
+            f.write(item.split(b"\t", 1)[1] + b"\n")
     entries = []
-    for item in git(git_dir, ["ls-tree", "-r", "-z", "--full-tree", commit]).split(b"\0"):
-        if not item:
-            continue
+    for item in items:
         meta, path = item.split(b"\t", 1)
         mode, kind, oid = meta.decode("ascii").split(" ")
         name = path.decode("utf-8", "surrogateescape")
@@ -299,7 +305,7 @@ def canary_copy(copy, out, token):
     return 0
 
 
-def drop_unread(copy, canary, report_file):
+def drop_unread(copy, canary, report_file, remove=True):
     try:
         report = json.loads(open(report_file, "rb").read().decode("utf-8"))
     except (OSError, UnicodeDecodeError, ValueError) as e:
@@ -314,7 +320,8 @@ def drop_unread(copy, canary, report_file):
             read.add(os.path.relpath(p, top))
     for rel in copy_files(copy):
         if rel not in read:
-            os.remove(os.path.join(copy, rel))
+            if remove:
+                os.remove(os.path.join(copy, rel))
             print(rel)
     return 0
 
@@ -375,15 +382,15 @@ def main(argv):
         return 0
     if len(argv) == 6 and argv[1] == "check-reply":
         return check_reply_main(argv[2], argv[3], argv[4], argv[5])
-    if len(argv) == 5 and argv[1] == "snapshot":
-        return snapshot(argv[2], argv[3], argv[4])
+    if len(argv) == 6 and argv[1] == "snapshot":
+        return snapshot(argv[2], argv[3], argv[4], argv[5])
     if len(argv) == 5 and argv[1] == "canary-copy":
         return canary_copy(argv[2], argv[3], argv[4])
-    if len(argv) == 5 and argv[1] == "drop-unread":
-        return drop_unread(argv[2], argv[3], argv[4])
+    if len(argv) == 5 and argv[1] in ("drop-unread", "unread"):
+        return drop_unread(argv[2], argv[3], argv[4], argv[1] == "drop-unread")
     if len(argv) == 4 and argv[1] == "instruction-files":
         return instruction_files(argv[2], argv[3])
-    sys.stderr.write("usage: review_lib.py lenses <type> <raw> | check-reply <reply> <lens> <diff> <evidence|-> | snapshot <git dir> <commit> <out> | canary-copy <copy> <out> <token> | drop-unread <copy> <canary> <report> | instruction-files <folder> <codex home>\n")
+    sys.stderr.write("usage: review_lib.py lenses <type> <raw> | check-reply <reply> <lens> <diff> <evidence|-> | snapshot <git dir> <commit> <out> <names> | canary-copy <copy> <out> <token> | drop-unread|unread <copy> <canary> <report> | instruction-files <folder> <codex home>\n")
     return 2
 
 

@@ -1,6 +1,6 @@
 # Decision: the review runner is codex only, owner-only, and keeps evidence beside the diff
 
-- **Date:** 2026-10-28 and 2026-10-29 (two decisions that day)
+- **Date:** 2026-10-28 and 2026-10-29 (three decisions that day)
 - **Decided by:** owner (Thebigtuna88), one question at a time while approving the FRG-7 plan
 - **Status:** accepted
 
@@ -20,6 +20,11 @@
    that decided when it was required is removed. A CLEAN codex spend review is required on every
    PR, and both the runner and the merge gate refuse a computed lens list without `code`,
    `security` and `spend`, so neither a review nor an edit to the computation can leave it out.
+5. **Codex's whole input is one scanned folder** (2026-10-29, after FRG-7 review round 6). The
+   runner builds one folder per run (the copy of the commit, its file names, the review files,
+   the reply schema, the prompt), gitleaks must read every file in it and find nothing, and codex
+   is given nothing outside it. Codex can still open other files of this macOS user by full path
+   (L16, open until FRG-27).
 
 ## Why
 
@@ -35,6 +40,11 @@
    run per round (run alongside the others) and a little more of the Codex allowance. The same
    choice as FRG-4's gh reads (`2026-10-19-gh-reads-plain.md`): a smaller rule instead of patching
    trick by trick.
+5. Rounds 3, 4, 5 and 6 each found one more thing codex received that the scan didn't cover
+   (evidence and notes, the live worktree, files gitleaks skips, file names and the schema). One
+   folder makes "scanned" a single rule to test, not a list of inputs to keep complete. The
+   alternative, keeping the scans as a best-effort extra and recording the gap as a known limit,
+   was not taken.
 
 ## Not changed
 
