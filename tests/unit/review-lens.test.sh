@@ -721,6 +721,89 @@ test_codex_needs_its_checklist() { # C4
   ! exec_ran || _t_fail "codex ran without its checklist"
 }
 
+# --- round 2 of FRG-7's own review ---------------------------------------------------------------
+
+test_spend_list_shape_is_the_spend_gates() { # spend SPEND-1, code C3, security SEC-2
+  local d="$T_TMP/lists" c
+  mkdir -p "$d"
+  printf '{"providers": {"manual": {"enabled": true}, "x": {"enabled": false, "hosts": [], "key_vars": [], "commands": []}}, "payments": {"hosts": [], "key_vars": [], "commands": []}, "always_blocked": ["sk_live_"]}\n' >"$d/ok.json"
+  printf '{"providers": {"x": {"enabled": false, "monthly_cap_usd": 0}}, "payments": {"hosts": [], "key_vars": [], "commands": []}, "always_blocked": ["sk_live_"]}\n' >"$d/no-lists.json"
+  printf '{"providers": {"x": {"hosts": [], "key_vars": [], "commands": []}}, "always_blocked": ["sk_live_"]}\n' >"$d/no-payments.json"
+  printf '{"providers": {"x": {"hosts": [], "key_vars": [], "commands": []}}, "payments": {"hosts": [], "key_vars": [], "commands": []}, "always_blocked": []}\n' >"$d/no-blocked.json"
+  assert_eq "$(SPEND_LIST="$d/ok.json" lenses_for harness src/a.sh $'x\n')" "code security " "manual needs no lists"
+  for c in no-lists no-payments no-blocked; do
+    assert_contains "$(SPEND_LIST="$d/$c.json" lenses_for harness src/a.sh $'x\n')" "spend-limits" "$c refuses"
+  done
+}
+
+test_a_newer_attempt_hides_no_older_clean() { # code C1
+  mk_rv
+  rv init "$TICKET" "$PR"
+  round code security
+  rv init "$TICKET" "$PR"
+  printf '1\n' >"$B/codex/rc"
+  rv codex "$TICKET" code
+  rm "$B/codex/rc"
+  rv finalize "$TICKET" "$PR"
+  assert_exit 1 "$RC" "round 2's failed code run is the latest: $OUT"
+  rv init "$TICKET" "$PR"
+  round code
+  rv codex "$TICKET" security
+  rm "$WORK/rounds/3/reply-security.json" "$WORK/rounds/3/codex-security.ok"
+  rv finalize "$TICKET" "$PR"
+  assert_exit 1 "$RC" "round 3's unfinished security run (only its prompt left) is the latest: $OUT"
+}
+
+test_a_failed_voluntary_lens_still_counts() { # security SEC-3
+  mk_rv
+  rv init "$TICKET" "$PR"
+  round code security
+  printf '1\n' >"$B/codex/rc"
+  rv codex "$TICKET" ios
+  rm "$B/codex/rc"
+  rv finalize "$TICKET" "$PR"
+  assert_exit 1 "$RC" "ios ran (and failed): $OUT"
+  assert_contains "$OUT" "ios"
+}
+
+test_an_unreadable_evidence_file_stops_init() { # code C2
+  mk_rv
+  mkdir -p "$WORK/evidence"
+  printf 'secret-free log\n' >"$WORK/evidence/a.txt"
+  chmod 000 "$WORK/evidence/a.txt"
+  rv init "$TICKET" "$PR"
+  chmod 644 "$WORK/evidence/a.txt"
+  assert_exit 1 "$RC" "init with an unreadable evidence file: $OUT"
+  [[ ! -e "$WORK/rounds/1" ]] || _t_fail "no round from a failed evidence join"
+}
+
+test_deferrals_must_match_a_verified_finding() { # security SEC-1
+  mk_rv
+  rv init "$TICKET" "$PR"
+  with_findings security "$(finding S1 blocker 'pushes main' 'no owner')" "$(finding S2 minor 'later' 'later')"
+  round security
+  gh_issue 31 OPEN
+  local bad
+  for bad in \
+    '[{"lens": "security", "finding": "S1", "round": 1, "severity": "minor", "title": "pushes main", "issue": 31}]' \
+    '[{"lens": "security", "finding": "S9", "round": 1, "severity": "minor", "title": "made up", "issue": 31}]' \
+    '[{"lens": "security", "finding": "S2", "round": 1, "severity": "minor", "title": "something else", "issue": 31}]'; do
+    printf '%s\n' "$bad" >"$WORK/deferred.json"
+    rv init "$TICKET" "$PR"
+    rv codex "$TICKET" code
+    assert_exit 1 "$RC" "a hand-made deferral reaches no prompt: $bad"
+    rv finalize "$TICKET" "$PR"
+    assert_exit 1 "$RC" "a hand-made deferral reaches no review.md: $bad"
+  done
+  rm "$WORK/deferred.json"
+  rv defer "$TICKET" security S2 31
+  assert_exit 0 "$RC" "a real deferral: $OUT"
+  rv init "$TICKET" "$PR"
+  rv codex "$TICKET" security
+  assert_exit 0 "$RC" "a real deferral is fine: $OUT"
+  assert_contains "$(last_prompt)" "checked against"
+}
+
 # --- the real gate on the real runner's review ---------------------------------------------------
 
 # mk_gate: the hooks' side of the sandbox: the merge gate, its runtime and config in M, and the
@@ -753,6 +836,18 @@ test_gate_accepts_the_runners_review() {
   assert_exit 0 "$RC" "finalize: $OUT"
   merge
   assert_exit 0 "$RC" "the gate on the runner's review.md: $OUT"
+  # Round 2 of FRG-7's review: a later attempt (failed or unfinished) and a lens that ran but isn't
+  # listed make review.md stale.
+  local f
+  for f in rounds/2/reply-code.failed.json rounds/2/prompt-security.md rounds/1/reply-ios.json; do
+    mkdir -p "$WORK/$(dirname "$f")"
+    printf '{}\n' >"$WORK/$f"
+    merge
+    assert_exit 2 "$RC" "the gate with $f there"
+    rm "$WORK/$f"
+  done
+  merge
+  assert_exit 0 "$RC" "the gate again without them: $OUT"
 }
 
 test_gate_requires_the_computed_lenses() {

@@ -73,25 +73,33 @@ def raw_paths(raw):
 
 def spend_words(spend_file):
     # (texts matched anywhere, ignoring case; commands matched as whole words) from
-    # spend-limits.json: hosts, key_vars and commands of every provider and of payments, and
-    # always_blocked. Anything that isn't the expected shape is an error.
-    def strings(v, where):
+    # spend-limits.json: hosts, key_vars and commands of every provider but manual and of
+    # payments, and always_blocked. The shape is the one gate-spend requires (hookrt.sh): a
+    # providers object, a payments object, all three lists on each of those sections (empty is
+    # fine) and a non-empty always_blocked; anything else is an error (FRG-7 review round 2).
+    def strings(section, key, where):
+        if key not in section:
+            raise ValueError("%s has no %s list" % (where, key))
+        v = section[key]
         if not isinstance(v, list) or not all(isinstance(s, str) and s for s in v):
-            raise ValueError("%s is not a list of texts" % where)
+            raise ValueError("%s.%s is not a list of texts" % (where, key))
         return v
     try:
         doc = json.loads(open(spend_file, "rb").read().decode("utf-8"))
         if not isinstance(doc, dict) or not isinstance(doc.get("providers"), dict):
             raise ValueError("no providers object")
-        sections = list(doc["providers"].items())
-        if "payments" in doc:
-            sections.append(("payments", doc["payments"]))
-        texts, commands = list(strings(doc.get("always_blocked", []), "always_blocked")), []
+        if not isinstance(doc.get("payments"), dict):
+            raise ValueError("no payments object")
+        sections = [(n, p) for n, p in doc["providers"].items() if n != "manual"] + [("payments", doc["payments"])]
+        texts = list(strings(doc, "always_blocked", "the file"))
+        if not texts:
+            raise ValueError("always_blocked is empty")
+        commands = []
         for name, p in sections:
             if not isinstance(p, dict):
                 raise ValueError("%s is not an object" % name)
-            texts += strings(p.get("hosts", []), name + ".hosts") + strings(p.get("key_vars", []), name + ".key_vars")
-            commands += strings(p.get("commands", []), name + ".commands")
+            texts += strings(p, "hosts", name) + strings(p, "key_vars", name)
+            commands += strings(p, "commands", name)
     except (OSError, UnicodeDecodeError, ValueError) as e:
         sys.exit("spend-limits.json can't be read (%s), so the spend lens can't be worked out" % e)
     return texts, commands

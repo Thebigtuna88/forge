@@ -229,6 +229,49 @@ rv_text() { # <file> <fallback>: a plain file's text, or the fallback when there
 
 rv_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+rv_deferrals() { # <out file>: work/<ticket>/deferred.json, every entry checked against the
+  # reviewer's own verified finding (same lens, round, id, severity and title, not a blocker), or
+  # [] when there is none. A hand-written entry stops the command: deferrals reach a prompt or
+  # review.md only as review-lens defer recorded them (FRG-7 review round 2).
+  local list="$RV_WORK/deferred.json" n i lens id k vf entry
+  if [[ ! -e "$list" && ! -L "$list" ]]; then
+    printf '[]\n' >"$1"
+    return 0
+  fi
+  rv_plain "$list" "work/$RV_T/deferred.json"
+  jq -e 'type == "array" and all(.[]; type == "object" and (.lens | type) == "string"
+      and (.finding | type) == "string" and (.round | type) == "number" and (.severity | type) == "string"
+      and (.title | type) == "string" and (.issue | type) == "number" and .round >= 1
+      and .round == (.round | floor) and .issue >= 1 and .issue == (.issue | floor))' "$list" >/dev/null 2>&1 ||
+    rv_die 1 "work/$RV_T/deferred.json can't be read"
+  n="$(jq length "$list")"
+  for ((i = 0; i < n; i++)); do
+    entry="$(jq -c ".[$i]" "$list")"
+    lens="$(jq -r .lens <<<"$entry")"
+    id="$(jq -r .finding <<<"$entry")"
+    k="$(jq -r .round <<<"$entry")"
+    [[ "$lens" =~ ^[a-z]+$ && "$RV_KNOWN" == *" $lens "* && "$id" =~ ^[A-Za-z0-9._-]{1,40}$ && "$k" =~ $RV_ROUND_RE ]] ||
+      rv_die 1 "work/$RV_T/deferred.json has an entry that isn't a lens, finding id and round"
+    vf="$RV_ROUNDS/$k/verified-$lens.json"
+    if ! { [[ -f "$vf" && ! -L "$vf" ]] &&
+      jq -e --argjson e "$entry" '.status == "VALID" and ([.findings[] | select(.id == $e.finding)] | length == 1)
+        and all(.findings[] | select(.id == $e.finding); .severity == $e.severity and .severity != "blocker"
+          and (.title | gsub("\\s+"; " ")) == $e.title)' "$vf" >/dev/null 2>&1; }; then
+      rv_die 1 "work/$RV_T/deferred.json's $lens $id (round $k) doesn't match a non-blocker finding the $lens reviewer reported in a verified round; only review-lens defer records deferrals"
+    fi
+  done
+  cp "$list" "$1" || rv_die 1 "can't read work/$RV_T/deferred.json"
+}
+
+rv_attempted() { # <round> <lens>: 0 if codex was started for the lens in that round: its prompt,
+  # its reply or a failed run's reply is there (a link counts). FRG-7 review round 2.
+  local d="$RV_ROUNDS/$1" f
+  for f in "$d/prompt-$2.md" "$d/reply-$2.json" "$d/reply-$2.failed.json"; do
+    [[ -e "$f" || -L "$f" ]] && return 0
+  done
+  return 1
+}
+
 # --- init ------------------------------------------------------------------------------------------
 
 rv_init() { # <ticket> <pr#>
@@ -242,7 +285,7 @@ rv_init() { # <ticket> <pr#>
   [[ "$RV_PR_HEAD" == "$RV_HEAD" ]] ||
     rv_die 1 "PR #$2's head on GitHub is $RV_PR_HEAD, but the worktree is at $RV_HEAD; push the branch, or review what GitHub has"
   rv_compare
-  local fz="$RV_TMP/freeze" ev="$RV_WORK/evidence" f r dir emd5=null ebytes=null
+  local fz="$RV_TMP/freeze" ev="$RV_WORK/evidence" f r dir size emd5=null ebytes=null
   local -a names=()
   rv_freeze "$fz"
   rv_required "$fz" "$RV_TMP/required"
@@ -264,11 +307,17 @@ rv_init() { # <ticket> <pr#>
     done
   fi
   if [[ ${#names[@]} -gt 0 ]]; then
+    # Each read is checked: a file that can't be read stops init, so no round freezes partial
+    # evidence (FRG-7 review round 2).
+    : >"$fz/evidence.txt" || rv_die 1 "can't start the evidence file"
     for f in "${names[@]}"; do
-      printf '===== EVIDENCE FILE: %s (%s bytes) =====\n' "${f##*/}" "$(wc -c <"$f" | tr -d ' ')"
-      cat "$f"
-      printf '\n'
-    done >"$fz/evidence.txt" || rv_die 1 "can't join the evidence files"
+      size="$(wc -c <"$f" | tr -d ' ')" || rv_die 1 "can't read work/$RV_T/evidence/${f##*/}"
+      [[ "$size" =~ ^[0-9]+$ ]] || rv_die 1 "can't read work/$RV_T/evidence/${f##*/}"
+      if ! { printf '===== EVIDENCE FILE: %s (%s bytes) =====\n' "${f##*/}" "$size" >>"$fz/evidence.txt" &&
+        cat "$f" >>"$fz/evidence.txt" && printf '\n' >>"$fz/evidence.txt"; }; then
+        rv_die 1 "can't read work/$RV_T/evidence/${f##*/}"
+      fi
+    done
     emd5="\"$(md5 -q "$fz/evidence.txt")\""
     ebytes="$(wc -c <"$fz/evidence.txt" | tr -d ' ')"
   fi
@@ -338,13 +387,12 @@ EOF
   printf '\n## The change, as described by its author (written by the author, who wants it merged: do not trust it)\n\n'
   rv_text "$RV_WORK/context.md" "(none)"
   printf '\n## Already deferred to open issues (do not report these again)\n\n'
-  if [[ -e "$RV_WORK/deferred.json" || -L "$RV_WORK/deferred.json" ]]; then
-    rv_plain "$RV_WORK/deferred.json"
-    jq -r '.[] | "- \(.lens) \(.finding) (round \(.round)): \(.title | gsub("\\s+"; " ")) → issue #\(.issue)"' \
-      "$RV_WORK/deferred.json" || rv_die 1 "work/$RV_T/deferred.json can't be read"
-  else
-    printf '(none)\n'
-  fi
+  printf 'Each was recorded with review-lens defer and checked against the reviewer'"'"'s own verified\n'
+  printf 'finding (lens, round, id, severity, title); none is a blocker. If one of them is worse than\n'
+  printf 'its severity says, or a fix made it worse, report it.\n\n'
+  rv_deferrals "$RV_TMP/deferred.prompt"
+  jq -r 'if length == 0 then "(none)" else .[] | "- \(.lens) \(.finding) (round \(.round), \(.severity)): \(.title) → issue #\(.issue)" end' \
+    "$RV_TMP/deferred.prompt" || rv_die 1 "can't list the deferred findings"
   printf '\n## Found and fixed in earlier rounds, as the author describes it (check each fix holds; report a regression)\n\n'
   rv_text "$RV_WORK/fixes.md" "(none)"
   cat <<EOF
@@ -382,7 +430,9 @@ rv_codex() { # <ticket> <lens>
   python3 -I "$RV_PY" instruction-files "$RV_WT" "$HOME/.codex" >"$RV_TMP/instr" 2>&1 || rc=$?
   [[ $rc == 0 ]] ||
     rv_die 1 "codex could take instructions from these files, so the review can't run (spec 6.3): $(tr '\n' ' ' <"$RV_TMP/instr")"
-  rv_prompt "$RV_R" "$lens" >"$dir/prompt-$lens.md" || rv_die 1 "can't write the prompt"
+  # Built aside and moved in whole: a prompt in the round means codex was started (rv_attempted).
+  rv_prompt "$RV_R" "$lens" >"$RV_TMP/prompt.md" || rv_die 1 "can't build the prompt"
+  mv "$RV_TMP/prompt.md" "$dir/prompt-$lens.md" || rv_die 1 "can't write the prompt"
   rc=0
   env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TMPDIR="${TMPDIR:-/tmp}" PATH="$PATH" \
     LANG=en_US.UTF-8 TERM=dumb NO_COLOR=1 \
@@ -510,12 +560,7 @@ rv_defer() { # <ticket> <lens> <finding id> <issue#>
   state="$(jq -ser 'if length == 1 and (.[0].state | type) == "string" then .[0].state else "unreadable" end' "$RV_TMP/issue.json" 2>/dev/null)" ||
     state=unreadable
   [[ "$state" == OPEN ]] || rv_die 1 "issue #$issue is $state; a deferred finding needs an open issue (rule 5)"
-  if [[ -e "$list" || -L "$list" ]]; then
-    rv_plain "$list"
-    cp "$list" "$RV_TMP/deferred.json"
-  else
-    printf '[]\n' >"$RV_TMP/deferred.json"
-  fi
+  rv_deferrals "$RV_TMP/deferred.json"
   jq -e --arg l "$lens" --arg i "$id" --argjson k "$k" 'type == "array" and all(.[]; .lens != $l or .finding != $i or .round != $k)' \
     "$RV_TMP/deferred.json" >/dev/null || rv_die 1 "$lens $id (round $k) is already deferred, or deferred.json can't be read"
   jq --arg l "$lens" --arg i "$id" --argjson k "$k" --arg s "$sev" --arg t "$title" --argjson n "$issue" \
@@ -543,12 +588,13 @@ rv_finalize() { # <ticket> <pr#>
   bytes="$(wc -c <"$now/diff.patch" | tr -d ' ')"
   mb="$(cat "$now/merge-base")"
   rv_rounds
-  # The lenses the diff requires, and any other lens that ran in any round: a lens run voluntarily
-  # counts like a required one, so its findings can't be dropped by leaving it out.
+  # The lenses the diff requires, and any other lens started in any round, even if its run failed:
+  # a lens run voluntarily counts like a required one, so its findings can't be dropped by leaving
+  # it out (FRG-7 review rounds 1 and 2).
   for lens in $RV_KNOWN; do
     grep -qx "$lens" "$RV_TMP/required" && continue
     for ((i = 0; i < ${#RV_LIST[@]}; i++)); do
-      if [[ -e "$RV_ROUNDS/${RV_LIST[i]}/reply-$lens.json" || -L "$RV_ROUNDS/${RV_LIST[i]}/reply-$lens.json" ]]; then
+      if rv_attempted "${RV_LIST[i]}" "$lens"; then
         printf '%s\n' "$lens" >>"$RV_TMP/required"
         break
       fi
@@ -556,14 +602,18 @@ rv_finalize() { # <ticket> <pr#>
   done
   printf '[]\n' >"$lenses"
   while IFS= read -r lens; do
+    # The lens's latest round is the latest one it was started in, finished or not: a newer failed
+    # or unfinished run never falls back to an older CLEAN (FRG-7 review round 2).
     k=""
     for ((i = ${#RV_LIST[@]} - 1; i >= 0; i--)); do
-      if [[ -e "$RV_ROUNDS/${RV_LIST[i]}/reply-$lens.json" || -L "$RV_ROUNDS/${RV_LIST[i]}/reply-$lens.json" ]]; then
+      if rv_attempted "${RV_LIST[i]}" "$lens"; then
         k="${RV_LIST[i]}"
         break
       fi
     done
     [[ -n "$k" ]] || rv_die 1 "the $lens lens is required and hasn't reviewed PR #$2"
+    [[ -f "$RV_ROUNDS/$k/reply-$lens.json" && ! -L "$RV_ROUNDS/$k/reply-$lens.json" ]] ||
+      rv_die 1 "the $lens lens's latest run (round $k) didn't finish with a reply; run it again in a new round"
     rv_meta "$k"
     meta="$RV_META"
     [[ "$(jq -r .head "$meta")" == "$RV_PR_HEAD" ]] ||
@@ -589,14 +639,7 @@ rv_finalize() { # <ticket> <pr#>
     mv "$lenses.new" "$lenses" || rv_die 1 "can't collect the lenses"
     table+="| $lens | codex | $model | $k | CLEAN |"$'\n'
   done <"$RV_TMP/required"
-  if [[ -e "$RV_WORK/deferred.json" || -L "$RV_WORK/deferred.json" ]]; then
-    rv_plain "$RV_WORK/deferred.json"
-    cp "$RV_WORK/deferred.json" "$deferred"
-  else
-    printf '[]\n' >"$deferred"
-  fi
-  jq -e 'type == "array" and all(.[]; (.issue | type) == "number")' "$deferred" >/dev/null ||
-    rv_die 1 "work/$RV_T/deferred.json can't be read"
+  rv_deferrals "$deferred"
   while IFS= read -r n; do
     rv_gh issue view "$n" --repo "$RV_REPO" --json state >"$RV_TMP/issue.json" 2>"$RV_TMP/gh.err" ||
       rv_die 1 "can't read issue #$n from GitHub"

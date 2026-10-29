@@ -96,9 +96,11 @@ while IFS=$'\x1f' read -r lens mech verdict reply rsha rounds; do
   [[ "$rounds" =~ ^[1-9][0-9]*$ ]] ||
     hr_deny "review.md records '$rounds' rounds for the $lens lens, not a whole number written out"
   # A link counts as there even when it points nowhere (-L): a broken or unreadable later round is
-  # still a later round (review round 9).
-  for later in "$work"/rounds/*/reply-"$lens".json; do
-    k="${later%/reply-*}"
+  # still a later round (review round 9). So does a later run that failed (reply-<lens>.failed.json)
+  # or never finished (only its prompt): it is the lens's latest attempt (FRG-7 review round 2).
+  for later in "$work"/rounds/*/reply-"$lens".json "$work"/rounds/*/reply-"$lens".failed.json \
+    "$work"/rounds/*/prompt-"$lens".md; do
+    k="${later%/*}"
     k="${k##*/}"
     if [[ (-e "$later" || -L "$later") && ! "$k" =~ ^[1-9][0-9]*$ ]]; then
       hr_deny "work/$ticket/rounds/$k/ is not a round number, so the $lens lens's rounds can't be checked"
@@ -125,6 +127,16 @@ while IFS= read -r lens; do
   [[ "$seen" == *" $lens "* ]] ||
     hr_deny "work/$ticket/review.md has no $lens lens, and PR #$HR_PR's diff requires it (spec 6.2: required lenses are computed, not chosen)"
 done <"$HR_TMP/lenses.req"
+# A lens that was started in any round, required or not, must be listed (and so CLEAN): its
+# findings can't be dropped by leaving it out of review.md (FRG-7 review round 2).
+for lens in code security frontend ios spend; do
+  for ran in "$work"/rounds/*/reply-"$lens".json "$work"/rounds/*/reply-"$lens".failed.json \
+    "$work"/rounds/*/prompt-"$lens".md; do
+    if [[ (-e "$ran" || -L "$ran") && "$seen" != *" $lens "* ]]; then
+      hr_deny "the $lens lens ran (work/$ticket/${ran#"$work"/}) but review.md doesn't list it; every lens that ran must be CLEAN"
+    fi
+  done
+done
 
 jq -r "$HR_JQ_FIELDS"'.deferred[] | [.finding, (.issue | tostring)] | fields' "$HR_TMP/review.json" \
   >"$HR_TMP/deferred" 2>/dev/null ||
