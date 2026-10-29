@@ -9,7 +9,14 @@
 #   check-reply <reply.json> <lens> <diff.patch> <evidence.txt or ->
 #       prints one JSON object: status VALID or INVALID, reason, verdict, findings, hash.
 #       Exit 0 if VALID, 3 if INVALID.
-#   instruction-files <worktree> <codex home>
+#   snapshot <git dir> <commit> <out folder>
+#       writes the commit's files, and nothing else, into <out folder> (which must not exist), for
+#       codex to review instead of the worktree (FRG-7 review round 4): no untracked or ignored
+#       file, nothing git status can't see. Each blob is re-hashed against its object id, so a
+#       planted object can't show codex other content. A symbolic link, a submodule, a path that
+#       could leave the folder, or two paths that differ only in case (one file on macOS) is an
+#       error. Git runs with no system or global settings.
+#   instruction-files <folder> <codex home>
 #       lists every file or folder that could hand codex instructions (spec 6.3, FRG-7 step 2):
 #       AGENTS.md, AGENTS.override.md, .agents/ or .codex/ anywhere in the worktree; AGENTS.md,
 #       AGENTS.override.md or .agents/ in any folder above it; AGENTS.md or AGENTS.override.md
@@ -19,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 
 LENSES = ["code", "security", "frontend", "ios", "spend"]
@@ -201,6 +209,68 @@ def check_reply_main(reply_file, lens, diff_file, evidence_file):
     return 0
 
 
+# --- the copy codex reviews (spec 6.3) ------------------------------------------------------------
+
+def git(git_dir, args, stdin=None):
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ATTR_NOSYSTEM": "1"}
+    r = subprocess.run(["git", "--git-dir=" + git_dir, "-c", "core.commitGraph=false"] + args,
+                       input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    if r.returncode != 0:
+        sys.exit("git %s failed: %s" % (args[0], r.stderr.decode("utf-8", "replace").strip()[:200]))
+    return r.stdout
+
+
+def snapshot(git_dir, commit, out):
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        sys.exit("%s is not a commit id" % commit)
+    entries = []
+    for item in git(git_dir, ["ls-tree", "-r", "-z", "--full-tree", commit]).split(b"\0"):
+        if not item:
+            continue
+        meta, path = item.split(b"\t", 1)
+        mode, kind, oid = meta.decode("ascii").split(" ")
+        name = path.decode("utf-8", "surrogateescape")
+        parts = name.split("/")
+        if name.startswith("/") or any(p in ("", ".", "..") or p.lower() == ".git" for p in parts):
+            sys.exit("the commit has a path codex's copy can't hold: %r" % name)
+        if mode == "120000":
+            sys.exit("the commit has a symbolic link, %s, which could lead codex to any file; the review runner doesn't review links" % name)
+        if mode == "160000":
+            sys.exit("the commit has a submodule, %s; the review runner doesn't review submodules" % name)
+        if kind != "blob" or mode not in ("100644", "100755"):
+            sys.exit("the commit has %s with mode %s, which codex's copy can't hold" % (name, mode))
+        entries.append((path, mode, oid))
+    # macOS folds case in names: two paths (or folders) that differ only in case would become one.
+    seen = {}
+    for path, _, _ in entries:
+        parts = path.decode("utf-8", "surrogateescape").split("/")
+        for k in range(1, len(parts) + 1):
+            name = "/".join(parts[:k])
+            if seen.setdefault(name.lower(), name) != name:
+                sys.exit("two paths in the commit differ only in case (%s, %s); on macOS they are one" %
+                         (seen[name.lower()], name))
+    batch = git(git_dir, ["cat-file", "--batch"], b"".join(oid.encode("ascii") + b"\n" for _, _, oid in entries))
+    os.mkdir(out, 0o755)
+    i = 0
+    for path, mode, oid in entries:
+        head_end = batch.index(b"\n", i)
+        got_oid, kind, size = batch[i:head_end].decode("ascii").split(" ")
+        size = int(size)
+        data = batch[head_end + 1:head_end + 1 + size]
+        i = head_end + 1 + size + 1
+        if got_oid != oid or kind != "blob" or len(data) != size or \
+                hashlib.sha1(b"blob %d\0" % size + data).hexdigest() != oid:
+            sys.exit("object %s doesn't hash to its id; the copy would not be the commit" % oid)
+        target = os.path.join(os.fsencode(out), path)
+        os.makedirs(os.path.dirname(target), 0o755, exist_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o755 if mode == "100755" else 0o644)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    return 0
+
+
 # --- instruction files (spec 6.3) ------------------------------------------------------------------
 
 DOC_NAMES = {"agents.md", "agents.override.md"}
@@ -257,9 +327,11 @@ def main(argv):
         return 0
     if len(argv) == 6 and argv[1] == "check-reply":
         return check_reply_main(argv[2], argv[3], argv[4], argv[5])
+    if len(argv) == 5 and argv[1] == "snapshot":
+        return snapshot(argv[2], argv[3], argv[4])
     if len(argv) == 4 and argv[1] == "instruction-files":
         return instruction_files(argv[2], argv[3])
-    sys.stderr.write("usage: review_lib.py lenses <type> <raw> | check-reply <reply> <lens> <diff> <evidence|-> | instruction-files <worktree> <codex home>\n")
+    sys.stderr.write("usage: review_lib.py lenses <type> <raw> | check-reply <reply> <lens> <diff> <evidence|-> | snapshot <git dir> <commit> <out> | instruction-files <folder> <codex home>\n")
     return 2
 
 

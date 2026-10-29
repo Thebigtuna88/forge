@@ -766,13 +766,26 @@ codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules -
   -c memories.use_memories=false --disable hooks --disable plugins --disable apps \
   --disable skill_search --disable multi_agent --disable browser_use --disable computer_use \
   --disable image_generation --disable in_app_browser \
-  -C <worktree> --output-schema .harness/lenses/reply.schema.json \
+  --skip-git-repo-check -C <copy of the commit> --output-schema .harness/lenses/reply.schema.json \
   -o work/<T>/rounds/<r>/reply-<lens>.json - < prompt-<lens>.md
 ```
 
+- **Codex reviews a copy of the commit, not the worktree** (FRG-7 review round 4). For each run,
+  `review_lib.py snapshot` writes the frozen head's files, and nothing else, into a fresh scratch
+  folder outside any git checkout, re-hashing every blob against its object id; it refuses a
+  symbolic link (which could lead anywhere), a submodule, and two paths that differ only in case.
+  So an untracked or ignored file (a `.env`) isn't there, and neither is a change git status
+  can't see (`assume-unchanged`, `skip-worktree`): codex reads exactly the committed files the
+  diff and the gate describe. The copy is removed when the run ends.
 - `read-only` means codex can read files and run read-only commands (needed to compute the
   fingerprints) but can't change anything. `--ephemeral` keeps no session files. It runs with a
   fixed, minimal environment.
+- **What codex can still read: any file this macOS user can.** Codex's read-only sandbox limits
+  writes, not reads; codex 0.163.0 has no setting the runner could use to keep reads inside the
+  copy. The prompt tells it to read only the copy and the review files, which lowers the risk
+  without removing it: a reviewer that opens another file by its full path (a key in the home
+  folder, a `.env` in the worktree) sends it to OpenAI unscanned. Open as **L16** until codex
+  runs as a user that can't read them (FRG-27).
 - **Codex loads no instruction file by itself** (tested on this Mac for codex 0.163.0, FRG-7
   step 2, `work/FRG-7-review-runner/codex-isolation.md`). Codex follows `AGENTS.md` and
   `AGENTS.override.md` files from the repository root down to the folder it runs in, and lists
@@ -782,7 +795,7 @@ codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules -
   the user's codex settings (plugins, helper servers, trust) out; the rest turns off tools a
   review doesn't need. Project `.codex/` settings and hooks load only for trusted projects, and
   with the user settings ignored none is trusted. Belt and braces, `codex` refuses to run when
-  the worktree holds an `AGENTS.md`, `AGENTS.override.md`, `.agents/` or `.codex/` at any depth,
+  the copy holds an `AGENTS.md`, `AGENTS.override.md`, `.agents/` or `.codex/` at any depth,
   when a folder above it holds an `AGENTS.md`, `AGENTS.override.md` or `.agents/`, or when codex's
   home holds an `AGENTS.md` or `AGENTS.override.md` (names compared without case). It also
   refuses any codex version but the tested one; a new version means re-running those tests and
@@ -790,14 +803,18 @@ codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules -
   report of what it was given, not a copy of the request. A folder this check can't look into
   (in the worktree, above it, or codex's home when it exists) counts as a hit, so an incomplete
   look never lets codex run (FRG-7 review round 3).
-- **Nothing unscanned leaves the Mac** (rule 10, FRG-7 review round 3). The prompt (with
-  `context.md`, `fixes.md` and the deferred findings in it), `diff.patch`, `charter.md` and
-  `evidence.txt` are scanned by gitleaks with FORGE's rules (never a repository's own config,
-  `.gitleaksignore` or `gitleaks:allow` comments) before codex runs. A detection, a missing
-  gitleaks or rules file, or a scan that fails stops the run, and so does a file gitleaks didn't
-  really read: each is scanned again with a fake token added at its end, which it must report (as
-  the hooks' `hr_scan_text`). A refused run leaves no prompt in the round. What a scan doesn't
-  know as a secret still goes out; the scan narrows rule 10's risk, it doesn't remove it.
+- **What the runner gives codex is scanned for secrets first** (rule 10, FRG-7 review rounds 3
+  and 4). The prompt (with `context.md`, `fixes.md` and the deferred findings in it),
+  `diff.patch`, `charter.md`, `evidence.txt` and every file of the copy, changed or not, are
+  scanned by gitleaks with FORGE's rules (never a repository's own config, `.gitleaksignore` or
+  `gitleaks:allow` comments) before codex runs. A detection, a missing gitleaks or rules file, or
+  a scan that fails stops the run. The prompt and the review files are also each scanned again
+  with a fake token added at their end, which gitleaks must report (as the hooks'
+  `hr_scan_text`), so a file it skipped as binary can't pass; the copy's files aren't, and
+  gitleaks skips what it takes for binary there, but their changes are in `diff.patch`, which is
+  checked as text. A refused run leaves no prompt in the round. What gitleaks doesn't know as a
+  secret still goes out, and so does any file codex opens outside the copy (L16); the scan
+  narrows rule 10's risk, it doesn't remove it.
 - **What remains: text in the reviewed files.** The reviewer reads the PR's own files, and any of
   them (code, comments, docs, the PR's copy of `CLAUDE.md`, the evidence) can address it, as a
   planted instruction would (prompt injection). The prompt names the charter as it was at the
@@ -859,7 +876,9 @@ the round; there is no separate prompt step to edit it between the two.
 6. **Stall:** if this lens's last two valid rounds have the same non-empty findings-hash (an
    INVALID round in between doesn't count), it writes `STALL.md` and exits 4. The agent must
    stop and hand the decision to the owner, and `init` refuses another round while `STALL.md`
-   exists. That's the only circuit breaker; there's no round limit.
+   exists. That's the only circuit breaker; there's no round limit. (Round folders are numbered
+   up to 999999999; `init` refuses to make one the other commands couldn't read, FRG-7 review
+   round 4.)
 
 **Any new commit invalidates all earlier CLEAN verdicts.** Every required lens must be CLEAN
 at the **current** head sha.
@@ -1291,7 +1310,7 @@ a known limit, with cleanup steps and when to revisit it, in
 | `handoff verify` | fails on each of checks 1–8 in 4.5, one test each; passes on a genuine run |
 | `hookrt.sh` | missing, malformed, unknown-value and missing-key `mode.json` all mean enforce; load failure denies |
 | each hook | deny and allow fixtures (conformance), including quoting tricks, `-C`, aliases, chained commands |
-| `review-lens` | read-proof mismatch means INVALID, for the diff and the evidence file (missing or mismatched evidence fields too); CLEAN with findings is rejected; refused mechanisms; findings-hash normalisation; stall after two identical rounds; required-lens computation (spend on every PR, and a computed list without code, security or spend refused by the runner and the gate); a new commit invalidates CLEAN; finalize refuses an incomplete set; codex runs isolated (its arguments and environment) and refuses instruction files, a folder it can't look into, and an untested codex version; nothing reaches codex that gitleaks finds a secret in or can't scan; git settings run no program, and filters and submodules are refused; hidden evidence files are refused; the merge gate accepts what `finalize` writes (FRG-7) |
+| `review-lens` | read-proof mismatch means INVALID, for the diff and the evidence file (missing or mismatched evidence fields too); CLEAN with findings is rejected; refused mechanisms; findings-hash normalisation; stall after two identical rounds; required-lens computation (spend on every PR, and a computed list without code, security or spend refused by the runner and the gate); a new commit invalidates CLEAN; finalize refuses an incomplete set; codex runs isolated (its arguments and environment) and refuses instruction files, a folder it can't look into, and an untested codex version; nothing reaches codex that gitleaks finds a secret in or can't scan, including unchanged files; codex reviews a copy of the commit (no ignored files, no edits git status hides, no links); git settings run no program, and filters and submodules are refused; hidden evidence files are refused; init never makes a round number the other commands refuse; the merge gate accepts what `finalize` writes (FRG-7) |
 | `gate-merge-on-review` | edited `review.md` text, a stale sha, a moved merge-base or `--auto` all deny |
 | `review-diff.sh` | the same bytes whatever the repository, global or environment settings; binary files shown as text; a missing commit, two merge bases or a forged object refused |
 | `status` | a failing `gh` prints `UNKNOWN`, never an empty list |
@@ -1332,6 +1351,7 @@ its mitigation and, where one exists, a stronger option the owner can adopt late
 | L12 | **Evidence the agent writes can be forged or swapped by the agent** (FRG-4 review round 1). The merge gate re-checks `review.md` and the reply files (binding, recomputed diff, hashes, read-proof), which proves which code they describe, not that a reviewer wrote them: the agent could write CLEAN replies and a matching `review.md` itself. Likewise a second command running at the same moment could replace a `--body-file` between the scan and `gh` sending it. | Agent, reviewer runner and files share one macOS user; nothing on disk is beyond the agent's reach. The review runner (FRG-7) changes nothing here: it, its checklists, codex's home folder and the review files are all writable by the agent's user. FRG-7 stops codex loading instruction files a **PR** plants and tells the reviewer the PR's text is not instructions (6.3); it doesn't stop text in the reviewed files trying to steer the reviewer, or anything the agent itself could change. | The gates stop mistakes and shortcuts, not a deliberately dishonest agent (as L1, L4); every PR touching an owner-only path is merged by the owner; review summaries are posted on the PR; charter rules 3, 6 and 9. **Decided 2026-10-18** (owner): accepted as a known limit. **Stays open** until FRG-27's tests pass (owner, 2026-10-20). | FRG-27 (#27): the runner and its output where the agent can't change them, a review user, each review bound to the exact commit; agent (and codex) as separate macOS users, or a GitHub machine account whose merges need the owner's approval (L2). |
 | L14 | **Shell writes to the main checkout are not prevented** (FRG-5, owner decision 2026-10-27). `guard-live-checkout` judges only the agent's file tools (Edit, Write, MultiEdit, NotebookEdit). A shell command (`echo x > CLAUDE.md`, `cp`, `mv`, `rm`, `sed -i`, or a script) can still change the main checkout, its handoff evidence, `pastes.log` or settings files. **Open: not resolved** until permission-based protection is implemented and tested. | A shell-write checker reads shell syntax, and FRG-5 review rounds 1-12 kept finding ordinary forms it misread. | Charter rule 1 (the main checkout is never edited by hand); `deny-commit-on-shared-checkout` stops commits there; verify's paste record (4.5); the file-tool guard. | FRG-26: the agent runs as a macOS user that can't write the main checkout, tested. FRG-32 (after the FRG-26 checkpoint) decides whether a shell-write checker is still needed. |
 | L13 | **Commands deliberately disguised from the gates** (FRG-4 review rounds 6-10). A command built to hide that it runs `gh`, `git` or a deploy tool (its name or words spelled so the text check doesn't recognise them) may not be judged as that tool. Accepted risk, not fixed: round 10's SEC-1, deferred to FRG-26. | The hooks read a command's text; what the shell makes of it can't be fully predicted, and each patch was followed by a new spelling. | The gates recognise ordinary commands and mistakes (conformance proves each listed case); the round 2-9 checks stay; charter rule 9; GitHub branch protection on `main` and `dev`. Against a deliberate attempt, nothing technical holds while the agent uses the owner's admin login (L2). **Decided 2026-10-19** (owner): `docs/decisions/2026-10-19-disguised-commands-known-limit.md`. | FRG-26: define what the agent's own GitHub credentials and macOS user must be unable to do, and test each restriction. A separate account alone isn't enough. |
+| L16 | **Codex can read any file the agent's macOS user can** (FRG-7 review round 4). Codex reviews a scanned copy of the commit and is told to read only that and the review files, but its read-only sandbox limits writes, not reads: if it opens another file by its full path (a key in the home folder, an ignored `.env` in the worktree), that file's text goes to OpenAI unscanned. **Open: not resolved.** | Codex runs as the agent's macOS user; codex 0.163.0 has no setting that keeps reads inside a folder. | Review of a copy holding only the commit's files, all scanned by gitleaks; the prompt's instruction; no real business credentials, payment access or production deploy access on this Mac until FRG-26's protections are tested (the owner's 5:00 limit). | FRG-27 (#27): codex as a separate macOS user that can read only the copy. |
 | L15 | **A failing CI run doesn't block a merge** (FRG-6, owner decision 2026-10-27). Harness CI runs on every PR into `dev` or `main`, but no protection rule requires its check, so a red PR can still be merged. And a green run isn't a full pass: GitHub's runners have no Claude Code, so conformance skips its version check there. | Requiring the check changes FORGE's branch protection, which waits for the FRG-26 checkpoint. | The owner merges every PR touching an owner-only path; each owner-merge handoff checks the CI result for the exact head and stops if it isn't green; `bash tests/run.sh` → `ALL PASS` on the owner's Mac before any merge. Practice and scripts, not GitHub rules. `docs/decisions/2026-10-27-ci-not-required-until-frg-34.md`. | FRG-34 (#34): passing CI and the owner's approval required on `dev` and `main`, every existing rule kept, after the FRG-26 checkpoint. |
 | L5 | **Read-proof proves access, not diligence.** A reviewer can hash the diff and still review it badly. | — | Adversarial prompt, structured findings, multiple lenses, stall rule, owner merges `main`. | Owner skims `review.md` for risky PRs. |
 | L6 | **Heuristic hooks.** The Stop hook `gate-owner-handoff-form` guesses from text. | Natural language is open-ended. | It starts in observe; the owner promotes it by PR after reviewing `observed.log`. | — |

@@ -10,7 +10,8 @@
 #   model              the model its header names (default: fake-model); "none" leaves the line out
 #   rc                 the exit status of `exec` (default 0)
 # It records, for call n: its arguments, one per line, in call-<n>.args, its environment in
-# call-<n>.env and the prompt it read on stdin in call-<n>.prompt.
+# call-<n>.env, the prompt it read on stdin in call-<n>.prompt and, for exec, every file in its -C
+# folder with its md5 in call-<n>.tree ("<path relative to the folder> <md5>", sorted).
 set -u
 dir="$(cd "$(dirname "$0")/../codex" 2>/dev/null && pwd)" || {
   echo "stub codex: no answer folder next to $0" >&2
@@ -38,6 +39,11 @@ for a in "$@"; do
   prev="$a"
 done
 cat >"$dir/call-$n.prompt"
+if [[ -n "$cd" && -d "$cd" ]]; then
+  (cd "$cd" && find . \( -type f -o -type l \) | sort | while IFS= read -r f; do
+    printf '%s %s\n' "${f#./}" "$(md5 -q "$f" 2>/dev/null || echo unreadable)"
+  done) >"$dir/call-$n.tree"
+fi
 lens="$(sed -n 's/^Set lens to "\([a-z]*\)"\.$/\1/p' "$dir/call-$n.prompt" | head -n 1)"
 diff="$(sed -n 's/^  diff file: //p' "$dir/call-$n.prompt" | head -n 1)"
 ev="$(sed -n 's/^  evidence file: //p' "$dir/call-$n.prompt" | head -n 1)"
