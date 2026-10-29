@@ -29,5 +29,7 @@
 ## Not changed
 
 Known limit L12: the runner, its files, codex's home folder and the agent share one macOS user.
-FRG-7 stops what a PR can plant for the reviewer (spec 6.3), not what the agent itself could
-change. It stays open until FRG-27's tests pass.
+FRG-7 stops codex loading instruction files a PR plants (spec 6.3), not text in the reviewed
+files trying to steer the reviewer (the prompt says it isn't instructions, which lowers that
+risk without removing it), and not what the agent itself could change. It stays open until
+FRG-27's tests pass.

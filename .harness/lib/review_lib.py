@@ -1,9 +1,12 @@
 # review_lib.py (FRG-7, spec 6): the review runner's checks that are easier to get exactly right
 # in Python than in bash. Run with python3 -I (no user site, no environment, no current folder on
 # the import path). Python 3.9 (Apple's /usr/bin/python3).
-#   lenses <project type> <raw> <diff.patch>
+#   lenses <project type> <raw> <diff.patch> <spend-limits.json>
 #       the lenses spec 6.2 requires for a frozen diff (review-diff.sh's raw and diff.patch), one
-#       per line. The runner and the merge gate both call this, so they can't disagree.
+#       per line. The runner and the merge gate both call this, so they can't disagree. The spend
+#       rule also reads every provider's and payments' hosts, key variables and commands (tools
+#       and SDK packages), and the always-blocked texts, from spend-limits.json; a missing or
+#       malformed list is an error, never an empty one.
 #   check-reply <reply.json> <lens> <diff.patch> <evidence.txt or ->
 #       prints one JSON object: status VALID or INVALID, reason, verdict, findings, hash.
 #       Exit 0 if VALID, 3 if INVALID.
@@ -20,6 +23,8 @@ import re
 import sys
 
 LENSES = ["code", "security", "frontend", "ios", "spend"]
+# A finding id: the reply schema's pattern, and the one review-lens defer accepts.
+ID_RE = r"^[A-Za-z0-9._-]{1,40}$"
 SEVERITIES = ["blocker", "major", "minor", "nit"]
 REPLY_KEYS = ["lens", "diff_md5", "diff_bytes", "evidence_md5", "evidence_bytes", "verdict", "findings"]
 FINDING_KEYS = ["id", "severity", "file", "line", "title", "detail", "evidence"]
@@ -28,8 +33,9 @@ FINDING_KEYS = ["id", "severity", "file", "line", "title", "detail", "evidence"]
 
 PROJECT_TYPES = ["harness", "web", "ios"]
 # spend: the spend limits, the spend gate, a budget wrapper, ledger, image generation, provider
-# adapter or payments code, or a paid-API host or key variable anywhere in the diff's text. The
-# lists are a floor: a lens can always be run when it isn't required.
+# adapter or payments code, or a paid-API host, key variable, tool or SDK package anywhere in the
+# diff's text: these lists, and spend-limits.json's (spend_words). The rule is a floor: any known
+# lens can also be run when it isn't required, and then counts like a required one.
 SPEND_PATHS = [
     re.compile(r"(^|/)spend-limits\.json$", re.I),
     re.compile(r"^\.claude/hooks/gate-spend\.sh$"),
@@ -65,17 +71,47 @@ def raw_paths(raw):
     return paths
 
 
-def lenses(project, raw_file, patch_file):
+def spend_words(spend_file):
+    # (texts matched anywhere, ignoring case; commands matched as whole words) from
+    # spend-limits.json: hosts, key_vars and commands of every provider and of payments, and
+    # always_blocked. Anything that isn't the expected shape is an error.
+    def strings(v, where):
+        if not isinstance(v, list) or not all(isinstance(s, str) and s for s in v):
+            raise ValueError("%s is not a list of texts" % where)
+        return v
+    try:
+        doc = json.loads(open(spend_file, "rb").read().decode("utf-8"))
+        if not isinstance(doc, dict) or not isinstance(doc.get("providers"), dict):
+            raise ValueError("no providers object")
+        sections = list(doc["providers"].items())
+        if "payments" in doc:
+            sections.append(("payments", doc["payments"]))
+        texts, commands = list(strings(doc.get("always_blocked", []), "always_blocked")), []
+        for name, p in sections:
+            if not isinstance(p, dict):
+                raise ValueError("%s is not an object" % name)
+            texts += strings(p.get("hosts", []), name + ".hosts") + strings(p.get("key_vars", []), name + ".key_vars")
+            commands += strings(p.get("commands", []), name + ".commands")
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        sys.exit("spend-limits.json can't be read (%s), so the spend lens can't be worked out" % e)
+    return texts, commands
+
+
+def lenses(project, raw_file, patch_file, spend_file):
     if project not in PROJECT_TYPES:
         sys.exit("unknown project type: %s (%s)" % (project, ", ".join(PROJECT_TYPES)))
+    texts, commands = spend_words(spend_file)
     paths = raw_paths(open(raw_file, "rb").read())
     text = open(patch_file, "rb").read().decode("utf-8", "replace")
+    low = text.lower()
     need = ["code", "security"]
     if project == "web" and any(r.search(p) for p in paths for r in FRONTEND_PATHS):
         need.append("frontend")
     if project == "ios":
         need.append("ios")
-    if any(r.search(p) for p in paths for r in SPEND_PATHS) or any(r.search(text) for r in SPEND_TEXT):
+    if (any(r.search(p) for p in paths for r in SPEND_PATHS) or any(r.search(text) for r in SPEND_TEXT)
+            or any(t.lower() in low for t in texts)
+            or any(re.search(r"(?<![A-Za-z0-9_-])" + re.escape(c) + r"(?![A-Za-z0-9_-])", text) for c in commands)):
         need.append("spend")
     for lens in need:
         print(lens)
@@ -150,8 +186,8 @@ def check_reply(reply_file, lens, diff_file, evidence_file):
         for k in ("id", "file", "title", "detail", "evidence"):
             if not isinstance(f[k], str):
                 raise Invalid("finding %d's %s is not text" % (n, k))
-        if not f["id"] or "\n" in f["id"] or len(f["id"]) > 40:
-            raise Invalid("finding %d's id must be one short line" % n)
+        if not re.fullmatch(ID_RE, f["id"]):
+            raise Invalid("finding %d's id %r doesn't match %s (letters, digits, . _ -; at most 40)" % (n, f["id"], ID_RE))
         if f["severity"] not in SEVERITIES:
             raise Invalid("finding %d's severity %r is not one of %s" % (n, f["severity"], ", ".join(SEVERITIES)))
         if not (f["line"] is None or is_int(f["line"])):
@@ -253,14 +289,14 @@ def instruction_files(worktree, codex_home):
 
 
 def main(argv):
-    if len(argv) == 5 and argv[1] == "lenses":
-        lenses(argv[2], argv[3], argv[4])
+    if len(argv) == 6 and argv[1] == "lenses":
+        lenses(argv[2], argv[3], argv[4], argv[5])
         return 0
     if len(argv) == 6 and argv[1] == "check-reply":
         return check_reply_main(argv[2], argv[3], argv[4], argv[5])
     if len(argv) == 4 and argv[1] == "instruction-files":
         return instruction_files(argv[2], argv[3])
-    sys.stderr.write("usage: review_lib.py lenses <type> <raw> <patch> | check-reply <reply> <lens> <diff> <evidence|-> | instruction-files <worktree> <codex home>\n")
+    sys.stderr.write("usage: review_lib.py lenses <type> <raw> <patch> <spend-limits.json> | check-reply <reply> <lens> <diff> <evidence|-> | instruction-files <worktree> <codex home>\n")
     return 2
 
 

@@ -16,7 +16,7 @@
         "additionalProperties": false,
         "required": ["id", "severity", "file", "line", "title", "detail", "evidence"],
         "properties": {
-          "id": { "type": "string" },
+          "id": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,40}$" },
           "severity": { "type": "string", "enum": ["blocker", "major", "minor", "nit"] },
           "file": { "type": "string" },
           "line": { "type": ["integer", "null"] },
