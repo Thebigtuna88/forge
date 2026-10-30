@@ -1081,6 +1081,14 @@ test_refused_evidence_names_are_not_printed() { # security SEC-1
   rv init "$TICKET" "$PR"
   assert_exit 1 "$RC" "a folder in the evidence: $OUT"
   assert_not_contains "$OUT" "$tok" "its name isn't printed"
+  rmdir "$WORK/evidence/$tok"
+  # Round 9: nor by the shell, when the file can't be read.
+  printf 'log\n' >"$WORK/evidence/$tok.txt"
+  chmod 000 "$WORK/evidence/$tok.txt"
+  rv init "$TICKET" "$PR"
+  chmod 644 "$WORK/evidence/$tok.txt"
+  assert_exit 1 "$RC" "an unreadable evidence file: $OUT"
+  assert_not_contains "$OUT" "$tok" "its name isn't printed by the shell either"
 }
 
 test_codex_gets_no_caller_environment() { # security SEC-2

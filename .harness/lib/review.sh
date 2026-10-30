@@ -350,13 +350,14 @@ rv_init() { # <ticket> <pr#>
   fi
   if [[ ${#names[@]} -gt 0 ]]; then
     # Each read is checked: a file that can't be read stops init, so no round freezes partial
-    # evidence (FRG-7 review round 2).
+    # evidence (FRG-7 review round 2). The shell's and cat's own errors would print the name, so
+    # they go nowhere (round 9).
     : >"$fz/evidence.txt" || rv_die 1 "can't start the evidence file"
     for f in "${names[@]}"; do
-      size="$(wc -c <"$f" | tr -d ' ')" || rv_die 1 "can't read a file in work/$RV_T/evidence (its name is not printed)"
+      size="$({ wc -c <"$f"; } 2>/dev/null | tr -d ' ')" || rv_die 1 "can't read a file in work/$RV_T/evidence (its name is not printed)"
       [[ "$size" =~ ^[0-9]+$ ]] || rv_die 1 "can't read a file in work/$RV_T/evidence (its name is not printed)"
       if ! { printf '===== EVIDENCE FILE: %s (%s bytes) =====\n' "${f##*/}" "$size" >>"$fz/evidence.txt" &&
-        cat "$f" >>"$fz/evidence.txt" && printf '\n' >>"$fz/evidence.txt"; }; then
+        { cat <"$f" >>"$fz/evidence.txt"; } 2>/dev/null && printf '\n' >>"$fz/evidence.txt"; }; then
         rv_die 1 "can't read a file in work/$RV_T/evidence (its name is not printed)"
       fi
     done
@@ -409,15 +410,17 @@ rv_gitleaks() { # <folder> <report.json>: gitleaks dir with FORGE's rules only; 
 # binary and still reports success, so a file it reports nothing in wasn't read; their paths go
 # to stdout (drop-unread also removes them from <folder>).
 rv_canary_read() {
+  # It may run before the names are scanned, so its messages quote no tool output, which can
+  # hold a path (FRG-7 review round 9).
   local c="$RV_TMP/canary.$RANDOM$RANDOM" rc
-  python3 -I "$RV_PY" canary-copy "$1" "$c" "$(rv_canary)" 2>"$RV_TMP/canary.err" ||
-    rv_die 1 "can't prepare the scan of codex's folder: $(head -c 200 "$RV_TMP/canary.err")"
+  python3 -I "$RV_PY" canary-copy "$1" "$c" "$(rv_canary)" 2>/dev/null ||
+    rv_die 1 "can't prepare the scan of codex's folder, so nothing was sent to codex"
   rc="$(rv_gitleaks "$c" "$c.json")"
   if ! { [[ $rc == 0 || $rc == 1 ]] && jq -e 'type == "array"' "$c.json" >/dev/null 2>&1; }; then
-    rv_die 1 "gitleaks couldn't scan codex's folder (status $rc), so nothing was sent to codex: $(tail -n 2 "$c.json.out" | tr '\n' ' ')"
+    rv_die 1 "gitleaks couldn't scan codex's folder (status $rc), so nothing was sent to codex"
   fi
-  python3 -I "$RV_PY" "$2" "$1" "$c" "$c.json" 2>"$RV_TMP/canary.err" ||
-    rv_die 1 "can't sort out which files gitleaks read: $(head -c 200 "$RV_TMP/canary.err")"
+  python3 -I "$RV_PY" "$2" "$1" "$c" "$c.json" 2>/dev/null ||
+    rv_die 1 "can't sort out which files gitleaks read, so nothing was sent to codex"
 }
 
 # rv_scan_folder <folder>: codex gets its whole input from this one folder, and nothing reaches it
