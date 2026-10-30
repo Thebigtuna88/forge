@@ -305,6 +305,7 @@ sweep_gh() { # <open PRs as JSON, or fail> <states...> — the PR list gh would 
   owner_gh() {
     case "$1 $2" in
       "pr list")
+        echo listed >>"$T_TMP/lists"
         [[ "$SWEEP_LIST" != fail ]] || return 1
         printf '%s' "$SWEEP_LIST" | jq -r "${@: -1}"
         ;;
@@ -355,6 +356,56 @@ test_a_passing_phase_ends_with_no_test_pr_open() {
   assert_exit 1 "$rc"
   assert_contains "$out" "could not list the open PRs"
   assert_not_contains "$out" "ALL PASS"
+}
+
+test_an_error_stop_mid_phase_closes_every_open_test_pr() {
+  # B11 arms auto-merge, then the owner's approval fails and the script stops with an error
+  # (die): the exit itself still closes the armed PR, and no later test runs.
+  local out rc=0
+  out="$(stub_phase; sweep_gh '[{"number":77,"title":"FRG-26 B11 (protected)"}]' OPEN CLOSED
+    t_B11() { echo "RAN B11"; die "the owner could not approve PR #77"; }
+    cmd_tests protected 2>&1)" || rc=$?
+  assert_exit 2 "$rc"
+  assert_contains "$out" "could not approve PR #77"
+  assert_not_contains "$out" "RAN B12"
+  assert_contains "$(cat "$T_TMP/closes")" "pr close 77"
+  assert_contains "$out" "PHASE protected: STOPPED by an error"
+  assert_not_contains "$out" "ALL PASS"
+}
+
+test_an_error_stop_reports_a_test_pr_it_cant_close() {
+  local out rc=0
+  out="$(stub_phase; sweep_gh '[{"number":77,"title":"FRG-26 B11 (protected)"}]' OPEN OPEN
+    t_B11() { die "the owner could not approve PR #77"; }
+    cmd_tests protected 2>&1)" || rc=$?
+  assert_exit 2 "$rc"
+  assert_contains "$out" "CLEANUP FAIL PR #77"
+}
+
+test_an_error_before_the_phase_starts_closes_nothing() {
+  # Until the tests start, the script has opened no PR, so an error then sweeps nothing.
+  local out rc=0
+  : >"$T_TMP/lists"
+  out="$(stub_phase; sweep_gh '[{"number":77,"title":"FRG-26 B11 (protected)"}]' OPEN CLOSED
+    verify_phase() { die "dev is not protected as the phase needs"; }
+    cmd_tests protected 2>&1)" || rc=$?
+  assert_exit 2 "$rc"
+  assert_eq "$(wc -l <"$T_TMP/lists" | tr -d ' ')" 0 "PR lists read"
+  assert_not_contains "$out" "STOPPED by an error"
+}
+
+test_a_phase_sweeps_once() {
+  # A failed test and a passing phase each sweep once, not again on exit.
+  local out rc=0
+  : >"$T_TMP/lists"
+  out="$(stub_phase B1:allowed; sweep_gh '[]'; cmd_tests protected 2>&1)" || rc=$?
+  assert_exit 1 "$rc"
+  assert_eq "$(wc -l <"$T_TMP/lists" | tr -d ' ')" 1 "PR lists read after a failed test"
+  : >"$T_TMP/lists"
+  rc=0
+  out="$(stub_phase; sweep_gh '[]'; cmd_tests protected 2>&1)" || rc=$?
+  assert_exit 0 "$rc"
+  assert_eq "$(wc -l <"$T_TMP/lists" | tr -d ' ')" 1 "PR lists read after a passing phase"
 }
 
 status_gh() { # <dev protected?> — a stand-in owner_gh for cmd_status; other reads fail

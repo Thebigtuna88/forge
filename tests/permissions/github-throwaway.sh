@@ -68,7 +68,18 @@ redact() { # <text> — the helper's token never reaches the screen or a log
 
 say() { redact "$*"; printf '\n'; }
 
+# Set once the bypass tests start; cleared when cmd_tests sweeps on its own. While it's set, any
+# other way out (die, or bash stopping on an error) closes the open test PRs first, so a PR (B11's
+# with auto-merge armed) is never left behind. Subshells don't run this trap.
+SWEEP_ON_EXIT=""
+
 cleanup() {
+  local rc=$?
+  if [[ -n "$SWEEP_ON_EXIT" ]]; then
+    SWEEP_ON_EXIT=""
+    say "PHASE $PHASE: STOPPED by an error (status $rc); closing the open test PRs"
+    sweep_prs
+  fi
   if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
@@ -1131,17 +1142,21 @@ cmd_tests() {
   helper_git clone -q --template="$WORK/template" "https://github.com/$REPO.git" "$CLONE" || die "clone failed"
   say "== FRG-26 bypass tests, phase $PHASE, helper $HELPER, $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
   # The stop rule (plan section 3): after a failed or inconclusive test nothing more is changed
-  # except closing test PRs. The next test never starts; sweep_prs closes every test PR left open.
+  # except closing test PRs. The next test never starts; sweep_prs closes every test PR left open,
+  # here or, if the phase stops with an error, on exit.
   local id
+  SWEEP_ON_EXIT=1
   for id in $TEST_ORDER; do
     "t_$id"
     if [[ $FAILS -ne 0 ]]; then
+      SWEEP_ON_EXIT=""
       sweep_prs
       if helper_rate; then say "helper allowance after the phase: $RATE_LINE"; fi
       say "PHASE $PHASE: STOPPED after $id (a failed test stops the phase; only test PRs were closed after it)"
       exit 1
     fi
   done
+  SWEEP_ON_EXIT=""
   sweep_prs
   if helper_rate; then say "helper allowance after the phase: $RATE_LINE"; fi
   if [[ $FAILS -ne 0 ]]; then
