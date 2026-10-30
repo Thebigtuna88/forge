@@ -1,0 +1,80 @@
+#!/bin/bash
+# Test stub for codex (spec 10.2, FRG-7). review-lens runs it instead of the real codex only when
+# it is installed in a conformance-shaped sandbox (<tmp>/forge-conformance.XXXXXX/s<n>/code/forge),
+# from <that sandbox>/stubs/codex. It never reaches OpenAI. It answers from <sandbox>/codex/:
+#   version            what `codex --version` prints (default: codex-cli 0.163.0)
+#   reply-<lens>.json  the reply `exec` writes to its -o file, with @DIFF_MD5@, @DIFF_BYTES@,
+#                      @EVIDENCE_MD5@ and @EVIDENCE_BYTES@ replaced by the real values of the files
+#                      the prompt names (the evidence ones as JSON: a string or number, or null)
+#                      (default: a CLEAN reply with the right values)
+#   model              the model its header names (default: fake-model); "none" leaves the line out
+#   rc                 the exit status of `exec` (default 0)
+#   login              what `codex login status` prints, on stderr as codex does (default: Logged in
+#                      using ChatGPT)
+# It records, for call n: its arguments, one per line, in call-<n>.args, its environment in
+# call-<n>.env, the prompt it read on stdin in call-<n>.prompt and, for exec, every file in its -C
+# folder with its md5 in call-<n>.tree ("<path relative to the folder> <md5>", sorted).
+set -u
+dir="$(cd "$(dirname "$0")/../codex" 2>/dev/null && pwd)" || {
+  echo "stub codex: no answer folder next to $0" >&2
+  exit 1
+}
+n=1
+while [[ -e "$dir/call-$n.args" ]]; do n=$((n + 1)); done
+printf '%s\n' "$@" >"$dir/call-$n.args"
+env >"$dir/call-$n.env"
+if [[ "${1:-}" == --version ]]; then
+  if [[ -f "$dir/version" ]]; then cat "$dir/version"; else echo "codex-cli 0.163.0"; fi
+  exit 0
+fi
+if [[ "${1:-}" == login && "${2:-}" == status ]]; then
+  if [[ -f "$dir/login" ]]; then cat "$dir/login" >&2; else echo "Logged in using ChatGPT" >&2; fi
+  exit 0
+fi
+[[ "${1:-}" == exec ]] || {
+  echo "stub codex: only --version, login status and exec are faked" >&2
+  exit 1
+}
+out="" cd=""
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    -o) out="$a" ;;
+    -C) cd="$a" ;;
+  esac
+  prev="$a"
+done
+cat >"$dir/call-$n.prompt"
+if [[ -n "$cd" && -d "$cd" ]]; then
+  (cd "$cd" && find . \( -type f -o -type l \) | sort | while IFS= read -r f; do
+    printf '%s %s\n' "${f#./}" "$(md5 -q "$f" 2>/dev/null || echo unreadable)"
+  done) >"$dir/call-$n.tree"
+fi
+lens="$(sed -n 's/^Set lens to "\([a-z]*\)"\.$/\1/p' "$dir/call-$n.prompt" | head -n 1)"
+diff="$(sed -n 's/^  diff file: //p' "$dir/call-$n.prompt" | head -n 1)"
+ev="$(sed -n 's/^  evidence file: //p' "$dir/call-$n.prompt" | head -n 1)"
+dmd5="$(md5 -q "$diff" 2>/dev/null || echo missing)"
+dbytes="$(wc -c <"$diff" 2>/dev/null | tr -d ' ' || echo 0)"
+emd5=null ebytes=null
+if [[ -n "$ev" && "$ev" != none ]]; then
+  emd5="\"$(md5 -q "$ev")\""
+  ebytes="$(wc -c <"$ev" | tr -d ' ')"
+fi
+model=fake-model
+[[ -f "$dir/model" ]] && model="$(cat "$dir/model")"
+printf 'OpenAI Codex v0.163.0 (stub)\n--------\nworkdir: %s\n' "$cd"
+[[ "$model" == none ]] || printf 'model: %s\n' "$model"
+printf 'sandbox: read-only\n--------\n'
+if [[ -n "$out" ]]; then
+  if [[ -f "$dir/reply-$lens.json" ]]; then
+    sed -e "s/@DIFF_MD5@/$dmd5/g" -e "s/@DIFF_BYTES@/$dbytes/g" -e "s/@EVIDENCE_MD5@/$emd5/g" \
+      -e "s/@EVIDENCE_BYTES@/$ebytes/g" "$dir/reply-$lens.json" >"$out"
+  else
+    printf '{"lens": "%s", "diff_md5": "%s", "diff_bytes": %s, "evidence_md5": %s, "evidence_bytes": %s, "verdict": "CLEAN", "findings": []}\n' \
+      "$lens" "$dmd5" "$dbytes" "$emd5" "$ebytes" >"$out"
+  fi
+  cat "$out"
+fi
+rc=0
+[[ -f "$dir/rc" ]] && rc="$(cat "$dir/rc")"
+exit "$rc"

@@ -1124,6 +1124,33 @@ hr_review_json() { # <review.md> <out.json>: 0 if review.md holds exactly one fo
   python3 -I -c "$_HR_PY_REVIEW" "$1" "$2" 2>/dev/null
 }
 
+# hr_required_lenses <raw>: the lenses spec 6.2 requires for review-diff.sh's output, one per line
+# in "$HR_TMP/lenses.req", worked out by review_lib.py, the code the review runner uses too, so
+# the two can't disagree (FRG-7). A merge may name only FORGE's repository, whose project type is
+# harness until projects.json (FRG-10). Returns 1, with the reason in "$HR_TMP/lenses.err", when
+# the answer isn't a list of known lenses with code, security and spend in it: those three review
+# every PR (owner decision 2026-10-29), so a list without one is refused, never followed.
+hr_required_lenses() {
+  local l seen=" "
+  python3 -I "$HR_ROOT/.harness/lib/review_lib.py" lenses harness "$1" \
+    >"$HR_TMP/lenses.req" 2>"$HR_TMP/lenses.err" || return 1
+  while IFS= read -r l; do
+    case "$l" in
+      code | security | frontend | ios | spend) seen+="$l " ;;
+      *)
+        printf 'unexpected lens [%s]\n' "$l" >>"$HR_TMP/lenses.err"
+        return 1
+        ;;
+    esac
+  done <"$HR_TMP/lenses.req"
+  for l in code security spend; do
+    if [[ "$seen" != *" $l "* ]]; then
+      printf 'review_lib.py left out the %s lens, which every PR needs\n' "$l" >>"$HR_TMP/lenses.err"
+      return 1
+    fi
+  done
+}
+
 # jq reads 1e0 or 1.0 as 1 before anyone sees the spelling, so whole numbers are checked as written:
 # Python's json calls parse_float for any number with a fraction or an exponent, parse_constant
 # for NaN and Infinity (review round 11), and parse_int for the rest, which must be digits only,

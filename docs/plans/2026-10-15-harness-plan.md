@@ -162,10 +162,11 @@ Runs from the worktree's runtime (bootstrap, spec 4.9).
 
 ## Phase 3 — Review runner (FRG-7)
 
-`review.sh`, `review-lens init|prompt|codex|ingest|verify|defer|finalize`,
-`reply.schema.json`, `.harness/lenses/*.md`, findings-hash, stall detection, PR-comment
-summary; `gate-merge-on-review` recomputation wired to the real files. **Exit:** the runner
-reviews its own PR to CLEAN.
+`review.sh`, `review-lens init|codex|verify|defer|finalize`, `reply.schema.json`,
+`.harness/lenses/*.md`, findings-hash, stall detection, PR-comment summary;
+`gate-merge-on-review` recomputation wired to the real files. **Exit:** the runner reviews its
+own PR to CLEAN. Codex only, no `ingest` or `prompt` step, evidence beside the diff, the runner
+and lenses owner-only: details in `docs/plans/2026-10-28-phase-3.md`.
 
 ## Phase 4 — Status, worktree, ticket, CONTINUE (FRG-8)
 
