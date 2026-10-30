@@ -174,7 +174,10 @@ stub_phase() { # <id:allowed|refused|setup>...
   need_allowance() { :; }
   helper_git() { :; }
   helper_rate() { return 1; }
-  WORK="$T_TMP"
+  owner_gh() { :; } # no open PRs, nothing reaches gh
+  # The script's exit cleanup removes WORK, so it must not be the folder holding the logs.
+  WORK="$T_TMP/work"
+  mkdir -p "$WORK"
   local id spec
   for id in $ALL_TESTS; do eval "t_$id() { echo \"RAN $id\"; }"; done
   for spec in "$@"; do
@@ -292,6 +295,66 @@ test_a_failed_cleanup_stops_the_phase() {
   assert_contains "$out" "CLEANUP FAIL PR #9"
   assert_not_contains "$out" "RAN B1"
   assert_contains "$out" "STOPPED after B5"
+}
+
+sweep_gh() { # <open PRs as JSON, or fail> <states...> — the PR list gh would give (filtered with
+  # the script's own --jq, its last argument), plus cleanup_gh's states and logged closes
+  SWEEP_LIST="$1"
+  shift
+  cleanup_gh "$@"
+  owner_gh() {
+    case "$1 $2" in
+      "pr list")
+        [[ "$SWEEP_LIST" != fail ]] || return 1
+        printf '%s' "$SWEEP_LIST" | jq -r "${@: -1}"
+        ;;
+      *) echo "$*" >>"$T_TMP/closes" ;;
+    esac
+  }
+}
+
+test_a_stopped_phase_closes_every_open_test_pr() {
+  # B16's dev-advance merge fails, leaving its approved PR (77) open, and an earlier PR whose URL
+  # couldn't be read (78) is open too. Both are closed before the phase stops; a PR that isn't a
+  # FRG-26 test PR is left alone.
+  local out rc=0 list
+  list='[{"number":77,"title":"FRG-26 B16-advance (protected)"},{"number":78,"title":"FRG-26 B9 (protected)"},{"number":5,"title":"Someone else"}]'
+  out="$(stub_phase B16:setup; sweep_gh "$list" OPEN CLOSED OPEN CLOSED; cmd_tests protected 2>&1)" || rc=$?
+  assert_exit 1 "$rc"
+  assert_contains "$out" "STOPPED after B16"
+  assert_contains "$(cat "$T_TMP/closes")" "pr close 77"
+  assert_contains "$(cat "$T_TMP/closes")" "pr close 78"
+  assert_not_contains "$(cat "$T_TMP/closes")" "pr close 5"
+  assert_not_contains "$out" "CLEANUP FAIL"
+}
+
+test_a_stopped_phase_reports_a_test_pr_it_cant_close() {
+  local out rc=0
+  out="$(stub_phase B16:setup; sweep_gh '[{"number":77,"title":"FRG-26 B16-advance (protected)"}]' OPEN OPEN; cmd_tests protected 2>&1)" || rc=$?
+  assert_exit 1 "$rc"
+  assert_contains "$out" "CLEANUP FAIL PR #77"
+  assert_contains "$out" "STOPPED after B16"
+}
+
+test_a_passing_phase_ends_with_no_test_pr_open() {
+  local out rc=0
+  # A test PR still open at the end is closed; the phase passes only once it's confirmed closed.
+  out="$(stub_phase; sweep_gh '[{"number":9,"title":"FRG-26 B5 (ruleset)"}]' OPEN CLOSED; cmd_tests ruleset 2>&1)" || rc=$?
+  assert_exit 0 "$rc"
+  assert_contains "$out" "closed test PR #9"
+  assert_contains "$out" "PHASE ruleset: ALL PASS"
+  # It can't be closed: the phase fails.
+  rc=0
+  out="$(stub_phase; sweep_gh '[{"number":9,"title":"FRG-26 B5 (ruleset)"}]' OPEN OPEN; cmd_tests ruleset 2>&1)" || rc=$?
+  assert_exit 1 "$rc"
+  assert_contains "$out" "CLEANUP FAIL PR #9"
+  assert_not_contains "$out" "ALL PASS"
+  # The open PRs can't be listed: the phase fails.
+  rc=0
+  out="$(stub_phase; sweep_gh fail; cmd_tests ruleset 2>&1)" || rc=$?
+  assert_exit 1 "$rc"
+  assert_contains "$out" "could not list the open PRs"
+  assert_not_contains "$out" "ALL PASS"
 }
 
 status_gh() { # <dev protected?> — a stand-in owner_gh for cmd_status; other reads fail

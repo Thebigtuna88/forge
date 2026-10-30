@@ -236,7 +236,9 @@ Code. If I ran "push to `main`" myself, even expecting a refusal, I'd be getting
    *Changed during the build (stricter, PR #37 review round 1):* the stop is per test, not per
    phase. The first failed or inconclusive test ends the phase after tidying up its own PR; no
    later test runs. Within B12 and M4, the first attempt to weaken protection that isn't refused
-   ends the test, so no later attempt is made.
+   ends the test, so no later attempt is made. When a phase stops or ends, every test PR still
+   open (title "FRG-26 ") is closed; a PR it can't confirm closed fails the phase and is named
+   for you to close (rounds 2 and 3).
 
    **How the handoffs run the script:** each step reads it from the reviewed git commit into
    memory, checks its sha256, and runs that copy in an empty environment. No file can be swapped

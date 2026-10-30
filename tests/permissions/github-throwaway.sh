@@ -739,6 +739,28 @@ close_if_open() { # <pr> — tidy up after a refused attempt
   return 1
 }
 
+# When a phase stops or ends, every test PR still open in the throwaway repository is closed,
+# found by its "FRG-26 " title rather than by number: a test can stop before it knows its PR's
+# number (dev_ahead, or a PR URL that couldn't be read). Any PR it can't confirm closed, or a
+# list it can't read, is a failure.
+sweep_prs() {
+  local open pr
+  if ! open="$(owner_gh pr list --repo "$REPO" --state open --limit 1000 --json number,title \
+    --jq '.[] | select(.title | startswith("FRG-26 ")) | .number' 2>/dev/null)"; then
+    FAILS=$((FAILS + 1))
+    say "CLEANUP FAIL could not list the open PRs in $REPO: close any \"FRG-26 \" test PR on GitHub before another phase"
+    return 1
+  fi
+  for pr in $open; do
+    if [[ ! "$pr" =~ ^[0-9]+$ ]]; then
+      FAILS=$((FAILS + 1))
+      say "CLEANUP FAIL unexpected PR list entry; close any \"FRG-26 \" test PR in $REPO on GitHub before another phase"
+      return 1
+    fi
+    if close_if_open "$pr"; then say "CLEANUP closed test PR #$pr, left open by a test"; fi
+  done
+}
+
 dev_ahead() { # <id> — helper PR into dev, owner approves, helper merges (the B16 control)
   feature_pr "$1"
   owner_approve "$LAST_PR"
@@ -1108,18 +1130,24 @@ cmd_tests() {
   CLONE="$WORK/clone"
   helper_git clone -q --template="$WORK/template" "https://github.com/$REPO.git" "$CLONE" || die "clone failed"
   say "== FRG-26 bypass tests, phase $PHASE, helper $HELPER, $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
-  # The stop rule (plan section 3): after a failed or inconclusive test nothing more is changed.
-  # A test tidies up after itself before it returns; the next one never starts.
+  # The stop rule (plan section 3): after a failed or inconclusive test nothing more is changed
+  # except closing test PRs. The next test never starts; sweep_prs closes every test PR left open.
   local id
   for id in $TEST_ORDER; do
     "t_$id"
     if [[ $FAILS -ne 0 ]]; then
+      sweep_prs
       if helper_rate; then say "helper allowance after the phase: $RATE_LINE"; fi
-      say "PHASE $PHASE: STOPPED after $id (a failed test stops the phase; nothing more was changed)"
+      say "PHASE $PHASE: STOPPED after $id (a failed test stops the phase; only test PRs were closed after it)"
       exit 1
     fi
   done
+  sweep_prs
   if helper_rate; then say "helper allowance after the phase: $RATE_LINE"; fi
+  if [[ $FAILS -ne 0 ]]; then
+    say "PHASE $PHASE: FAILED at the final cleanup (a test PR may still be open)"
+    exit 1
+  fi
   say "PHASE $PHASE: ALL PASS"
   exit 0
 }
