@@ -72,7 +72,7 @@ rv_setup() {
   RV_LENS_DIR="$RV_INSTALL/.harness/lenses"
   RV_PY="$RV_LIB/review_lib.py"
   RV_DIFF="$RV_LIB/review-diff.sh"
-  common="$(git -C "$RV_INSTALL" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+  common="$(rv_gitc -C "$RV_INSTALL" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
     rv_die 1 "$RV_INSTALL is not a git checkout"
   [[ "$common" == */.git && -d "$common" ]] || rv_die 1 "$RV_INSTALL's repository is not a main checkout's .git ($common)"
   RV_MAIN="$(cd "${common%/.git}" && pwd -P)" || rv_die 1 "can't find the main checkout"
@@ -119,14 +119,18 @@ rv_plain() { # <file> [what]: refuse a link or anything but a plain file
   [[ -f "$1" && ! -L "$1" ]] || rv_die 1 "${2:-$1} is missing, or not a plain file"
 }
 
-# rv_git: git in the ticket's worktree with no system or global settings and no file-system
-# monitor. A setting can name a program git runs (core.fsmonitor, a filter's clean or process
-# command), and this runs before codex's sandbox does (FRG-7 review round 3). The repository's own
-# filters can't be switched off by name, so rv_worktree refuses any.
-rv_git() {
+# rv_gitc: every git the runner runs, with no system or global settings, no file-system monitor,
+# no lazy fetching of missing objects and no transport at all. A setting can name a program git
+# runs (core.fsmonitor, a filter's clean or process command, a promisor remote's ext:: or ssh
+# command), and this runs before codex's sandbox does (FRG-7 review rounds 3 and 10).
+# GIT_ALLOW_PROTOCOL overrides every protocol.*.allow setting; "none" is no real protocol. The
+# repository's own filters can't be switched off by name, so rv_worktree refuses any.
+rv_gitc() {
   env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 \
-    GIT_ATTR_NOSYSTEM=1 git -c core.fsmonitor=false -C "$RV_WT" "$@"
+    GIT_ATTR_NOSYSTEM=1 GIT_NO_LAZY_FETCH=1 GIT_ALLOW_PROTOCOL=none git -c core.fsmonitor=false "$@"
 }
+
+rv_git() { rv_gitc -C "$RV_WT" "$@"; } # git in the ticket's worktree
 
 rv_worktree() { # the ticket's worktree: of this repository, on its branch, clean; sets RV_HEAD
   local c st br rc=0
@@ -136,16 +140,18 @@ rv_worktree() { # the ticket's worktree: of this repository, on its branch, clea
   [[ "$(cd "$c" 2>/dev/null && pwd -P)" == "$RV_MAIN/.git" ]] || rv_die 1 "$RV_WT is not a worktree of $RV_MAIN"
   br="$(rv_git symbolic-ref --quiet HEAD 2>/dev/null)" || br=""
   [[ "$br" == "refs/heads/$RV_BRANCH" ]] || rv_die 1 "$RV_WT is not on $RV_BRANCH"
-  rv_git config --get-regexp '^filter\.' >"$RV_TMP/filters" 2>&1 || rc=$?
+  # These messages quote no git output: setting names and values, and file names, are the
+  # author's text, scanned for secrets only later (FRG-7 review round 10).
+  rv_git config --get-regexp '^filter\.' >/dev/null 2>&1 || rc=$?
   case "$rc" in
-    0) rv_die 1 "the repository's git settings name a filter ($(cut -d ' ' -f 1 "$RV_TMP/filters" | tr '\n' ' ')), a program git status would run; remove it first" ;;
+    0) rv_die 1 "the repository's git settings name a filter (a program git status would run; see git config --get-regexp '^filter\.'); remove it first" ;;
     1) ;;
-    *) rv_die 1 "can't read the repository's git settings: $(head -c 200 "$RV_TMP/filters")" ;;
+    *) rv_die 1 "can't read the repository's git settings (git config status $rc)" ;;
   esac
   # A submodule is a repository of its own, with settings this doesn't check.
   rv_git ls-files --stage >"$RV_TMP/index" 2>/dev/null || rv_die 1 "can't read the worktree's index"
   ! grep -q '^160000 ' "$RV_TMP/index" || rv_die 1 "the worktree has a submodule; the review runner doesn't review submodules"
-  st="$(rv_git status --porcelain=v1 --untracked-files=all 2>&1)" || rv_die 1 "git status failed in $RV_WT: $st"
+  st="$(rv_git status --porcelain=v1 --untracked-files=all 2>/dev/null)" || rv_die 1 "git status failed in $RV_WT (its output is not printed)"
   [[ -z "$st" ]] || rv_die 1 "the worktree $RV_WT has uncommitted changes; commit and push them first"
   RV_HEAD="$(rv_git rev-parse HEAD 2>/dev/null)" || RV_HEAD=""
   [[ "$RV_HEAD" =~ $RV_SHA_RE ]] || rv_die 1 "can't read the worktree's HEAD"
@@ -325,8 +331,8 @@ rv_init() { # <ticket> <pr#>
   # The charter in force is the merge base's CLAUDE.md, never the PR's own copy, which the PR can
   # edit to address the reviewer (FRG-7 review round 1). Read as a raw blob (no filters, no
   # replacement objects) from objects review-diff.sh has just re-hashed.
-  if env GIT_NO_REPLACE_OBJECTS=1 git -C "$RV_MAIN" cat-file -e "$(cat "$fz/merge-base"):CLAUDE.md" 2>/dev/null; then
-    env GIT_NO_REPLACE_OBJECTS=1 git -C "$RV_MAIN" cat-file blob "$(cat "$fz/merge-base"):CLAUDE.md" >"$fz/charter.md" ||
+  if rv_gitc -C "$RV_MAIN" cat-file -e "$(cat "$fz/merge-base"):CLAUDE.md" 2>/dev/null; then
+    rv_gitc -C "$RV_MAIN" cat-file blob "$(cat "$fz/merge-base"):CLAUDE.md" >"$fz/charter.md" 2>/dev/null ||
       rv_die 1 "can't read CLAUDE.md at the merge base"
   else
     printf '(There was no CLAUDE.md at the merge base.)\n' >"$fz/charter.md"

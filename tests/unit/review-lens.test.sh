@@ -1101,6 +1101,32 @@ test_codex_gets_no_caller_environment() { # security SEC-2
   assert_not_contains "$(last_env)" "$(fake_token)" "nothing from the caller's USER or LOGNAME"
 }
 
+# --- round 10 of FRG-7's own review --------------------------------------------------------------
+
+test_git_fetches_nothing() { # code C1: a promisor remote with an external transport
+  mk_rv
+  mg config core.repositoryformatversion 1
+  mg config extensions.partialClone origin
+  mg config remote.origin.promisor true
+  mg config remote.origin.url "ext::touch $T_TMP/FETCHED"
+  mg config protocol.ext.allow always
+  local tree
+  tree="$(wg rev-parse 'HEAD^{tree}')"
+  rm "$M/.git/objects/${tree:0:2}/${tree:2}"
+  rv init "$TICKET" "$PR"
+  [[ ! -e "$T_TMP/FETCHED" ]] || _t_fail "git ran the remote's transport to fetch a missing object"
+  assert_exit 1 "$RC" "init with HEAD's tree missing: $OUT"
+}
+
+test_filter_names_are_not_printed() { # security SEC-1
+  mk_rv
+  mg config "filter.$(fake_token).clean" cat
+  rv init "$TICKET" "$PR"
+  assert_exit 1 "$RC" "a filter named with a token: $OUT"
+  assert_contains "$OUT" "filter"
+  assert_not_contains "$OUT" "$(fake_token)" "the filter's name isn't printed"
+}
+
 # --- the real gate on the real runner's review ---------------------------------------------------
 
 # mk_gate: the hooks' side of the sandbox: the merge gate, its runtime and config in M, and the

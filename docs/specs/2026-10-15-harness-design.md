@@ -720,12 +720,16 @@ STALL.md           written when a stall stops the loop
 open into `dev` from the ticket's branch (not a fork), the worktree is on that branch and clean,
 and its HEAD is the PR's head on GitHub.
 
-**Git in the worktree runs no program** (FRG-7 review round 3). Checking the worktree runs before
-codex's sandbox does, and a git setting can name a program git runs (`core.fsmonitor`, a filter's
-`clean` or `process` command). The runner's git in the worktree reads no system or global
-settings and has `core.fsmonitor` off; the repository's own filters can't be switched off by name,
-so `init` and `codex` refuse a repository whose settings name any filter, and a worktree with a
-submodule (a repository with settings of its own).
+**Git in the worktree runs no program** (FRG-7 review rounds 3 and 10). Checking the worktree runs
+before codex's sandbox does, and a git setting can name a program git runs (`core.fsmonitor`, a
+filter's `clean` or `process` command, or the `ext::` or ssh command of a promisor remote, which
+git calls to fetch a missing object by itself). Every git the runner runs reads no system or
+global settings, has `core.fsmonitor` off, never fetches a missing object (`GIT_NO_LAZY_FETCH`)
+and may use no transport (`GIT_ALLOW_PROTOCOL`, which overrides the repository's
+`protocol.*.allow`). The repository's own filters can't be switched off by name, so `init` and
+`codex` refuse a repository whose settings name any filter, and a worktree with a submodule (a
+repository with settings of its own). These refusals quote no git output: setting names and file
+names are the author's text, scanned for secrets only later.
 
 ### 6.2 Required lenses (computed, not chosen)
 

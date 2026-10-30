@@ -237,12 +237,15 @@ def check_reply_main(reply_file, lens, diff_file, evidence_file):
 # --- the copy codex reviews (spec 6.3) ------------------------------------------------------------
 
 def git(git_dir, args, stdin=None):
+    # As review.sh's rv_gitc: no settings from outside the repository, no lazy fetch, no transport
+    # (FRG-7 review round 10). Its error text isn't printed: it can name a file.
     env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
-           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ATTR_NOSYSTEM": "1"}
-    r = subprocess.run(["git", "--git-dir=" + git_dir, "-c", "core.commitGraph=false"] + args,
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ATTR_NOSYSTEM": "1",
+           "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "none"}
+    r = subprocess.run(["git", "--git-dir=" + git_dir, "-c", "core.commitGraph=false", "-c", "core.fsmonitor=false"] + args,
                        input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     if r.returncode != 0:
-        sys.exit("git %s failed: %s" % (args[0], r.stderr.decode("utf-8", "replace").strip()[:200]))
+        sys.exit("git %s failed (status %d); a missing object is never fetched" % (args[0], r.returncode))
     return r.stdout
 
 
