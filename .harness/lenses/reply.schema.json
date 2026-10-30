@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lens", "diff_md5", "diff_bytes", "evidence_md5", "evidence_bytes", "verdict", "findings"],
+  "properties": {
+    "lens": { "type": "string", "enum": ["code", "security", "frontend", "ios", "spend"] },
+    "diff_md5": { "type": "string" },
+    "diff_bytes": { "type": "integer" },
+    "evidence_md5": { "type": ["string", "null"] },
+    "evidence_bytes": { "type": ["integer", "null"] },
+    "verdict": { "type": "string", "enum": ["CLEAN", "FINDINGS"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "file", "line", "title", "detail", "evidence"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,40}$" },
+          "severity": { "type": "string", "enum": ["blocker", "major", "minor", "nit"] },
+          "file": { "type": "string" },
+          "line": { "type": ["integer", "null"] },
+          "title": { "type": "string" },
+          "detail": { "type": "string" },
+          "evidence": { "type": "string" }
+        }
+      }
+    }
+  }
+}

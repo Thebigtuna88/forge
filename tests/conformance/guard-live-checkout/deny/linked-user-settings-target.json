@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "@TMP@/active.json",
+    "content": "{}"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "is where a Claude Code settings file really is"
+}

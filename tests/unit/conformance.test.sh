@@ -311,6 +311,28 @@ test_hook_cannot_write_the_live_checkout() {
   assert_eq "$(cat "$H/CLAUDE.md")" "charter" "the hook's write was refused"
 }
 
+# xcrun's lookup cache lives in the user's temp folder, outside every sandbox; a hook that could
+# write it would leave a change behind (FRG-6 review round 4). The test names a file of the
+# cache's temporary form (xcrun_db-<letters>), never the cache itself, and removes it if made.
+# Without the real temp folder the test would probe some other path, so it fails instead.
+test_hook_cannot_write_the_xcrun_cache() {
+  mk_conf_harness sample-gate toucher
+  local ut="" f
+  ut="$(getconf DARWIN_USER_TEMP_DIR)" || ut=""
+  [[ "$ut" == /?*/ && -d "$ut" && -w "$ut" ]] || {
+    _t_fail "can't find the user's temp folder (getconf DARWIN_USER_TEMP_DIR gave [$ut])"
+    return 0
+  }
+  f="${ut}xcrun_db-forgetest$$"
+  case_json toucher deny main 'git push origin main'
+  mkdir -p "$H/tests/conformance/toucher/allow"
+  jq -n --arg f "$f" '{hook_event_name: "PreToolUse", tool_name: "Bash",
+    tool_input: {command: "ls", file_path: $f}, cwd: "@ROOT@"}' >"$H/tests/conformance/toucher/allow/touch.json"
+  expect_fail "toucher allow/touch.json: expected exit 0"
+  [[ ! -e "$f" ]] || _t_fail "the hook wrote $f"
+  rm -f "$f"
+}
+
 
 test_fails_when_observe_log_was_seeded() {
   mk_conf_harness sample-gate always-allow
@@ -351,8 +373,9 @@ test_placeholders_survive_odd_temp_paths() {
   case_json cwd-gate deny in-main 'ls' '@ROOT@'
   case_json cwd-gate allow in-worktree 'ls' '@WORKTREES@/FRG-2-x'
   mkdir -p "$T_TMP/a&b|c\\d"
-  OUT="$(cd "$H" && env HOME="$T_TMP/home" TMPDIR="$T_TMP/a&b|c\\d" "$H/.harness/bin/conformance" 2>&1)"
-  RC=$?
+  # Through conform, with its fake claude: run directly, this needed a real Claude Code, and passed
+  # on GitHub's runner only while GITHUB_ACTIONS leaked into the unit tests (FRG-6, run 40652702756).
+  conform TMPDIR="$T_TMP/a&b|c\\d"
   assert_exit 0 "$RC" "$OUT"
 }
 
@@ -1189,6 +1212,108 @@ test_harness_toml_files_reach_the_sandbox() {
   case_json rules-gate allow other 'ls'
   conform
   assert_exit 0 "$RC" "$OUT"
+}
+
+# --- FRG-5: the two hooks that fail open, and record cases ----------------------------------------
+
+# mk_fail_open_harness: mk_conf_harness plus the real capture-owner-paste and
+# gate-owner-handoff-form, registered as FORGE registers them (the capture hook without
+# onFailure, so a failure never blocks the owner's message), each with cases.
+mk_fail_open_harness() {
+  mk_conf_harness
+  local h
+  for h in capture-owner-paste gate-owner-handoff-form; do
+    cp "$FORGE_SRC/.claude/hooks/$h.sh" "$H/.claude/hooks/"
+    chmod 755 "$H/.claude/hooks/$h.sh"
+  done
+  jq --arg c "\"\$CLAUDE_PROJECT_DIR\"/.claude/hooks/capture-owner-paste.sh" \
+    --arg f "\"\$CLAUDE_PROJECT_DIR\"/.claude/hooks/gate-owner-handoff-form.sh" \
+    '.hooks.UserPromptSubmit = [{hooks: [{type: "command", command: $c, timeout: 30}]}]
+     | .hooks.Stop = [{hooks: [{type: "command", command: $f, timeout: 30}]}]' \
+    "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  prompt_case allow no-block 'yes' false
+  mkdir -p "$H/tests/conformance/gate-owner-handoff-form/deny" "$H/tests/conformance/gate-owner-handoff-form/allow"
+  jq -n '{hook_event_name: "Stop", stop_hook_active: false, last_assistant_message: "```\nbrew install jq\n```", cwd: "@ROOT@"}' \
+    >"$H/tests/conformance/gate-owner-handoff-form/deny/brew.json"
+  jq -n '{hook_event_name: "Stop", stop_hook_active: false, last_assistant_message: "Done.", cwd: "@ROOT@"}' \
+    >"$H/tests/conformance/gate-owner-handoff-form/allow/plain.json"
+}
+
+# prompt_case <deny|allow> <name> <prompt> <records: true|false> [setup script]
+prompt_case() {
+  local d="$H/tests/conformance/capture-owner-paste/$1"
+  mkdir -p "$d"
+  jq -n --arg p "$3" --argjson r "$4" '{hook_event_name: "UserPromptSubmit", prompt: $p, cwd: "@ROOT@", forge_records: $r}' >"$d/$2.json"
+  if [[ -n "${5:-}" ]]; then printf '%s\n' "$5" >"$d/$2.setup.sh"; fi
+}
+
+READY_SETUP='mkdir -p "$ROOT/work/owner/2026-01-01-demo"
+printf "{\"id\": \"2026-01-01-demo\", \"state\": \"ready\"}\n" >"$ROOT/work/owner/2026-01-01-demo/META.json"'
+DEMO_BLOCK="$(printf '%s\n' '----- HANDOFF-RESULT BEGIN -----' 'id: 2026-01-01-demo' 'result: OK' '----- HANDOFF-RESULT END -----')"
+
+test_fail_open_hooks_pass_when_registered_as_forge_does() {
+  mk_fail_open_harness
+  prompt_case allow one-block "$DEMO_BLOCK" true "$READY_SETUP"
+  conform
+  assert_exit 0 "$RC" "$OUT"
+  [[ "$OUT" =~ capture-owner-paste\ +\|\ enforce\ +\|\ 0\ +\|\ 2\ +\|\ PASS ]] || _t_fail "capture row: $OUT"
+}
+
+test_fails_when_the_capture_hook_blocks_on_failure() {
+  mk_fail_open_harness
+  jq '.hooks.UserPromptSubmit[0].hooks[0].onFailure = "block"' "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  expect_fail 'capture-owner-paste.sh (UserPromptSubmit) must not have "onFailure": "block"'
+}
+
+test_fails_when_the_capture_hook_runs_on_another_event() {
+  mk_fail_open_harness
+  jq '.hooks.PreToolUse[0].hooks += .hooks.UserPromptSubmit[0].hooks | del(.hooks.UserPromptSubmit)' \
+    "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  expect_fail "capture-owner-paste.sh may be registered only for UserPromptSubmit"
+}
+
+test_fails_when_the_handoff_form_hook_runs_on_another_event() {
+  mk_fail_open_harness
+  jq '.hooks.PreToolUse[0].hooks += [.hooks.Stop[0].hooks[0] + {onFailure: "block"}]' \
+    "$H/.claude/settings.json" >"$T_TMP/s.json"
+  mv "$T_TMP/s.json" "$H/.claude/settings.json"
+  expect_fail "gate-owner-handoff-form.sh may be registered only for Stop"
+}
+
+test_fails_when_the_capture_hook_has_a_deny_case() {
+  mk_fail_open_harness
+  prompt_case deny refused 'no' false
+  expect_fail "capture-owner-paste never denies"
+}
+
+test_fails_when_a_case_expects_a_record_that_is_not_made() {
+  mk_fail_open_harness
+  prompt_case allow lost "$DEMO_BLOCK" true
+  expect_fail "capture-owner-paste allow/lost.json: expected the paste to be recorded in .harness/state/pastes.log"
+}
+
+# Round 1: the fail-open hooks load the runtime with a header that exits 0; no other hook may.
+test_fails_when_a_fail_open_hook_uses_the_blocking_header() {
+  mk_fail_open_harness
+  sed -i '' 's/{ echo "FORGE hook failed open: hookrt failed to load"; exit 0; }/{ echo "hookrt failed to load" >\&2; exit 2; }/' \
+    "$H/.claude/hooks/capture-owner-paste.sh"
+  expect_fail "capture-owner-paste.sh fails open, so it must load the runtime with the fail-open header lines"
+}
+
+test_fails_when_a_gate_uses_the_fail_open_header() {
+  mk_fail_open_harness
+  sed -i '' 's/{ echo "hookrt failed to load" >&2; exit 2; }/{ echo "FORGE hook failed open: hookrt failed to load"; exit 0; }/' \
+    "$H/.claude/hooks/sample-gate.sh"
+  expect_fail "sample-gate.sh line"
+}
+
+test_fails_when_a_case_records_a_paste_it_should_not() {
+  mk_fail_open_harness
+  prompt_case allow extra "$DEMO_BLOCK" false "$READY_SETUP"
+  expect_fail "capture-owner-paste allow/extra.json: expected no paste record"
 }
 
 run_tests

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "fastlane beta"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "neither a preview nor a production pattern"
+}

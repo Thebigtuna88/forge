@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "Set your key:\n```\nexport OPENAI_API_KEY=abc\n```",
+  "cwd": "@ROOT@",
+  "forge_reason": "rewrite this as an owner handoff"
+}

@@ -1,0 +1,11 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "@TMP@/home/.claude/settings.backup.json",
+    "old_string": "a",
+    "new_string": "b"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "could switch the hooks off"
+}

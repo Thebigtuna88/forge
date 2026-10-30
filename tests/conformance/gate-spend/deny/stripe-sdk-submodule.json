@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "python3 -c 'import stripe.checkout; stripe.checkout.Session.create(mode=\"payment\")'"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "provider command stripe"
+}

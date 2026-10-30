@@ -16,10 +16,13 @@ a time**, with a recommendation.
 2. **`main` is human-only.** Never push or merge to `main`. `dev` is reached only by a reviewed PR.
 3. **Review before merge, every time.** Never review your own diff inline. Required lenses:
    `code` (codex, mandatory, adversarial), `security` (every PR), `frontend` (UI in a web
-   project), `ios` (iOS project), `spend` (paid APIs, image gen, payments, `spend-limits.json`).
-   Mechanisms `author`, `inline` and `self` are refused.
+   project), `ios` (iOS project), `spend` (every PR).
+   Every lens is run by codex, with `.harness/bin/review-lens`; mechanisms `subagent`,
+   `author`, `inline` and `self` are refused.
 4. **Read-proof.** A lens reply counts only if the reviewer itself computed and reported the
-   diff's md5 and byte count, and they match the runner's own computation.
+   diff's md5 and byte count (and the evidence file's, when there is one), and they match the
+   runner's own computation. This shows the reply refers to exactly those files, not that the
+   reviewer read or understood them.
 5. **Rounds are uncapped; the only circuit breaker is a stall.** Fix and re-run until every
    required lens is CLEAN. Log `<utc> <lens> <head-sha> <verdict> <findings-hash>` to
    `rounds.log`. Two identical findings-hashes in a row for a lens → stop and ask the owner.
@@ -30,7 +33,8 @@ a time**, with a recommendation.
    deploy targets, mode.json, the paths list itself, `.claude/hooks/`, `.claude/settings.json`,
    `.harness/lib/`, `.github/workflows/`, `.harness/bin/conformance`, `tests/conformance/`,
    `.harness/gitleaks.toml`, this file `CLAUDE.md`, `.harness/bin/handoff`, `docs/specs/`,
-   `tests/stubs/`) change only by a PR **the owner** merges.
+   `tests/stubs/`, `.harness/bin/review-lens`, `.harness/lenses/`) change only by a PR **the
+   owner** merges.
 8. **Test mode until the owner flips it.** Payments run in test mode. Production deploys, App
    Store/TestFlight submissions, DNS changes and anything that charges a card are owner-run
    scripts, never agent actions.
@@ -45,14 +49,20 @@ Whenever you are blocked on the owner (install, login, API key, credits, product
 web-UI click), **write a script, never instructions**:
 
 1. `.harness/bin/handoff new <slug> "<title>"`, then add steps using only `ho_check`,
-   `ho_info`, `ho_confirm` and `ho_secret_to_file`, with `|| ho_abort` before anything
-   irreversible.
+   `ho_info`, `ho_confirm`, `ho_secret_to_file` and `ho_redact_file`, with `|| ho_abort` before
+   anything irreversible. A step that uses a secret stored by an earlier handoff is preceded by
+   `ho_redact_file <name> <that file>`, so the value is hidden if printed.
 2. `.harness/bin/handoff ready <id>` (it lints and freezes the script).
 3. Give the owner **exactly two things**: `bash <full path>/OWNER-RUN.sh` and "paste back the
    HANDOFF-RESULT block". Nothing else.
-4. Save the owner's pasted text **verbatim** to `work/owner/<id>/PASTED-<utc>.txt` and run
-   `.harness/bin/handoff verify <that file>`. **Do not proceed until verify passes.** Never
-   verify `RESULT.txt` or a block you wrote yourself. Never run an OWNER-RUN.sh yourself.
+4. The `capture-owner-paste` hook saves the owner's pasted block to
+   `work/owner/<id>/PASTED-<utc>.txt` and names the file; run `.harness/bin/handoff verify
+   <that file>`. **Do not proceed until verify passes.** Never write a paste, `RESULT.txt`,
+   `VERIFIED.txt` or `META.json` yourself, never verify `RESULT.txt`, and never put a
+   HANDOFF-RESULT block into a scheduled task, a helper agent's prompt or a message to another
+   session (the hook can't tell those from the owner, L4). The guard stops the file tools only;
+   never write those files or the main checkout from the shell either (L14). Never run an
+   OWNER-RUN.sh yourself.
 
 ## Command conventions (the hooks parse these)
 

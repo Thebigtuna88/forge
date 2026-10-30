@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "No OWNER-RUN.sh or HANDOFF-RESULT is available yet.\nRun this in your terminal:\nbrew install jq",
+  "cwd": "@ROOT@",
+  "forge_reason": "rewrite this as an owner handoff"
+}

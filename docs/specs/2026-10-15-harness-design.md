@@ -103,7 +103,9 @@ cloned under `projects/`, and is governed by FORGE's rules, hooks and review run
                                     conformance new-project
     lib/                            shared code: hookrt.sh handoff.sh review.sh pr.sh
                                     review-diff.sh (the one review diff, FRG-4)
+                                    review_lib.py (reply checks, required lenses, FRG-7)
     lenses/                         review checklists: code security frontend ios spend (.md)
+                                    and reply.schema.json                  [owner-only]
     mode.json                       per-hook enforce|observe (missing/malformed = enforce)
     spend-limits.json               monthly $ cap per paid API              [owner-only]
     deploy-targets.json             which deploy targets are preview vs production
@@ -159,8 +161,9 @@ Worktrees live **outside** the repo:
   `.harness/self-modification-paths.json`, `.claude/hooks/`, `.claude/settings.json`,
   `.harness/lib/`, `.github/workflows/`, `.harness/bin/conformance`, `tests/conformance/`
   (FRG-2), `.harness/gitleaks.toml` (FRG-3), `CLAUDE.md`, `.harness/bin/handoff`,
-  `docs/specs/` and `tests/stubs/` (FRG-4). `gate-self-modification` reads both this list and the one at a PR's
-  merge base.
+  `docs/specs/` and `tests/stubs/` (FRG-4), `.harness/bin/review-lens` and `.harness/lenses/`
+  (FRG-7: the runner, its checklists and the reply schema, owner decision 2026-10-29).
+  `gate-self-modification` reads both this list and the one at a PR's merge base.
 
 ---
 
@@ -174,8 +177,8 @@ governed project. "Enforced by" says what actually stops a violation. Where it o
 |---|---|---|
 | 1 | **One ticket, one branch, one worktree.** A ticket is a GitHub Issue on the repo it concerns, titled `<KEY>-<n>`. Branch `feature/<KEY>-<n>-<slug>` → `dev` → `main`. | `enforce-branch-format`, `deny-commit-on-shared-checkout`, `ticket`/`worktree` commands |
 | 2 | **`main` is human-only.** The agent never pushes to or merges into `main`. `dev` is reached only by a reviewed PR, which the agent may merge. | `deny-push-to-protected`, `gate-merge-on-review` (only `--base dev`), GitHub branch protection (3.2) |
-| 3 | **Review before merge, every time.** Never review your own diff inline. Required lenses: `code` (codex, mandatory, adversarial), `security` (every PR), `frontend` (UI in a web project), `ios` (iOS project), `spend` (paid APIs, image gen, payments, `spend-limits.json`). Mechanisms `author`, `inline`, `self` are refused. | `review-lens` runner, `gate-merge-on-review` |
-| 4 | **Read-proof.** A lens reply counts only if the reviewer itself computed and reported the diff's md5 and byte count, and they match the runner's own computation. | `review-lens verify` |
+| 3 | **Review before merge, every time.** Never review your own diff inline. Required lenses: `code` (codex, mandatory, adversarial), `security` (every PR), `frontend` (UI in a web project), `ios` (iOS project), `spend` (every PR, owner decision 2026-10-29). Every lens is run by codex (FRG-7); mechanisms `subagent`, `author`, `inline`, `self` are refused. | `review-lens` runner, `gate-merge-on-review` |
+| 4 | **Read-proof.** A lens reply counts only if the reviewer itself computed and reported the diff's md5 and byte count, and they match the runner's own computation (and the evidence file's, when there is one, FRG-7). Matching fingerprints show the reply refers to exactly those files; they don't prove the reviewer read or understood them (6.3). | `review-lens verify`, `gate-merge-on-review` |
 | 5 | **Rounds are uncapped; the only circuit breaker is a stall.** Fix and re-run until every required lens is CLEAN. Each round is logged to `rounds.log` as `<utc> <lens> <head-sha> <verdict> <findings-hash>`. Two consecutive identical findings-hashes for a lens = stall → stop and hand the decision to the owner. Every deferred finding becomes a ticket **before** merge. | `review-lens`, `gate-merge-on-review` (checks deferred findings have issue numbers) |
 | 6 | **A finding clears only when the fix is demonstrated**: a test that fails without the fix, command output, or `file:line`. The same standard applies to every claim the agent makes to the owner. | review checklist; next round re-checks |
 | 7 | **Limits are the owner's.** The paths in `self-modification-paths.json` (section 2.2) may be changed only by a PR the owner merges. | `gate-self-modification`, `guard-live-checkout` (5.2) |
@@ -197,7 +200,10 @@ The local hooks run on the owner's Mac. GitHub branch protection is the second, 
 layer. On each governed repo:
 
 - `main`: changes only through a PR; no force-push; no deletion; applies to admins too.
-- `dev`: changes only through a PR; the CI check must pass; no force-push; no deletion.
+- `dev`: changes only through a PR; no force-push; no deletion.
+- **CI is not required yet** (L15). Harness CI (FRG-6) runs on every PR into `dev` or `main`,
+  but a failing run doesn't technically block a merge until FRG-34 (after the FRG-26
+  checkpoint) makes passing CI and the owner's approval required on both branches.
 
 **Limit:** the agent uses the owner's own `gh` login, so GitHub can't tell agent and owner
 apart. Server-side protection stops direct pushes and force-pushes, but only the local hooks stop
@@ -241,7 +247,7 @@ agent → owner, exactly two lines:
 owner: runs it in a normal Terminal window (not inside Claude Code)
 runtime: writes RESULT.txt, copies the block to the clipboard
 owner: pastes the block into chat
-agent: saves the paste verbatim → work/owner/<id>/PASTED-<utc>.txt
+hook:  capture-owner-paste saves it verbatim → work/owner/<id>/PASTED-<utc>.txt (+ pastes.log)
 agent: handoff verify work/owner/<id>/PASTED-<utc>.txt → VERIFIED.txt on success
 agent: proceeds only after verify passes
 ```
@@ -276,7 +282,19 @@ ho_end
   sha256 (it was never frozen by `handoff ready`, or it is already verified);
 - its own sha256 or the runtime's can't be computed;
 - shell tracing is on (`bash -x`), which would print secrets;
-- a symlink sits at `logs/` or `RESULT.txt` (the last three added in the FRG-1 review).
+- allexport is on (`set -a`, or an exported `SHELLOPTS` carrying it), which would export a secret
+  as soon as it is read (FRG-14);
+- a symlink sits at `logs/` or `RESULT.txt` (the last three added in the FRG-1 review);
+- the live redaction filter `.harness/lib/handoff_redact.py` is missing, a symlink, or not the
+  one whose sha256 `handoff.sh` pins (FRG-14). So `runtime-sha256` covers the filter too. The
+  filter is read with a shell builtin and hashed by the checked interpreter, never by a tool on
+  `PATH`.
+  `ho_begin` reads the filter once and every step runs that checked text (`python3 -c`), so
+  replacing the file mid-run changes nothing;
+- no `python3` from Apple's Command Line Tools or Xcode is found at its fixed path with it and
+  every folder above it root-owned and not writable by the owner (so the Xcode copy under the
+  admin-writable `/Applications` is refused). The filter never runs on the `/usr/bin/python3`
+  shim, whose choice of interpreter follows `DEVELOPER_DIR`.
 
 The refusal means running the script through Claude Code's `!` prefix fails too. That's
 intended: the owner uses a separate Terminal window.
@@ -290,14 +308,16 @@ can stop before an irreversible step.
 | `ho_check <name> <cmd…>` | `PASS` or `FAIL` + last non-empty output line | command exits 0 |
 | `ho_info <name> <cmd…>` | `INFO` + last output line | never fails |
 | `ho_confirm <name> "<question>"` | `PASS` (answered `y`) or `FAIL` | owner types `y` at `/dev/tty` |
-| `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty and uses only `A-Z a-z 0-9 . _ + / = : @ % , -`; the target is a regular file (or absent) and gitignored (`git check-ignore`), as is its temp file; and every write step succeeds |
+| `ho_secret_to_file <name> <VAR> <file>` | `PASS stored VAR in <file> (mode 600)` | hidden input is non-empty, uses only `A-Z a-z 0-9 . _ + / = : @ % , -`, and doesn't appear in the handoff's own text (FRG-14); the target is a regular file (or absent) and gitignored (`git check-ignore`), as is its temp file; and every write step succeeds |
+| `ho_redact_file <name> <file>` | `PASS hiding N values from <file>` (a count, never a value); on any refusal the run stops at once (`result: FAILED`), since later steps may use those values | no value appears in the handoff's own text (see below), the file is absolute, reached through no symlink, a regular readable file (opened without following a symlink, and confirmed after opening to be the file at that path), untracked and gitignored, and every line that isn't blank (spaces only) or a comment is `VAR=value` (a trailing CR is ignored) with a value of at least 8 characters from the `ho_secret_to_file` set. Its values are then hidden like collected secrets for the rest of the run (FRG-14) |
 | `ho_abort` | `result: FAILED` | ends the run early with the block |
 | `ho_end` | the block | — |
 
 Details:
 - Step names are `[a-z0-9-]+` and unique within a script.
-- Command output still streams to the owner's screen and is saved to `logs/<name>.log`. Only
-  the last line (trimmed to 200 characters, newlines and `-----` stripped) goes into the block.
+- Command output still streams to the owner's screen and is saved to `logs/<name>.log`, both
+  through the live redaction filter (below). Only the last line (trimmed to 200 characters,
+  newlines and `-----` stripped) goes into the block.
 - `ho_secret_to_file` reads with echo off, writes or replaces the single `VAR=value` line in
   the file via a private temp file, `chmod 600`, and unsets the variable. The value is written
   unquoted, which is why its characters are restricted: it means the same to a shell and a
@@ -305,13 +325,44 @@ Details:
   clipboard or the block; if a later step prints it anyway, the runtime replaces it with
   `[REDACTED]` in the evidence and in that step's log. Evidence is redacted both before and
   after it is normalised, so stripping `-----` or control characters can't rejoin a secret.
-- Commands run as `script -q <log> /bin/bash -c '"$@"' …`, so they keep the terminal and shell
-  builtins work. The handoff folder and its logs are mode 700, `RESULT.txt` mode 600. Each
-  step's log is removed before the step runs, and `RESULT.txt` is written fresh; if it can't be
-  saved, `ho_end` prints no block and exits 1.
-- Redaction happens after a step ends, so it protects the evidence and the saved log, not the
-  live screen; see limit L11 and FRG-14. If a log can't be replaced by its redacted copy, the
-  run ends FAILED (the log may hold a secret).
+- Commands run as `script -q /dev/null /bin/bash -c '"$@"' … | <python3> -I -c <checked filter>
+  <log>`, so they keep the terminal and shell builtins work. The handoff folder and its logs are
+  mode 700, logs and `RESULT.txt` mode 600. Each step's log is removed before the step runs, and
+  `RESULT.txt` is written fresh; if it can't be saved, `ho_end` prints no block and exits 1.
+- **Live redaction (FRG-14).** The filter shows the step's output and writes its log with every
+  known secret (collected this run, or loaded by `ho_redact_file`) masked before either sees it:
+  every byte any occurrence of any secret covers, judged on the original bytes, so secrets that
+  contain or overlap one another are hidden whole, and a run of masked bytes shows as one
+  `[REDACTED]`. The secrets reach it on a private pipe (descriptor 3): never on a command line,
+  and not in the step's environment. The list ends with the line `#END`; a list without it may
+  have been cut short, so the filter shows nothing and the run ends FAILED. Everything else the
+  runtime shows that holds words from the script goes through the filter too, without a log:
+  step banners (`▶ name: command`), confirm questions, prompts, file paths and failure reasons.
+  The block's check lines are masked as a whole before the block is saved, shown or copied, so
+  a step name that matches a known secret shows as `[REDACTED]`, and verify then refuses the
+  block. Evidence is masked the same way, through the filter, never one secret at a time.
+- **No secret in the handoff's own text.** `ho_secret_to_file` refuses a typed value, and
+  `ho_redact_file` refuses a file with a value, that appears anywhere in the handoff's own text:
+  the frozen script, its folder, the runtime's and the interpreter's paths, the id, the
+  checksums or the start time; the runtime's and the filter's own source (fixed messages, the `[REDACTED]` marker, the
+  filter text on its command line); and each step's log path. Every line the runtime prints or
+  passes on a command line, other than step output, is built from that text: banners,
+  questions, prompts, paths, failure reasons, the block's header, and the filter's arguments. So a value found there could never be kept hidden, and a real secret
+  found there has leaked already. The filter's own messages are fixed text, with no path,
+  system message or traceback. If masking fails while evidence is cleaned, the run ends FAILED. It holds back only the longest end of the output that could
+  still become a secret (less than one secret's length), and shows that as soon as more output
+  rules it out or the step ends. There is no timer, which could show part of a
+  secret: a step that prints the start of a secret and then waits for input shows those
+  characters only when it continues. The filter ignores SIGINT; if it is killed, what it held is
+  dropped.
+- **Fail closed.** If the filter fails (it can't create the log, it dies, or writing fails), the
+  run ends FAILED: `check _runtime: FAIL live redaction failed in step <name>`. The evidence and
+  the log are also redacted again after the step, as before FRG-14. If a log can't be replaced by
+  its redacted copy, the run ends FAILED (the log may hold a secret).
+- **What it doesn't stop:** a step built to get around it, for example by writing to the
+  terminal device directly, splitting a secret with screen codes, or encoding it. That is L11
+  ("steps run arbitrary programs"), narrowed by FRG-30. Live redaction protects against a step
+  printing a secret by accident.
 - Ctrl-C, TERM or a hang-up ends the run through the same exit path: the block reports FAILED
   and any secret temp file is removed.
 - Steps run from `/`, never from wherever Terminal was opened, so a step names its repository
@@ -344,7 +395,10 @@ step lines, and `ho_end`. Each step line is one helper call made of plain words 
 strings, optionally ending in `|| ho_abort`: no `$` or backticks (except inside single quotes,
 where they stay literal), no other operators, redirection, globs, assignments or function
 definitions. Forbidden names are checked after quote removal, and no `ho_check`/`ho_info` step
-may name a file that a `ho_secret_to_file` step wrote.
+may name a file that a `ho_secret_to_file` step writes or a `ho_redact_file` step names.
+`ho_redact_file` takes exactly one absolute path (read with the grammar's own tokenizer, so a
+quoted path is judged whole), which must already be inside a git repository, untracked and
+gitignored when the script is linted (the runtime checks again at run time).
 
 In addition, lint rejects a script (and `handoff ready` refuses to freeze it) if it:
 - doesn't source the runtime by its exact absolute path, or doesn't call `ho_begin` first and
@@ -369,17 +423,33 @@ Passes only if **all** of these hold:
    `handoff ready`, and the run's `at:` is not older than `readied` (no replaying a run made
    before the script was frozen).
 4. `runtime-sha256` equals the sha256 of the current `.harness/lib/handoff.sh`, and the
-   runtime named in `META.json` is that file.
+   runtime named in `META.json` is that file. The redaction filter beside it still matches the
+   sha256 the runtime pins (FRG-14), as hashed by `/usr/bin/shasum` in an empty environment.
 5. Every step declared in the script appears exactly once, and no undeclared step appears.
 6. Every step is `PASS` or `INFO`, and `result: OK`.
 7. The paste matches `RESULT.txt` (written by the runtime on the owner's run), ignoring
    leading and trailing whitespace.
 8. The pasted file lives at `work/owner/<id>/PASTED-*.txt` and is its own regular file (not a
    symlink or hard link). Verify refuses to take `RESULT.txt` itself as input.
+9. `.harness/state/pastes.log` in the main checkout (a regular file with one link, in folders
+   that are not links) has a finished line (ending in a line break) of four fields naming
+   `work/owner/<id>/PASTED-*.txt` with the paste's sha256 (FRG-5).
+
+Verify reads the paste once: checks 1 to 9 all use that one copy, so the bytes it checks are the
+bytes whose hash must be recorded.
 
 **From FRG-5 on** (owner decision 2026-10-16-handoff-evidence-provenance), the paste file is
-written by the `capture-owner-paste` UserPromptSubmit hook, not by the agent, and verify also
-requires the paste's sha256 to be recorded in `.harness/state/pastes.log` by that hook.
+written by the `capture-owner-paste` UserPromptSubmit hook, not by the agent, and verify's check 9
+requires the paste's sha256 to be recorded in `.harness/state/pastes.log` by that hook. The hook
+gets the owner's message in full (a collapsed paste arrives expanded, between `<pasted_content>`
+lines). When the message holds exactly one block (lines compared as verify compares them) for a
+`<date>-<slug>` handoff whose `work/owner/<id>/` is a real folder with a `META.json` in state
+`ready`, it saves the block's lines exactly as received to a new `PASTED-<utc>.txt` (never
+replacing a file, never through a link) and appends `<utc> <id> <file> <sha256>` to
+`pastes.log`. Its one-line note (what it saved, or why not) reaches the agent as added context. It
+never blocks the message: it is registered without `onFailure` and fails open (5.1), so a failure
+only means verify refuses the paste. `guard-live-checkout` keeps the agent's file tools away from
+both files (5.3).
 
 On success, it writes `VERIFIED.txt` (the block + verify time) in one step (temp file, then
 rename). `VERIFIED.txt` alone is the record that a handoff is verified; `META.json`'s state
@@ -391,15 +461,19 @@ fails by design. The fix is a fresh handoff, not a patched verify.
 
 ### 4.6 Stop hook: `gate-owner-handoff-form`
 
-Runs when the agent finishes a turn. It reads the last assistant message from the transcript.
+Runs when the agent finishes a turn. It reads the turn's last message from the input's
+`last_assistant_message` (FRG-5: Claude Code's docs say the transcript file may lag behind).
 - **Blocks** (exit 2, with "rewrite this as an owner handoff") when the message gives the owner
-  prose run-instructions, i.e. it contains a shell block or `$ ` lines aimed at the owner
-  (`brew install`, `gh auth`, `npm i -g`, `export *_KEY=`, `curl … | sh`, etc.) or phrases like
-  "run this in your terminal", "go to … and click", **and** it doesn't also contain an
-  `OWNER-RUN.sh` path and "HANDOFF-RESULT".
+  prose run-instructions, i.e. it contains a block marked as shell, `$ ` lines, or a setup command
+  at the start of a line or list item, aimed at the owner (`brew install`, `gh auth`, `npm i -g`,
+  `export *_KEY=`, `curl … | sh`, etc.), or phrases like "run this in your terminal", "go to … and
+  click". Only an owner handoff's own lines are exempt: `bash <…>/work/owner/<id>/OWNER-RUN.sh`
+  (alone, or in a block of such lines) and "paste back the HANDOFF-RESULT block". The rest of a
+  message that also holds a handoff is still checked (FRG-5 review round 2).
 - **Never blocks twice in a row.** When Claude Code reports `stop_hook_active: true`, it allows.
-- **Fails open.** If the transcript is missing or unreadable, it allows and logs to
-  `.harness/observed.log`. A Stop hook that fails closed would block every turn.
+- **Fails open.** If the message is missing or unreadable, or the hook itself fails, it allows
+  and logs `FAILED-OPEN` to `.harness/observed.log` (hookrt, 5.1). A Stop hook that fails closed
+  would block every turn.
 - Starts in **observe** mode, because it is a text heuristic. The owner promotes it to enforce
   by PR once the observed log shows few false positives.
 
@@ -442,7 +516,14 @@ one that times out, unless it is registered with `"onFailure": "block"` (Claude 
 later). Then any failure blocks, as exit 2 does. **Every FORGE hook is registered that way, with
 a timeout of at most 120 seconds**, except on the events where Claude Code ignores the field
 (`Stop`, `SubagentStop`, `TaskCompleted`, `TeammateIdle`), which is why the Stop hook below has
-neither and fails open (4.6) (FRG-20, `docs/decisions/2026-10-18-failed-hooks-block.md`).
+neither and fails open (4.6) (FRG-20, `docs/decisions/2026-10-18-failed-hooks-block.md`). The one
+other exception is `capture-owner-paste` (UserPromptSubmit, FRG-5), registered with a timeout but
+without `onFailure`, on purpose: there a blocking failure would stop the owner's message reaching
+the agent, and fail-closed is kept at verify instead (4.5). The runtime lets exactly these two
+hooks fail open, known by their file names: a crash or an input they can't judge allows and logs
+`FAILED-OPEN`, while an explicit deny still denies. They load the runtime with header lines that
+exit 0, not 2, if it can't load. Conformance checks that each is registered only for its own
+event, and that they, and only they, use those header lines.
 
 Registration is project-scoped, in the committed `.claude/settings.json` (never `~/.claude`):
 
@@ -475,6 +556,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$here/../../.harness/lib/hookrt.sh" || { echo "hookrt failed to load" >&2; exit 2; }
 [ "${HOOKRT_LOADED:-}" = 1 ] || { echo "hookrt not loaded" >&2; exit 2; }
 ```
+
+The two hooks that fail open (5.1: `capture-owner-paste` and `gate-owner-handoff-form`) use the
+same lines with `exit 0` in place of `exit 2`, and an `echo "FORGE hook failed open: …"` on standard
+output, so even a runtime that can't load never blocks the owner's message or every turn.
+Conformance requires those lines for these two hooks and refuses them in any other (FRG-5).
 
 The runtime is found relative to the hook's own file, never through an environment variable.
 It provides:
@@ -525,16 +611,17 @@ It provides:
 |---|---|---|---|
 | `deny-push-to-protected` | Pre / Bash | `git push` to `main` or `dev` (any refspec form: `main`, `HEAD:main`, `refs/heads/dev`, `:main`); any `--force`, `-f`, `--force-with-lease`, `+refspec`; `--delete`/`-d`, `--mirror`, `--all`; a **bare** `git push` (target must be explicit: `git push origin <branch>`) | enforce |
 | `secret-scan` | Pre / Bash | `git commit` if `gitleaks git --staged` finds a secret, or gitleaks is missing; also any `git commit` using `-m`, `-a`, `--no-verify` or without `-F <file>` | enforce |
-| `gate-merge-on-review` | Pre / Bash | `gh pr merge` in any form but `gh pr merge <n> --repo Thebigtuna88/forge --squash --match-head-commit <40-character sha>` (so no `--auto`, `--admin`, `--delete-branch`, `--rebase`, `--merge`, `--subject`, `--body`), and that form unless all hold (FRG-4): GitHub says the PR is open, its base is `dev`, its head is a ticket branch of this repository (not a fork) at exactly that sha, its merge base with `dev` is the one recomputed locally, and `dev` requires no merge queue (where `gh pr merge` could turn on auto-merge); every answer and file it reads is exactly one JSON value; `work/<KEY>-<n>-<slug>/review.md` (6.6) is bound to that repository, branch, PR, head **and** merge base, and the diff recomputed now has its md5 and byte count; every lens listed is CLEAN, run by `codex` or `subagent` (`code` only by `codex`; `author`, `inline`, `self` refused), and its reply file still has the recorded sha256 and is itself a CLEAN reply for this lens and this diff's md5 and bytes; `code` and `security` are present; every deferred finding cites an issue open now; and gitleaks finds no secret in what the squash commit would hold (the PR's title, body, commit messages and authors). The hook recomputes everything; it trusts none of review.md's text. Merges through the API are refused by `deny-repo-admin` | enforce |
+| `gate-merge-on-review` | Pre / Bash | `gh pr merge` in any form but `gh pr merge <n> --repo Thebigtuna88/forge --squash --match-head-commit <40-character sha>` (so no `--auto`, `--admin`, `--delete-branch`, `--rebase`, `--merge`, `--subject`, `--body`), and that form unless all hold (FRG-4): GitHub says the PR is open, its base is `dev`, its head is a ticket branch of this repository (not a fork) at exactly that sha, its merge base with `dev` is the one recomputed locally, and `dev` requires no merge queue (where `gh pr merge` could turn on auto-merge); every answer and file it reads is exactly one JSON value; `work/<KEY>-<n>-<slug>/review.md` (6.6) is bound to that repository, branch, PR, head **and** merge base, and the diff recomputed now has its md5 and byte count; every lens listed is CLEAN, run by `codex` (`subagent`, `author`, `inline`, `self` refused, FRG-7), and its reply file still has the recorded sha256 and is itself a CLEAN reply for this lens and this diff's md5 and bytes; every lens the recomputed diff requires (6.2, the same code the runner uses) is present, as is every lens that ran in any round, and no listed lens has a later round, even a failed or unfinished run; every deferred finding cites an issue open now; and gitleaks finds no secret in what the squash commit would hold (the PR's title, body, commit messages and authors). The hook recomputes everything; it trusts none of review.md's text. Merges through the API are refused by `deny-repo-admin` | enforce |
 | `gate-self-modification` | Pre / Bash | `gh pr merge` when the PR touches any path in `self-modification-paths.json`, the live list or the one at the PR's merge base (or a project's own owner-only list in `projects.json`) → "owner must merge this". The changed paths come from the recomputed diff, not GitHub's file list (which stops at 100); names are compared case-folded and Unicode-normalised, a rename counts as both paths, and any symlink or submodule in the diff counts as owner-only. A missing or malformed list refuses | enforce |
-| `guard-live-checkout` (added) | Pre / Edit, Write, MultiEdit, NotebookEdit **and** Bash | Edits inside the main checkout `~/code/forge` or `~/code/forge/projects/<name>` other than gitignored scratch areas (`work/`, `.harness/state/`); any write to `.claude/settings.local.json` or `~/.claude/settings*.json` (these could switch hooks off). For Bash, a best-effort check for write operators (`>`, `tee`, `sed -i`, `cp`, `mv`, `rm`) aimed at those paths | enforce (Edit/Write); **observe** (Bash part) |
+| `guard-live-checkout` (added) | Pre / Edit, Write, MultiEdit, NotebookEdit | The agent's file-tool edits (the path the tool writes: `file_path`, or `NotebookEdit`'s `notebook_path`; a `NotebookEdit` naming a different `file_path` too is refused) inside the main checkout (the one the hook sits in, so it follows FORGE if it moves) or a project's main checkout under `projects/<name>`, other than gitignored scratch areas (`work/`, `.harness/state/`); in `work/owner/<id>/` anything but a draft `OWNER-RUN.sh` (results, pastes, `VERIFIED.txt`, `META.json`, logs), and `.harness/state/pastes.log` (FRG-5, 4.5); any write to a `.claude/settings.local.json` or `~/.claude/settings*.json` (these could switch hooks off). Paths are judged as written and with links resolved, compared as macOS compares names, and a file with more than one hard link is refused wherever it is; settings files in `CLAUDE_CONFIG_DIR` count as `~/.claude`'s (names compared ignoring case), and a settings file's real location is guarded too when the file, or a folder on its way, is a link (in a worktree only `settings.local.json`: its tracked `settings.json` changes by owner-merged PR). Anything a link inside the main checkout points to is refused too, whichever folder the link sits in (every link reachable in it is found, in scratch folders, linked folders, `node_modules` and `.git` too; a checkout too large to list, or with a folder that can't be listed, means every file-tool write is refused). **Shell commands that write there are not prevented** (L14): the planned Bash part moved to FRG-32, after the FRG-26 checkpoint (owner decision 2026-10-27) | enforce |
 | `deny-repo-admin` (added) | Pre / Bash | Every `gh` command not on its allowlist (FRG-4): the read-only commands; `gh auth status` (no `--show-token`); `gh api <path>` as a GET only (no `-X`/`--method` but GET, no `-f`/`-F`/`--field`/`--raw-field`/`--input`, no `-H`, `--hostname` or `graphql`); `gh issue create/edit/comment/close/reopen` and `gh pr create/edit/comment/close/ready` with listed options only (a PR only into `dev` from a ticket branch, its base never edited); and the one merge form. So `gh repo edit`/`delete`/`rename`/`archive`/…, rulesets, secrets, variables, `gh auth login/logout/refresh/token/setup-git`, `gh config`, `gh alias`, `gh extension`, `gh workflow run` and anything a newer `gh` adds are refused. Text reaches GitHub only through `--title` and `--body-file`, and the whole command, each of its words as the shell passes them, and every body file are scanned by gitleaks first. (`git config` writes to `alias.*` or `core.hooksPath` are refused by `deny-history-rewrite`, FRG-3) | enforce |
 | `deny-history-rewrite` (added) | Pre / Bash | `git rebase`, `git commit --amend`, `git filter-branch`, `git filter-repo`, `git replace`, `git update-ref -d`, `git push` of rewritten history (already caught by the force rules) | enforce |
-| `gate-deploy-target` | Pre / Bash | Any command that matches a **production** pattern in `deploy-targets.json` (`vercel --prod`, `vercel deploy --prod`, `vercel promote`, `vercel alias`, `vercel domains`, `vercel dns`, `xcrun altool --upload*`, `fastlane` upload lanes, `eas submit`, `gh workflow run <production workflow>`); **any deploy tool command matching neither list** (fail closed). Preview patterns are allowed | enforce |
-| `gate-spend` | Pre / Bash | Commands that mention a paid-API host (`api.openai.com`, `fal.run`, `api.replicate.com`, the Higgsfield API host, `api.stripe.com`, …) or a provider key variable (`FAL_KEY`, `REPLICATE_API_TOKEN`, …) unless the command is the project's budget wrapper. The hosts and variables are listed in `spend-limits.json`, so they're owner-only. Also any `sk_live_` Stripe key in a command | enforce |
+| `gate-deploy-target` | Pre / Bash | Any command that matches a **production** pattern in `deploy-targets.json` (`vercel --prod`, `vercel deploy --prod`, `vercel promote`, `vercel alias`, `vercel domains`, `vercel dns`, `vercel env`, `xcrun altool --upload*`, `fastlane` upload lanes, `eas submit`), compared ignoring case; **any deploy tool command matching neither list** (fail closed). Preview patterns are allowed, but none is listed for now: Vercel's docs (2026-10-27) say a new project's first deployment, and every `--temporary` one, goes to production whatever the command says, so every deploy stays an owner script until a preview-only form is proven (FRG-9 or FRG-12). A deploy command must already be one plain command starting with the tool itself (5.2); `gh workflow run` is refused by `deny-repo-admin` | enforce |
+| `gate-spend` | Pre / Bash | Commands that mention a paid-API host (`api.openai.com`, `fal.run`, `api.replicate.com`, the Higgsfield API host, `api.stripe.com`, …), a provider key variable (`FAL_KEY`, `REPLICATE_API_TOKEN`, …) or names a provider's command-line tool or main Python/JavaScript SDK package (`openai`, `replicate`, `stripe`, `fal_client`, `@fal-ai/client`, …, also followed by a dot as in `stripe.checkout`, which read a key from the environment; others are added with the provider in FRG-11, and code calling a paid API under another name is L1), anywhere, except in a plain command (words joined by `|` `;` `&&` `||`, with no quoting, `$`, brackets or redirections) whose every program only reads and can run no other program (`cat`, `grep`, `ls`, `head`, …; not `rg`, whose `--pre` runs one), unless the command is the project's budget wrapper (from FRG-11; until then nothing is exempt). The hosts and variables are listed in `spend-limits.json` (8.5), so they're owner-only. It recognises the listed hosts, key variables, commands and libraries only, **not every possible paid API call** (L1). Also any live Stripe key prefix (`sk_live_`, `rk_live_`) in a command. Matched ignoring case, as written and with quotes removed; a missing or malformed list refuses | enforce |
 | `enforce-branch-format` | Pre / Bash | Creating a branch (`git checkout -b`, `git switch -c`, `git branch <new>`, `git worktree add -b`) or pushing one whose name isn't `feature/<KEY>-<n>-<slug>` (`^feature/[A-Z]{3}-[0-9]+-[a-z0-9]+(-[a-z0-9]+)*$`) with a known key (FRG or one in `projects.json`) | enforce |
 | `deny-commit-on-shared-checkout` | Pre / Bash | `git commit` whose repo toplevel (cwd or `-C`) is the main checkout of FORGE or of any project, rather than a worktree under `~/code/forge-worktrees/`, or whose current branch isn't a `feature/…` branch | enforce |
 | `gate-owner-handoff-form` | Stop | Prose run-instructions to the owner (section 4.6). Never blocks twice; fails open | **observe** |
+| `capture-owner-paste` (FRG-5) | UserPromptSubmit | Nothing: it records the owner's pasted HANDOFF-RESULT block and never blocks (4.5); registered without `onFailure`, fails open | — (records only) |
 
 The owner moves an observe hook to enforce by a PR that changes `mode.json`, which only the
 owner can merge.
@@ -587,91 +674,248 @@ It proves the gates work **as configured right now**:
 
 ### 6.1 Overview
 
-`.harness/bin/review-lens` (logic in `.harness/lib/review.sh`) runs every review. The agent never
-reviews its own diff. It asks an independent reviewer, **codex** (OpenAI's CLI agent, a
-different model family from Claude), to find what's wrong, and the runner checks the answer
-mechanically.
+`.harness/bin/review-lens` (logic in `.harness/lib/review.sh` and `review_lib.py`, FRG-7) runs
+every review. The agent never reviews its own diff. It asks an independent reviewer, **codex**
+(OpenAI's CLI agent, a different model family from Claude), to find what's wrong, and the runner
+checks the answer mechanically. **Every lens is run by codex** (owner decision 2026-10-28): there
+is no subagent fallback; if codex is unavailable, the agent stops and asks the owner.
 
 ```
-review-lens init <ticket> <pr#>      freeze diff for current head, work out required lenses
-review-lens prompt <lens>            build the prompt (checklist + diff path + instructions)
-review-lens codex <lens>             run codex read-only, save its reply
-review-lens ingest <lens> <file> --mechanism subagent    (non-code lenses only)
-review-lens verify <lens>            schema + read-proof + log the round + stall check
-review-lens defer <lens> <id> <issue#>                   ticket a finding instead of fixing it
-review-lens finalize                 all required lenses CLEAN at head → review.md + PR comment
+review-lens init <ticket> <pr#>                 new round: read the PR from GitHub, freeze the diff,
+                                                work out the required lenses
+review-lens codex <ticket> <lens>               build the prompt, run codex read-only, save the reply
+review-lens verify <ticket> <lens>              schema + fingerprints + rounds.log + stall check
+review-lens defer <ticket> <lens> <id> <issue#> ticket a finding instead of fixing it
+review-lens finalize <ticket> <pr#>             all required lenses CLEAN at the PR's head →
+                                                review.md + the PR comment's text
 ```
+
+The runner finds its own files from where it is installed, never from the current folder, the
+environment or its arguments; it runs with its own PATH and only HOME, USER, LOGNAME and TMPDIR
+kept. The main checkout is the one its git belongs to, and the ticket's worktree is
+`<main>/../forge-worktrees/<ticket>`. It reads the PR's head, its base and dev from GitHub itself.
+So the agent's only inputs are the ticket, the PR number and the lens. (FRG-27 moves it where the
+agent can't change it; until then L12 stays open.)
 
 Evidence goes in `work/<KEY>-<n>-<slug>/`:
 
 ```
-meta.json          repo, PR#, branch, base merge-base sha, required lenses
-rounds/<r>/        diff.patch, prompt-<lens>.md, reply-<lens>.json, stdout-<lens>.log
-rounds.log         one line per lens round
+rounds/<r>/        meta.json (PR, branch, head, dev, merge base, required lenses, fingerprints),
+                   diff.patch, raw, merge-base, charter.md (CLAUDE.md at the merge base),
+                   evidence.txt (when there is evidence), prompt-<lens>.md, stdout-<lens>.log,
+                   model-<lens>.txt, reply-<lens>.json, codex-<lens>.ok (codex finished),
+                   reply-<lens>.failed.json (a failed run's reply, never counted),
+                   verified-<lens>.json
+rounds.log         one line per verified reply
+context.md         the author's description of the change (marked as such in every prompt)
 fixes.md           finding id → demonstrated fix (test, command output, file:line)
-deferred.md        finding id → issue number
-evidence/          screenshots, test output (frontend/ios)
+evidence/          test runs, logs, screenshots, joined into each round's evidence.txt
+deferred.json, deferred.md   finding → open issue
 review.md          final, branch- and sha-bound summary read by the merge gate
+pr-comment.md      the summary the agent posts on the PR
 STALL.md           written when a stall stops the loop
 ```
 
+`init` starts a new round each time; a lens runs once per round. `init` refuses unless the PR is
+open into `dev` from the ticket's branch (not a fork), the worktree is on that branch and clean,
+and its HEAD is the PR's head on GitHub.
+
+**Git in the worktree runs no program** (FRG-7 review rounds 3 and 10). Checking the worktree runs
+before codex's sandbox does, and a git setting can name a program git runs (`core.fsmonitor`, a
+filter's `clean` or `process` command, or the `ext::` or ssh command of a promisor remote, which
+git calls to fetch a missing object by itself). Every git the runner runs reads no system or
+global settings, has `core.fsmonitor` off, never fetches a missing object (`GIT_NO_LAZY_FETCH`)
+and may use no transport (`GIT_ALLOW_PROTOCOL`, which overrides the repository's
+`protocol.*.allow`). The repository's own filters can't be switched off by name, so `init` and
+`codex` refuse a repository whose settings name any filter, and a worktree with a submodule (a
+repository with settings of its own). These refusals quote no git output: setting names and file
+names are the author's text, scanned for secrets only later.
+
 ### 6.2 Required lenses (computed, not chosen)
 
-`init` computes the set from the changed paths and the project type in `projects.json`. The
-agent can't drop a lens.
+`review_lib.py lenses` computes the set from the frozen diff and the project type (FORGE itself is
+`harness`; projects get theirs from `projects.json`, FRG-10). The runner and `gate-merge-on-review`
+call the same code on the same diff, so the agent can't drop a lens: the gate refuses a review
+that lacks one the recomputed diff requires, whatever `review.md` lists. Both also refuse a
+computed list that leaves out `code`, `security` or `spend`, so an edit to the computation can't
+drop one of them either.
 
 | Lens | Required when |
 |---|---|
-| `code` | always. **Mechanism must be codex.** |
+| `code` | always |
 | `security` | always |
-| `frontend` | web project **and** the diff touches UI (`app/`, `components/`, `*.tsx`, `*.css`, `public/`, design tokens) |
+| `frontend` | web project **and** the diff touches UI (`app/`, `components/`, `public/`, `*.tsx`, `*.jsx`, `*.css`, `*.scss`, design-token files) |
 | `ios` | iOS project (any diff) |
-| `spend` | the diff touches `spend-limits.json`, the budget wrapper or provider adapters, payments code, or mentions a paid-API host or key variable |
+| `spend` | always (owner decision 2026-10-29) |
 
-**Mechanisms:** `codex` (default for every lens) or `subagent` (a separate Claude subagent, only
-for non-code lenses, as a fallback if codex is unavailable). The runner refuses `author`,
-`inline` and `self`, and anything not on the allow-list.
+**Why `spend` reviews every PR.** It was first required only when the diff looked like it touched
+paid APIs: spend paths, provider hosts, key variables, tools and SDK packages, from fixed lists and
+`spend-limits.json`. Three review rounds in a row (FRG-7 rounds 1 to 3) found a provider or SDK
+that guess missed, and each fix closed only that one case; a list can't know every provider. The
+owner chose to drop the guess and require a CLEAN `spend` review on every PR: one more codex run
+per round, run alongside the others.
+
+These lists are a floor: a lens can't be skipped when required. Any known lens may also be run
+when it isn't required; once it has run, it must be CLEAN at the final head like a required one,
+so its findings can't be dropped by leaving it out.
+
+**Mechanism:** `codex` only. The gate refuses `subagent`, `author`, `inline`, `self` and anything
+else.
 
 ### 6.3 Running codex
 
 ```
-codex exec --sandbox read-only --ephemeral -C <worktree> \
-  --output-schema .harness/lenses/reply.schema.json \
-  -o work/<T>/rounds/<r>/reply-<lens>.json  -  < prompt-<lens>.md
+codex exec --sandbox read-only --ephemeral --ignore-user-config --ignore-rules --color never \
+  -c project_doc_max_bytes=0 -c skills.include_instructions=false -c 'web_search="disabled"' \
+  -c memories.use_memories=false --disable hooks --disable plugins --disable apps \
+  --disable skill_search --disable multi_agent --disable browser_use --disable computer_use \
+  --disable image_generation --disable in_app_browser \
+  --skip-git-repo-check -C <folder>/tree --output-schema <folder>/reply.schema.json \
+  -o work/<T>/rounds/<r>/reply-<lens>.json - < <folder>/prompt.md
 ```
 
-- `read-only` means codex can read files and run read-only commands (needed to hash the diff)
-  but can't change anything. `--ephemeral` keeps no session files.
-- Frontend and iOS lenses also get the screenshots via `--image <file>`.
+- **Codex's whole input is one folder** (owner decision 2026-10-29, after review rounds 3 to 6
+  each found one more input outside the secret scan). For each run the runner builds a scratch
+  folder holding `tree/` (the copy of the commit, below), `files.txt` (every file name of the
+  commit), `diff.patch`, `charter.md`, `evidence.txt` when there is one, `reply.schema.json`
+  (the installed schema) and `prompt.md`, scans it as a whole (below), and hands codex nothing
+  else: its working folder, its schema, its prompt and every path the prompt names are in it. The
+  round keeps its own copies; the folder is removed when the run ends. Its environment is all
+  accounted for: `HOME` (where its ChatGPT login is kept), review-lens's fixed `PATH`, a fresh
+  `TMPDIR` inside the run's scratch folder, and fixed `LANG`, `TERM` and `NO_COLOR`; nothing else
+  from the caller (round 8).
+- **One run per lens at a time** (FRG-7 review round 7). `codex` and `verify` hold a lock
+  (`rounds/<r>/running-<lens>/`) for their lens and round, given back when they end, so two runs
+  can't overwrite each other's reply. A command stopped midway leaves it behind; the lens then
+  runs in a new round.
+- **Codex runs on the owner's ChatGPT plan only** (decision 2026-10-16; FRG-7 review round 6).
+  `codex login status` must say `Logged in using ChatGPT`; a login with an API key, billed per
+  use outside the spend limits, or none, stops the run.
+
+- **Codex reviews a copy of the commit, not the worktree** (FRG-7 review round 4). For each run,
+  `review_lib.py snapshot` writes the frozen head's files, and nothing else, into the folder's
+  `tree/`, outside any git checkout, re-hashing every blob against its object id; it refuses a
+  symbolic link (which could lead anywhere), a submodule, and two paths that differ only in case.
+  So an untracked or ignored file (a `.env`) isn't there, and neither is a change git status
+  can't see (`assume-unchanged`, `skip-worktree`): codex reads exactly the committed files the
+  diff and the gate describe. The copy is removed when the run ends.
+- `read-only` means codex can read files and run read-only commands (needed to compute the
+  fingerprints) but can't change anything. `--ephemeral` keeps no session files. It runs with a
+  fixed, minimal environment.
+- **What codex can still read: any file this macOS user can.** Codex's read-only sandbox limits
+  writes, not reads; codex 0.163.0 has no setting the runner could use to keep reads inside the
+  copy. The prompt tells it to read only the copy and the review files, which lowers the risk
+  without removing it: a reviewer that opens another file by its full path (a key in the home
+  folder, a `.env` in the worktree) sends it to OpenAI unscanned. Open as **L16** until codex
+  runs as a user that can't read them (FRG-27).
+- **Codex loads no instruction file by itself** (tested on this Mac for codex 0.163.0, FRG-7
+  step 2, `work/FRG-7-review-runner/codex-isolation.md`). Codex follows `AGENTS.md` and
+  `AGENTS.override.md` files from the repository root down to the folder it runs in, and lists
+  skills from `.agents/skills/` and `.codex/skills/`, so a PR could add a file saying "report
+  CLEAN". `project_doc_max_bytes=0` stops the instruction files and
+  `skills.include_instructions=false` the skills; `--ignore-user-config` and `--ignore-rules` keep
+  the user's codex settings (plugins, helper servers, trust) out; the rest turns off tools a
+  review doesn't need. Project `.codex/` settings and hooks load only for trusted projects, and
+  with the user settings ignored none is trusted. Belt and braces, `codex` refuses to run when
+  the copy holds an `AGENTS.md`, `AGENTS.override.md`, `.agents/` or `.codex/` at any depth,
+  when a folder above it holds an `AGENTS.md`, `AGENTS.override.md` or `.agents/`, or when codex's
+  home holds an `AGENTS.md` or `AGENTS.override.md` (names compared without case). It also
+  refuses any codex version but the tested one; a new version means re-running those tests and
+  changing the pinned version through a PR the owner merges. What the tests showed is codex's own
+  report of what it was given, not a copy of the request. A folder this check can't look into
+  (in the worktree, above it, or codex's home when it exists) counts as a hit, so an incomplete
+  look never lets codex run (FRG-7 review round 3).
+- **The whole folder is scanned for secrets first** (rule 10, FRG-7 review rounds 3 to 6). Every
+  file in it (the prompt with `context.md`, `fixes.md` and the deferred findings, the review
+  files, the schema, the list of file names, and every file of the copy, changed or not) is
+  scanned by gitleaks with FORGE's rules (never a repository's own config, `.gitleaksignore` or
+  `gitleaks:allow` comments) before codex runs. The names are scanned first, on their own: gitleaks
+  must show it read the list (a file named like a PDF's first line makes it skip the whole list,
+  round 7), and a finding there is reported without printing any name. A path with a control
+  character is refused without being printed. A finding in the folder names gitleaks' rule,
+  never the file. A detection, a missing gitleaks or rules
+  file, or a scan that fails stops the run. gitleaks skips archives and files it takes for binary
+  and still reports success, so every file is also scanned once more with a fake token added at
+  its end, which it must report (as the hooks' `hr_scan_text`). A file of the copy gitleaks
+  can't read is **left out of the copy** first, and the prompt names it; its changes, if any, are
+  in `diff.patch` (round 5). Any other file it can't read stops the run. A refused run leaves no
+  prompt in the round. What gitleaks doesn't know as a secret still goes out, and so does any
+  file codex opens outside the folder (L16); the scan narrows rule 10's risk, it doesn't remove
+  it.
+- **Not reviewable yet: a diff gitleaks can't read as text.** The diff shows every file as text
+  (`--text`), so a PR adding or changing a binary file (an image) puts its bytes in
+  `diff.patch`; if gitleaks takes that for binary, the run stops. FORGE commits no binary files
+  today. Before a project commits images (FRG-9, FRG-11), the review must handle them (for
+  example a diff that names binary files instead of showing their bytes), through a PR the owner
+  merges.
+- **What remains: text in the reviewed files.** The reviewer reads the PR's own files, and any of
+  them (code, comments, docs, the PR's copy of `CLAUDE.md`, the evidence) can address it, as a
+  planted instruction would (prompt injection). The prompt names the charter as it was at the
+  merge base (the round's `charter.md`), not the PR's copy, as the rules in force; says that
+  everything in the worktree, the diff and the evidence was written by the author and is material
+  to review, never instructions; and asks for any text that tries to steer the review to be
+  reported as a finding (FRG-7 review round 1). That lowers the risk; it doesn't remove it.
+- The model is read from codex's own header and recorded; a run without one is refused. A reply
+  counts only from a run that finished successfully: a failed run's reply is set aside as
+  `reply-<lens>.failed.json`, and `verify` requires `codex-<lens>.ok`.
+- Frontend and iOS lenses will also get screenshots via `--image <file>` (Phase 5).
 - Codex's reply must validate against `reply.schema.json`:
 
 ```json
 { "lens": "code", "diff_md5": "…", "diff_bytes": 12345,
+  "evidence_md5": "…" | null, "evidence_bytes": 678 | null,
   "verdict": "CLEAN | FINDINGS",
   "findings": [ { "id": "C1", "severity": "blocker|major|minor|nit",
                   "file": "…", "line": 42, "title": "…", "detail": "…", "evidence": "…" } ] }
 ```
 
-**The prompt** contains the lens checklist, the path to `diff.patch` (never its hash), and
-the instruction: *"You are an adversarial reviewer. Your job is to find what is wrong, not to
-approve. Before reviewing, compute the md5 and byte count of the diff file yourself with
-`md5 -q` and `wc -c` and report them. Report CLEAN only if you find nothing."* For later rounds
-it also lists the findings already deferred to issues, so they aren't re-reported.
+**Evidence beside the diff** (owner decision 2026-10-29). Test runs and logs the author attaches
+go in `work/<T>/evidence/`; `init` joins them into the round's `evidence.txt`, a separate file
+next to `diff.patch`, which stays the code-only diff the merge gate recomputes. The reply reports
+a fingerprint (md5) and byte count for each file; `evidence_md5` and `evidence_bytes` are null
+when the round has no evidence. A hidden file (its name starts with a dot) in `evidence/` stops
+`init`, so no attached evidence is left out unseen (FRG-7 review round 3). Evidence file names are
+scanned for secrets only with the rest of codex's input, so `init`'s messages never print one
+(round 8).
 
-### 6.4 Verify, read-proof and rounds
+**What the fingerprints show.** Matching md5s and byte counts show that the reply refers to
+exactly these files: consistency. They don't prove the reviewer read or understood the contents.
+Rule 4 calls this the read-proof; it is a binding between a reply and its input, not a proof of
+reading.
 
-`review-lens verify <lens>`:
-1. The reply parses and matches the schema. `lens` matches. `verdict` is CLEAN **only if**
-   `findings` is empty, and nits count.
-2. **Read-proof:** `diff_md5` and `diff_bytes` equal the runner's own `md5 -q` / `wc -c` of the
-   same `diff.patch`. A mismatch makes the round `INVALID` (logged), and it must be re-run.
-3. It appends to `rounds.log`: `<utc> <lens> <head-sha> <CLEAN|FINDINGS|INVALID> <findings-hash>`.
-4. **Findings-hash:** each finding becomes `file|title|detail`, lower-cased, with line numbers
+**The prompt** contains the adversarial instruction (*"You are an adversarial reviewer. Your job
+is to find what is wrong, not to approve."*), the paths of the diff, evidence and charter files
+(never their fingerprints), what each is and who wrote it, the request to compute the
+fingerprints with `md5 -q` and `wc -c` and report them, the lens checklist (a missing checklist
+stops the run), the author's description of the change from `context.md`, **labelled as written
+by the author, who wants it merged, and not to be trusted**, the findings already deferred
+to issues (so they aren't re-reported), the author's notes on earlier fixes (to check they hold),
+and *"Report verdict CLEAN only if you find nothing."* `codex` builds the prompt and keeps it in
+the round; there is no separate prompt step to edit it between the two.
+
+### 6.4 Verify, fingerprints and rounds
+
+`review-lens verify <ticket> <lens>`, once per reply:
+1. The round's `diff.patch` (and `evidence.txt`) still have the fingerprints `init` recorded.
+2. The reply is one JSON object that matches the schema exactly: no extra or missing fields, no
+   key twice, whole numbers written as digits, a known severity, unique finding ids, `lens`
+   matches. `verdict` is CLEAN **only if** `findings` is empty, and nits count.
+3. **Fingerprints:** `diff_md5` and `diff_bytes` equal the runner's own md5 and byte count of
+   `diff.patch`. When the round has evidence, `evidence_md5` and `evidence_bytes` must be there
+   and equal the runner's for `evidence.txt`; when it has none, they must be null. Any mismatch
+   or missing value makes the round `INVALID` (logged), and the lens runs again in a new round.
+   So does anything else that stops the check (text that isn't UTF-8, nesting too deep to parse),
+   never a crash (FRG-7 review rounds 7 and 8).
+4. It appends to `rounds.log`: `<utc> <lens> <head-sha> <CLEAN|FINDINGS|INVALID> <findings-hash>`.
+5. **Findings-hash:** each finding becomes `file|title|detail`, lower-cased, with line numbers
    masked (`:123` → `:N`, `line 123` → `line N`), whitespace collapsed; then sorted,
-   de-duplicated and sha256-hashed.
-5. **Stall:** if this lens's last two valid rounds have the same non-empty findings-hash, it
-   writes `STALL.md` and exits 4. The agent must stop and hand the decision to the owner.
-   That's the only circuit breaker; there's no round limit.
+   de-duplicated and sha256-hashed (`-` when there are none).
+6. **Stall:** if this lens's last two valid rounds have the same non-empty findings-hash (an
+   INVALID round in between doesn't count), it writes `STALL.md` and exits 4. The agent must
+   stop and hand the decision to the owner, and `init` refuses another round while `STALL.md`
+   exists. That's the only circuit breaker; there's no round limit. (Round folders are numbered
+   up to 999999999; `init` refuses to make one the other commands couldn't read, FRG-7 review
+   round 4.)
 
 **Any new commit invalidates all earlier CLEAN verdicts.** Every required lens must be CLEAN
 at the **current** head sha.
@@ -679,21 +923,34 @@ at the **current** head sha.
 ### 6.5 Fixes and deferrals
 
 - **Fix:** each finding cleared gets an entry in `fixes.md` with its demonstration: a test that
-  fails without the fix, command output, or `file:line` (rule 6). The next round re-checks it.
-- **Defer:** `review-lens defer` requires an existing open issue (checked with `gh issue view`)
-  and records it in `deferred.md`. **Blocker findings can't be deferred**; they're fixed or go
-  to the owner.
+  fails without the fix, command output, or `file:line` (rule 6). The next round's prompt
+  includes it, and the reviewer checks it.
+- **Defer:** `review-lens defer` takes a finding from the lens's latest verified round, requires
+  an open issue (read from GitHub) and records it in `deferred.json` and `deferred.md`.
+  **Blocker findings can't be deferred**; they're fixed or go to the owner. Every entry of
+  `deferred.json` is checked again, against the reviewer's own verified finding (lens, round, id,
+  severity, title; not a blocker), before it goes into a prompt ("don't report these again") or
+  `review.md`; a hand-written entry stops the command (FRG-7 review round 2).
 
 ### 6.6 Finalize and the merge gate
 
-`review-lens finalize` succeeds only if every required lens's latest valid round is CLEAN at
-the current head. It writes `review.md` (branch, PR#, head sha, merge-base sha, diff md5/bytes,
-per lens: mechanism, model, rounds, verdict, sha256 of the reply file; deferred findings with
-issue numbers) and posts a short summary as a PR comment.
+`review-lens finalize` reads the PR from GitHub again, recomputes the diff, and succeeds only if,
+for every lens that diff requires and every other lens started in any round, the lens's latest
+attempt (the latest round with its prompt, reply or failed reply, so a newer failed or unfinished
+run never falls back to an older CLEAN) is of the PR's current head and the same diff, finished,
+verified, CLEAN, and its reply still checks out; and every deferred finding checks out and its
+issue is open. It writes `review.md` (branch, PR#, head sha, merge-base sha, diff md5/bytes, per lens:
+mechanism, model, last round, verdict, sha256 of the reply file; deferred findings with issue
+numbers; what the fingerprints do and don't show; L12) and `pr-comment.md`, a short summary.
+**The agent posts `pr-comment.md`** with a plain `gh pr comment <n> --body-file`, so the hooks scan
+it for secrets like every other text sent to GitHub; a script posting it would skip that scan.
 
 `gate-merge-on-review` does **not** trust `review.md`'s text. It recomputes the diff from the
-merge base to the PR head, rechecks each reply's md5/bytes and file sha256, and checks that the
-recorded merge base is still the merge base of GitHub's `dev` and the head.
+merge base to the PR head, rechecks each reply's md5/bytes and file sha256, works out the
+required lenses from the recomputed diff, refuses a listed lens with a later round (a reply, a
+failed run's reply or an unfinished run's prompt) and a lens that ran in any round but isn't
+listed, and checks that the recorded merge base is still the merge base of GitHub's `dev` and the
+head.
 
 **The diff** (FRG-4) is made by one command, `.harness/lib/review-diff.sh <repo> <dev sha>
 <head sha> <out>`, which the runner uses to freeze `diff.patch` and the gate uses to recompute
@@ -713,29 +970,32 @@ exactly one block fenced by a line ` ```json forge-review ` and a line ` ``` `:
   "pr": 22, "head": "<40 hex>", "merge_base": "<40 hex>", "diff_md5": "<32 hex>", "diff_bytes": 1234,
   "lenses": [ { "lens": "code", "mechanism": "codex", "model": "…", "rounds": 3, "verdict": "CLEAN",
                 "reply": "rounds/3/reply-code.json", "reply_sha256": "<64 hex>" } ],
-  "deferred": [ { "finding": "S4", "issue": 31 } ] }
+  "deferred": [ { "finding": "security S4 (round 2)", "issue": 31 } ] }
 ```
 
-`reply` is relative to `work/<KEY>-<n>-<slug>/` and must be `rounds/<r>/reply-<lens>.json`.
-Every number in the block is written as plain digits, with no fraction or exponent (`1`, not
-`1e0` or `1.0`).
+`reply` is relative to `work/<KEY>-<n>-<slug>/` and must be `rounds/<r>/reply-<lens>.json`, where
+`rounds` is `<r>`, the lens's last round. Every number in the block is written as plain digits,
+with no fraction or exponent (`1`, not `1e0` or `1.0`).
 
-### 6.7 Lens checklists (`.harness/lenses/*.md`)
+### 6.7 Lens checklists (`.harness/lenses/*.md`, owner-only)
 
 | Lens | Checks (summary) |
 |---|---|
 | `code` | correctness and edge cases, error handling, tests that would fail without the change, dead or duplicated code, matches the ticket's scope, no silent behaviour changes |
-| `security` | secrets, injection (shell/SQL/HTML), auth and access, unsafe defaults, dependency risk, input validation, logging of sensitive data, hook bypasses |
+| `security` | secrets, injection (shell/SQL/HTML), auth and access, unsafe defaults, dependency risk, input validation, logging of sensitive data, hook bypasses, evidence the agent controls |
 | `frontend` | screenshots at 390px and 1440px: layout, overflow, contrast and a11y, empty/loading/error states, design-token use, keyboard navigation |
 | `ios` | SwiftUI state handling, Dynamic Type, VoiceOver labels, contrast, memory/threading, simulator screenshots |
-| `spend` | every paid call goes through the budget wrapper, caps read from `spend-limits.json`, ledger entries written, no live keys, test mode for payments, retries can't multiply cost |
+| `spend` | (every PR) anything that could start spending: a new paid call, SDK, tool or provider, wherever it is; every paid call goes through the budget wrapper, caps read from `spend-limits.json`, ledger entries written, no live keys, test mode for payments, retries can't multiply cost |
 
-### 6.8 Before the runner exists, and what codex needs
+The checklists are general; what is particular to a PR goes in `context.md`.
 
-- **Phases 1–2** (before the runner is built): the agent runs the same `codex exec` command by
-  hand with the code and security checklists, saves the output under `work/<T>/manual/`, and
-  checks the md5/bytes by hand against `md5 -q` / `wc -c`. From Phase 3 on, the harness reviews
-  itself with the runner.
+### 6.8 Before the runner existed, and what codex needs
+
+- **Phases 1–2** (before the runner was built): the agent ran `codex exec` by hand with the code
+  and security checklists, saved the output under `work/<T>/manual/`, and checked the md5/bytes
+  by hand. Those runs used the user's codex settings (plugins and helper servers included) and
+  would have followed an `AGENTS.md`; the repository has never had one. From Phase 3 on, the
+  harness reviews itself with the runner, starting with the runner's own PR (FRG-7).
 - Codex needs either a **ChatGPT plan that includes Codex** (log in with `codex login`) or an
   **OpenAI API key** (pay per use). The owner picks at the Phase 1 login handoff. Pricing is
   checked live at that point.
@@ -906,16 +1166,23 @@ Prompts are stored only as hashes. The prompt text lives in the image's sidecar 
   "providers": {
     "manual":     { "enabled": true,  "monthly_cap_usd": 0 },
     "higgsfield": { "enabled": false, "monthly_cap_usd": 0,
-                    "hosts": ["<api host, filled in when added>"], "key_vars": ["HIGGSFIELD_API_KEY"] },
+                    "hosts": ["api.higgsfield.ai"],
+                    "key_vars": ["HIGGSFIELD_API_KEY", "HF_API_KEY_ID", "HF_API_KEY_SECRET"],
+                    "commands": [] },
     "fal":        { "enabled": false, "monthly_cap_usd": 0,
-                    "hosts": ["fal.run", "queue.fal.run"], "key_vars": ["FAL_KEY"] }
+                    "hosts": ["fal.run", "queue.fal.run"], "key_vars": ["FAL_KEY"], "commands": ["fal"] }
   },
-  "always_blocked": ["sk_live_"]
+  "payments": { "hosts": ["api.stripe.com"], "key_vars": ["STRIPE_SECRET_KEY"], "commands": ["stripe"] },
+  "always_blocked": ["sk_live_", "rk_live_"]
 }
 ```
 
-`gate-spend` (section 5) reads `hosts`, `key_vars` and `always_blocked` from this file, so a
-paid host is blocked outside the wrapper even while the provider is disabled.
+`gate-spend` (section 5) reads every provider's `hosts`, `key_vars` and `commands` (its
+command-line tools), the `payments` section's (8.7) and `always_blocked` from this file, so a paid
+host is blocked outside the wrapper even while the provider is disabled. Every provider but
+`manual`, and `payments`, must hold all three lists (empty is fine, missing is malformed and
+refuses everything). FRG-5's file also lists `replicate` and `openai` (disabled), so their
+hosts and keys are blocked too.
 
 ### 8.6 Turning on a paid provider later
 
@@ -935,9 +1202,11 @@ It takes one ticket and one owner handoff:
 - **Payments (Stripe/Shopify)** charge customers, not the owner, so they aren't routed through
   the budget wrapper. Rule 8 keeps them in **test mode**: only `sk_test_`/test-store
   credentials, `sk_live_` is blocked everywhere, and switching to live is an owner-run script.
-- **Codex review:** with a ChatGPT plan it costs a flat subscription. If the owner chooses an
-  OpenAI API key instead, the Phase 1 login handoff also sets a **monthly usage limit in the
-  OpenAI dashboard** (`ho_confirm`), because codex calls can't go through the project's wrapper.
+- **Codex review:** with a ChatGPT plan it costs a flat subscription. The owner chose the plan
+  (2026-10-16), and since FRG-7 the review runner refuses to run codex logged in any other way
+  (6.3). Switching to an OpenAI API key would mean changing the runner through a PR the owner
+  merges, with a **monthly usage limit in the OpenAI dashboard** set by a handoff (`ho_confirm`),
+  because codex calls can't go through the project's wrapper.
 - **Hosting (Vercel), GitHub, Apple:** subscriptions bought only by owner scripts.
 
 ---
@@ -1042,34 +1311,45 @@ or 1.
   shellcheck, gitleaks.
 - **Each test runs in a fresh temp folder** with its own throwaway git repo and a local "bare"
   repo standing in for GitHub. No test touches the network or the real repos.
-- **`gh` and `codex` are replaced by stubs** (`tests/stubs/`) put first on `PATH` *inside the
-  test only*. The stubs record how they were called and return canned replies, for example a
-  codex reply with a wrong md5. The hooks set their own `PATH`, so for them conformance copies
-  the stubs into each sandbox, and the runtime's `hr_gh` runs the fake `gh` there and only
-  there (FRG-4). Its answers come from files the case's setup wrote (`tests/stubs/scene.sh`
-  builds a PR, its review and GitHub's answers about it).
+- **`gh` and `codex` are replaced by stubs** (`tests/stubs/`). The stubs record how they were
+  called and return canned replies, for example a codex reply with a wrong md5. The hooks and
+  the review runner set their own `PATH`, so a stub on `PATH` wouldn't reach them: they run the
+  fakes only when installed in a conformance-shaped sandbox
+  (`<tmp>/forge-conformance.XXXXXX/s<n>/code/forge`), from its `stubs/` folder, never otherwise
+  (hookrt's `hr_gh`, FRG-4; `review-lens`, FRG-7). Their answers come from files the case's
+  setup wrote (`tests/stubs/scene.sh` builds a PR, its review and GitHub's answers about it;
+  `tests/stubs/codex` answers from the sandbox's `codex/` folder).
 - **Handoff tests need a terminal**, so they run the script in a pseudo-terminal
   (`tests/lib/ptyrun.py`, which also types the answers) with all four agent markers removed.
   That the test suite can do this is exactly why section 4.8 calls the TTY check a speed bump.
 - **Platform:** scripts target macOS (the owner's machine) and use small helpers
-  (`hr_md5`, `hr_sha256`) instead of tool-specific flags. Harness CI runs on GitHub's
-  **macOS** runners, which are free for public repos.
+  (`hr_md5`, `hr_sha256`) instead of tool-specific flags. Harness CI
+  (`.github/workflows/ci.yml`, FRG-6) runs on GitHub's standard **macOS** runner `macos-26`,
+  which is free for public repos (checked 2026-10-27), with the hooks' PATH, so the suite gets
+  `/bin/bash` 3.2 and Apple's tools there too. It isn't a required check until FRG-34 (L15), and a
+  green run doesn't replace the local `ALL PASS`: conformance skips the Claude Code version check
+  on GitHub Actions.
 
 The pty driver kills, when a run ends, every descendant it saw in its process snapshots, after a
-best-effort check that each is still the same process. A process that double-forks and detaches
-between two snapshots can escape, and the identity check has one-second precision; macOS has no
-unprivileged containment or race-free signalling for either (FRG-15). The tests start no daemons.
+best-effort check that each is still the same process. A process that detaches itself (fork,
+setsid, parent exits) between two snapshots can escape, whether to evade cleanup or as ordinary
+daemon start-up, and it and its children keep the permissions of the user running the tests; the
+identity check has one-second precision. None of the unprivileged approaches tested on macOS
+closes either gap. The driver is not a security sandbox; the tests start no daemons. Accepted as
+a known limit, with cleanup steps and when to revisit it, in
+`docs/decisions/2026-10-25-pty-driver-cleanup-limit.md`; stronger isolation is FRG-28.
 
 ### 10.3 Required test coverage (minimum)
 
 | Area | Must prove |
 |---|---|
-| `handoff.sh` | refuses without a TTY and with `CLAUDECODE` set; each helper's PASS/FAIL/INFO; secret never appears in logs, screen capture or block; refuses a non-gitignored secret file; `ho_abort` produces `result: FAILED` |
+| `handoff.sh` | refuses without a TTY and with `CLAUDECODE` set; each helper's PASS/FAIL/INFO; secret never appears in logs, screen capture or block; refuses a non-gitignored secret file; `ho_abort` produces `result: FAILED`; live redaction (FRG-14): no piece of a secret on screen or in the log, mid-step or after a killed run, split across writes or overlapping another; secrets on no command line and not in the step's environment; a missing or changed filter refuses, a filter dying mid-step ends the run FAILED; `ho_redact_file` hides stored values and refuses unsafe files |
+| `handoff_redact.py` | shows text at once; holds back only a possible start of a secret, shows it once ruled out or at the end; longest secret whole; private log, never through a symlink; ignores SIGINT |
 | `handoff lint` | rejects each forbidden pattern in 4.4, one test each |
 | `handoff verify` | fails on each of checks 1–8 in 4.5, one test each; passes on a genuine run |
 | `hookrt.sh` | missing, malformed, unknown-value and missing-key `mode.json` all mean enforce; load failure denies |
 | each hook | deny and allow fixtures (conformance), including quoting tricks, `-C`, aliases, chained commands |
-| `review-lens` | read-proof mismatch means INVALID; CLEAN with findings is rejected; refused mechanisms; findings-hash normalisation; stall after two identical rounds; required-lens computation; a new commit invalidates CLEAN; finalize refuses an incomplete set |
+| `review-lens` | read-proof mismatch means INVALID, for the diff and the evidence file (missing or mismatched evidence fields too); CLEAN with findings is rejected; refused mechanisms; findings-hash normalisation; stall after two identical rounds; required-lens computation (spend on every PR, and a computed list without code, security or spend refused by the runner and the gate); a new commit invalidates CLEAN; finalize refuses an incomplete set; codex runs isolated (its arguments and environment) and refuses instruction files, a folder it can't look into, and an untested codex version; codex runs only on the ChatGPT login; codex's whole input is one folder, and nothing reaches it that gitleaks finds a secret in (file names included) or can't scan, including unchanged files and the reply schema; codex reviews a copy of the commit (no ignored files, no edits git status hides, no links); git settings run no program, and filters and submodules are refused; hidden evidence files are refused; init never makes a round number the other commands refuse; the merge gate accepts what `finalize` writes (FRG-7) |
 | `gate-merge-on-review` | edited `review.md` text, a stale sha, a moved merge-base or `--auto` all deny |
 | `review-diff.sh` | the same bytes whatever the repository, global or environment settings; binary files shown as text; a missing commit, two merge bases or a forged object refused |
 | `status` | a failing `gh` prints `UNKNOWN`, never an empty list |
@@ -1105,12 +1385,15 @@ its mitigation and, where one exists, a stronger option the owner can adopt late
 | L1 | **Indirect commands.** A guarded action inside a script file (`bash x.sh` containing `git push origin main`), or a Node/Python program calling a paid API, isn't seen by the command-matching hooks. | Hooks see the command line, not what a program does. | GitHub branch protection (public repos); no paid key exists while Tier C is in force; `spend` and `security` lenses; charter rule 9. | Run the agent under a separate OS user with no access to keys. |
 | L2 | **Same GitHub identity.** The agent uses the owner's `gh` login, so GitHub can't tell agent from owner; only the local hook stops a `dev`→`main` merge. | Personal accounts can't use bypass lists or required reviewers against yourself. | `gate-merge-on-review` (base must be `dev`, API merges denied), `deny-repo-admin`. | A separate free **machine account** for the agent with write access, with `main` requiring the owner's approving review. |
 | L3 | **Handoff runtime checks are a speed bump.** The TTY and `CLAUDECODE` checks can be faked (the test suite does it). | Any program with a shell can fake a terminal. | Evidence = the owner's paste matching `RESULT.txt`, frozen script sha, unchanged runtime; `handoff lint`. | — (the owner's paste is the real control) |
-| L4 | **The paste file is written by the agent** (until FRG-5). The agent saves the owner's pasted text to disk; a dishonest agent could write something else, with a matching `RESULT.txt` (FRG-1 review S1). | Claude Code has no "owner-signed" input. | The paste is visible in the chat transcript; verify cross-checks `RESULT.txt`; charter. **Decided 2026-10-16:** FRG-5 adds a UserPromptSubmit hook that captures the paste and a guard on evidence files. | Agent runs as a separate macOS user. |
-| L11 | **Handoff steps run arbitrary programs.** The grammar limits shell syntax, but an allowed step (`python3 -c …`) can do anything the owner can: forge evidence, or print a collected secret to the screen before redaction (FRG-1 review S15, C3, S18). | The agent writes the scripts the owner runs. | Allowlist grammar; secret-file rule; redaction of evidence and logs; owner sees each step's command on screen. | FRG-14: reject inline interpreters, live redaction. |
-| L12 | **Evidence the agent writes can be forged or swapped by the agent** (FRG-4 review round 1). The merge gate re-checks `review.md` and the reply files (binding, recomputed diff, hashes, read-proof), which proves which code they describe, not that a reviewer wrote them: the agent could write CLEAN replies and a matching `review.md` itself. Likewise a second command running at the same moment could replace a `--body-file` between the scan and `gh` sending it. | Agent, reviewer runner and files share one macOS user; nothing on disk is beyond the agent's reach. | The gates stop mistakes and shortcuts, not a deliberately dishonest agent (as L1, L4); every PR touching an owner-only path is merged by the owner; review summaries are posted on the PR; charter rules 3, 6 and 9. **Decided 2026-10-18** (owner): accepted as a known limit. | Agent (and codex) run as separate macOS users, or a GitHub machine account whose merges need the owner's approval (L2). |
+| L4 | **The paste file is recorded from any prompt-shaped input.** Since FRG-5 the `capture-owner-paste` hook, not the agent, saves the paste, verify accepts only a recorded one, and the agent's file tools can't write the paste, its record or the other evidence files (FRG-1 review S1, decision 2026-10-16). But Claude Code also runs UserPromptSubmit hooks on turns it starts itself (a scheduled task, a background agent reporting back, another session's message) and doesn't say who wrote the text, so an agent that sent a forged block through one of those would get it recorded. And a shell command can still write the files (L14). | Claude Code has no "owner-signed" input, and its hook input names no sender. | The paste and each of those channels are visible in the chat transcript; verify cross-checks `RESULT.txt`; the charter forbids putting a block into those channels. Forgery takes a deliberate act, not a slip. | Agent runs as a separate macOS user (FRG-26), with evidence it can't write. |
+| L11 | **Handoff steps run arbitrary programs.** The grammar limits shell syntax, but an allowed step (`python3 -c …`) can do anything the owner can: forge evidence, or deliberately get a known secret past live redaction (write to the terminal device directly, split it with screen codes, encode it) (FRG-1 review S15, C3, S18). | The agent writes the scripts the owner runs. | Allowlist grammar; secret-file rule; live redaction of the screen and logs and redaction of evidence (FRG-14, for secrets printed by accident); owner sees each step's command on screen. | FRG-30: reject inline interpreters, with runtime replacements (after FRG-26's checkpoint). |
+| L12 | **Evidence the agent writes can be forged or swapped by the agent** (FRG-4 review round 1). The merge gate re-checks `review.md` and the reply files (binding, recomputed diff, hashes, read-proof), which proves which code they describe, not that a reviewer wrote them: the agent could write CLEAN replies and a matching `review.md` itself. Likewise a second command running at the same moment could replace a `--body-file` between the scan and `gh` sending it. | Agent, reviewer runner and files share one macOS user; nothing on disk is beyond the agent's reach. The review runner (FRG-7) changes nothing here: it, its checklists, codex's home folder and the review files are all writable by the agent's user. FRG-7 stops codex loading instruction files a **PR** plants and tells the reviewer the PR's text is not instructions (6.3); it doesn't stop text in the reviewed files trying to steer the reviewer, or anything the agent itself could change. | The gates stop mistakes and shortcuts, not a deliberately dishonest agent (as L1, L4); every PR touching an owner-only path is merged by the owner; review summaries are posted on the PR; charter rules 3, 6 and 9. **Decided 2026-10-18** (owner): accepted as a known limit. **Stays open** until FRG-27's tests pass (owner, 2026-10-20). | FRG-27 (#27): the runner and its output where the agent can't change them, a review user, each review bound to the exact commit; agent (and codex) as separate macOS users, or a GitHub machine account whose merges need the owner's approval (L2). |
+| L14 | **Shell writes to the main checkout are not prevented** (FRG-5, owner decision 2026-10-27). `guard-live-checkout` judges only the agent's file tools (Edit, Write, MultiEdit, NotebookEdit). A shell command (`echo x > CLAUDE.md`, `cp`, `mv`, `rm`, `sed -i`, or a script) can still change the main checkout, its handoff evidence, `pastes.log` or settings files. **Open: not resolved** until permission-based protection is implemented and tested. | A shell-write checker reads shell syntax, and FRG-5 review rounds 1-12 kept finding ordinary forms it misread. | Charter rule 1 (the main checkout is never edited by hand); `deny-commit-on-shared-checkout` stops commits there; verify's paste record (4.5); the file-tool guard. | FRG-26: the agent runs as a macOS user that can't write the main checkout, tested. FRG-32 (after the FRG-26 checkpoint) decides whether a shell-write checker is still needed. |
 | L13 | **Commands deliberately disguised from the gates** (FRG-4 review rounds 6-10). A command built to hide that it runs `gh`, `git` or a deploy tool (its name or words spelled so the text check doesn't recognise them) may not be judged as that tool. Accepted risk, not fixed: round 10's SEC-1, deferred to FRG-26. | The hooks read a command's text; what the shell makes of it can't be fully predicted, and each patch was followed by a new spelling. | The gates recognise ordinary commands and mistakes (conformance proves each listed case); the round 2-9 checks stay; charter rule 9; GitHub branch protection on `main` and `dev`. Against a deliberate attempt, nothing technical holds while the agent uses the owner's admin login (L2). **Decided 2026-10-19** (owner): `docs/decisions/2026-10-19-disguised-commands-known-limit.md`. | FRG-26: define what the agent's own GitHub credentials and macOS user must be unable to do, and test each restriction. A separate account alone isn't enough. |
+| L16 | **Codex can read any file the agent's macOS user can** (FRG-7 review round 4). Codex reviews a scanned copy of the commit and is told to read only that and the review files, but its read-only sandbox limits writes, not reads: if it opens another file by its full path (a key in the home folder, an ignored `.env` in the worktree), that file's text goes to OpenAI unscanned. **Open: not resolved.** | Codex runs as the agent's macOS user; codex 0.163.0 has no setting that keeps reads inside a folder. | Review of a copy holding only the commit's files, all scanned by gitleaks; the prompt's instruction; no real business credentials, payment access or production deploy access on this Mac until FRG-26's protections are tested (the owner's 5:00 limit). | FRG-27 (#27): codex as a separate macOS user that can read only the copy. |
+| L15 | **A failing CI run doesn't block a merge** (FRG-6, owner decision 2026-10-27). Harness CI runs on every PR into `dev` or `main`, but no protection rule requires its check, so a red PR can still be merged. And a green run isn't a full pass: GitHub's runners have no Claude Code, so conformance skips its version check there. | Requiring the check changes FORGE's branch protection, which waits for the FRG-26 checkpoint. | The owner merges every PR touching an owner-only path; each owner-merge handoff checks the CI result for the exact head and stops if it isn't green; `bash tests/run.sh` → `ALL PASS` on the owner's Mac before any merge. Practice and scripts, not GitHub rules. `docs/decisions/2026-10-27-ci-not-required-until-frg-34.md`. | FRG-34 (#34): passing CI and the owner's approval required on `dev` and `main`, every existing rule kept, after the FRG-26 checkpoint. |
 | L5 | **Read-proof proves access, not diligence.** A reviewer can hash the diff and still review it badly. | — | Adversarial prompt, structured findings, multiple lenses, stall rule, owner merges `main`. | Owner skims `review.md` for risky PRs. |
-| L6 | **Heuristic hooks.** The Stop hook and the Bash part of `guard-live-checkout` guess from text. | Natural language and shell are open-ended. | They start in observe; the owner promotes them by PR after reviewing `observed.log`. | — |
+| L6 | **Heuristic hooks.** The Stop hook `gate-owner-handoff-form` guesses from text. | Natural language is open-ended. | It starts in observe; the owner promotes it by PR after reviewing `observed.log`. | — |
 | L7 | **Local-only evidence.** `work/` and the spend ledger live on one Mac. | Gitignored by design (may hold logs/screens). | PR comment summary of every review; prepaid wallets as the real spend cap; deleting the ledger doesn't remove a provider's own limits. | Back up `work/` with Time Machine. |
 | L8 | **Private projects on GitHub Free** have no server-side protection. | Plan limit (section 3.2). | Recorded as `local-only`, shown by `status`. | GitHub Pro. |
 | L9 | **Claude Code or tool updates** can change hook input formats or CLI flags. | External software. | Conformance runs on every `tests/run.sh` and in CI, so breakage shows as FAILED. | — |

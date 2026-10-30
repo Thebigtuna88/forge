@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "env DEBUG=1 openai api models.list"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "provider command openai"
+}

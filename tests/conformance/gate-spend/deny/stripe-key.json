@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo $STRIPE_SECRET_KEY"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "key variable STRIPE_SECRET_KEY"
+}

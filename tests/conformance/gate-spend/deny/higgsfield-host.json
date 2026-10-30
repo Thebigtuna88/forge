@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "curl --request POST --url https://api.higgsfield.ai/higgsfield-ai/soul/v2/standard"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "paid host api.higgsfield.ai"
+}

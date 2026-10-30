@@ -6,14 +6,15 @@ FORGE_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TESTLIB="$FORGE_SRC/tests/lib"
 STUBS="$FORGE_SRC/tests/stubs"
 
-# mk_harness: copy the handoff runtime and tool into $T_TMP/h, a fresh git repo where
-# work/, .env and .env.* are gitignored (as in the real repo). Sets H (harness root) and
-# HANDOFF (the tool).
+# mk_harness: copy the handoff runtime, its redaction filter and the tool into $T_TMP/h, a fresh
+# git repo where work/, .env and .env.* are gitignored (as in the real repo). Sets H (harness
+# root) and HANDOFF (the tool).
 mk_harness() {
   H="$T_TMP/h"
   mkdir -p "$H/.harness/lib" "$H/.harness/bin"
   cp "$FORGE_SRC/.harness/lib/handoff.sh" "$H/.harness/lib/"
   cp "$FORGE_SRC/.harness/lib/handoff_grammar.py" "$H/.harness/lib/"
+  cp "$FORGE_SRC/.harness/lib/handoff_redact.py" "$H/.harness/lib/"
   cp "$FORGE_SRC/.harness/bin/handoff" "$H/.harness/bin/"
   git -C "$H" init -q
   printf 'work/\n.env\n.env.*\n' >"$H/.gitignore"
@@ -39,6 +40,15 @@ mk_script() {
   jq -n --arg id "$id" --arg sha "$(shasum -a 256 "$dir/OWNER-RUN.sh" | awk '{print $1}')" \
     '{id: $id, state: "ready", script_sha256: $sha, readied: "2000-01-01T00:00:00Z"}' >"$dir/META.json"
   SCRIPT="$dir/OWNER-RUN.sh"
+}
+
+# record_paste <file>: what capture-owner-paste adds for a paste it saved (FRG-5): a line in the
+# harness's .harness/state/pastes.log naming the file and its sha256.
+record_paste() {
+  local file="$1"
+  mkdir -p "$H/.harness/state"
+  printf '2026-01-01T00:00:00Z %s %s %s\n' "$(basename "$(dirname "$file")")" "${file#"$H"/}" \
+    "$(shasum -a 256 "$file" | awk '{print $1}')" >>"$H/.harness/state/pastes.log"
 }
 
 # pty_run [--answer X]... -- <script>: run as the owner would, in a terminal, outside the agent.

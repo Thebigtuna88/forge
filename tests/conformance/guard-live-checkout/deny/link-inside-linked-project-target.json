@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "@TMP@/outside-source/config.json",
+    "content": "x"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "is reached through the link"
+}

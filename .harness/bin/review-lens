@@ -1,0 +1,21 @@
+#!/bin/bash -p
+# review-lens — the review runner (FRG-7, spec 6). The logic is in .harness/lib/review.sh;
+# `review-lens` with no arguments prints the commands. Runs as `bash -p` with its own PATH and
+# only HOME, USER, LOGNAME and TMPDIR kept from the environment, so nothing set in the shell
+# changes which gh, codex or git it runs or how. Must run on macOS /bin/bash 3.2.
+set -uo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin
+export PATH LC_ALL=C
+for v in $(compgen -e); do
+  case "$v" in
+    HOME | USER | LOGNAME | TMPDIR | PATH | LC_ALL) ;;
+    *) unset "$v" 2>/dev/null || true ;;
+  esac
+done
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
+# shellcheck source=.harness/lib/review.sh
+source "$here/../lib/review.sh" || {
+  echo "review-lens: can't load .harness/lib/review.sh" >&2
+  exit 1
+}
+rv_main "$@"

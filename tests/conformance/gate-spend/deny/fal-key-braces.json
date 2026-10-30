@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo ${FAL_KEY}"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "key variable FAL_KEY"
+}

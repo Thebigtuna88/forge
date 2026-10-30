@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "python3 -mopenai api chat.completions.create -m gpt-4o -g user hello"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "provider command openai"
+}

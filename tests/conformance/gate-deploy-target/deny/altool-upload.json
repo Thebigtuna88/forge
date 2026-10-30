@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "xcrun altool --upload-app -f app.ipa"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "matches a production pattern"
+}

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "content": "x"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "no file path"
+}

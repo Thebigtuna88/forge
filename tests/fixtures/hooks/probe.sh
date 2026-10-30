@@ -54,5 +54,12 @@ case "$probe_what" in
     p="$(_hr_gh_path)"
     printf 'gh=%s\n' "$p"
     ;;
+  python)
+    rc=0
+    _hr_python "$HR_TMP/py.out" -I -c 'import sys; sys.stderr.write("warning\n"); sys.stderr.flush(); print("answer"); sys.exit(1)' || rc=$?
+    first="$(head -n 1 "$HR_TMP/py.out")"
+    all="$(tr '\n' '|' <"$HR_TMP/py.out")"
+    printf 'rc=%s first=%s all=%s\n' "$rc" "$first" "$all"
+    ;;
 esac
 hr_allow

@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "printenv REPLICATE_API_TOKEN"
+  },
+  "cwd": "@ROOT@",
+  "forge_reason": "key variable REPLICATE_API_TOKEN"
+}

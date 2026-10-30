@@ -5,7 +5,8 @@
 # never touched, and fixed names and dates make the same scene give the same commits) it builds:
 #   dev         a base commit: README.md, docs/plans/plan.md and an owner-only list
 #   SC_BRANCH   a ticket branch with one more commit (scene_change sets what it holds)
-# then freezes the diff with review-diff.sh, writes CLEAN code and security replies and
+# then freezes the diff with review-diff.sh, writes CLEAN code, security and spend replies (every
+# PR needs all three, FRG-7) and
 # work/<ticket>/review.md, and the fake gh's answers about the PR and dev...head. The command's
 # --match-head-commit is the case's @SHA@, which conformance reads from $TMP/case.sha. A case
 # changes one thing before or after. scene_genuine does it all.
@@ -18,6 +19,7 @@ SC_GH="$TMP/gh"
 SC_WORK="$ROOT/work/$SC_TICKET"
 SC_CODE_MECH=codex
 SC_SEC_MECH=codex
+SC_SPEND_MECH=codex
 SC_DEFERRED='[]'
 SC_BASE="" SC_DEV="" SC_HEAD="" SC_MB="" SC_MD5="" SC_BYTES=""
 mkdir -p "$SC_GH"
@@ -102,16 +104,19 @@ sc_sha() { shasum -a 256 <"$1" | cut -d ' ' -f 1; } # <file>
 scene_review_json() { # $TMP/review.json from the replies as they are now
   jq -n --arg repo "$SC_REPO" --arg br "$SC_BRANCH" --argjson pr "$SC_PR" --arg head "$SC_HEAD" \
     --arg mb "$SC_MB" --arg md5 "$SC_MD5" --argjson bytes "$SC_BYTES" \
-    --arg cm "$SC_CODE_MECH" --arg sm "$SC_SEC_MECH" \
+    --arg cm "$SC_CODE_MECH" --arg sm "$SC_SEC_MECH" --arg pm "$SC_SPEND_MECH" \
     --arg cs "$(sc_sha "$SC_WORK/rounds/1/reply-code.json")" \
-    --arg ss "$(sc_sha "$SC_WORK/rounds/1/reply-security.json")" --argjson def "$SC_DEFERRED" \
+    --arg ss "$(sc_sha "$SC_WORK/rounds/1/reply-security.json")" \
+    --arg ps "$(sc_sha "$SC_WORK/rounds/1/reply-spend.json")" --argjson def "$SC_DEFERRED" \
     '{forge_review: 1, repo: $repo, branch: $br, pr: $pr, head: $head, merge_base: $mb,
       diff_md5: $md5, diff_bytes: $bytes,
       lenses: [
         {lens: "code", mechanism: $cm, model: "gpt-5-codex", rounds: 1, verdict: "CLEAN",
          reply: "rounds/1/reply-code.json", reply_sha256: $cs},
         {lens: "security", mechanism: $sm, model: "gpt-5-codex", rounds: 1, verdict: "CLEAN",
-         reply: "rounds/1/reply-security.json", reply_sha256: $ss}],
+         reply: "rounds/1/reply-security.json", reply_sha256: $ss},
+        {lens: "spend", mechanism: $pm, model: "gpt-5-codex", rounds: 1, verdict: "CLEAN",
+         reply: "rounds/1/reply-spend.json", reply_sha256: $ps}],
       deferred: $def}' >"$TMP/review.json"
 }
 
@@ -124,11 +129,12 @@ scene_review_md() { # work/<ticket>/review.md around $TMP/review.json
   } >"$SC_WORK/review.md"
 }
 
-scene_review() { # freeze, CLEAN replies for code and security, review.md
+scene_review() { # freeze, CLEAN replies for code, security and spend, review.md
   scene_freeze || return 1
   mkdir -p "$SC_WORK/rounds/1"
   sc_reply code >"$SC_WORK/rounds/1/reply-code.json"
   sc_reply security >"$SC_WORK/rounds/1/reply-security.json"
+  sc_reply spend >"$SC_WORK/rounds/1/reply-spend.json"
   scene_review_json
   scene_review_md
 }
@@ -157,6 +163,13 @@ sc_review_edit() { # <jq filter> [jq options…]: change review.json and rewrite
   shift
   jq "$@" "$filter" "$TMP/review.json" >"$TMP/review.edit" && mv "$TMP/review.edit" "$TMP/review.json"
   scene_review_md
+}
+
+scene_add_lens() { # <lens>: a CLEAN reply for one more lens in round 1, listed in review.md
+  sc_reply "$1" >"$SC_WORK/rounds/1/reply-$1.json"
+  # shellcheck disable=SC2016 # a jq filter
+  sc_review_edit '.lenses += [{lens: $l, mechanism: "codex", model: "gpt-5-codex", rounds: 1, verdict: "CLEAN",
+    reply: "rounds/1/reply-\($l).json", reply_sha256: $s}]' --arg l "$1" --arg s "$(sc_sha "$SC_WORK/rounds/1/reply-$1.json")"
 }
 
 sc_secret() { printf '%s%s' "ghp_" "4Vq9TzLm2Rk8XwPn6YbJc3HdF7GsA1KeUoNi"; } # a fake token, built at run time
