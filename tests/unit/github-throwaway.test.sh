@@ -230,6 +230,70 @@ test_admin_attempts_stop_at_the_first_change_that_gets_through() {
   assert_eq "$(wc -l <"$T_TMP/calls" | tr -d ' ')" 1 "attempts made after the first got through"
 }
 
+cleanup_gh() { # <states...> — pr_view answers these in turn (none = can't read); closes are logged
+  printf '%s\n' "$@" >"$T_TMP/states"
+  : >"$T_TMP/closes"
+  pr_view() {
+    local st
+    st="$(head -n 1 "$T_TMP/states")"
+    sed -i '' 1d "$T_TMP/states"
+    [[ -n "$st" && "$st" != none ]] || return 1
+    echo "$st"
+  }
+  owner_gh() { echo "$*" >>"$T_TMP/closes"; return "${CLOSE_RC:-0}"; }
+}
+
+test_a_pr_left_open_is_a_failure() {
+  # A test PR must not stay open after its test: it could still merge (B11 arms auto-merge).
+  load
+  PHASE=protected
+  local out rc
+  # The close command fails and the PR stays open.
+  FAILS=0 rc=0 CLOSE_RC=1
+  cleanup_gh OPEN OPEN
+  out="$(close_if_open 7; echo "rc=$? fails=$FAILS")"
+  assert_contains "$out" "CLEANUP FAIL PR #7"
+  assert_contains "$out" "rc=1 fails=1"
+  # The close command succeeds but GitHub still reports the PR open.
+  CLOSE_RC=0
+  cleanup_gh OPEN OPEN
+  out="$(close_if_open 7; echo "rc=$? fails=$FAILS")"
+  assert_contains "$out" "rc=1 fails=1"
+  # The PR's state can't be read.
+  cleanup_gh none
+  out="$(close_if_open 7; echo "rc=$? fails=$FAILS")"
+  assert_contains "$out" "state unreadable"
+  assert_contains "$out" "rc=1 fails=1"
+}
+
+test_a_closed_or_merged_pr_needs_no_cleanup() {
+  load
+  PHASE=protected
+  local out st
+  FAILS=0 CLOSE_RC=0
+  cleanup_gh OPEN CLOSED
+  out="$(close_if_open 7; echo "rc=$? fails=$FAILS")"
+  assert_contains "$out" "rc=0 fails=0"
+  assert_contains "$(cat "$T_TMP/closes")" "pr close 7"
+  for st in CLOSED MERGED; do
+    cleanup_gh "$st"
+    out="$(close_if_open 7; echo "rc=$? fails=$FAILS")"
+    assert_contains "$out" "rc=0 fails=0" "$st"
+    assert_eq "$(wc -l <"$T_TMP/closes" | tr -d ' ')" 0 "a close for a $st PR"
+  done
+}
+
+test_a_failed_cleanup_stops_the_phase() {
+  local out rc=0
+  # B5 passes, but its PR's state can't be read afterwards: the phase stops there.
+  out="$(stub_phase; cleanup_gh none; t_B5() { echo "RAN B5"; record B5 refused "stand-in"; close_if_open 9; }; cmd_tests protected 2>&1)" || rc=$?
+  assert_exit 1 "$rc"
+  assert_contains "$out" "RESULT B5 protected PASS"
+  assert_contains "$out" "CLEANUP FAIL PR #9"
+  assert_not_contains "$out" "RAN B1"
+  assert_contains "$out" "STOPPED after B5"
+}
+
 status_gh() { # <dev protected?> — a stand-in owner_gh for cmd_status; other reads fail
   STATUS_DEV="$1"
   owner_gh() {

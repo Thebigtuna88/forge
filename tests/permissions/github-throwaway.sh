@@ -724,8 +724,19 @@ owner_approve() { # <pr>
   sleep 3
 }
 
+# A test PR left open could still merge (B11 arms auto-merge), so a PR not confirmed closed or
+# merged afterwards is a failure: the phase stops, and the owner is told which PR to close.
 close_if_open() { # <pr> — tidy up after a refused attempt
-  if [[ "$(pr_view "$1" state .state)" == OPEN ]]; then owner_gh pr close "$1" --repo "$REPO" >/dev/null 2>&1 || true; fi
+  local st
+  st="$(pr_view "$1" state .state)" || st=""
+  if [[ "$st" == OPEN ]]; then
+    owner_gh pr close "$1" --repo "$REPO" >/dev/null 2>&1 || true
+    st="$(pr_view "$1" state .state)" || st=""
+  fi
+  if [[ "$st" == CLOSED || "$st" == MERGED ]]; then return 0; fi
+  FAILS=$((FAILS + 1))
+  say "CLEANUP FAIL PR #$1 may still be open (state ${st:-unreadable}): close it on GitHub, in $REPO, before another phase"
+  return 1
 }
 
 dev_ahead() { # <id> — helper PR into dev, owner approves, helper merges (the B16 control)
