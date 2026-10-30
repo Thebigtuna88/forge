@@ -572,13 +572,31 @@ cmd_actions_setting() {
   [[ "$v" == false ]]
 }
 
+# A branch without protection and a repository without a ruleset have nothing more to read; any
+# other read that fails makes the status step fail.
 cmd_status() {
   need_owner
   assert_throwaway
-  say "dev: $(branch_state dev) [$(protection_of dev)]"
-  say "main: $(branch_state main) [$(protection_of main)]"
-  say "rulesets: $(ruleset_count) [$(ruleset_summary)]"
-  say "default branch: $(owner_gh api "repos/$REPO" --jq .default_branch)"
+  local b st prot n sum def bad=""
+  for b in dev main; do
+    st="$(branch_state "$b")"
+    prot=none
+    if [[ "$st" == protected ]]; then prot="$(protection_of "$b")"; fi
+    if [[ "$st" == error || "$prot" == error ]]; then bad="$bad $b"; fi
+    say "$b: $st [$prot]"
+  done
+  n="$(ruleset_count)"
+  sum=none
+  if [[ ! "$n" =~ ^[0-9]+$ ]]; then bad="$bad rulesets"
+  elif [[ "$n" -gt 0 ]]; then
+    sum="$(ruleset_summary)"
+    if [[ "$sum" == error ]]; then bad="$bad ruleset"; fi
+  fi
+  say "rulesets: $n [$sum]"
+  def="$(owner_gh api "repos/$REPO" --jq .default_branch)" || def=""
+  if [[ -z "$def" ]]; then bad="$bad default-branch"; fi
+  say "default branch: ${def:-error}"
+  if [[ -n "$bad" ]]; then die "could not read:$bad"; fi
 }
 
 # --- Bypass tests -------------------------------------------------------------------------------
@@ -615,6 +633,10 @@ setup_fail() { # <id> <what failed>
 # also carries its own id.
 RUN_ID=""
 stamp() { printf '%s' "$RUN_ID"; }
+
+# The order cmd_tests runs the tests in. Last: in the open phase B14 and M5 rewrite or delete dev
+# and main (a reset follows).
+readonly TEST_ORDER="B5 B1 B2 B3 B4a B4b B6 B7 B8 B9 B10 B11 B12 B13 B16 M1 M2 M3 M4 M6 B14a B14b M5a M5b"
 
 fresh_from() { # <remote branch> <local branch>
   helper_git -C "$CLONE" fetch -q --prune origin || die "fetch failed"
@@ -923,17 +945,15 @@ t_B11() {
 }
 
 admin_attempts() { # <id> <method path [input]>... separated by ";;" — refused only if every one is
+  # The first attempt that isn't refused ends the test: none after it is made (the stop rule).
   local id="$1" obs=refused ev="" c
   shift
-  while [[ $# -gt 0 ]]; do
+  while [[ $# -gt 0 && "$obs" == refused ]]; do
     c=()
     while [[ $# -gt 0 && "$1" != ";;" ]]; do c+=("$1"); shift; done
     [[ $# -gt 0 ]] && shift
     capture helper_gh api "${c[@]}" || true
-    case "$(classify_api)" in
-      allowed) obs=allowed ;;
-      inconclusive) [[ "$obs" == refused ]] && obs=inconclusive ;;
-    esac
+    obs="$(classify_api)"
     ev="$ev ${c[0]} ${c[1]}: $(evidence) |"
   done
   record "$id" "$obs" "$ev"
@@ -1077,17 +1097,20 @@ cmd_tests() {
   CLONE="$WORK/clone"
   helper_git clone -q --template="$WORK/template" "https://github.com/$REPO.git" "$CLONE" || die "clone failed"
   say "== FRG-26 bypass tests, phase $PHASE, helper $HELPER, $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
-  t_B5; t_B1; t_B2; t_B3; t_B4a; t_B4b; t_B6; t_B7; t_B8; t_B9; t_B10; t_B11; t_B12; t_B13; t_B16
-  t_M1; t_M2; t_M3; t_M4; t_M6
-  # Last: in the open phase these rewrite or delete dev and main (a reset follows).
-  t_B14a; t_B14b; t_M5a; t_M5b
+  # The stop rule (plan section 3): after a failed or inconclusive test nothing more is changed.
+  # A test tidies up after itself before it returns; the next one never starts.
+  local id
+  for id in $TEST_ORDER; do
+    "t_$id"
+    if [[ $FAILS -ne 0 ]]; then
+      if helper_rate; then say "helper allowance after the phase: $RATE_LINE"; fi
+      say "PHASE $PHASE: STOPPED after $id (a failed test stops the phase; nothing more was changed)"
+      exit 1
+    fi
+  done
   if helper_rate; then say "helper allowance after the phase: $RATE_LINE"; fi
-  if [[ $FAILS -eq 0 ]]; then
-    say "PHASE $PHASE: ALL PASS"
-    exit 0
-  fi
-  say "PHASE $PHASE: $FAILS FAILED"
-  exit 1
+  say "PHASE $PHASE: ALL PASS"
+  exit 0
 }
 
 main() {

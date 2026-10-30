@@ -120,10 +120,14 @@ test_expected_table_matches_the_plan() {
 }
 
 test_every_test_in_the_run_has_an_expectation() {
-  # The ids cmd_tests runs are exactly the ones the table above covers.
-  local ran
-  ran="$(grep -E '^  t_' "$GT" | tr ';' '\n' | sed -E 's/^ *t_//; s/ *$//' | LC_ALL=C sort | tr '\n' ' ')"
+  # The ids cmd_tests runs are exactly the ones the table above covers, each one a function.
+  load
+  local ran id
+  # shellcheck disable=SC2086 # one id per line
+  ran="$(printf '%s\n' $TEST_ORDER | LC_ALL=C sort | tr '\n' ' ')"
   assert_eq "$ran" "B1 B10 B11 B12 B13 B14a B14b B16 B2 B3 B4a B4b B5 B6 B7 B8 B9 M1 M2 M3 M4 M5a M5b M6 "
+  for id in $TEST_ORDER; do assert_eq "$(type -t "t_$id")" function "t_$id"; done
+  assert_eq "$TEST_ORDER" "$ALL_TESTS" "the stand-ins below cover the same tests in the same order"
 }
 
 test_names_carry_a_per_run_id() {
@@ -154,6 +158,123 @@ test_record_judges_results() {
   out="$(setup_fail B8 "could not advance dev"; echo "fails=$FAILS")"
   assert_contains "$out" "RESULT B8 protected FAIL"
   assert_contains "$out" "observed=setup-failed"
+}
+
+# Every test cmd_tests runs, in its order. stub_phase replaces each one with a stand-in that logs
+# its name and, for the ids given, records a result as the real test would.
+ALL_TESTS="B5 B1 B2 B3 B4a B4b B6 B7 B8 B9 B10 B11 B12 B13 B16 M1 M2 M3 M4 M6 B14a B14b M5a M5b"
+
+stub_phase() { # <id:allowed|refused|setup>...
+  load
+  need_owner() { :; }
+  load_helper() { :; }
+  need_helper_identity() { :; }
+  assert_throwaway() { :; }
+  verify_phase() { :; }
+  need_allowance() { :; }
+  helper_git() { :; }
+  helper_rate() { return 1; }
+  WORK="$T_TMP"
+  local id spec
+  for id in $ALL_TESTS; do eval "t_$id() { echo \"RAN $id\"; }"; done
+  for spec in "$@"; do
+    id="${spec%%:*}"
+    case "${spec#*:}" in
+      setup) eval "t_$id() { echo \"RAN $id\"; setup_fail $id \"stand-in setup failure\"; }" ;;
+      *) eval "t_$id() { echo \"RAN $id\"; record $id ${spec#*:} \"stand-in\"; }" ;;
+    esac
+  done
+}
+
+test_a_failed_test_stops_the_phase() {
+  # The plan's stop rule: after a failed test nothing more is changed. B1 unexpectedly gets
+  # through in the protected phase, so no test after it may run.
+  local out rc=0
+  out="$(stub_phase B1:allowed; cmd_tests protected 2>&1)" || rc=$?
+  assert_exit 1 "$rc"
+  assert_contains "$out" "RAN B5"
+  assert_contains "$out" "RESULT B1 protected FAIL"
+  assert_not_contains "$out" "RAN B2"
+  assert_not_contains "$out" "RAN M5b"
+  assert_contains "$out" "PHASE protected: STOPPED after B1"
+}
+
+test_a_failed_setup_stops_the_phase() {
+  local out rc=0
+  out="$(stub_phase B5:setup; cmd_tests ruleset 2>&1)" || rc=$?
+  assert_exit 1 "$rc"
+  assert_contains "$out" "observed=setup-failed"
+  assert_not_contains "$out" "RAN B1"
+  assert_contains "$out" "PHASE ruleset: STOPPED after B5"
+}
+
+test_a_passing_phase_runs_every_test() {
+  local out rc=0 id
+  out="$(stub_phase B5:refused M6:allowed; cmd_tests protected 2>&1)" || rc=$?
+  assert_exit 0 "$rc"
+  for id in $ALL_TESTS; do assert_contains "$out" "RAN $id"; done
+  assert_contains "$out" "PHASE protected: ALL PASS"
+}
+
+test_admin_attempts_stop_at_the_first_change_that_gets_through() {
+  # B12 and M4 try several ways to weaken protection; once one works, the rest must not run.
+  load
+  PHASE=protected
+  FAILS=0
+  capture() { echo "CALL $*" >>"$T_TMP/calls"; }
+  classify_api() { echo allowed; }
+  evidence() { echo "HTTP 200"; }
+  local out
+  out="$(admin_attempts B12 -X PUT "repos/$REPO/branches/dev/protection" ";;" -X DELETE "repos/$REPO/branches/dev/protection")"
+  assert_contains "$out" "RESULT B12 protected FAIL"
+  assert_eq "$(wc -l <"$T_TMP/calls" | tr -d ' ')" 1 "attempts made after the first got through"
+}
+
+status_gh() { # <dev protected?> — a stand-in owner_gh for cmd_status; other reads fail
+  STATUS_DEV="$1"
+  owner_gh() {
+    case "$*" in
+      "api repos/$REPO/branches/dev --jq .protected") echo "$STATUS_DEV" ;;
+      "api repos/$REPO/branches/main --jq .protected") echo false ;;
+      "api repos/$REPO/rulesets --jq length") echo 0 ;;
+      "api repos/$REPO --jq .default_branch") echo side ;;
+      *) echo "gh: Not Found (HTTP 404)" >&2; return 1 ;;
+    esac
+  }
+}
+
+test_status_reports_an_unprotected_repository() {
+  load
+  need_owner() { :; }
+  assert_throwaway() { :; }
+  status_gh false
+  local out rc=0
+  out="$(cmd_status 2>&1)" || rc=$?
+  assert_exit 0 "$rc"
+  assert_contains "$out" "dev: unprotected"
+  assert_contains "$out" "default branch: side"
+}
+
+test_status_fails_when_a_read_fails() {
+  load
+  need_owner() { :; }
+  assert_throwaway() { :; }
+  local out rc=0
+  # dev's state can't be read at all.
+  status_gh unreadable
+  out="$(cmd_status 2>&1)" || rc=$?
+  assert_exit 2 "$rc"
+  assert_contains "$out" "could not read"
+  # dev reads as protected, but its protection can't be read.
+  rc=0
+  status_gh true
+  out="$(cmd_status 2>&1)" || rc=$?
+  assert_exit 2 "$rc"
+  # Nothing can be read.
+  rc=0
+  owner_gh() { return 1; }
+  out="$(cmd_status 2>&1)" || rc=$?
+  assert_exit 2 "$rc"
 }
 
 test_classify_push() {

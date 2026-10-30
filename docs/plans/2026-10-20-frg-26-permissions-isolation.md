@@ -233,6 +233,10 @@ Code. If I ran "push to `main`" myself, even expecting a refusal, I'd be getting
 
    **A failed phase stops the handoff** (the stop rule, section 3): nothing more is changed, and
    I come back to you.
+   *Changed during the build (stricter, PR #37 review round 1):* the stop is per test, not per
+   phase. The first failed or inconclusive test ends the phase after tidying up its own PR; no
+   later test runs. Within B12 and M4, the first attempt to weaken protection that isn't refused
+   ends the test, so no later attempt is made.
 
    **How the handoffs run the script:** each step reads it from the reviewed git commit into
    memory, checks its sha256, and runs that copy in an empty environment. No file can be swapped
