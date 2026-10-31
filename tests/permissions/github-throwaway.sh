@@ -12,11 +12,14 @@
 #   github-throwaway.sh accept            helper: try to accept the invitation with its token
 #   github-throwaway.sh check-helper      helper login, token scopes = public_repo, permission = write
 #   github-throwaway.sh rate              the helper's API allowance: limit, used, reset (read-only)
+#   github-throwaway.sh allowance         fails unless the helper has enough allowance for a phase
 #   github-throwaway.sh diagnose          as the helper: GET /user, GET /rate_limit, one GraphQL
 #                                         query; statuses, rate-limit headers, messages (read-only)
 #   github-throwaway.sh reset             owner: main dev side back to the baseline (unprotected only)
 #   github-throwaway.sh protect           owner: apply the dev and main branch protection
-#   github-throwaway.sh ruleset           owner: add the main ruleset (only the owner may bypass)
+#   github-throwaway.sh unprotect         owner: remove exactly that protection (protected state only)
+#   github-throwaway.sh ruleset           owner: add the main ruleset (only the owner may bypass);
+#                                         first checks the helper has enough allowance
 #   github-throwaway.sh tests <phase>     run the bypass tests; phase = open | protected | ruleset
 #   github-throwaway.sh actions-setting   B15: "Allow GitHub Actions to approve PRs" must be off
 #   github-throwaway.sh status            print the repo's protection and rulesets (read-only)
@@ -414,6 +417,14 @@ cmd_rate() {
   say "HELPER-RATE $RATE_LINE"
 }
 
+# The same gate a phase applies, on its own: fails (status 2) unless the helper has enough left,
+# so a handoff can stop before anything is changed.
+cmd_allowance() {
+  load_helper token
+  need_helper_identity
+  need_allowance
+}
+
 # One diagnostic request as the helper, through the same helper_gh the tests use. Prints the HTTP
 # status, the listed headers only (never Authorization or cookies) and GitHub's answer in brief.
 diag() { # <label> <helper_gh arguments…>
@@ -533,6 +544,18 @@ cmd_protect() {
   say "main protection: $(protection_of main)"
 }
 
+# The reverse of protect, only from exactly the state protect leaves (no ruleset), so a phase
+# open can run again (owner, 2026-10-31: a fresh open phase on the reviewed commit).
+cmd_unprotect() {
+  need_owner
+  assert_throwaway
+  verify_phase protected
+  owner_gh api -X DELETE "repos/$REPO/branches/dev/protection" >/dev/null || die "unprotecting dev failed"
+  owner_gh api -X DELETE "repos/$REPO/branches/main/protection" >/dev/null || die "unprotecting main failed"
+  verify_phase open
+  say "dev and main unprotected; no ruleset"
+}
+
 ruleset_json() { # <actor_type> <actor_id>
   cat <<EOF
 {
@@ -557,6 +580,11 @@ cmd_ruleset() {
   need_owner
   assert_throwaway
   verify_phase protected
+  # The ruleset phase that follows needs the helper's allowance; without it, the ruleset isn't
+  # added (it would sit there untested). Owner, review round 6: executable and fail-closed.
+  load_helper token
+  need_helper_identity
+  need_allowance
   local uid
   uid="$(owner_uid)"
   ruleset_json User "$uid" >"$WORK/ruleset-user.json"
@@ -1179,14 +1207,16 @@ main() {
     accept) cmd_accept ;;
     check-helper) cmd_check_helper ;;
     rate) cmd_rate ;;
+    allowance) cmd_allowance ;;
     diagnose) cmd_diagnose ;;
     reset) cmd_reset ;;
     protect) cmd_protect ;;
+    unprotect) cmd_unprotect ;;
     ruleset) cmd_ruleset ;;
     tests) cmd_tests "$@" ;;
     actions-setting) cmd_actions_setting ;;
     status) cmd_status ;;
-    *) die "usage: github-throwaway.sh create|invite|accept|check-helper|rate|diagnose|reset|protect|ruleset|tests <phase>|actions-setting|status" ;;
+    *) die "usage: github-throwaway.sh create|invite|accept|check-helper|rate|allowance|diagnose|reset|protect|unprotect|ruleset|tests <phase>|actions-setting|status" ;;
   esac
 }
 

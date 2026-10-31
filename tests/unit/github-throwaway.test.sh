@@ -603,6 +603,74 @@ test_a_phase_needs_enough_helper_allowance() {
   assert_contains "$out" "helper allowance: graphql limit=5000 used=1000 remaining=4000"
 }
 
+owner_cmd_stubs() { # an owner command's checks pass; its gh calls are logged to $T_TMP/owner
+  load
+  need_owner() { :; }
+  assert_throwaway() { :; }
+  load_helper() { :; }
+  need_helper_identity() { :; }
+  owner_uid() { echo 1; }
+  owner_gh() { echo "$*" >>"$T_TMP/owner"; }
+  WORK="$T_TMP/work"
+  mkdir -p "$WORK"
+  : >"$T_TMP/owner"
+}
+
+test_ruleset_needs_enough_helper_allowance_before_it_changes_anything() {
+  # The phase after the ruleset needs the helper's allowance; if it is short, the ruleset must
+  # not be added (it would sit there untested). Round 6, owner: executable and fail-closed.
+  owner_cmd_stubs
+  verify_phase() { :; }
+  local out rc
+  helper_gh() { rate_fixture 10; }
+  rc=0; out="$(cmd_ruleset 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "10 points left"
+  assert_contains "$out" "only 10 GraphQL points left"
+  assert_eq "$(cat "$T_TMP/owner")" "" "owner calls with 10 points left"
+  helper_gh() { echo "HTTP 503" >&2; return 1; }
+  rc=0; out="$(cmd_ruleset 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "unreadable allowance"
+  assert_eq "$(cat "$T_TMP/owner")" "" "owner calls with an unreadable allowance"
+  helper_gh() { rate_fixture 4000; }
+  rc=0; out="$(cmd_ruleset 2>&1)" || rc=$?
+  assert_contains "$(cat "$T_TMP/owner")" "api -X POST repos/$REPO/rulesets"
+}
+
+test_allowance_check_fails_closed() {
+  owner_cmd_stubs
+  local out rc
+  helper_gh() { rate_fixture 10; }
+  rc=0; out="$(cmd_allowance 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "10 points left"
+  helper_gh() { echo "HTTP 503" >&2; return 1; }
+  rc=0; out="$(cmd_allowance 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "unreadable allowance"
+  helper_gh() { rate_fixture 4000; }
+  rc=0; out="$(cmd_allowance 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "4000 points left"
+  assert_contains "$out" "helper allowance: graphql limit=5000 used=1000 remaining=4000"
+}
+
+test_unprotect_lifts_exactly_what_protect_applies() {
+  # The fresh open phase (owner, 2026-10-31) starts from the protected state the throwaway is in:
+  # unprotect only runs from exactly that state, removes both protections, and checks the result.
+  owner_cmd_stubs
+  verify_phase() { echo "verify $1" >>"$T_TMP/owner"; }
+  local rc=0
+  cmd_unprotect >/dev/null 2>&1 || rc=$?
+  assert_exit 0 "$rc"
+  assert_eq "$(cat "$T_TMP/owner")" "verify protected
+api -X DELETE repos/$REPO/branches/dev/protection
+api -X DELETE repos/$REPO/branches/main/protection
+verify open"
+  : >"$T_TMP/owner"
+  verify_phase() { die "phase $1 needs dev and main protected"; }
+  rc=0
+  (cmd_unprotect) >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc" "not in the protected state"
+  assert_eq "$(cat "$T_TMP/owner")" "" "owner calls outside the protected state"
+}
+
 fake_diag_gh() { # stands in for helper_gh: logs its arguments, answers like `gh api -i`
   printf '%s\n' "$*" >>"$T_TMP/helper-gh.log"
   case "$*" in

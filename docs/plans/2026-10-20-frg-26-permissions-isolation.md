@@ -241,6 +241,17 @@ Code. If I ran "push to `main`" myself, even expecting a refusal, I'd be getting
    "FRG-26 ") is closed; a PR it can't confirm closed fails the phase and is named for you to
    close (rounds 2 to 4; the error-stop part is your decision of 2026-10-30, "sweep on every
    exit").
+   *Changed during the build (your decisions of 2026-10-31, review round 6):*
+   - **A fresh open phase on the final reviewed commit**, with no exception to "do not proceed
+     until verify passes". The 2026-10-20 open phase (commit 4d1741a, ALL PASS) isn't reused: its
+     handoff never verified. Since `protect` has already run, the run starts with `unprotect`,
+     which removes exactly that protection and only from that state, then reset, open, reset,
+     protect.
+   - **The allowance gate is executable and fail-closed:** `ruleset` refuses unless the helper has
+     enough allowance for the phase after it, and an `allowance` step stops a handoff before its
+     first change. (Before, the ruleset could be added and then sit untested.)
+   - B13 no longer puts the repo's description back after its attempts (stop rule; a refused helper
+     changed nothing, and after one that got through the repo is left for you to see).
 
    **How the handoffs run the script:** each step reads it from the reviewed git commit into
    memory, checks its sha256, and runs that copy in an empty environment. No file can be swapped
