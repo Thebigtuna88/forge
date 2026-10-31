@@ -233,6 +233,29 @@ test_admin_attempts_stop_at_the_first_change_that_gets_through() {
   assert_eq "$(wc -l <"$T_TMP/calls" | tr -d ' ')" 1 "attempts made after the first got through"
 }
 
+test_b13_changes_nothing_after_its_attempts() {
+  # The stop rule: after a failed attempt only test PRs are closed. B13 used to put the repo's
+  # description back as the owner, failed or not (round 6, C3). A refused helper changed nothing,
+  # and after one that got through the repo is left as it is (the next command's throwaway check
+  # then refuses until the owner restores it).
+  load
+  PHASE=protected
+  WORK="$T_TMP/work"
+  mkdir -p "$WORK"
+  owner_uid() { echo 1; }
+  capture() { :; }
+  evidence() { echo "stand-in"; }
+  owner_gh() { echo "$*" >>"$T_TMP/owner"; }
+  local obs
+  for obs in allowed refused; do
+    : >"$T_TMP/owner"
+    FAILS=0
+    classify_api() { echo "$obs"; }
+    t_B13 >/dev/null
+    assert_eq "$(cat "$T_TMP/owner")" "" "owner writes after B13's attempts were $obs"
+  done
+}
+
 cleanup_gh() { # <states...> — pr_view answers these in turn (none = can't read); closes are logged
   printf '%s\n' "$@" >"$T_TMP/states"
   : >"$T_TMP/closes"

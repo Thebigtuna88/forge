@@ -1016,9 +1016,9 @@ t_B13() {
   admin_attempts B13 -X POST "repos/$REPO/rulesets" --input "$WORK/helper-ruleset-user.json" ";;" \
     -X POST "repos/$REPO/rulesets" --input "$WORK/helper-ruleset-admin.json" ";;" \
     -X PATCH "repos/$REPO" -f description="changed by the helper"
-  # Put the marker back if the helper managed to change it, so later commands still recognise
-  # the throwaway repo.
-  owner_gh api -X PATCH "repos/$REPO" -f description="$MARKER" >/dev/null 2>&1 || true
+  # Nothing is put back (the stop rule): a refused helper changed nothing, and if one got through
+  # the repo stays as it is, so every later command's assert_throwaway refuses until the owner
+  # restores the description.
 }
 
 force_push() { # <id> <branch> — an unrelated history pushed over <branch>
