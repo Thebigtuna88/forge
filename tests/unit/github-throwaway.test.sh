@@ -321,20 +321,61 @@ test_a_failed_cleanup_stops_the_phase() {
 }
 
 sweep_gh() { # <open PRs as JSON, or fail> <states...> — the PR list gh would give (filtered with
-  # the script's own --jq, its last argument), plus cleanup_gh's states and logged closes
+  # the script's own --jq, its last argument), plus cleanup_gh's states and logged closes. With
+  # SWEEP_PAGE2 set, that JSON page comes after the first only when every page is asked for.
   SWEEP_LIST="$1"
   shift
   cleanup_gh "$@"
   owner_gh() {
-    case "$1 $2" in
-      "pr list")
+    case "$*" in
+      "api --paginate repos/$REPO/pulls?state=open&per_page=100 "* | "pr list "*)
         echo listed >>"$T_TMP/lists"
         [[ "$SWEEP_LIST" != fail ]] || return 1
-        printf '%s' "$SWEEP_LIST" | jq -r "${@: -1}"
+        {
+          printf '%s\n' "$SWEEP_LIST"
+          if [[ -n "${SWEEP_PAGE2:-}" && "$1 $2" == "api --paginate" ]]; then printf '%s\n' "$SWEEP_PAGE2"; fi
+        } | jq -r "${@: -1}"
         ;;
       *) echo "$*" >>"$T_TMP/closes" ;;
     esac
   }
+}
+
+test_a_sweep_reads_every_page_of_open_prs() {
+  # Round 9 C1: a test PR beyond the first page of open PRs (B11's, with auto-merge armed) must be
+  # closed too, not missed while the sweep reports success.
+  load
+  PHASE=protected
+  FAILS=0
+  sweep_gh '[{"number":5,"title":"Someone else"}]' OPEN CLOSED
+  SWEEP_PAGE2='[{"number":91,"title":"FRG-26 B11 (protected)"}]'
+  sweep_prs >/dev/null
+  assert_contains "$(cat "$T_TMP/closes")" "pr close 91"
+}
+
+test_reset_closes_every_open_pr_on_every_page() {
+  # Round 9 C1: reset closed only the first 100 open PRs.
+  load
+  need_owner() { :; }
+  assert_throwaway() { :; }
+  branch_state() { echo unprotected; }
+  ruleset_count() { echo 0; }
+  repo_settings() { :; }
+  verify_phase() { :; }
+  : >"$T_TMP/owner"
+  owner_gh() {
+    case "$*" in
+      "api repos/$REPO/git/ref/tags/$BASELINE_TAG"*) printf '%040d\n' 0 ;;
+      *"pulls?state=open"*)
+        echo 11
+        if [[ "$*" == *--paginate* ]]; then echo 12; fi
+        ;;
+      *) echo "$*" >>"$T_TMP/owner" ;;
+    esac
+  }
+  (cmd_reset) >/dev/null 2>&1
+  assert_contains "$(cat "$T_TMP/owner")" "pr close 11"
+  assert_contains "$(cat "$T_TMP/owner")" "pr close 12"
 }
 
 test_a_stopped_phase_closes_every_open_test_pr() {

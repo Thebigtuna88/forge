@@ -510,7 +510,7 @@ cmd_reset() {
   local base open_prs n
   base="$(owner_gh api "repos/$REPO/git/ref/tags/$BASELINE_TAG" --jq .object.sha)" || die "the baseline tag is missing"
   [[ "$base" =~ ^[0-9a-f]{40}$ ]] || die "unexpected baseline sha"
-  open_prs="$(owner_gh api "repos/$REPO/pulls?state=open&per_page=100" --jq '.[].number')" || die "can't list open PRs"
+  open_prs="$(owner_gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" --jq '.[].number')" || die "can't list open PRs"
   for n in $open_prs; do
     [[ "$n" =~ ^[0-9]+$ ]] || die "unexpected PR number '$n'"
     owner_gh pr close "$n" --repo "$REPO" >/dev/null 2>&1 || die "closing PR #$n failed"
@@ -816,7 +816,8 @@ close_if_open() { # <pr> — tidy up after a refused attempt
 # list it can't read, is a failure.
 sweep_prs() {
   local open pr
-  if ! open="$(owner_gh pr list --repo "$REPO" --state open --limit 1000 --json number,title \
+  # Every page, so no test PR is missed however many PRs are open (review round 9).
+  if ! open="$(owner_gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" \
     --jq '.[] | select(.title | startswith("FRG-26 ")) | .number' 2>/dev/null)"; then
     FAILS=$((FAILS + 1))
     say "CLEANUP FAIL could not list the open PRs in $REPO: close any \"FRG-26 \" test PR on GitHub before another phase"
