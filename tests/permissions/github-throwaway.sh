@@ -44,6 +44,8 @@ readonly BASELINE_TAG=frg26-baseline
 readonly DEFAULT_BRANCH=side
 # GraphQL points the helper must have left before a phase starts (each gh pr command uses some).
 readonly MIN_GRAPHQL=300
+# REST requests too (gh api calls and the identity check); the normal limit is 5000 an hour.
+readonly MIN_REST=300
 SECRETS="${FRG26_SECRETS:-/Users/atl/code/forge/work/owner-secrets/frg26/helper.env}"
 
 HELPER=""
@@ -279,6 +281,18 @@ protection_of() { # <branch> — approvals codeowners last-push stale enforce-ad
   owner_gh api "repos/$REPO/branches/$1/protection" --jq '[.required_pull_request_reviews.required_approving_review_count, .required_pull_request_reviews.require_code_owner_reviews, .required_pull_request_reviews.require_last_push_approval, .required_pull_request_reviews.dismiss_stale_reviews, .enforce_admins.enabled, .allow_force_pushes.enabled, .allow_deletions.enabled] | map(tostring) | join(" ")' 2>/dev/null || echo error
 }
 
+# A branch's whole protection as GitHub returns it, its url fields removed and keys sorted, or error.
+protection_full() { # <branch>
+  owner_gh api "repos/$REPO/branches/$1/protection" 2>/dev/null \
+    | jq -S -c 'walk(if type == "object" then del(.url) else . end)' 2>/dev/null || echo error
+}
+
+# What protection_full reads after protection_json <enforce_admins> is applied (read from the
+# throwaway on 2026-10-31). GitHub leaves out required_status_checks and restrictions when null.
+want_protection() { # <enforce_admins true|false>
+  printf '{"allow_deletions":{"enabled":false},"allow_force_pushes":{"enabled":false},"allow_fork_syncing":{"enabled":false},"block_creations":{"enabled":false},"enforce_admins":{"enabled":%s},"lock_branch":{"enabled":false},"required_conversation_resolution":{"enabled":false},"required_linear_history":{"enabled":false},"required_pull_request_reviews":{"dismiss_stale_reviews":true,"require_code_owner_reviews":true,"require_last_push_approval":true,"required_approving_review_count":1},"required_signatures":{"enabled":false}}\n' "$1"
+}
+
 ruleset_summary() { # one line describing the only ruleset, or error
   local id
   id="$(owner_gh api "repos/$REPO/rulesets" --jq '.[0].id' 2>/dev/null)" || { echo error; return; }
@@ -305,6 +319,12 @@ verify_phase() { # <phase> — the repository must be exactly in the state that 
       [[ "$got" == "$WANT_DEV" ]] || die "dev protection is '$got', expected '$WANT_DEV'"
       got="$(protection_of main)"
       [[ "$got" == "$WANT_MAIN" ]] || die "main protection is '$got', expected '$WANT_MAIN'"
+      # All of it, not only those fields: an extra required check or restriction would make a
+      # refusal pass for the wrong reason, and unprotect would delete what protect didn't apply.
+      got="$(protection_full dev)"
+      [[ "$got" == "$(want_protection true)" ]] || die "dev protection is not exactly what protect applies: $got"
+      got="$(protection_full main)"
+      [[ "$got" == "$(want_protection false)" ]] || die "main protection is not exactly what protect applies: $got"
       if [[ "$1" == protected ]]; then
         [[ "$r" == 0 ]] || die "phase protected needs no ruleset (found $r)"
       else
@@ -393,13 +413,15 @@ cmd_accept() {
 }
 
 # The helper's API allowance, read-only (GitHub doesn't count this request against it). Sets
-# RATE_LINE (for people) and RATE_LEFT (GraphQL points remaining); 1 if it can't be read.
+# RATE_LINE (for people), RATE_LEFT (GraphQL points remaining) and RATE_REST (REST requests
+# remaining); 1 if any of them can't be read.
 helper_rate() {
-  RATE_LINE="" RATE_LEFT=""
+  RATE_LINE="" RATE_LEFT="" RATE_REST=""
   capture helper_gh api rate_limit || return 1
   RATE_LINE="$(printf '%s' "$LAST_OUT" | jq -r '.resources | "graphql limit=\(.graphql.limit) used=\(.graphql.used) remaining=\(.graphql.remaining) resets=\(.graphql.reset | todate) / rest limit=\(.core.limit) used=\(.core.used) remaining=\(.core.remaining)"' 2>/dev/null)" || return 1
   RATE_LEFT="$(printf '%s' "$LAST_OUT" | jq -r '.resources.graphql.remaining' 2>/dev/null)" || return 1
-  [[ "$RATE_LEFT" =~ ^[0-9]+$ ]]
+  RATE_REST="$(printf '%s' "$LAST_OUT" | jq -r '.resources.core.remaining' 2>/dev/null)" || return 1
+  [[ "$RATE_LEFT" =~ ^[0-9]+$ && "$RATE_REST" =~ ^[0-9]+$ ]]
 }
 
 # A phase that ran out of allowance halfway would stop on a rate limit, so it doesn't start.
@@ -408,6 +430,8 @@ need_allowance() {
   say "helper allowance: $RATE_LINE"
   [[ "$RATE_LEFT" -ge $MIN_GRAPHQL ]] \
     || die "the helper has only $RATE_LEFT GraphQL points left (a phase needs about $MIN_GRAPHQL): $RATE_LINE. Run this step again after that reset time."
+  [[ "$RATE_REST" -ge $MIN_REST ]] \
+    || die "the helper has only $RATE_REST REST requests left (a phase needs about $MIN_REST): $RATE_LINE. Run this step again in an hour."
 }
 
 cmd_rate() {
@@ -1044,9 +1068,11 @@ t_B13() {
   admin_attempts B13 -X POST "repos/$REPO/rulesets" --input "$WORK/helper-ruleset-user.json" ";;" \
     -X POST "repos/$REPO/rulesets" --input "$WORK/helper-ruleset-admin.json" ";;" \
     -X PATCH "repos/$REPO" -f description="changed by the helper"
-  # Nothing is put back (the stop rule): a refused helper changed nothing, and if one got through
-  # the repo stays as it is, so every later command's assert_throwaway refuses until the owner
-  # restores the description.
+  # Nothing is put back (the stop rule): a refused helper changed nothing, and whatever got
+  # through stays for the owner to see. A ruleset the helper added makes every later verify_phase,
+  # ruleset and reset refuse (each needs an exact ruleset count, and the attempts stop there, before
+  # the description). A changed description makes every later command's assert_throwaway refuse.
+  # Either way nothing runs again until the owner puts it right.
 }
 
 force_push() { # <id> <branch> — an unrelated history pushed over <branch>

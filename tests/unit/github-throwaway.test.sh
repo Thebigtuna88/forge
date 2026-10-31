@@ -603,6 +603,67 @@ test_a_phase_needs_enough_helper_allowance() {
   assert_contains "$out" "helper allowance: graphql limit=5000 used=1000 remaining=4000"
 }
 
+test_a_phase_needs_enough_rest_allowance_too() {
+  # Round 7 C1: the helper's REST requests run out too; GraphQL to spare is not enough.
+  load
+  local out rc
+  helper_gh() { printf '{"resources":{"core":{"limit":5000,"used":5000,"remaining":0,"reset":1792540800},"graphql":{"limit":5000,"used":0,"remaining":5000,"reset":1792540800}}}'; }
+  rc=0; out="$( need_allowance 2>&1 )" || rc=$?
+  assert_exit 2 "$rc" "0 REST requests left"
+  assert_contains "$out" "only 0 REST requests left"
+  helper_gh() { printf '{"resources":{"graphql":{"limit":5000,"used":0,"remaining":5000,"reset":1792540800}}}'; }
+  rc=0; out="$( need_allowance 2>&1 )" || rc=$?
+  assert_exit 2 "$rc" "no REST allowance in the answer"
+}
+
+# GitHub's answers for the protection `protect` applies, as read from the throwaway on 2026-10-31.
+protection_fixture() { # <dev|main>
+  local ea=false
+  [[ "$1" == dev ]] && ea=true
+  printf '{"url":"https://api.github.com/repos/Thebigtuna88/forge-frg26-throwaway/branches/%s/protection","required_pull_request_reviews":{"url":"https://api.github.com/repos/Thebigtuna88/forge-frg26-throwaway/branches/%s/protection/required_pull_request_reviews","dismiss_stale_reviews":true,"require_code_owner_reviews":true,"require_last_push_approval":true,"required_approving_review_count":1},"required_signatures":{"url":"https://api.github.com/repos/Thebigtuna88/forge-frg26-throwaway/branches/%s/protection/required_signatures","enabled":false},"enforce_admins":{"url":"https://api.github.com/repos/Thebigtuna88/forge-frg26-throwaway/branches/%s/protection/enforce_admins","enabled":%s},"required_linear_history":{"enabled":false},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false},"block_creations":{"enabled":false},"required_conversation_resolution":{"enabled":false},"lock_branch":{"enabled":false},"allow_fork_syncing":{"enabled":false}}\n' "$1" "$1" "$1" "$1" "$ea"
+}
+
+protection_gh() { # owner_gh answering protection reads from $T_TMP/<branch>.json; other calls logged
+  protection_fixture dev >"$T_TMP/dev.json"
+  protection_fixture main >"$T_TMP/main.json"
+  : >"$T_TMP/owner"
+  branch_state() { echo protected; }
+  ruleset_count() { echo 0; }
+  owner_gh() {
+    local f=""
+    case "$*" in
+      "api repos/$REPO/branches/dev/protection"*) f=dev ;;
+      "api repos/$REPO/branches/main/protection"*) f=main ;;
+    esac
+    if [[ -z "$f" ]]; then echo "$*" >>"$T_TMP/owner"; return 0; fi
+    if [[ "${3:-}" == --jq ]]; then jq -r "$4" "$T_TMP/$f.json"; else cat "$T_TMP/$f.json"; fi
+  }
+}
+
+test_protected_means_exactly_what_protect_applies() {
+  # Round 7 C2: a protection with anything more (or less) than protect's settings is not the
+  # protected state: no phase runs on it, and unprotect doesn't delete it.
+  load
+  protection_gh
+  local rc out
+  rc=0; (verify_phase protected) >/dev/null 2>&1 || rc=$?
+  assert_exit 0 "$rc" "protect's own settings"
+  jq -c '. + {required_status_checks: {strict: true, contexts: ["owner-extra-check"]}}' "$T_TMP/dev.json" >"$T_TMP/x" && mv "$T_TMP/x" "$T_TMP/dev.json"
+  rc=0; out="$(verify_phase protected 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "an extra required check on dev"
+  assert_contains "$out" "dev protection is not exactly what protect applies"
+  need_owner() { :; }
+  assert_throwaway() { :; }
+  rc=0; (cmd_unprotect) >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc" "unprotect with an extra required check"
+  assert_eq "$(cat "$T_TMP/owner")" "" "deletes with an extra required check"
+  protection_fixture main | jq -c 'del(.lock_branch)' >"$T_TMP/main.json"
+  protection_fixture dev >"$T_TMP/dev.json"
+  rc=0; out="$(verify_phase protected 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a setting missing on main"
+  assert_contains "$out" "main protection is not exactly what protect applies"
+}
+
 owner_cmd_stubs() { # an owner command's checks pass; its gh calls are logged to $T_TMP/owner
   load
   need_owner() { :; }

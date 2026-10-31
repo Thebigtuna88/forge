@@ -249,7 +249,11 @@ Code. If I ran "push to `main`" myself, even expecting a refusal, I'd be getting
      protect.
    - **The allowance gate is executable and fail-closed:** `ruleset` refuses unless the helper has
      enough allowance for the phase after it, and an `allowance` step stops a handoff before its
-     first change. (Before, the ruleset could be added and then sit untested.)
+     first change. (Before, the ruleset could be added and then sit untested.) It checks both the
+     GraphQL and the REST allowance (review round 7).
+   - *Stricter (review round 7):* the protected state is checked in full: every protection setting
+     GitHub returns must be exactly what `protect` applies, so no phase runs on, and `unprotect`
+     never deletes, a protection someone changed.
    - B13 no longer puts the repo's description back after its attempts (stop rule; a refused helper
      changed nothing, and after one that got through the repo is left for you to see).
 
