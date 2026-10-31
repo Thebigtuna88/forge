@@ -301,7 +301,9 @@ ruleset_summary() { # one line describing the only ruleset, or error
 }
 
 want_ruleset() { # the two bypass choices this script may have installed
-  printf 'active branch refs/heads/main 0 deletion,non_fast_forward,update:false User:%s:always\n' "$(owner_uid)"
+  local uid
+  uid="$(owner_uid)" || return 1 # owner_uid's die ends only this subshell (review round 10)
+  printf 'active branch refs/heads/main 0 deletion,non_fast_forward,update:false User:%s:always\n' "$uid"
   printf 'active branch refs/heads/main 0 deletion,non_fast_forward,update:false RepositoryRole:5:always\n'
 }
 
@@ -610,7 +612,7 @@ cmd_ruleset() {
   need_helper_identity
   need_allowance
   local uid
-  uid="$(owner_uid)"
+  uid="$(owner_uid)" || die "can't read the owner's user id, so no ruleset was requested"
   ruleset_json User "$uid" >"$WORK/ruleset-user.json"
   ruleset_json RepositoryRole 5 >"$WORK/ruleset-admin.json"
   if capture owner_gh api -X POST "repos/$REPO/rulesets" --input "$WORK/ruleset-user.json"; then
@@ -1072,7 +1074,9 @@ t_B12() {
 
 t_B13() {
   # The same payloads the owner's own ruleset step uses (one of them is proven valid there).
-  ruleset_json User "$(owner_uid)" >"$WORK/helper-ruleset-user.json"
+  local uid
+  uid="$(owner_uid)" || { setup_fail B13 "could not read the owner's user id"; return; }
+  ruleset_json User "$uid" >"$WORK/helper-ruleset-user.json"
   ruleset_json RepositoryRole 5 >"$WORK/helper-ruleset-admin.json"
   admin_attempts B13 -X POST "repos/$REPO/rulesets" --input "$WORK/helper-ruleset-user.json" ";;" \
     -X POST "repos/$REPO/rulesets" --input "$WORK/helper-ruleset-admin.json" ";;" \

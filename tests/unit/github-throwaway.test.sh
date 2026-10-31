@@ -767,6 +767,29 @@ test_ruleset_falls_back_only_after_a_clear_rejection() {
   done
 }
 
+test_a_failed_owner_id_read_stops_whatever_needs_it() {
+  # Round 10 C1: owner_uid's die inside $( ) ends only the subshell. Each of its three users must
+  # stop on a failed read instead of going on with an empty id.
+  owner_cmd_stubs
+  verify_phase() { :; }
+  helper_gh() { rate_fixture 4000; }
+  owner_uid() { die "can't read the owner's user id"; }
+  local rc=0
+  (cmd_ruleset) >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc" "ruleset with no owner id"
+  assert_eq "$(cat "$T_TMP/owner")" "" "owner calls with no owner id"
+  PHASE=protected
+  FAILS=0
+  : >"$T_TMP/calls"
+  capture() { echo "CALL $*" >>"$T_TMP/calls"; }
+  local out
+  out="$(t_B13; echo "FAILS=$FAILS")"
+  assert_contains "$out" "RESULT B13 protected FAIL"
+  assert_contains "$out" "observed=setup-failed"
+  assert_eq "$(cat "$T_TMP/calls")" "" "helper attempts with no owner id"
+  if want_ruleset >/dev/null 2>&1; then _t_fail "want_ruleset passed with no owner id"; fi
+}
+
 test_allowance_check_fails_closed() {
   owner_cmd_stubs
   local out rc
