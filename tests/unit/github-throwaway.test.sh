@@ -697,6 +697,35 @@ test_ruleset_needs_enough_helper_allowance_before_it_changes_anything() {
   assert_contains "$(cat "$T_TMP/owner")" "api -X POST repos/$REPO/rulesets"
 }
 
+test_ruleset_falls_back_only_after_a_clear_rejection() {
+  # Round 8 C1: a lost answer after GitHub created the ruleset must not lead to a second one. The
+  # Repository admin form is tried only when GitHub rejected the User form as invalid (HTTP 422)
+  # and there is still no ruleset.
+  owner_cmd_stubs
+  verify_phase() { :; }
+  helper_gh() { rate_fixture 4000; }
+  owner_gh() {
+    case "$*" in
+      *"-X POST repos/$REPO/rulesets"*)
+        echo "$*" >>"$T_TMP/owner"
+        if [[ "$(grep -c 'X POST' "$T_TMP/owner")" == 1 ]]; then echo "$FIRST_ERR" >&2; return 1; fi
+        ;;
+    esac
+  }
+  local case_ err count rc posts
+  for case_ in "gh: HTTP 502 Bad Gateway|0|2|1" "gh: Validation Failed (HTTP 422)|1|2|1" \
+    "gh: Validation Failed (HTTP 422)|error|2|1" "gh: Validation Failed (HTTP 422)|0|0|2"; do
+    IFS='|' read -r err count rc posts <<<"$case_"
+    FIRST_ERR="$err"
+    eval "ruleset_count() { echo $count; }"
+    : >"$T_TMP/owner"
+    local got=0
+    (cmd_ruleset) >/dev/null 2>&1 || got=$?
+    assert_exit "$rc" "$got" "first answer '$err', rulesets after it: $count"
+    assert_eq "$(grep -c 'X POST' "$T_TMP/owner")" "$posts" "ruleset requests after '$err' with $count rulesets"
+  done
+}
+
 test_allowance_check_fails_closed() {
   owner_cmd_stubs
   local out rc

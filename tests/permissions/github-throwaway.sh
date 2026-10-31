@@ -616,7 +616,15 @@ cmd_ruleset() {
   if capture owner_gh api -X POST "repos/$REPO/rulesets" --input "$WORK/ruleset-user.json"; then
     say "ruleset created with bypass: the owner (User $uid)"
   else
-    say "GitHub refused a User bypass: $(evidence)"
+    # Fall back only on a clear rejection that changed nothing: GitHub answered 422 (invalid) and
+    # there is still no ruleset. A lost answer after GitHub created it must not lead to a second.
+    local ev n
+    ev="$(evidence)"
+    n="$(ruleset_count)"
+    if ! printf '%s' "$LAST_OUT" | grep -q 'HTTP 422' || [[ "$n" != 0 ]]; then
+      die "the ruleset request failed without a clear rejection, or a ruleset exists now (rulesets: $n): check $REPO's rulesets on GitHub before running this again: $ev"
+    fi
+    say "GitHub refused a User bypass: $ev"
     capture owner_gh api -X POST "repos/$REPO/rulesets" --input "$WORK/ruleset-admin.json" \
       || die "GitHub refused the Repository admin bypass too: $(evidence)"
     say "ruleset created with bypass: Repository admin role (5)"
