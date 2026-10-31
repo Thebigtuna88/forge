@@ -353,6 +353,39 @@ test_a_sweep_reads_every_page_of_open_prs() {
   assert_contains "$(cat "$T_TMP/closes")" "pr close 91"
 }
 
+test_reset_rewrites_a_branch_only_while_it_reads_unprotected_or_missing() {
+  # Round 11 C1: reset's second look at each branch (right before rewriting it) took anything but
+  # "missing" as leave to force-update it, an unreadable or protected branch included.
+  load
+  need_owner() { :; }
+  assert_throwaway() { :; }
+  ruleset_count() { echo 0; }
+  repo_settings() { :; }
+  verify_phase() { :; }
+  local later rc
+  for later in error protected; do
+    : >"$T_TMP/owner"
+    : >"$T_TMP/reads"
+    LATER="$later"
+    # The first three reads (the checks before anything changes) say unprotected; later ones don't.
+    branch_state() {
+      echo x >>"$T_TMP/reads"
+      if [[ "$(wc -l <"$T_TMP/reads" | tr -d ' ')" -le 3 ]]; then echo unprotected; else echo "$LATER"; fi
+    }
+    owner_gh() {
+      case "$*" in
+        "api repos/$REPO/git/ref/tags/$BASELINE_TAG"*) printf '%040d\n' 0 ;;
+        *"pulls?state=open"*) ;;
+        *) echo "$*" >>"$T_TMP/owner" ;;
+      esac
+    }
+    rc=0
+    (cmd_reset) >/dev/null 2>&1 || rc=$?
+    assert_exit 2 "$rc" "a branch that reads $later just before its rewrite"
+    assert_not_contains "$(cat "$T_TMP/owner")" "git/refs" "branch writes when a branch reads $later"
+  done
+}
+
 test_reset_closes_every_open_pr_on_every_page() {
   # Round 9 C1: reset closed only the first 100 open PRs.
   load

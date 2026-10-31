@@ -517,14 +517,21 @@ cmd_reset() {
     [[ "$n" =~ ^[0-9]+$ ]] || die "unexpected PR number '$n'"
     owner_gh pr close "$n" --repo "$REPO" >/dev/null 2>&1 || die "closing PR #$n failed"
   done
+  # Read again right before each rewrite, and rewrite only an unprotected branch (or recreate a
+  # missing one): an unreadable or newly protected branch stops the reset (review round 11).
   for b in main dev side; do
-    if [[ "$(branch_state "$b")" == missing ]]; then
-      owner_gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$b" -f sha="$base" >/dev/null \
-        || die "recreating $b failed"
-    else
-      owner_gh api -X PATCH "repos/$REPO/git/refs/heads/$b" -f sha="$base" -F force=true >/dev/null \
-        || die "resetting $b failed"
-    fi
+    s="$(branch_state "$b")"
+    case "$s" in
+      missing)
+        owner_gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$b" -f sha="$base" >/dev/null \
+          || die "recreating $b failed"
+        ;;
+      unprotected)
+        owner_gh api -X PATCH "repos/$REPO/git/refs/heads/$b" -f sha="$base" -F force=true >/dev/null \
+          || die "resetting $b failed"
+        ;;
+      *) die "reset stopped before rewriting $b: it reads $s now" ;;
+    esac
   done
   repo_settings
   verify_phase open
