@@ -11,8 +11,8 @@ source "$(dirname "$0")/../lib/assert.sh"
 
 GT="$(cd "$(dirname "$0")/.." && pwd)/permissions/github-throwaway.sh"
 
-# A fake classic token, built at run time so no token-shaped text sits in the repository.
-fake_token() { printf 'gh%s_%s' p "$(printf 'Z%.0s' $(seq 1 36))"; }
+# A fake installation token, built at run time so no token-shaped text sits in the repository.
+fake_token() { printf 'gh%s_%s' s "$(printf 'Z%.0s' $(seq 1 36))"; }
 
 load() { # source the script (main doesn't run when sourced)
   # shellcheck source=tests/permissions/github-throwaway.sh
@@ -42,16 +42,23 @@ EOF
   printf 'git-leaked:%s%s%s\n' "${GIT_COMMON_DIR:-}" "${GIT_TEMPLATE_DIR:-}" "${GIT_DIR:-}"
 } >>"$FAKE_LOG"
 EOF
-  chmod +x "$T_TMP/bin/gh" "$T_TMP/bin/git"
+  cat >"$T_TMP/bin/curl" <<'EOF'
+#!/bin/bash
+printf 'curl-args:%s\n' "$*" >>"$FAKE_LOG"
+printf '{"fake":"answer"}\nHTTP %s' "${FAKE_HTTP:-201}"
+EOF
+  chmod +x "$T_TMP/bin/gh" "$T_TMP/bin/git" "$T_TMP/bin/curl"
   export FAKE_LOG="$T_TMP/fake.log"
   : >"$FAKE_LOG"
   PATH="$T_TMP/bin:$PATH"
 }
 
-secrets() { # <login> <token> [mode]
-  printf 'HELPER_LOGIN=%s\nHELPER_TOKEN=%s\n' "$1" "$2" >"$T_TMP/helper.env"
-  chmod "${3:-600}" "$T_TMP/helper.env"
-  export FRG26_SECRETS="$T_TMP/helper.env"
+app_files() { # <app id> [env mode] [key mode] — the app's id and a fresh test key (never a real one)
+  printf 'APP_ID=%s\n' "$1" >"$T_TMP/app.env"
+  chmod "${2:-600}" "$T_TMP/app.env"
+  [[ -f "$T_TMP/app.pem" ]] || openssl genrsa -out "$T_TMP/app.pem" 2048 2>/dev/null
+  chmod "${3:-600}" "$T_TMP/app.pem"
+  export FRG26_SECRETS="$T_TMP/app.env" FRG26_APP_KEY="$T_TMP/app.pem"
 }
 
 # These run the real script. They stay offline even if the agent guard were broken: an empty
@@ -167,13 +174,15 @@ ALL_TESTS="B5 B1 B2 B3 B4a B4b B6 B7 B8 B9 B10 B11 B12 B13 B16 M1 M2 M3 M4 M6 B1
 stub_phase() { # <id:allowed|refused|setup>...
   load
   need_owner() { :; }
-  load_helper() { :; }
-  need_helper_identity() { :; }
+  load_app() { :; }
+  need_app_identity() { :; }
+  need_installation_scope() { :; }
+  mint_token() { :; }
   assert_throwaway() { :; }
   verify_phase() { :; }
   need_allowance() { :; }
-  helper_git() { :; }
-  helper_rate() { return 1; }
+  app_git() { :; }
+  app_rate() { return 1; }
   owner_gh() { :; } # no open PRs, nothing reaches gh
   # The script's exit cleanup removes WORK, so it must not be the folder holding the logs.
   WORK="$T_TMP/work"
@@ -592,7 +601,7 @@ test_b11_open_needs_a_confirmed_result() {
   wait_settled() { return 0; }
   sleep() { :; }
   close_if_open() { :; }
-  helper_gh() { echo "HTTP 503 Service Unavailable" >&2; return 1; }
+  app_gh() { echo "HTTP 503 Service Unavailable" >&2; return 1; }
   pr_view() { return 1; }
   local out
   out="$(t_B11; echo "fails=$FAILS")"
@@ -613,13 +622,13 @@ test_b9_reaims_through_the_rest_api() {
   owner_approve() { :; }
   sleep() { :; }
   close_if_open() { :; }
-  helper_merge() { OBS=allowed; LAST_OUT=merged; }
-  helper_gh() { printf '%s\n' "$*" >>"$T_TMP/helper-gh.log"; }
+  app_merge() { OBS=allowed; LAST_OUT=merged; }
+  app_gh() { printf '%s\n' "$*" >>"$T_TMP/app-gh.log"; }
   pr_view() { echo "$FAKE_BASE"; }
   local out
   FAKE_BASE=dev
   out="$(t_B9; echo "fails=$FAILS")"
-  assert_eq "$(cat "$T_TMP/helper-gh.log")" "api -X PATCH repos/$REPO/pulls/7 -f base=dev"
+  assert_eq "$(cat "$T_TMP/app-gh.log")" "api -X PATCH repos/$REPO/pulls/7 -f base=dev"
   assert_contains "$out" "RESULT B9 open PASS expected=allowed observed=allowed"
   # A re-aim GitHub didn't apply is a broken setup, not a result.
   FAKE_BASE=side
@@ -629,15 +638,15 @@ test_b9_reaims_through_the_rest_api() {
   # A refused re-aim never tries the merge B9 is about: setup-failed, never a protected PASS.
   PHASE=protected
   FAKE_BASE=dev
-  helper_gh() { echo "gh: Resource not accessible by personal access token (HTTP 403)" >&2; return 1; }
+  app_gh() { echo "gh: Resource not accessible by personal access token (HTTP 403)" >&2; return 1; }
   out="$(t_B9; echo "fails=$FAILS")"
   assert_contains "$out" "RESULT B9 protected FAIL"
   assert_contains "$out" "observed=setup-failed"
 }
 
-test_helper_never_uses_gh_pr_edit() {
+test_app_never_uses_gh_pr_edit() {
   # Same reason as above, for every test: the helper's gh must not run `pr edit`.
-  assert_eq "$(grep -c 'helper_gh pr edit' "$GT" || true)" "0" "helper_gh pr edit needs read:org"
+  assert_eq "$(grep -c 'app_gh pr edit' "$GT" || true)" "0" "app_gh pr edit needs read:org"
 }
 
 rate_fixture() { # <graphql remaining>
@@ -645,47 +654,47 @@ rate_fixture() { # <graphql remaining>
     "$((5000 - $1))" "$1"
 }
 
-test_helper_rate_reads_the_allowance() {
+test_app_rate_reads_the_allowance() {
   # The owner's runs stopped on "GraphQL: API rate limit already exceeded" for the helper:
   # the script must be able to show the helper's allowance (GitHub doesn't count that request).
   load
-  helper_gh() { printf '%s\n' "$*" >>"$T_TMP/helper-gh.log"; rate_fixture 10; }
-  helper_rate || _t_fail "a valid allowance was not read"
-  assert_eq "$(cat "$T_TMP/helper-gh.log")" "api rate_limit"
+  app_gh() { printf '%s\n' "$*" >>"$T_TMP/app-gh.log"; rate_fixture 10; }
+  app_rate || _t_fail "a valid allowance was not read"
+  assert_eq "$(cat "$T_TMP/app-gh.log")" "api rate_limit"
   assert_eq "$RATE_LEFT" 10
   assert_contains "$RATE_LINE" "graphql limit=5000 used=4990 remaining=10 resets=2026-10-21T00:00:00Z"
   assert_contains "$RATE_LINE" "rest limit=5000 used=12 remaining=4988"
-  helper_gh() { echo "HTTP 503" >&2; return 1; }
-  if helper_rate; then _t_fail "an unreadable allowance was accepted"; fi
+  app_gh() { echo "HTTP 503" >&2; return 1; }
+  if app_rate; then _t_fail "an unreadable allowance was accepted"; fi
 }
 
-test_a_phase_needs_enough_helper_allowance() {
+test_a_phase_needs_enough_app_allowance() {
   # A phase that would run out halfway stops before its first test, naming the reset time.
   load
   local out rc
-  helper_gh() { rate_fixture 10; }
+  app_gh() { rate_fixture 10; }
   rc=0; out="$( need_allowance 2>&1 )" || rc=$?
   assert_exit 2 "$rc" "10 points left"
   assert_contains "$out" "only 10 GraphQL points left"
   assert_contains "$out" "resets=2026-10-21T00:00:00Z"
-  helper_gh() { echo "HTTP 503" >&2; return 1; }
+  app_gh() { echo "HTTP 503" >&2; return 1; }
   rc=0; out="$( need_allowance 2>&1 )" || rc=$?
   assert_exit 2 "$rc" "unreadable allowance"
-  helper_gh() { rate_fixture 4000; }
+  app_gh() { rate_fixture 4000; }
   rc=0; out="$( need_allowance 2>&1 )" || rc=$?
   assert_exit 0 "$rc" "4000 points left"
-  assert_contains "$out" "helper allowance: graphql limit=5000 used=1000 remaining=4000"
+  assert_contains "$out" "app allowance: graphql limit=5000 used=1000 remaining=4000"
 }
 
 test_a_phase_needs_enough_rest_allowance_too() {
   # Round 7 C1: the helper's REST requests run out too; GraphQL to spare is not enough.
   load
   local out rc
-  helper_gh() { printf '{"resources":{"core":{"limit":5000,"used":5000,"remaining":0,"reset":1792540800},"graphql":{"limit":5000,"used":0,"remaining":5000,"reset":1792540800}}}'; }
+  app_gh() { printf '{"resources":{"core":{"limit":5000,"used":5000,"remaining":0,"reset":1792540800},"graphql":{"limit":5000,"used":0,"remaining":5000,"reset":1792540800}}}'; }
   rc=0; out="$( need_allowance 2>&1 )" || rc=$?
   assert_exit 2 "$rc" "0 REST requests left"
   assert_contains "$out" "only 0 REST requests left"
-  helper_gh() { printf '{"resources":{"graphql":{"limit":5000,"used":0,"remaining":5000,"reset":1792540800}}}'; }
+  app_gh() { printf '{"resources":{"graphql":{"limit":5000,"used":0,"remaining":5000,"reset":1792540800}}}'; }
   rc=0; out="$( need_allowance 2>&1 )" || rc=$?
   assert_exit 2 "$rc" "no REST allowance in the answer"
 }
@@ -742,8 +751,10 @@ owner_cmd_stubs() { # an owner command's checks pass; its gh calls are logged to
   load
   need_owner() { :; }
   assert_throwaway() { :; }
-  load_helper() { :; }
-  need_helper_identity() { :; }
+  load_app() { :; }
+  need_app_identity() { :; }
+  need_installation_scope() { :; }
+  mint_token() { :; }
   owner_uid() { echo 1; }
   owner_gh() { echo "$*" >>"$T_TMP/owner"; }
   WORK="$T_TMP/work"
@@ -751,22 +762,22 @@ owner_cmd_stubs() { # an owner command's checks pass; its gh calls are logged to
   : >"$T_TMP/owner"
 }
 
-test_ruleset_needs_enough_helper_allowance_before_it_changes_anything() {
+test_ruleset_needs_enough_app_allowance_before_it_changes_anything() {
   # The phase after the ruleset needs the helper's allowance; if it is short, the ruleset must
   # not be added (it would sit there untested). Round 6, owner: executable and fail-closed.
   owner_cmd_stubs
   verify_phase() { :; }
   local out rc
-  helper_gh() { rate_fixture 10; }
+  app_gh() { rate_fixture 10; }
   rc=0; out="$(cmd_ruleset 2>&1)" || rc=$?
   assert_exit 2 "$rc" "10 points left"
   assert_contains "$out" "only 10 GraphQL points left"
   assert_eq "$(cat "$T_TMP/owner")" "" "owner calls with 10 points left"
-  helper_gh() { echo "HTTP 503" >&2; return 1; }
+  app_gh() { echo "HTTP 503" >&2; return 1; }
   rc=0; out="$(cmd_ruleset 2>&1)" || rc=$?
   assert_exit 2 "$rc" "unreadable allowance"
   assert_eq "$(cat "$T_TMP/owner")" "" "owner calls with an unreadable allowance"
-  helper_gh() { rate_fixture 4000; }
+  app_gh() { rate_fixture 4000; }
   rc=0; out="$(cmd_ruleset 2>&1)" || rc=$?
   assert_contains "$(cat "$T_TMP/owner")" "api -X POST repos/$REPO/rulesets"
 }
@@ -777,7 +788,7 @@ test_ruleset_falls_back_only_after_a_clear_rejection() {
   # and there is still no ruleset.
   owner_cmd_stubs
   verify_phase() { :; }
-  helper_gh() { rate_fixture 4000; }
+  app_gh() { rate_fixture 4000; }
   owner_gh() {
     case "$*" in
       *"-X POST repos/$REPO/rulesets"*)
@@ -805,7 +816,7 @@ test_a_failed_owner_id_read_stops_whatever_needs_it() {
   # stop on a failed read instead of going on with an empty id.
   owner_cmd_stubs
   verify_phase() { :; }
-  helper_gh() { rate_fixture 4000; }
+  app_gh() { rate_fixture 4000; }
   owner_uid() { die "can't read the owner's user id"; }
   local rc=0
   (cmd_ruleset) >/dev/null 2>&1 || rc=$?
@@ -826,16 +837,16 @@ test_a_failed_owner_id_read_stops_whatever_needs_it() {
 test_allowance_check_fails_closed() {
   owner_cmd_stubs
   local out rc
-  helper_gh() { rate_fixture 10; }
+  app_gh() { rate_fixture 10; }
   rc=0; out="$(cmd_allowance 2>&1)" || rc=$?
   assert_exit 2 "$rc" "10 points left"
-  helper_gh() { echo "HTTP 503" >&2; return 1; }
+  app_gh() { echo "HTTP 503" >&2; return 1; }
   rc=0; out="$(cmd_allowance 2>&1)" || rc=$?
   assert_exit 2 "$rc" "unreadable allowance"
-  helper_gh() { rate_fixture 4000; }
+  app_gh() { rate_fixture 4000; }
   rc=0; out="$(cmd_allowance 2>&1)" || rc=$?
   assert_exit 0 "$rc" "4000 points left"
-  assert_contains "$out" "helper allowance: graphql limit=5000 used=1000 remaining=4000"
+  assert_contains "$out" "app allowance: graphql limit=5000 used=1000 remaining=4000"
 }
 
 test_unprotect_lifts_exactly_what_protect_applies() {
@@ -856,47 +867,6 @@ verify open"
   (cmd_unprotect) >/dev/null 2>&1 || rc=$?
   assert_exit 2 "$rc" "not in the protected state"
   assert_eq "$(cat "$T_TMP/owner")" "" "owner calls outside the protected state"
-}
-
-fake_diag_gh() { # stands in for helper_gh: logs its arguments, answers like `gh api -i`
-  printf '%s\n' "$*" >>"$T_TMP/helper-gh.log"
-  case "$*" in
-    "api -i user")
-      printf 'HTTP/2.0 200 OK\r\nAuthorization: token %s\r\nSet-Cookie: s=1\r\nX-Oauth-Scopes: public_repo\r\nX-Ratelimit-Limit: 60\r\nX-Ratelimit-Remaining: 52\r\nX-Ratelimit-Resource: core\r\nX-Github-Request-Id: AB:CD\r\n\r\n{"login":"TTHelper","id":345506119}\n' "$TOKEN" ;;
-    "api -i rate_limit")
-      printf 'HTTP/2.0 200 OK\r\nX-Ratelimit-Limit: 60\r\n\r\n%s\n' "$(rate_fixture 0)" ;;
-    "api -i graphql "*)
-      printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Limit: 0\r\nX-Ratelimit-Resource: graphql\r\n\r\n{"errors":[{"type":"RATE_LIMITED","message":"API rate limit already exceeded for user ID 345506119."}]}\ngh: API rate limit already exceeded for user ID 345506119.\n'
-      return 1 ;;
-  esac
-}
-
-test_diagnose_records_statuses_headers_and_messages_only() {
-  # The owner asked: authenticate exactly as the tests do, then record HTTP statuses, rate-limit
-  # headers and GitHub's messages for GET /user, GET /rate_limit and GraphQL, never the token
-  # or an Authorization header.
-  load
-  TOKEN="$(fake_token)"
-  HELPER=TTHelper
-  load_helper() { :; }
-  helper_gh() { fake_diag_gh "$@"; }
-  local out
-  out="$(cmd_diagnose 2>&1)"
-  assert_eq "$(sed -n 1,2p "$T_TMP/helper-gh.log")" "$(printf 'api -i user\napi -i rate_limit')"
-  assert_contains "$(sed -n 3p "$T_TMP/helper-gh.log")" "api -i graphql -f query="
-  assert_contains "$out" "DIAG GET /user: exit=0 HTTP/2.0 200 OK"
-  assert_contains "$out" "x-oauth-scopes: public_repo"
-  assert_contains "$out" "x-ratelimit-limit: 60"
-  assert_contains "$out" "x-github-request-id: AB:CD"
-  assert_contains "$out" "login=TTHelper"
-  assert_contains "$out" "DIAG GET /rate_limit: exit=0 HTTP/2.0 200 OK"
-  assert_contains "$out" "graphql limit=5000 used=5000 remaining=0"
-  assert_contains "$out" "DIAG POST /graphql: exit=1 HTTP/2.0 403 Forbidden"
-  assert_contains "$out" "x-ratelimit-resource: graphql"
-  assert_contains "$out" "RATE_LIMITED: API rate limit already exceeded for user ID 345506119."
-  assert_not_contains "$out" "$TOKEN" "the token"
-  assert_not_contains "$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')" "authorization" "an Authorization header"
-  assert_not_contains "$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')" "set-cookie" "a header outside the list"
 }
 
 test_ruleset_summary_includes_the_update_rules_parameter() {
@@ -924,11 +894,11 @@ test_ruleset_summary_includes_the_update_rules_parameter() {
   want_ruleset | grep -Fxq -- "$got" || _t_fail "the installed ruleset was not recognised: $got"
 }
 
-test_helper_merge_needs_a_blocked_mergeable_pr_to_count_as_refused() {
+test_app_merge_needs_a_blocked_mergeable_pr_to_count_as_refused() {
   load
   PHASE=protected
   sleep() { :; }
-  helper_gh() { echo "X Pull request is not mergeable: the base branch policy prohibits the merge." >&2; return 1; }
+  app_gh() { echo "X Pull request is not mergeable: the base branch policy prohibits the merge." >&2; return 1; }
   pr_view() {
     case "$2" in
       mergeable) echo MERGEABLE ;;
@@ -936,10 +906,10 @@ test_helper_merge_needs_a_blocked_mergeable_pr_to_count_as_refused() {
     esac
   }
   FAKE_FACTS="OPEN MERGEABLE BLOCKED REVIEW_REQUIRED"
-  helper_merge B6 7 --squash
+  app_merge B6 7 --squash
   assert_eq "$OBS" refused "blocked by protection"
   FAKE_FACTS="OPEN MERGEABLE CLEAN APPROVED"
-  helper_merge B6 7 --squash
+  app_merge B6 7 --squash
   assert_eq "$OBS" inconclusive "open but not blocked: something else went wrong"
   # Blocked on GitHub, but the merge request itself failed for another reason: proves nothing.
   pr_view() {
@@ -948,14 +918,14 @@ test_helper_merge_needs_a_blocked_mergeable_pr_to_count_as_refused() {
       *) echo "OPEN MERGEABLE BLOCKED REVIEW_REQUIRED" ;;
     esac
   }
-  helper_gh() { echo "HTTP 503 Service Unavailable" >&2; return 1; }
-  helper_merge B6 7 --squash
+  app_gh() { echo "HTTP 503 Service Unavailable" >&2; return 1; }
+  app_merge B6 7 --squash
   assert_eq "$OBS" inconclusive "a failed request with a blocked PR"
-  helper_gh() { echo "gh: API rate limit exceeded; base branch policy prohibits the merge" >&2; return 1; }
-  helper_merge B6 7 --squash
+  app_gh() { echo "gh: API rate limit exceeded; base branch policy prohibits the merge" >&2; return 1; }
+  app_merge B6 7 --squash
   assert_eq "$OBS" inconclusive "a rate limit with a policy-looking message"
   pr_view() { return 1; }
-  helper_merge B6 7 --squash
+  app_merge B6 7 --squash
   assert_eq "$OBS" inconclusive "state unreadable (network)"
   assert_contains "$LAST_OUT" "never settled"
 }
@@ -986,58 +956,15 @@ test_redact_hides_the_token() {
   assert_not_contains "$out" "$TOKEN" "die redacts too"
 }
 
-test_load_helper_accepts_a_classic_token() {
-  load
-  secrets frg-helper "$(fake_token)"
-  SECRETS="$FRG26_SECRETS"
-  ( load_helper token ) || _t_fail "a valid login and classic token were refused"
-}
-
-test_load_helper_refusals() {
-  load
-  local out rc
-  secrets frg-helper "$(fake_token)" 644
-  SECRETS="$FRG26_SECRETS"
-  rc=0; out="$( load_helper token 2>&1 )" || rc=$?
-  assert_exit 2 "$rc" "mode 644"
-  assert_contains "$out" "must be mode 600"
-
-  secrets frg-helper "github_pat_$(printf 'Y%.0s' $(seq 1 40))"
-  rc=0; out="$( load_helper token 2>&1 )" || rc=$?
-  assert_exit 2 "$rc" "fine-grained token"
-  assert_contains "$out" "not a classic token"
-
-  secrets thebigtuna88 "$(fake_token)"
-  rc=0; out="$( load_helper token 2>&1 )" || rc=$?
-  assert_exit 2 "$rc" "owner as helper"
-  assert_contains "$out" "must not be the owner"
-
-  secrets 'bad;name' "$(fake_token)"
-  rc=0; out="$( load_helper token 2>&1 )" || rc=$?
-  assert_exit 2 "$rc" "invalid login"
-
-  secrets frg-helper "$(fake_token)"
-  chmod 755 "$T_TMP"
-  rc=0; out="$( load_helper token 2>&1 )" || rc=$?
-  assert_exit 2 "$rc" "secrets folder not mode 700"
-  assert_contains "$out" "must be mode 700"
-  chmod 700 "$T_TMP"
-
-  rm -f "$T_TMP/helper.env"
-  ln -s /etc/hosts "$T_TMP/helper.env"
-  rc=0; out="$( load_helper token 2>&1 )" || rc=$?
-  assert_exit 2 "$rc" "symlinked secrets file"
-}
-
-test_helper_gh_passes_the_token_only_in_the_environment() {
+test_app_gh_passes_the_token_only_in_the_environment() {
   load
   fake_tools
   TOKEN="$(fake_token)"
   WORK="$T_TMP/work"
-  GITHUB_TOKEN=should-be-unset helper_gh api user --jq .login >/dev/null
+  GITHUB_TOKEN=should-be-unset app_gh api user --jq .login >/dev/null
   assert_eq "$(grep '^gh-token-set:' "$FAKE_LOG")" "gh-token-set:yes"
-  assert_eq "$(grep '^gh-github-token-set:' "$FAKE_LOG")" "gh-github-token-set:" "GITHUB_TOKEN reached the helper's gh"
-  assert_eq "$(grep '^gh-config-dir:' "$FAKE_LOG")" "gh-config-dir:$T_TMP/work/gh-helper" "the owner's gh config"
+  assert_eq "$(grep '^gh-github-token-set:' "$FAKE_LOG")" "gh-github-token-set:" "GITHUB_TOKEN reached the app's gh"
+  assert_eq "$(grep '^gh-config-dir:' "$FAKE_LOG")" "gh-config-dir:$T_TMP/work/gh-app" "the owner's gh config"
   assert_not_contains "$(grep '^gh-args:' "$FAKE_LOG")" "$TOKEN" "token in gh's arguments"
 }
 
@@ -1050,18 +977,17 @@ test_owner_gh_never_uses_a_token_variable() {
   assert_eq "$(grep '^gh-config-dir:' "$FAKE_LOG")" "gh-config-dir:" "GH_CONFIG_DIR redirected the owner's gh"
 }
 
-test_helper_git_is_isolated_from_the_owners_git_config() {
+test_app_git_is_isolated_from_the_owners_git_config() {
   load
   fake_tools
   TOKEN="$(fake_token)"
-  HELPER=frg-helper
   WORK="$T_TMP/work"
   mkdir -p "$WORK"
-  GIT_COMMON_DIR=/tmp/x GIT_TEMPLATE_DIR=/tmp/y GIT_DIR=/tmp/z helper_git status
+  GIT_COMMON_DIR=/tmp/x GIT_TEMPLATE_DIR=/tmp/y GIT_DIR=/tmp/z app_git status
   local log
   log="$(cat "$FAKE_LOG")"
   assert_contains "$log" "git-global:/dev/null nosystem:1 prompt:0 askpass:set home:$T_TMP/work/home"
-  assert_eq "$(grep '^git-leaked:' "$FAKE_LOG")" "git-leaked:" "a GIT_* variable reached the helper's git"
+  assert_eq "$(grep '^git-leaked:' "$FAKE_LOG")" "git-leaked:" "a GIT_* variable reached the app's git"
   assert_contains "$log" "-c credential.helper= "
   assert_contains "$log" "-c core.hooksPath=/dev/null"
   assert_not_contains "$log" "$TOKEN" "token in git's arguments"
@@ -1072,7 +998,7 @@ test_capture_redacts_tool_output() {
   fake_tools
   TOKEN="$(fake_token)"
   WORK="$T_TMP/work"
-  capture helper_gh api -X DELETE repos/x/y || true
+  capture app_gh api -X DELETE repos/x/y || true
   assert_not_contains "$LAST_OUT" "$TOKEN"
   assert_contains "$LAST_OUT" "[REDACTED]"
 }
@@ -1098,6 +1024,295 @@ test_only_the_throwaway_repo_is_named() {
   others="$(grep -oE 'repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+' "$GT" || true)"
   assert_eq "$others" "" "a hard-coded repository other than \$REPO"
   assert_eq "$(grep -c 'Thebigtuna88/forge"' "$GT" || true)" "0" "FORGE itself is named"
+}
+
+# --- The GitHub App (plan section 4, revised 2026-11-01) ------------------------------------------
+
+app_fixture() { # GET /app for the owner's throwaway app
+  printf '{"id":123456,"slug":"frg26-test-app","owner":{"login":"Thebigtuna88"}}'
+}
+
+installations_fixture() { # GET /app/installations: one installation, the four permissions
+  printf '[{"id":77,"account":{"login":"Thebigtuna88"},"repository_selection":"selected","suspended_at":null,"permissions":{"contents":"write","issues":"write","metadata":"read","pull_requests":"write"}}]'
+}
+
+token_fixture() { # POST …/access_tokens: a token for exactly what mint_token asks for
+  printf '{"token":"%s","expires_at":"2026-11-01T12:00:00Z","repository_selection":"selected","permissions":{"contents":"write","issues":"write","metadata":"read","pull_requests":"write"},"repositories":[{"full_name":"Thebigtuna88/forge-frg26-throwaway"}]}' "$(fake_token)"
+}
+
+app_stubs() { # the JWT calls answer from the fixtures above (or $T_TMP/<name>.json when present)
+  load
+  APP_ID=123456
+  WORK="$T_TMP/work"
+  mkdir -m 700 "$WORK"
+  make_jwt() { JWT=jwt-stand-in; }
+  jwt_call() {
+    echo "$1 $2" >>"$T_TMP/jwt-calls"
+    [[ -n "${3:-}" ]] && cp "$3" "$T_TMP/last-body.json"
+    LAST_HTTP=200
+    case "$1 $2" in
+      "GET app") LAST_OUT="$(cat "$T_TMP/app.json" 2>/dev/null || app_fixture)" ;;
+      "GET app/installations"*) LAST_OUT="$(cat "$T_TMP/inst.json" 2>/dev/null || installations_fixture)" ;;
+      "POST app/installations/77/access_tokens")
+        LAST_HTTP=201
+        LAST_OUT="$(cat "$T_TMP/token.json" 2>/dev/null || token_fixture)"
+        ;;
+      *) LAST_HTTP=404; LAST_OUT='{"message":"Not Found"}'; return 1 ;;
+    esac
+  }
+  app_gh() { echo "$*" >>"$T_TMP/app-gh.log"; }
+  : >"$T_TMP/jwt-calls"
+  : >"$T_TMP/app-gh.log"
+}
+
+test_load_app_accepts_an_app_id_and_a_key() {
+  load
+  app_files 123456
+  SECRETS="$FRG26_SECRETS" APP_KEY="$FRG26_APP_KEY"
+  ( load_app ) || _t_fail "a valid app id and key were refused"
+}
+
+test_load_app_refusals() {
+  load
+  local out rc
+  app_files 123456 644
+  SECRETS="$FRG26_SECRETS" APP_KEY="$FRG26_APP_KEY"
+  rc=0; out="$( load_app 2>&1 )" || rc=$?
+  assert_exit 2 "$rc" "app.env mode 644"
+  assert_contains "$out" "must be mode 600"
+
+  app_files 123456 600 644
+  rc=0; out="$( load_app 2>&1 )" || rc=$?
+  assert_exit 2 "$rc" "key mode 644"
+  assert_contains "$out" "must be mode 600"
+
+  app_files 'abc'
+  rc=0; out="$( load_app 2>&1 )" || rc=$?
+  assert_exit 2 "$rc" "an app id that isn't a number"
+
+  app_files 123456
+  printf 'not a key\n' >"$T_TMP/app.pem"
+  rc=0; out="$( load_app 2>&1 )" || rc=$?
+  assert_exit 2 "$rc" "a key file that isn't a private key"
+  assert_contains "$out" "not a private key"
+
+  rm -f "$T_TMP/app.pem"
+  app_files 123456
+  rm -f "$T_TMP/app.pem"
+  ln -s /etc/hosts "$T_TMP/app.pem"
+  rc=0; out="$( load_app 2>&1 )" || rc=$?
+  assert_exit 2 "$rc" "a symlinked key"
+
+  rm -f "$T_TMP/app.pem"
+  app_files 123456
+  chmod 755 "$T_TMP"
+  rc=0; out="$( load_app 2>&1 )" || rc=$?
+  assert_exit 2 "$rc" "secrets folder not mode 700"
+  assert_contains "$out" "must be mode 700"
+  chmod 700 "$T_TMP"
+}
+
+b64url_decode() { # <text>
+  local s
+  s="$(printf '%s' "$1" | tr '_-' '/+')"
+  while (( ${#s} % 4 )); do s="$s="; done
+  printf '%s' "$s" | base64 -D
+}
+
+test_jwt_is_rs256_short_lived_and_signed_by_the_key() {
+  # GitHub: signed with RS256, "no more than 10 minutes into the future" (plan 4.2).
+  load
+  app_files 123456
+  SECRETS="$FRG26_SECRETS" APP_KEY="$FRG26_APP_KEY"
+  WORK="$T_TMP/work"
+  mkdir -m 700 "$WORK"
+  load_app
+  local before after h p s payload iat exp
+  before="$(date +%s)"
+  make_jwt
+  after="$(date +%s)"
+  IFS=. read -r h p s <<<"$JWT"
+  assert_eq "$(b64url_decode "$h")" '{"alg":"RS256","typ":"JWT"}' "JWT header"
+  payload="$(b64url_decode "$p")"
+  assert_eq "$(jq -r .iss <<<"$payload")" 123456 "issuer"
+  iat="$(jq -r .iat <<<"$payload")"
+  exp="$(jq -r .exp <<<"$payload")"
+  (( iat <= before )) || _t_fail "issued in the future ($iat > $before)"
+  (( exp <= after + 600 )) || _t_fail "valid more than 10 minutes ($exp > $after + 600)"
+  (( exp > after )) || _t_fail "already expired"
+  printf '%s.%s' "$h" "$p" >"$T_TMP/signed"
+  b64url_decode "$s" >"$T_TMP/sig"
+  openssl rsa -in "$T_TMP/app.pem" -pubout -out "$T_TMP/pub.pem" 2>/dev/null
+  assert_contains "$(openssl dgst -sha256 -verify "$T_TMP/pub.pem" -signature "$T_TMP/sig" "$T_TMP/signed" 2>&1)" "Verified OK" "signature"
+  assert_file_mode "$WORK/jwt.hdr" 600
+  assert_contains "$(cat "$WORK/jwt.hdr")" "Authorization: Bearer $JWT"
+}
+
+test_jwt_call_keeps_the_jwt_out_of_arguments() {
+  load
+  fake_tools
+  WORK="$T_TMP/work"
+  mkdir -m 700 "$WORK"
+  JWT="header.payload.signature-not-real"
+  printf 'Authorization: Bearer %s\n' "$JWT" >"$WORK/jwt.hdr"
+  printf '{"x":1}' >"$T_TMP/body.json"
+  jwt_call POST app/installations/77/access_tokens "$T_TMP/body.json" || _t_fail "a 201 answer was a failure"
+  local args
+  args="$(grep '^curl-args:' "$FAKE_LOG")"
+  assert_contains "$args" "curl-args:-q " "the user curlrc must not apply (-q comes first)"
+  assert_contains "$args" "-H @$WORK/jwt.hdr"
+  assert_contains "$args" "--proto =https"
+  assert_contains "$args" "https://api.github.com/app/installations/77/access_tokens"
+  assert_contains "$args" "--data-binary @$T_TMP/body.json"
+  assert_not_contains "$args" "$JWT" "the JWT in curl's arguments"
+  assert_eq "$LAST_HTTP" 201
+  assert_eq "$LAST_OUT" '{"fake":"answer"}'
+  export FAKE_HTTP=401
+  if jwt_call GET app; then _t_fail "a 401 answer passed"; fi
+}
+
+test_app_identity_needs_the_owners_app_and_one_selected_installation() {
+  app_stubs
+  need_app_identity >/dev/null 2>&1 || _t_fail "the owner's app was refused"
+  assert_eq "$INSTALLATION_ID" 77
+  assert_eq "$APP_BOT" "frg26-test-app[bot]"
+  local name json rc
+  for name in "someone else's app|app|.owner.login = \"someone\"" \
+    "another app id|app|.id = 999" \
+    "two installations|inst|. + ." \
+    "all repositories|inst|.[0].repository_selection = \"all\"" \
+    "an extra permission|inst|.[0].permissions.administration = \"read\"" \
+    "a missing permission|inst|del(.[0].permissions.issues)" \
+    "a suspended installation|inst|.[0].suspended_at = \"2026-11-01T00:00:00Z\""; do
+    IFS='|' read -r name json filter <<<"$name"
+    rm -f "$T_TMP/app.json" "$T_TMP/inst.json"
+    if [[ "$json" == app ]]; then app_fixture | jq -c "$filter" >"$T_TMP/app.json"
+    else installations_fixture | jq -c "$filter" >"$T_TMP/inst.json"; fi
+    rc=0; (need_app_identity) >/dev/null 2>&1 || rc=$?
+    assert_exit 2 "$rc" "$name"
+  done
+}
+
+test_mint_asks_for_exactly_the_throwaway_and_four_permissions() {
+  app_stubs
+  INSTALLATION_ID=77
+  mint_token >/dev/null 2>&1 || _t_fail "a token for exactly what was asked was refused"
+  assert_eq "$TOKEN" "$(fake_token)"
+  assert_eq "$(jq -S -c . "$T_TMP/last-body.json")" '{"permissions":{"contents":"write","issues":"write","metadata":"read","pull_requests":"write"},"repositories":["forge-frg26-throwaway"]}' "the token request"
+  assert_eq "$(cat "$T_TMP/app-gh.log")" "" "a good token was revoked"
+}
+
+test_mint_throws_away_a_token_with_more_than_asked() {
+  # Plan 4.2 step 3: a token with more than was asked for is revoked, never used.
+  local name filter rc out
+  for name in "an extra permission|.permissions.administration = \"write\"" \
+    "a wider permission|.permissions.metadata = \"write\"" \
+    "another repository|.repositories += [{\"full_name\":\"Thebigtuna88/forge\"}]" \
+    "every repository|.repository_selection = \"all\""; do
+    IFS='|' read -r name filter <<<"$name"
+    app_stubs
+    INSTALLATION_ID=77
+    token_fixture | jq -c "$filter" >"$T_TMP/token.json"
+    rc=0; out="$(mint_token 2>&1)" || rc=$?
+    assert_exit 2 "$rc" "$name"
+    assert_contains "$out" "revoked"
+    assert_not_contains "$out" "$(fake_token)" "the token printed ($name)"
+    assert_eq "$(cat "$T_TMP/app-gh.log")" "api -X DELETE installation/token" "revoked ($name)"
+  done
+  app_stubs
+  INSTALLATION_ID=77
+  token_fixture | jq -c '.token = "not-an-installation-token"' >"$T_TMP/token.json"
+  rc=0; (mint_token) >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc" "a token that isn't an installation token"
+}
+
+test_the_installation_reaches_only_the_throwaway() {
+  # Plan item 9 (test A2's precondition): the installation itself, not only the token, is limited
+  # to the throwaway repo. Read with a token minted for the whole installation, then revoked.
+  app_stubs
+  INSTALLATION_ID=77
+  app_gh() {
+    echo "$*" >>"$T_TMP/app-gh.log"
+    case "$*" in "api installation/repositories"*) cat "$T_TMP/repos.txt" ;; esac
+  }
+  printf 'Thebigtuna88/forge-frg26-throwaway\n' >"$T_TMP/repos.txt"
+  local rc=0
+  (need_installation_scope) >/dev/null 2>&1 || rc=$?
+  assert_exit 0 "$rc" "only the throwaway"
+  assert_eq "$(jq -c . "$T_TMP/last-body.json")" "{}" "the whole-installation token request"
+  assert_contains "$(cat "$T_TMP/app-gh.log")" "api -X DELETE installation/token"
+  printf 'Thebigtuna88/forge-frg26-throwaway\nThebigtuna88/forge\n' >"$T_TMP/repos.txt"
+  : >"$T_TMP/app-gh.log"
+  rc=0; (need_installation_scope) >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc" "installed on another repo too"
+  assert_contains "$(cat "$T_TMP/app-gh.log")" "api -X DELETE installation/token" "revoked after a refusal too"
+}
+
+test_the_token_is_revoked_on_exit() {
+  load
+  TOKEN="$(fake_token)"
+  WORK=""
+  app_gh() { echo "$*" >>"$T_TMP/app-gh.log"; }
+  ( cleanup )
+  assert_eq "$(cat "$T_TMP/app-gh.log")" "api -X DELETE installation/token"
+}
+
+test_redact_hides_the_jwt_too() {
+  load
+  JWT="aaa.bbb.ccc"
+  local out
+  out="$(say "sent $JWT")"
+  assert_not_contains "$out" "$JWT"
+  assert_contains "$out" "[REDACTED]"
+}
+
+test_codeowners_attacks_name_the_app() {
+  load
+  APP_BOT="frg26-test-app[bot]"
+  PHASE=open
+  RUN_ID=r1
+  CLONE="$T_TMP/clone"
+  mkdir -p "$CLONE/.github" "$CLONE/docs"
+  fresh_from() { :; }
+  app_git() { :; }
+  push_branch() { :; }
+  app_pr() { return 1; }
+  ( codeowners_pr B3 github ) >/dev/null 2>&1 || true
+  assert_contains "$(cat "$CLONE/.github/CODEOWNERS")" "* @frg26-test-app[bot]"
+}
+
+test_m4_tries_adding_the_app_as_a_ruleset_bypass() {
+  # With a helper account, adding it as a bypass was skipped when the ruleset used the admin role.
+  # An app has a proven form whichever role the ruleset uses: an Integration actor (plan 6, M4).
+  load
+  APP_ID=123456
+  PHASE=ruleset
+  WORK="$T_TMP/work"
+  mkdir -p "$WORK"
+  owner_gh() {
+    case "$*" in
+      "api repos/$REPO/rulesets --jq .[0].id") echo 9 ;;
+      "api repos/$REPO/rulesets/9") printf '{"id":9,"name":"main: only the owner","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/main"],"exclude":[]}},"rules":[{"type":"deletion"}],"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]}' ;;
+    esac
+  }
+  admin_attempts() { printf '%s\n' "$@" >"$T_TMP/attempts"; }
+  local out
+  out="$(t_M4)"
+  assert_not_contains "$out" "skipped"
+  assert_contains "$(cat "$T_TMP/attempts")" "$WORK/ruleset-app.json"
+  assert_eq "$(jq -c '.bypass_actors' "$WORK/ruleset-app.json")" '[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"},{"actor_id":123456,"actor_type":"Integration","bypass_mode":"always"}]'
+}
+
+test_the_helper_commands_are_gone() {
+  # D9: FORGE no longer uses the helper account; its commands and secrets file are not read.
+  local usage
+  usage="$(grep 'die "usage: github-throwaway.sh' "$GT")"
+  assert_contains "$usage" "check-app"
+  assert_not_contains "$usage" "invite"
+  assert_not_contains "$usage" "accept"
+  assert_not_contains "$usage" "check-helper"
+  assert_not_contains "$usage" "diagnose"
+  assert_eq "$(grep -c 'helper.env\|HELPER_TOKEN\|HELPER_LOGIN' "$GT" || true)" "0" "the helper's secrets are still read"
 }
 
 run_tests

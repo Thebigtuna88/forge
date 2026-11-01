@@ -2,33 +2,33 @@
 # FRG-26 stage 1: GitHub feasibility tests on a throwaway repository
 # (docs/plans/2026-10-20-frg-26-permissions-isolation.md, sections 6 and 8).
 #
-# Run ONLY by the owner, from an owner handoff, in the owner's own Terminal. It acts as two people:
+# Run ONLY by the owner, from an owner handoff, in the owner's own Terminal. It acts as two parties:
 #   owner   the owner's own gh login: creates the repo, approves PRs, applies protection, resets
-#   helper  the helper account's classic token: every bypass attempt
+#   app     the owner's throwaway GitHub App (plan section 4, revised 2026-11-01): every bypass
+#           attempt, with an installation token limited to the throwaway repo and four permissions
 # It touches only github.com/Thebigtuna88/forge-frg26-throwaway and refuses any other repository.
 #
 #   github-throwaway.sh create            owner: create the throwaway repo (public; main dev side)
-#   github-throwaway.sh invite            owner: invite the helper with write access
-#   github-throwaway.sh accept            helper: try to accept the invitation with its token
-#   github-throwaway.sh check-helper      helper login, token scopes = public_repo, permission = write
-#   github-throwaway.sh rate              the helper's API allowance: limit, used, reset (read-only)
-#   github-throwaway.sh allowance         fails unless the helper has enough allowance for a phase
-#   github-throwaway.sh diagnose          as the helper: GET /user, GET /rate_limit, one GraphQL
-#                                         query; statuses, rate-limit headers, messages (read-only)
+#   github-throwaway.sh check-app         the app, its installation and its token carry exactly the
+#                                         throwaway repo and the four permissions (read-only; A1)
+#   github-throwaway.sh rate              the app's API allowance: limit, used, reset (read-only)
+#   github-throwaway.sh allowance         fails unless the app has enough allowance for a phase
 #   github-throwaway.sh reset             owner: main dev side back to the baseline (unprotected only)
 #   github-throwaway.sh protect           owner: apply the dev and main branch protection
 #   github-throwaway.sh unprotect         owner: remove exactly that protection (protected state only)
 #   github-throwaway.sh ruleset           owner: add the main ruleset (only the owner may bypass);
-#                                         first checks the helper has enough allowance
+#                                         first checks the app has enough allowance
 #   github-throwaway.sh tests <phase>     run the bypass tests; phase = open | protected | ruleset
 #   github-throwaway.sh actions-setting   B15: "Allow GitHub Actions to approve PRs" must be off
 #   github-throwaway.sh status            print the repo's protection and rulesets (read-only)
 #
 # The owner's handoffs don't run this file: each step reads it from the reviewed git commit into
 # memory, checks its sha256 and runs that copy with `bash -p -c` in an empty environment.
-# The helper's login and token come from FRG26_SECRETS (default below), a mode-600 file of
-# HELPER_LOGIN=... and HELPER_TOKEN=... lines written by ho_secret_to_file. The token is never
-# printed and never put in a command's arguments.
+# The app's id comes from FRG26_SECRETS (default below), a mode-600 file with an APP_ID=... line;
+# its private key from FRG26_APP_KEY, a mode-600 PEM file in the same mode-700 folder. The key only
+# signs a JWT (RS256, valid at most 10 minutes) to ask GitHub for an installation token (1 hour).
+# Neither the JWT nor a token is ever printed or put in a command's arguments; each token is
+# revoked when the script ends.
 # Must run on macOS /bin/bash 3.2.
 set -uo pipefail
 PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin
@@ -42,14 +42,23 @@ readonly BASELINE_TAG=frg26-baseline
 # The default branch is side, not dev as in FORGE, so that deleting dev can be tested (GitHub
 # never deletes a default branch, protected or not).
 readonly DEFAULT_BRANCH=side
-# GraphQL points the helper must have left before a phase starts (each gh pr command uses some).
+# GraphQL points the app must have left before a phase starts (each gh pr command uses some).
 readonly MIN_GRAPHQL=300
 # REST requests too (gh api calls and the identity check); the normal limit is 5000 an hour.
 readonly MIN_REST=300
-SECRETS="${FRG26_SECRETS:-/Users/atl/code/forge/work/owner-secrets/frg26/helper.env}"
+SECRETS="${FRG26_SECRETS:-/Users/atl/code/forge/work/owner-secrets/frg26/app.env}"
+APP_KEY="${FRG26_APP_KEY:-/Users/atl/code/forge/work/owner-secrets/frg26/app.pem}"
+# The only permissions the app, its installation and every token may carry (plan 4.1).
+readonly WANT_PERMS='{"contents":"write","issues":"write","metadata":"read","pull_requests":"write"}'
 
-HELPER=""
+APP_ID=""
+APP_SLUG=""
+APP_BOT=""
+INSTALLATION_ID=""
+JWT=""
 TOKEN=""
+REVOKED_TOKENS=""
+LAST_HTTP=""
 WORK=""
 CLONE=""
 PHASE=""
@@ -65,9 +74,9 @@ die() {
   exit 2
 }
 
-redact() { # <text> — the helper's token never reaches the screen or a log
-  local s="$1"
-  if [[ -n "$TOKEN" ]]; then s="${s//"$TOKEN"/[REDACTED]}"; fi
+redact() { # <text> — no token or JWT ever reaches the screen or a log
+  local s="$1" t
+  for t in $TOKEN $REVOKED_TOKENS $JWT; do s="${s//"$t"/[REDACTED]}"; done
   printf '%s' "$s"
 }
 
@@ -85,6 +94,7 @@ cleanup() {
     say "PHASE $PHASE: STOPPED by an error (status $rc); closing the open test PRs"
     sweep_prs
   fi
+  revoke_token
   if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
@@ -101,31 +111,31 @@ owner_gh() {
   )
 }
 
-# The helper's token, for this one process only: an exported variable, never an argument (so it
-# isn't in the process list), and an empty gh config folder (none of the owner's settings).
+# The app's installation token, for this one process only: an exported variable, never an argument
+# (so it isn't in the process list), and an empty gh config folder (none of the owner's settings).
 # shellcheck disable=SC2030,SC2031 # as above
-helper_gh() {
+app_gh() {
   (
     unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO
-    export GH_TOKEN="$TOKEN" GH_HOST=github.com GH_CONFIG_DIR="$WORK/gh-helper" \
+    export GH_TOKEN="$TOKEN" GH_HOST=github.com GH_CONFIG_DIR="$WORK/gh-app" \
       GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1
     exec gh "$@"
   )
 }
 
-# git as the helper: no GIT_* variable, no system or global config (so no credential helper or
+# git as the app: no GIT_* variable, no system or global config (so no credential helper or
 # URL rewrite of the owner's applies), no hooks, credentials only from our askpass script.
-helper_git() {
+app_git() {
   (
     local v
     for v in $(compgen -e); do
       case "$v" in GIT_* | SSH_ASKPASS) unset "$v" ;; esac
     done
     export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 HOME="$WORK/home"
-    export FRG26_ASK_USER="$HELPER" FRG26_ASK_PASS="$TOKEN" GIT_ASKPASS="$WORK/askpass"
+    export FRG26_ASK_USER=x-access-token FRG26_ASK_PASS="$TOKEN" GIT_ASKPASS="$WORK/askpass"
     exec git -c credential.helper= -c core.askPass="$WORK/askpass" -c core.hooksPath=/dev/null \
       -c commit.gpgsign=false -c protocol.allow=never -c protocol.https.allow=always \
-      -c user.name="frg26-helper-test" -c user.email="$HELPER@users.noreply.github.com" "$@"
+      -c user.name="frg26-app-test" -c user.email="frg26-app-test@users.noreply.github.com" "$@"
   )
 }
 
@@ -147,7 +157,7 @@ evidence() { # the last lines of LAST_OUT, on one line
 # validation error, a conflict, a state we couldn't read) is "inconclusive", which is always a
 # FAIL: it proves nothing either way.
 
-classify_push() { # after capture of a helper git push
+classify_push() { # after capture of an app git push
   if [[ $LAST_RC -eq 0 ]]; then echo allowed; return; fi
   if printf '%s' "$LAST_OUT" | grep -Eiq 'GH006|GH013|protected branch|rule violation|Cannot force-push|cannot delete|Changes must be made through a pull request'; then
     echo refused
@@ -156,14 +166,14 @@ classify_push() { # after capture of a helper git push
   fi
 }
 
-classify_api() { # after capture of a helper gh api call to an admin endpoint
+classify_api() { # after capture of an app gh api call to an admin endpoint
   if [[ $LAST_RC -eq 0 ]]; then echo allowed; return; fi
   # GitHub also answers 403 when a client sends too many requests: that proves nothing.
   if printf '%s' "$LAST_OUT" | grep -Eiq 'rate limit|abuse detection|secondary rate'; then
     echo inconclusive
     return
   fi
-  if printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 403|HTTP 404|Must have admin rights|Resource not accessible by personal access token'; then
+  if printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 403|HTTP 404|Must have admin rights|Resource not accessible by integration'; then
     echo refused
   else
     echo inconclusive
@@ -181,7 +191,7 @@ refuse_agent() {
 
 need_tools() {
   local t
-  for t in gh git jq shasum base64; do
+  for t in gh git jq shasum base64 curl openssl; do
     command -v "$t" >/dev/null 2>&1 || die "$t is required"
   done
   local v
@@ -206,33 +216,122 @@ owner_uid() {
   printf '%s' "$id"
 }
 
-load_helper() { # [token] — with "token", the token must be present and classic
-  local dir mode
-  dir="$(dirname "$SECRETS")"
-  [[ -d "$dir" && ! -L "$dir" ]] || die "missing secrets folder $dir"
-  mode="$(stat -f %Lp "$dir" 2>/dev/null)" || die "can't read the mode of $dir"
-  [[ "$mode" == 700 ]] || die "$dir must be mode 700 (it is $mode)"
-  [[ -f "$SECRETS" && ! -L "$SECRETS" ]] || die "missing secrets file $SECRETS"
-  mode="$(stat -f %Lp "$SECRETS" 2>/dev/null)" || die "can't read the mode of $SECRETS"
-  [[ "$mode" == 600 ]] || die "$SECRETS must be mode 600 (it is $mode)"
-  HELPER="$(sed -n 's/^HELPER_LOGIN=//p' "$SECRETS" | tail -n 1)"
-  TOKEN="$(sed -n 's/^HELPER_TOKEN=//p' "$SECRETS" | tail -n 1)"
-  [[ "$HELPER" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]] || die "HELPER_LOGIN is missing or not a GitHub user name"
-  local lh lo
-  lh="$(printf '%s' "$HELPER" | tr '[:upper:]' '[:lower:]')"
-  lo="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
-  [[ "$lh" != "$lo" ]] || die "HELPER_LOGIN must not be the owner"
-  if [[ "${1:-}" == token ]]; then
-    [[ "$TOKEN" =~ ^ghp_[A-Za-z0-9]{30,250}$ ]] || die "HELPER_TOKEN is missing or not a classic token (ghp_...)"
+load_app() { # the app's id and private key: present, private (mode 600 in a mode-700 folder)
+  local f dir mode
+  for f in "$SECRETS" "$APP_KEY"; do
+    dir="$(dirname "$f")"
+    [[ -d "$dir" && ! -L "$dir" ]] || die "missing secrets folder $dir"
+    mode="$(stat -f %Lp "$dir" 2>/dev/null)" || die "can't read the mode of $dir"
+    [[ "$mode" == 700 ]] || die "$dir must be mode 700 (it is $mode)"
+    [[ -f "$f" && ! -L "$f" ]] || die "missing file $f"
+    mode="$(stat -f %Lp "$f" 2>/dev/null)" || die "can't read the mode of $f"
+    [[ "$mode" == 600 ]] || die "$f must be mode 600 (it is $mode)"
+  done
+  APP_ID="$(sed -n 's/^APP_ID=//p' "$SECRETS" | tail -n 1)"
+  [[ "$APP_ID" =~ ^[0-9]{1,12}$ ]] || die "APP_ID is missing or not a number"
+  head -n 1 "$APP_KEY" | grep -Eq '^-----BEGIN (RSA )?PRIVATE KEY-----$' || die "$APP_KEY is not a private key (PEM)"
+}
+
+b64url() { base64 | tr -d '\n=' | tr '/+' '_-'; }
+
+# A JWT that says "I am app APP_ID" for at most 9 minutes (GitHub allows 10), signed RS256 with the
+# app's key. It goes to curl only through a mode-600 header file, never as an argument.
+make_jwt() {
+  local now h p sig
+  now="$(date +%s)" || die "can't read the clock"
+  h="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
+  p="$(printf '{"iat":%s,"exp":%s,"iss":%s}' "$((now - 60))" "$((now + 540))" "$APP_ID" | b64url)"
+  sig="$(printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -sign "$APP_KEY" -binary | b64url)" || die "signing the JWT failed"
+  [[ -n "$sig" ]] || die "signing the JWT failed"
+  JWT="$h.$p.$sig"
+  (
+    umask 077
+    printf 'Authorization: Bearer %s\nAccept: application/vnd.github+json\nX-GitHub-Api-Version: 2022-11-28\n' "$JWT" >"$WORK/jwt.hdr"
+  ) || die "writing the JWT header file failed"
+}
+
+# A request as the app itself (with the JWT), for what only the app can ask: who it is, where it is
+# installed, a token. -q first: no ~/.curlrc. Sets LAST_OUT (the body) and LAST_HTTP; 1 unless 2xx.
+jwt_call() { # <method> <path> [json body file]
+  local args=(-q -sS --proto "=https" -X "$1" -H @"$WORK/jwt.hdr" -w '\nHTTP %{http_code}')
+  if [[ -n "${3:-}" ]]; then args+=(-H "Content-Type: application/json" --data-binary @"$3"); fi
+  capture curl "${args[@]}" "https://api.github.com/$2" || true
+  LAST_HTTP="$(printf '%s\n' "$LAST_OUT" | tail -n 1 | sed -n 's/^HTTP \([0-9][0-9][0-9]\)$/\1/p')"
+  LAST_OUT="$(printf '%s\n' "$LAST_OUT" | sed '$d')"
+  [[ "$LAST_HTTP" =~ ^2[0-9][0-9]$ ]]
+}
+
+# The key must belong to the owner's app, installed exactly once (on the owner's account), on
+# selected repositories only, not suspended, with exactly the four permissions.
+need_app_identity() {
+  make_jwt
+  jwt_call GET app || die "GitHub refused the app's signed request (HTTP ${LAST_HTTP:-none}): $(evidence)"
+  local app id owner slug inst got
+  app="$LAST_OUT"
+  id="$(jq -r .id <<<"$app" 2>/dev/null)" || id=""
+  owner="$(jq -r .owner.login <<<"$app" 2>/dev/null)" || owner=""
+  slug="$(jq -r .slug <<<"$app" 2>/dev/null)" || slug=""
+  [[ "$id" == "$APP_ID" ]] || die "the key belongs to app '$id', not APP_ID $APP_ID"
+  [[ "$owner" == "$OWNER" ]] || die "the app belongs to '$owner', not $OWNER"
+  [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die "unexpected app name '$slug'"
+  APP_SLUG="$slug"
+  APP_BOT="${slug}[bot]"
+  jwt_call GET "app/installations?per_page=100" || die "can't list the app's installations: $(evidence)"
+  inst="$(jq -c --arg o "$OWNER" 'if type == "array" and length == 1 and .[0].account.login == $o then .[0] else empty end' <<<"$LAST_OUT" 2>/dev/null)" || inst=""
+  [[ -n "$inst" ]] || die "the app must be installed exactly once, on $OWNER's account"
+  [[ "$(jq -r .repository_selection <<<"$inst")" == selected ]] || die "the installation must use \"Only select repositories\""
+  [[ "$(jq -r .suspended_at <<<"$inst")" == null ]] || die "the app's installation is suspended"
+  got="$(jq -S -c .permissions <<<"$inst")"
+  [[ "$got" == "$WANT_PERMS" ]] || die "the app's permissions must be exactly $WANT_PERMS (they are $got)"
+  INSTALLATION_ID="$(jq -r .id <<<"$inst")"
+  [[ "$INSTALLATION_ID" =~ ^[0-9]+$ ]] || die "unexpected installation id"
+}
+
+# Asks GitHub for an installation token and keeps it only if GitHub issued exactly what was asked:
+# the four permissions, selected repositories, and (narrowed) only the throwaway. Anything more is
+# revoked at once (plan 4.2 step 3).
+mint() { # <request json> <narrowed|whole>
+  printf '%s\n' "$1" >"$WORK/token-request.json" || die "writing the token request failed"
+  jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" \
+    || die "GitHub refused the token request (HTTP ${LAST_HTTP:-none}): $(evidence)"
+  local ans="$LAST_OUT" t perms sel repos
+  LAST_OUT=""
+  t="$(jq -r .token <<<"$ans" 2>/dev/null)" || t=""
+  [[ "$t" =~ ^ghs_[A-Za-z0-9]{30,250}$ ]] || die "GitHub's answer holds no installation token"
+  TOKEN="$t"
+  perms="$(jq -S -c .permissions <<<"$ans" 2>/dev/null)" || perms=error
+  sel="$(jq -r .repository_selection <<<"$ans" 2>/dev/null)" || sel=error
+  repos="$(jq -c '[.repositories[]?.full_name]' <<<"$ans" 2>/dev/null)" || repos=error
+  if [[ "$perms" != "$WANT_PERMS" || "$sel" != selected ]] || [[ "$2" == narrowed && "$repos" != "[\"$REPO\"]" ]]; then
+    revoke_token
+    die "the token GitHub issued carries more than was asked (permissions $perms, repositories $sel $repos): it was revoked"
   fi
 }
 
-need_helper_identity() {
-  local who
-  who="$(helper_gh api user --jq .login 2>/dev/null)" || die "the helper token was refused by GitHub"
-  who="$(redact "$who")"
-  [[ "$(printf '%s' "$who" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$HELPER" | tr '[:upper:]' '[:lower:]')" ]] \
-    || die "the token belongs to '$who', not $HELPER"
+mint_token() { mint "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}" narrowed; }
+
+# Plan item 9: the installation itself, not only each token, reaches only the throwaway (so test A2
+# tries a repository the app isn't installed on). Read with a whole-installation token, then revoked.
+need_installation_scope() {
+  mint '{}' whole
+  local got
+  got="$(app_gh api installation/repositories --paginate --jq '.repositories[].full_name' 2>/dev/null)" || got=error
+  revoke_token
+  [[ "$got" == "$REPO" ]] || die "the app must be installed on $REPO only (it reaches: $(printf '%s' "$got" | tr '\n' ' '))"
+}
+
+revoke_token() { # the current token stops working at once (DELETE /installation/token)
+  [[ -n "$TOKEN" ]] || return 0
+  app_gh api -X DELETE installation/token >/dev/null 2>&1 || say "note: revoking a token failed; GitHub expires it within an hour"
+  REVOKED_TOKENS="$REVOKED_TOKENS $TOKEN"
+  TOKEN=""
+}
+
+app_session() { # every command that acts as the app starts here
+  load_app
+  need_app_identity
+  need_installation_scope
+  mint_token
 }
 
 # Every write is made only after this: the repo must be the throwaway one we created.
@@ -247,7 +346,7 @@ assert_throwaway() {
 make_work() {
   WORK="$(mktemp -d "/private/tmp/frg26.XXXXXX")" || die "mktemp failed"
   chmod 700 "$WORK" || die "chmod failed"
-  mkdir -m 700 "$WORK/home" "$WORK/gh-helper" "$WORK/template" || die "mkdir failed"
+  mkdir -m 700 "$WORK/home" "$WORK/gh-app" "$WORK/template" || die "mkdir failed"
   cat >"$WORK/askpass" <<'EOF'
 #!/bin/bash
 case "${1:-}" in
@@ -383,43 +482,12 @@ repo_settings() {
     || die "setting the repository options failed"
 }
 
-cmd_invite() {
-  need_owner
-  load_helper
-  assert_throwaway
-  owner_gh api -X PUT "repos/$REPO/collaborators/$HELPER" -f permission=push >/dev/null \
-    || die "inviting $HELPER failed"
-  say "invited $HELPER to $REPO with write access"
-}
-
-# Records whether a public_repo token can accept a repository invitation (plan item 7). Exit 0 if
-# it could, 3 if not (then the owner accepts it in the helper's browser window).
-cmd_accept() {
-  need_owner
-  load_helper token
-  need_helper_identity
-  assert_throwaway
-  local id
-  capture helper_gh api user/repository_invitations --jq ".[] | select(.repository.full_name == \"$REPO\") | .id" || true
-  id="$LAST_OUT"
-  if [[ ! "$id" =~ ^[0-9]+$ ]]; then
-    say "ACCEPT-WITH-PUBLIC_REPO: could not list the invitation with the token ($(evidence))"
-    exit 3
-  fi
-  if capture helper_gh api -X PATCH "user/repository_invitations/$id"; then
-    say "ACCEPT-WITH-PUBLIC_REPO: allowed (a public_repo token can accept invitations)"
-    exit 0
-  fi
-  say "ACCEPT-WITH-PUBLIC_REPO: refused ($(evidence))"
-  exit 3
-}
-
-# The helper's API allowance, read-only (GitHub doesn't count this request against it). Sets
+# The app's API allowance, read-only (GitHub doesn't count this request against it). Sets
 # RATE_LINE (for people), RATE_LEFT (GraphQL points remaining) and RATE_REST (REST requests
 # remaining); 1 if any of them can't be read.
-helper_rate() {
+app_rate() {
   RATE_LINE="" RATE_LEFT="" RATE_REST=""
-  capture helper_gh api rate_limit || return 1
+  capture app_gh api rate_limit || return 1
   RATE_LINE="$(printf '%s' "$LAST_OUT" | jq -r '.resources | "graphql limit=\(.graphql.limit) used=\(.graphql.used) remaining=\(.graphql.remaining) resets=\(.graphql.reset | todate) / rest limit=\(.core.limit) used=\(.core.used) remaining=\(.core.remaining)"' 2>/dev/null)" || return 1
   RATE_LEFT="$(printf '%s' "$LAST_OUT" | jq -r '.resources.graphql.remaining' 2>/dev/null)" || return 1
   RATE_REST="$(printf '%s' "$LAST_OUT" | jq -r '.resources.core.remaining' 2>/dev/null)" || return 1
@@ -428,76 +496,34 @@ helper_rate() {
 
 # A phase that ran out of allowance halfway would stop on a rate limit, so it doesn't start.
 need_allowance() {
-  helper_rate || die "could not read the helper's API allowance: $(evidence)"
-  say "helper allowance: $RATE_LINE"
+  app_rate || die "could not read the app's API allowance: $(evidence)"
+  say "app allowance: $RATE_LINE"
   [[ "$RATE_LEFT" -ge $MIN_GRAPHQL ]] \
-    || die "the helper has only $RATE_LEFT GraphQL points left (a phase needs about $MIN_GRAPHQL): $RATE_LINE. Run this step again after that reset time."
+    || die "the app has only $RATE_LEFT GraphQL points left (a phase needs about $MIN_GRAPHQL): $RATE_LINE. Run this step again after that reset time."
   [[ "$RATE_REST" -ge $MIN_REST ]] \
-    || die "the helper has only $RATE_REST REST requests left (a phase needs about $MIN_REST): $RATE_LINE. Run this step again in an hour."
+    || die "the app has only $RATE_REST REST requests left (a phase needs about $MIN_REST): $RATE_LINE. Run this step again in an hour."
 }
 
 cmd_rate() {
-  load_helper token
-  need_helper_identity
-  helper_rate || die "could not read the helper's API allowance: $(evidence)"
-  say "HELPER-RATE $RATE_LINE"
+  app_session
+  app_rate || die "could not read the app's API allowance: $(evidence)"
+  say "APP-RATE $RATE_LINE"
 }
 
-# The same gate a phase applies, on its own: fails (status 2) unless the helper has enough left,
-# so a handoff can stop before anything is changed.
+# The same gate a phase applies, on its own: fails (status 2) unless the app has enough left, so a
+# handoff can stop before anything is changed.
 cmd_allowance() {
-  load_helper token
-  need_helper_identity
+  app_session
   need_allowance
 }
 
-# One diagnostic request as the helper, through the same helper_gh the tests use. Prints the HTTP
-# status, the listed headers only (never Authorization or cookies) and GitHub's answer in brief.
-diag() { # <label> <helper_gh arguments…>
-  local label="$1" clean status hdrs json summary ghmsg
-  shift
-  capture helper_gh "$@" || true
-  clean="$(printf '%s\n' "$LAST_OUT" | tr -d '\r')"
-  status="$(printf '%s\n' "$clean" | grep -m1 '^HTTP/')" || status="no HTTP status"
-  hdrs="$(printf '%s\n' "$clean" | sed -n '/^HTTP\//,/^$/p' \
-    | grep -iE '^(x-ratelimit-(limit|remaining|used|reset|resource)|retry-after|x-oauth-scopes|x-accepted-oauth-scopes|x-github-request-id):' \
-    | awk '{ i = index($0, ":"); printf "%s:%s; ", tolower(substr($0, 1, i - 1)), substr($0, i + 1) }')"
-  json="$(printf '%s\n' "$clean" | sed '1,/^$/d' | grep -v '^gh: ')"
-  summary="$(printf '%s' "$json" | jq -r '
-    if type != "object" then "no JSON body"
-    elif .login then "login=\(.login) id=\(.id)"
-    elif .resources then (.resources | "graphql limit=\(.graphql.limit) used=\(.graphql.used) remaining=\(.graphql.remaining) / rest limit=\(.core.limit) used=\(.core.used) remaining=\(.core.remaining)")
-    elif .errors then (.errors | map("\(.type // "error"): \(.message)") | join(" | "))
-    elif .data then "data=\(.data | tojson)"
-    elif .message then "message=\(.message)"
-    else "unrecognised JSON body" end' 2>/dev/null)" || summary="no JSON body"
-  ghmsg="$(printf '%s\n' "$clean" | grep -m1 '^gh: ')" || ghmsg=""
-  say "DIAG $label: exit=$LAST_RC $status | ${hdrs}| $summary${ghmsg:+ | $ghmsg}"
-}
-
-# Authenticates exactly as the tests do (load_helper, then helper_gh), and records what GitHub
-# answers to three requests: who the token is, the allowance, and a one-line GraphQL query.
-cmd_diagnose() {
-  load_helper token
-  diag "GET /user" api -i user
-  diag "GET /rate_limit" api -i rate_limit
-  diag "POST /graphql" api -i graphql -f "query=query { viewer { login } rateLimit { limit remaining used resetAt } }"
-}
-
-cmd_check_helper() {
+# A1: the app, its installation and its token carry exactly the throwaway and the four permissions
+# (app_session stops otherwise). Read-only.
+cmd_check_app() {
   need_owner
-  load_helper token
-  need_helper_identity
   assert_throwaway
-  local hdr scopes perm role
-  capture helper_gh api -i user || die "the helper token was refused: $(evidence)"
-  hdr="$(printf '%s\n' "$LAST_OUT" | tr -d '\r' | grep -i '^x-oauth-scopes:' | head -n 1)"
-  scopes="$(printf '%s' "${hdr#*:}" | tr -d ' ')"
-  perm="$(owner_gh api "repos/$REPO/collaborators/$HELPER/permission" --jq .permission 2>/dev/null)" || perm=error
-  role="$(owner_gh api "repos/$REPO/collaborators/$HELPER/permission" --jq .role_name 2>/dev/null)" || role=error
-  say "helper=$HELPER token=classic scopes=${scopes:-none} permission=$perm role=$role"
-  [[ "$scopes" == public_repo ]] || die "token scopes must be exactly public_repo (they are '${scopes:-none}')"
-  [[ "$perm" == write && "$role" == write ]] || die "the helper must have write (not admin, maintain or read) on $REPO"
+  app_session
+  say "app=$APP_SLUG id=$APP_ID installation=$INSTALLATION_ID permissions=$WANT_PERMS repositories=$REPO (installation and token both checked)"
 }
 
 cmd_reset() {
@@ -613,10 +639,9 @@ cmd_ruleset() {
   need_owner
   assert_throwaway
   verify_phase protected
-  # The ruleset phase that follows needs the helper's allowance; without it, the ruleset isn't
-  # added (it would sit there untested). Owner, review round 6: executable and fail-closed.
-  load_helper token
-  need_helper_identity
+  # The ruleset phase that follows needs the app's allowance; without it, the ruleset isn't added
+  # (it would sit there untested). Owner, review round 6: executable and fail-closed.
+  app_session
   need_allowance
   local uid
   uid="$(owner_uid)" || die "can't read the owner's user id, so no ruleset was requested"
@@ -719,35 +744,35 @@ stamp() { printf '%s' "$RUN_ID"; }
 readonly TEST_ORDER="B5 B1 B2 B3 B4a B4b B6 B7 B8 B9 B10 B11 B12 B13 B16 M1 M2 M3 M4 M6 B14a B14b M5a M5b"
 
 fresh_from() { # <remote branch> <local branch>
-  helper_git -C "$CLONE" fetch -q --prune origin || die "fetch failed"
-  helper_git -C "$CLONE" checkout -q -B "$2" "origin/$1" || die "checkout of origin/$1 failed"
+  app_git -C "$CLONE" fetch -q --prune origin || die "fetch failed"
+  app_git -C "$CLONE" checkout -q -B "$2" "origin/$1" || die "checkout of origin/$1 failed"
 }
 
 add_commit() { # <path> <content>
   mkdir -p "$CLONE/$(dirname "$1")"
   printf '%s\n' "$2" >"$CLONE/$1"
-  helper_git -C "$CLONE" add -- "$1" || die "git add failed"
-  helper_git -C "$CLONE" commit -q -m "FRG-26 test: $1" || die "git commit failed"
+  app_git -C "$CLONE" add -- "$1" || die "git add failed"
+  app_git -C "$CLONE" commit -q -m "FRG-26 test: $1" || die "git commit failed"
 }
 
 push_branch() { # <branch> — push HEAD as a feature branch (always allowed)
-  capture helper_git -C "$CLONE" push -q origin "HEAD:refs/heads/$1" || die "pushing $1 failed: $(evidence)"
+  capture app_git -C "$CLONE" push -q origin "HEAD:refs/heads/$1" || die "pushing $1 failed: $(evidence)"
 }
 
-helper_pr() { # <base> <head> <id> — sets LAST_PR, or returns 1
-  capture helper_gh pr create --repo "$REPO" --base "$1" --head "$2" --title "FRG-26 $3 ($PHASE)" \
+app_pr() { # <base> <head> <id> — sets LAST_PR, or returns 1
+  capture app_gh pr create --repo "$REPO" --base "$1" --head "$2" --title "FRG-26 $3 ($PHASE)" \
     --body "FRG-26 throwaway test $3, phase $PHASE." || return 1
   LAST_PR="$(printf '%s' "$LAST_OUT" | tail -n 1)"
   LAST_PR="${LAST_PR##*/}"
   [[ "$LAST_PR" =~ ^[0-9]+$ ]]
 }
 
-feature_pr() { # <id> [base] — a fresh feature branch with one new file, and a PR from the helper
+feature_pr() { # <id> [base] — a fresh feature branch with one new file, and a PR from the app
   BR="frg26/$PHASE/$1-$(stamp)"
   fresh_from dev "$BR"
   add_commit "tests/$PHASE-$1-$(stamp).txt" "FRG-26 $1 $PHASE"
   push_branch "$BR"
-  helper_pr "${2:-dev}" "$BR" "$1" || die "creating the PR for $1 failed: $(evidence)"
+  app_pr "${2:-dev}" "$BR" "$1" || die "creating the PR for $1 failed: $(evidence)"
 }
 
 pr_view() { # <pr> <fields> <jq>
@@ -769,16 +794,16 @@ merge_facts() { # <pr> — "state mergeable mergeStateStatus reviewDecision"
     '"\(.state) \(.mergeable) \(.mergeStateStatus) \(.reviewDecision)"' || echo "unknown unknown unknown unknown"
 }
 
-# The helper tries to merge. Allowed = GitHub then reports the PR MERGED. Refused = still open,
+# The app tries to merge. Allowed = GitHub then reports the PR MERGED. Refused = still open,
 # free of conflicts, and GitHub reports it BLOCKED (by protection or a ruleset). Anything else is
 # inconclusive. When the test expects "allowed", transient refusals are retried, so a refusal is
 # never reported for a merge GitHub would have allowed.
-helper_merge() { # <id> <pr> <merge flags…>
+app_merge() { # <id> <pr> <merge flags…>
   local id="$1" pr="$2" _ facts
   shift 2
   for _ in 1 2 3; do
     if ! wait_settled "$pr"; then OBS=inconclusive; LAST_OUT="mergeability never settled [$(merge_facts "$pr")]"; return; fi
-    capture helper_gh pr merge "$pr" --repo "$REPO" "$@" || true
+    capture app_gh pr merge "$pr" --repo "$REPO" "$@" || true
     sleep 3
     facts="$(merge_facts "$pr")"
     if [[ "$facts" == MERGED* ]]; then OBS=allowed; LAST_OUT="$LAST_OUT [$facts]"; return; fi
@@ -842,58 +867,58 @@ sweep_prs() {
   done
 }
 
-dev_ahead() { # <id> — helper PR into dev, owner approves, helper merges (the B16 control)
+dev_ahead() { # <id> — app PR into dev, owner approves, app merges (the B16 control)
   feature_pr "$1"
   owner_approve "$LAST_PR"
-  helper_merge B16 "$LAST_PR" --squash
+  app_merge B16 "$LAST_PR" --squash
 }
 
 direct_push() { # <id> <branch> <path> <content> — a commit on top of <branch>, pushed to it
   fresh_from "$2" "$1-$(stamp)"
   add_commit "$3" "$4"
-  capture helper_git -C "$CLONE" push origin "HEAD:refs/heads/$2" || true
+  capture app_git -C "$CLONE" push origin "HEAD:refs/heads/$2" || true
   record "$1" "$(classify_push)" "$(evidence)"
 }
 
 t_B1() { direct_push B1 dev "tests/$PHASE-B1-$(stamp).txt" "direct push to dev"; }
 
-t_B2() { # helper names itself code owner, straight on dev
+t_B2() { # the app names itself code owner, straight on dev
   fresh_from dev "b2-$(stamp)"
-  printf '* @%s\n# B2 %s %s\n' "$HELPER" "$PHASE" "$(stamp)" >"$CLONE/.github/CODEOWNERS"
-  helper_git -C "$CLONE" commit -q -am "FRG-26 test: helper names itself code owner" || die "commit failed"
-  capture helper_git -C "$CLONE" push origin HEAD:refs/heads/dev || true
+  printf '* @%s\n# B2 %s %s\n' "$APP_BOT" "$PHASE" "$(stamp)" >"$CLONE/.github/CODEOWNERS"
+  app_git -C "$CLONE" commit -q -am "FRG-26 test: the app names itself code owner" || die "commit failed"
+  capture app_git -C "$CLONE" push origin HEAD:refs/heads/dev || true
   record B2 "$(classify_push)" "$(evidence)"
 }
 
-codeowners_pr() { # <id> <where: github|root|docs> — a PR that makes the helper the code owner
+codeowners_pr() { # <id> <where: github|root|docs> — a PR that makes the app the code owner
   BR="frg26/$PHASE/$1-$(stamp)"
   fresh_from dev "$BR"
   local line
-  line="$(printf '* @%s\n# %s %s %s' "$HELPER" "$1" "$PHASE" "$(stamp)")"
+  line="$(printf '* @%s\n# %s %s %s' "$APP_BOT" "$1" "$PHASE" "$(stamp)")"
   case "$2" in
     github)
       mkdir -p "$CLONE/.github"
       printf '%s\n' "$line" >"$CLONE/.github/CODEOWNERS"
-      helper_git -C "$CLONE" add .github/CODEOWNERS || die "git add failed"
+      app_git -C "$CLONE" add .github/CODEOWNERS || die "git add failed"
       ;;
     root | docs)
       # GitHub reads .github/CODEOWNERS first, then the root, then docs/: remove the earlier ones.
-      helper_git -C "$CLONE" rm -q --ignore-unmatch .github/CODEOWNERS || die "git rm failed"
+      app_git -C "$CLONE" rm -q --ignore-unmatch .github/CODEOWNERS || die "git rm failed"
       if [[ "$2" == docs ]]; then
-        helper_git -C "$CLONE" rm -q --ignore-unmatch CODEOWNERS || die "git rm failed"
+        app_git -C "$CLONE" rm -q --ignore-unmatch CODEOWNERS || die "git rm failed"
         printf '%s\n' "$line" >"$CLONE/docs/CODEOWNERS"
-        helper_git -C "$CLONE" add docs/CODEOWNERS || die "git add failed"
+        app_git -C "$CLONE" add docs/CODEOWNERS || die "git add failed"
       else
         printf '%s\n' "$line" >"$CLONE/CODEOWNERS"
-        helper_git -C "$CLONE" add CODEOWNERS || die "git add failed"
+        app_git -C "$CLONE" add CODEOWNERS || die "git add failed"
       fi
       ;;
   esac
-  helper_git -C "$CLONE" commit -q -m "FRG-26 test $1: CODEOWNERS ($2) names the helper" || die "commit failed"
+  app_git -C "$CLONE" commit -q -m "FRG-26 test $1: CODEOWNERS ($2) names the app" || die "commit failed"
   push_branch "$BR"
-  helper_pr dev "$BR" "$1" || die "creating the PR for $1 failed: $(evidence)"
+  app_pr dev "$BR" "$1" || die "creating the PR for $1 failed: $(evidence)"
   local pr="$LAST_PR"
-  helper_merge "$1" "$pr" --squash
+  app_merge "$1" "$pr" --squash
   record "$1" "$OBS" "$(evidence)"
   close_if_open "$pr"
 }
@@ -906,7 +931,7 @@ t_B5() {
   feature_pr B5
   local pr="$LAST_PR" obs
   wait_settled "$pr" || { setup_fail B5 "PR never became mergeable"; close_if_open "$pr"; return; }
-  capture helper_gh pr review "$pr" --repo "$REPO" --approve --body "self-approval attempt" || true
+  capture app_gh pr review "$pr" --repo "$REPO" --approve --body "self-approval attempt" || true
   if [[ $LAST_RC -eq 0 ]]; then obs=allowed
   elif printf '%s' "$LAST_OUT" | grep -Eiq 'approve your own pull request'; then obs=refused
   else obs=inconclusive
@@ -918,7 +943,7 @@ t_B5() {
 t_B6() {
   feature_pr B6
   local pr="$LAST_PR"
-  helper_merge B6 "$pr" --squash
+  app_merge B6 "$pr" --squash
   record B6 "$OBS" "$(evidence)"
   close_if_open "$pr"
 }
@@ -930,7 +955,7 @@ t_B7() {
   add_commit "tests/$PHASE-B7-after-approval-$(stamp).txt" "pushed after the owner's approval"
   push_branch "$BR"
   sleep 3
-  helper_merge B7 "$pr" --squash
+  app_merge B7 "$pr" --squash
   record B7 "$OBS" "$(evidence)"
   close_if_open "$pr"
 }
@@ -949,7 +974,7 @@ t_B8() {
     close_if_open "$pr"
     return
   fi
-  if ! capture helper_gh api -X PUT "repos/$REPO/pulls/$pr/update-branch"; then
+  if ! capture app_gh api -X PUT "repos/$REPO/pulls/$pr/update-branch"; then
     setup_fail B8 "update-branch refused ($(evidence))"
     close_if_open "$pr"
     return
@@ -960,7 +985,7 @@ t_B8() {
     close_if_open "$pr"
     return
   fi
-  helper_merge B8 "$pr" --squash
+  app_merge B8 "$pr" --squash
   record B8 "$OBS" "$(evidence)"
   close_if_open "$pr"
 }
@@ -982,9 +1007,10 @@ t_B9() {
   feature_pr B9 side
   local pr="$LAST_PR"
   owner_approve "$pr"
-  # REST, not `gh pr edit`: that also reads fields needing read:org, which the helper's token lacks.
-  # Re-aiming is setup, not the bypass under test (the merge is): any failure proves nothing.
-  if ! capture helper_gh api -X PATCH "repos/$REPO/pulls/$pr" -f base=dev; then
+  # REST, not `gh pr edit`: that also reads fields beyond the app's four permissions (it needed
+  # read:org with the helper's token). Re-aiming is setup, not the bypass under test (the merge
+  # is): any failure proves nothing.
+  if ! capture app_gh api -X PATCH "repos/$REPO/pulls/$pr" -f base=dev; then
     setup_fail B9 "re-aiming at dev failed: $(evidence)"
     close_if_open "$pr"
     return
@@ -997,7 +1023,7 @@ t_B9() {
     close_if_open "$pr"
     return
   fi
-  helper_merge B9 "$pr" --squash
+  app_merge B9 "$pr" --squash
   record B9 "$OBS" "$(evidence)"
   close_if_open "$pr"
 }
@@ -1005,13 +1031,13 @@ t_B9() {
 t_B10() {
   feature_pr B10
   local pr="$LAST_PR"
-  helper_merge B10 "$pr" --squash --admin
+  app_merge B10 "$pr" --squash --admin
   record B10 "$OBS" "$(evidence)"
   close_if_open "$pr"
 }
 
-# B11: auto-merge is enabled on the repository. In the open phase, the helper's auto-merge must
-# work (the PR merges, or auto-merge is armed). In the protected phases the helper arms it for
+# B11: auto-merge is enabled on the repository. In the open phase, the app's auto-merge must work
+# (the PR merges, or auto-merge is armed). In the protected phases the app arms it for
 # its unapproved PR, which must not merge; then, as a control, the owner approves and the PR
 # must merge by itself (proving auto-merge was really armed). An unreadable state is
 # inconclusive.
@@ -1019,7 +1045,7 @@ t_B11() {
   feature_pr B11
   local pr="$LAST_PR" armed st
   wait_settled "$pr" || { setup_fail B11 "PR never became mergeable"; close_if_open "$pr"; return; }
-  capture helper_gh pr merge "$pr" --repo "$REPO" --squash --auto || true
+  capture app_gh pr merge "$pr" --repo "$REPO" --squash --auto || true
   local first
   first="$(evidence)"
   sleep 30
@@ -1066,7 +1092,7 @@ admin_attempts() { # <id> <method path [input]>... separated by ";;" — refused
     c=()
     while [[ $# -gt 0 && "$1" != ";;" ]]; do c+=("$1"); shift; done
     [[ $# -gt 0 ]] && shift
-    capture helper_gh api "${c[@]}" || true
+    capture app_gh api "${c[@]}" || true
     obs="$(classify_api)"
     ev="$ev ${c[0]} ${c[1]}: $(evidence) |"
   done
@@ -1083,28 +1109,28 @@ t_B13() {
   # The same payloads the owner's own ruleset step uses (one of them is proven valid there).
   local uid
   uid="$(owner_uid)" || { setup_fail B13 "could not read the owner's user id"; return; }
-  ruleset_json User "$uid" >"$WORK/helper-ruleset-user.json"
-  ruleset_json RepositoryRole 5 >"$WORK/helper-ruleset-admin.json"
-  admin_attempts B13 -X POST "repos/$REPO/rulesets" --input "$WORK/helper-ruleset-user.json" ";;" \
-    -X POST "repos/$REPO/rulesets" --input "$WORK/helper-ruleset-admin.json" ";;" \
-    -X PATCH "repos/$REPO" -f description="changed by the helper"
-  # Nothing is put back (the stop rule): a refused helper changed nothing, and whatever got
-  # through stays for the owner to see. A ruleset the helper added makes every later verify_phase,
+  ruleset_json User "$uid" >"$WORK/app-ruleset-user.json"
+  ruleset_json RepositoryRole 5 >"$WORK/app-ruleset-admin.json"
+  admin_attempts B13 -X POST "repos/$REPO/rulesets" --input "$WORK/app-ruleset-user.json" ";;" \
+    -X POST "repos/$REPO/rulesets" --input "$WORK/app-ruleset-admin.json" ";;" \
+    -X PATCH "repos/$REPO" -f description="changed by the app"
+  # Nothing is put back (the stop rule): a refused app changed nothing, and whatever got
+  # through stays for the owner to see. A ruleset the app added makes every later verify_phase,
   # ruleset and reset refuse (each needs an exact ruleset count, and the attempts stop there, before
   # the description). A changed description makes every later command's assert_throwaway refuse.
   # Either way nothing runs again until the owner puts it right.
 }
 
 force_push() { # <id> <branch> — an unrelated history pushed over <branch>
-  helper_git -C "$CLONE" checkout -q --orphan "$1-$(stamp)" || die "checkout failed"
-  helper_git -C "$CLONE" rm -rq --cached . >/dev/null 2>&1 || true
+  app_git -C "$CLONE" checkout -q --orphan "$1-$(stamp)" || die "checkout failed"
+  app_git -C "$CLONE" rm -rq --cached . >/dev/null 2>&1 || true
   add_commit "tests/orphan-$1-$(stamp).txt" "unrelated history"
-  capture helper_git -C "$CLONE" push --force origin "HEAD:refs/heads/$2" || true
+  capture app_git -C "$CLONE" push --force origin "HEAD:refs/heads/$2" || true
   record "$1" "$(classify_push)" "$(evidence)"
 }
 
 delete_branch() { # <id> <branch>
-  capture helper_git -C "$CLONE" push origin ":refs/heads/$2" || true
+  capture app_git -C "$CLONE" push origin ":refs/heads/$2" || true
   record "$1" "$(classify_push)" "$(evidence)"
 }
 
@@ -1123,10 +1149,10 @@ t_M1() { direct_push M1 main "tests/$PHASE-M1-$(stamp).txt" "direct push to main
 t_M2() {
   dev_ahead M2-advance
   [[ "$OBS" == allowed ]] || { setup_fail M2 "could not advance dev ($(evidence))"; return; }
-  helper_pr main dev M2 || { setup_fail M2 "could not open dev->main ($(evidence))"; return; }
+  app_pr main dev M2 || { setup_fail M2 "could not open dev->main ($(evidence))"; return; }
   local pr="$LAST_PR"
   owner_approve "$pr"
-  helper_merge M2 "$pr" --merge
+  app_merge M2 "$pr" --merge
   record M2 "$OBS" "$(evidence)"
   close_if_open "$pr"
 }
@@ -1134,9 +1160,9 @@ t_M2() {
 t_M3() {
   dev_ahead M3-advance
   [[ "$OBS" == allowed ]] || { setup_fail M3 "could not advance dev ($(evidence))"; return; }
-  helper_pr main dev M3 || { setup_fail M3 "could not open dev->main ($(evidence))"; return; }
+  app_pr main dev M3 || { setup_fail M3 "could not open dev->main ($(evidence))"; return; }
   local pr="$LAST_PR"
-  helper_merge M3 "$pr" --merge --admin
+  app_merge M3 "$pr" --merge --admin
   record M3 "$OBS" "$(evidence)"
   close_if_open "$pr"
 }
@@ -1152,33 +1178,21 @@ t_M4() {
   id="$(owner_gh api "repos/$REPO/rulesets" --jq '.[0].id' 2>/dev/null)" || id=""
   [[ "$id" =~ ^[0-9]+$ ]] || { setup_fail M4 "could not read the ruleset's id"; return; }
   # Changing the ruleset. Both payloads are built from GitHub's own copy of the installed ruleset
-  # (so they are valid requests): one switches it off; the other adds the helper to the bypass
-  # list, in the actor form GitHub accepted for the owner on this repo (a User). If GitHub only
-  # accepted the Repository admin role, there is no proven form that names the helper, and that
-  # attempt is skipped (said in the evidence).
-  local rs kind
+  # (so they are valid requests): one switches it off; the other adds the app to the bypass list as
+  # an Integration actor (GitHub Apps may be bypass actors: Confirmed, docs), whichever form the
+  # owner's bypass took.
+  local rs
   rs="$(owner_gh api "repos/$REPO/rulesets/$id" 2>/dev/null)" || { setup_fail M4 "could not read the ruleset"; return; }
   printf '%s' "$rs" | jq '{name, target, enforcement: "disabled", conditions, rules, bypass_actors}' >"$WORK/ruleset-off.json" \
     || { setup_fail M4 "could not build the switch-off payload"; return; }
-  kind="$(printf '%s' "$rs" | jq -r '.bypass_actors[0].actor_type')" || kind=""
-  if [[ "$kind" == User ]]; then
-    local hid
-    hid="$(owner_gh api "users/$HELPER" --jq .id 2>/dev/null)" || hid=""
-    [[ "$hid" =~ ^[0-9]+$ ]] || { setup_fail M4 "could not read the helper's user id"; return; }
-    printf '%s' "$rs" | jq --argjson hid "$hid" '{name, target, enforcement, conditions, rules, bypass_actors: (.bypass_actors + [{actor_id: $hid, actor_type: "User", bypass_mode: "always"}])}' \
-      >"$WORK/ruleset-helper.json" || { setup_fail M4 "could not build the helper-bypass payload"; return; }
-    admin_attempts M4 -X PUT "repos/$REPO/branches/main/protection" --input "$WORK/weak.json" ";;" \
-      -X DELETE "repos/$REPO/branches/main/protection" ";;" \
-      -X PUT "repos/$REPO/rulesets/$id" --input "$WORK/ruleset-off.json" ";;" \
-      -X PUT "repos/$REPO/rulesets/$id" --input "$WORK/ruleset-helper.json" ";;" \
-      -X DELETE "repos/$REPO/rulesets/$id"
-  else
-    admin_attempts M4 -X PUT "repos/$REPO/branches/main/protection" --input "$WORK/weak.json" ";;" \
-      -X DELETE "repos/$REPO/branches/main/protection" ";;" \
-      -X PUT "repos/$REPO/rulesets/$id" --input "$WORK/ruleset-off.json" ";;" \
-      -X DELETE "repos/$REPO/rulesets/$id"
-    say "M4 note: the add-the-helper-as-bypass attempt was skipped (the ruleset's bypass is $kind, so no proven actor form names the helper)"
-  fi
+  [[ "$APP_ID" =~ ^[0-9]+$ ]] || { setup_fail M4 "no app id"; return; }
+  printf '%s' "$rs" | jq --argjson aid "$APP_ID" '{name, target, enforcement, conditions, rules, bypass_actors: (.bypass_actors + [{actor_id: $aid, actor_type: "Integration", bypass_mode: "always"}])}' \
+    >"$WORK/ruleset-app.json" || { setup_fail M4 "could not build the app-bypass payload"; return; }
+  admin_attempts M4 -X PUT "repos/$REPO/branches/main/protection" --input "$WORK/weak.json" ";;" \
+    -X DELETE "repos/$REPO/branches/main/protection" ";;" \
+    -X PUT "repos/$REPO/rulesets/$id" --input "$WORK/ruleset-off.json" ";;" \
+    -X PUT "repos/$REPO/rulesets/$id" --input "$WORK/ruleset-app.json" ";;" \
+    -X DELETE "repos/$REPO/rulesets/$id"
 }
 
 t_M6() { # the owner merges dev into main
@@ -1206,15 +1220,14 @@ cmd_tests() {
   PHASE="${1:-}"
   case "$PHASE" in open | protected | ruleset) ;; *) die "usage: tests open|protected|ruleset" ;; esac
   need_owner
-  load_helper token
-  need_helper_identity
   assert_throwaway
+  app_session
   verify_phase "$PHASE"
   need_allowance
   RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   CLONE="$WORK/clone"
-  helper_git clone -q --template="$WORK/template" "https://github.com/$REPO.git" "$CLONE" || die "clone failed"
-  say "== FRG-26 bypass tests, phase $PHASE, helper $HELPER, $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
+  app_git clone -q --template="$WORK/template" "https://github.com/$REPO.git" "$CLONE" || die "clone failed"
+  say "== FRG-26 bypass tests, phase $PHASE, app $APP_BOT, $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
   # The stop rule (plan section 3): after a failed or inconclusive test nothing more is changed
   # except closing test PRs. The next test never starts; sweep_prs closes every test PR left open,
   # here or, if the phase stops with an error, on exit.
@@ -1225,14 +1238,14 @@ cmd_tests() {
     if [[ $FAILS -ne 0 ]]; then
       SWEEP_ON_EXIT=""
       sweep_prs
-      if helper_rate; then say "helper allowance after the phase: $RATE_LINE"; fi
+      if app_rate; then say "app allowance after the phase: $RATE_LINE"; fi
       say "PHASE $PHASE: STOPPED after $id (a failed test stops the phase; only test PRs were closed after it)"
       exit 1
     fi
   done
   SWEEP_ON_EXIT=""
   sweep_prs
-  if helper_rate; then say "helper allowance after the phase: $RATE_LINE"; fi
+  if app_rate; then say "app allowance after the phase: $RATE_LINE"; fi
   if [[ $FAILS -ne 0 ]]; then
     say "PHASE $PHASE: FAILED at the final cleanup (a test PR may still be open)"
     exit 1
@@ -1249,12 +1262,9 @@ main() {
   shift || true
   case "$cmd" in
     create) cmd_create ;;
-    invite) cmd_invite ;;
-    accept) cmd_accept ;;
-    check-helper) cmd_check_helper ;;
+    check-app) cmd_check_app ;;
     rate) cmd_rate ;;
     allowance) cmd_allowance ;;
-    diagnose) cmd_diagnose ;;
     reset) cmd_reset ;;
     protect) cmd_protect ;;
     unprotect) cmd_unprotect ;;
@@ -1262,7 +1272,7 @@ main() {
     tests) cmd_tests "$@" ;;
     actions-setting) cmd_actions_setting ;;
     status) cmd_status ;;
-    *) die "usage: github-throwaway.sh create|invite|accept|check-helper|rate|allowance|diagnose|reset|protect|unprotect|ruleset|tests <phase>|actions-setting|status" ;;
+    *) die "usage: github-throwaway.sh create|check-app|rate|allowance|reset|protect|unprotect|ruleset|tests <phase>|actions-setting|status" ;;
   esac
 }
 
