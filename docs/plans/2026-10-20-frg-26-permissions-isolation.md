@@ -1,372 +1,404 @@
-# FRG-26: Permissions isolation — final plan
+# FRG-26: Permissions isolation — plan, revised for a GitHub App
 
-- **Status:** **Stage 1 approved by the owner, 2026-10-20.** The checkpoint after the
-  feasibility tests stays. Until it, nothing changes in FORGE's settings, the owner's Mac
-  accounts or home-folder permissions. Unexpected permissions, costs or limitations are
-  reported before going further. FRG-26 does not close L12; FRG-27 is next.
-- **Ticket:** FRG-26 (#26). Branch `feature/FRG-26-permissions-isolation`.
+- **Status:** **Revised plan approved by the owner for stage 1 implementation and independent
+  reviews, 2026-11-01** (draft 2 plus the owner's clarifications of the same day). It replaces the
+  2026-10-20 plan (helper account), which stays in git history; section 12 lists what changed.
+  Nothing on GitHub or the Mac has changed for it.
+- **Ticket:** FRG-26 (#26). Branch `feature/FRG-26-permissions-isolation`, draft PR #37.
 - **Follow-up:** FRG-27 (#27), review isolation, starts immediately after this one.
-- **Research:** 2026-10-20, against current official docs (sources at the end).
+- **Why revised:** the owner asked (2026-11-01) whether FRG-26 needs a separate GitHub account.
+  The comparison (owner's main account with a restricted token, a GitHub App, the helper account)
+  is in `docs/decisions/2026-11-01-frg26-github-app.md`.
+- **Kept unchanged:** the checkpoint after stage 1 (stage 2 and every Mac change wait for it); no
+  change to FORGE's settings, the owner's Mac accounts or home-folder permissions before it;
+  D1-D3 (no 5:00 credentials, test-mode keys included, until the protections are tested and the
+  owner decides); D7 (review isolation is FRG-27, L12 stays open); D8 (home folder shown first,
+  never recursive).
+- **Wording:** every protection is a **Goal** until its test passes. "Confirmed (docs)" means
+  GitHub's documentation says so; it is not a test result and never makes a protection a
+  guarantee.
 - **Stage 1 code:** `tests/permissions/github-throwaway.sh` (run only from owner handoffs),
   unit-tested without GitHub by `tests/unit/github-throwaway.test.sh`.
 
 ## 1. What this ticket does, in plain words
 
 Today I run as **your** Mac user (an administrator) with **your** GitHub login (a repository
-admin). FORGE's hooks catch ordinary commands and mistakes, but not a command deliberately
-disguised to get past them (known limit L13).
+admin). FORGE's hooks catch ordinary commands, not a deliberately disguised one (L13).
 
-FRG-26 gives me **my own Mac user and my own GitHub account**, set up so that **macOS and GitHub
-themselves refuse** the harmful things, whatever command I run. Every restriction is then tried
-for real and must be refused by GitHub or macOS, not by a FORGE hook.
+FRG-26 gives me **my own Mac user** and, on GitHub, **a GitHub App that you own** instead of your
+login. GitHub and macOS themselves should then refuse the harmful things, whatever command I run.
+Each restriction is tried for real and counts only when GitHub or macOS refuses it.
 
-## 2. Your decisions (all 2026-10-20)
+## 2. Decisions
 
 | # | Decision |
 |---|---|
-| D1 | 5:00 may be brainstormed and planned, but gets **no real business credentials, payment access or production deploy access** until the relevant FRG-26 protections are implemented and tested. Building 5:00 still waits for Phase 7 |
-| D2 | **Test-mode payment keys count as payment access** and wait exactly like live keys |
-| D3 | Before any 5:00 credential, I show you **every accepted risk that remains**, and **you decide**. Passing tests is necessary, not sufficient |
-| D4 | Shape: **three building blocks** (section 4) |
-| D5 | Nothing merges into `dev` without **your code-owner approval of the latest changes**. Tested against bypasses, including changing CODEOWNERS and pushing directly to `dev` |
-| D6 | **Only you can update `main`.** Tested on a throwaway repo first. If GitHub can't enforce it with our account and plan, I explain the alternatives **before** changing FORGE |
-| D7 | Review isolation is **FRG-27**, right after this ticket. **L12 stays open** until FRG-27's tests pass. **FRG-26 does not resolve review integrity** |
-| D8 | Home-folder permissions: shown first with effects and undo; **never recursive** |
-
-Recorded in `docs/decisions/2026-10-20-five-oclock-credentials-wait-for-frg-26.md` (commits
-be724d9, 27b6472, 7b0a076 on the FRG-26 branch).
+| D1-D3, D5-D8 | Unchanged from 2026-10-20 (D5: nothing merges into `dev` without your code-owner approval of the latest changes; D6: only you update `main`) |
+| D4 (revised, owner 2026-11-01) | Three building blocks, block B now a **GitHub App** (section 4) |
+| D9 (owner, 2026-11-01) | The helper account is no longer used by FORGE; its token file isn't read again. The account itself is your call |
+| D10 (owner, 2026-11-01) | The app's private key stays out of my reach: a token broker, not the simpler fallback |
 
 ## 3. How sure we are
 
-| Label | Meaning |
-|---|---|
-| **Confirmed (docs)** | Official GitHub / Apple / Anthropic documentation says so |
-| **Confirmed (this Mac / repo)** | I saw it with a read-only command on 2026-10-20 |
-| **Unconfirmed** | Likely, but the docs are silent or ambiguous; a test decides |
-| **Goal** | What we want; proven only when its test passes |
+Same labels and stop rule as before: Confirmed (docs), Confirmed (this Mac / repo), Unconfirmed,
+Goal. If a test fails or an Unconfirmed item turns out false, I stop and come back to you.
+**Before expanding scope** (a new permission, a cost, a new account or repo, a limitation the plan
+doesn't name), I report it to you and wait (owner, 2026-11-01).
 
-**Stop rule:** if a test fails, or an Unconfirmed item turns out false, I stop and come back to
-you before going further.
+**Approval:** approved for stage 1 implementation and independent reviews, 2026-11-01.
+Every live GitHub action stays behind a reviewed owner handoff. The checkpoint before stage 2 and
+any Mac change stays.
 
-## 4. The three building blocks and exact permissions
+## 4. The three building blocks
 
-**You: unchanged.** Still admin on the Mac and on GitHub. Two additions: your home folder closes
-to other users (section 7), and you become the repo's **code owner**, the only person whose
-approval lets work into `dev`.
+**You: unchanged.** Admin on the Mac and on GitHub; the repo's only code owner. You also own the
+GitHub App: only you can change its permissions, repositories or keys, from your browser.
 
-**A. Mac user `forge-agent`: standard, not an administrator**
+**A. Mac user `forge-agent`:** unchanged (standard user, no `sudo`, can't open your home).
 
-| Can | Cannot |
-|---|---|
-| Read and write its own home `/Users/forge-agent` (its own FORGE copy, worktrees, `work/`, memory) | Use `sudo` (run as administrator), or write to system folders |
-| Run Claude Code, git, `gh`, codex | Open your home folder or read your keychain |
-| Read the installed hooks and managed settings | Change them (owned by the system administrator account, `root`) |
-| Use the network; add login items for itself | Add system services or change system settings |
-|  | Read handoff secrets not deliberately given to it |
+**C. Hooks I can't edit or switch off:** unchanged (root-owned install, managed settings with
+`allowManagedHooksOnly`).
 
-**B. GitHub helper account: free machine account, you pick the name**
+**B. GitHub App, owned by your account (name yours to pick)**
 
-- **Access:** collaborator with **write** on `Thebigtuna88/forge` (later on each project repo),
-  and nothing else. It can push branches, open PRs and issues, and comment. It can merge **only
-  when GitHub's protection is satisfied**. It can't change settings, protection, collaborators,
-  webhooks, deploy keys or visibility, and can't delete, archive or transfer a repo.
-- **Token:** classic, **`public_repo` only**, with an expiry date (proposed 90 days; renewed with
-  a handoff). Not granted: `repo`, `workflow`, `delete_repo`, `admin:*`, `user`, `gist`,
-  `read:org`. If a `gh` command FORGE needs turns out to require more, I stop and ask you before
-  adding anything.
-- **Account secrets:** you keep its password, 2-step codes and recovery codes in your password
-  manager. I only ever hold the token.
+### 4.1 Minimum permissions
 
-**C. Hooks I can't edit or switch off**
+GitHub Apps start with no permissions (Confirmed, docs).
 
-- FORGE's hooks, and the owner-only files they read (`spend-limits.json`, `mode.json`,
-  `deploy-targets.json`, the owner-only paths list), are **installed** into a root-owned folder.
-- Claude Code's system settings file
-  `/Library/Application Support/ClaudeCode/managed-settings.json` turns them on, with
-  `allowManagedHooksOnly`.
-  - **Confirmed (docs):** nothing from my side overrides that file, and only it can switch
-    managed hooks off.
-  - **Confirmed (docs):** only a Mac administrator can edit it, so `forge-agent` is never one.
-  - **Confirmed (docs):** if the file can't be read, Claude Code silently starts without it. So
-    it's readable but not writable by me, and every check confirms Claude Code reports it as
-    active.
-- A merged change to hooks or limits takes effect only when **you** run the install script.
+| Permission | Level | Why |
+|---|---|---|
+| Metadata | read | Mandatory for every app; also reads rulesets |
+| Contents | read and write | Push feature branches; merge a PR (the merge endpoint needs Contents write) |
+| Pull requests | read and write | Open, update, comment on PRs |
+| Issues | read and write | Tickets and comments |
+| Everything else | **none** | No Administration (settings, protection, rulesets, collaborators), Workflows (`.github/workflows`), Secrets, Variables, Environments, Deployments, Webhooks, Pages, Actions |
 
-## 5. Protections, enforcement, limits, tests
+- CI reads (Checks, Commit statuses, Actions read) are not granted at first; test A11 decides. If
+  one is needed, I ask you before anything is added.
+- Installed "Only on this account" with "Only select repositories". Changed permissions take
+  effect only after you approve them on the installation (Confirmed, docs).
 
-"Fails first" applies to every row: each test is run once **before** the protection exists and
-must then succeed, to prove it can detect the gap.
+**What "only selected repositories" does and doesn't restrict (revision 4).** Public repositories
+are readable by anyone on the internet, logged in or not, so the app (or I) may still **read**
+public repositories it isn't installed on; that isn't a protection we claim. The protection we
+need is:
+- **no writes** (pushes, PRs, issues, comments, merges) to any repository the app isn't installed
+  on, and none beyond its four permissions where it is installed;
+- **no access to private resources**: private repositories it isn't installed on, and private
+  data in installed ones that needs a permission it doesn't have (settings, protection, secrets'
+  names, collaborators, webhooks, deploy keys).
 
-| # | I must be unable to… | Enforced by | Status | Limits |
+### 4.2 The token broker, in plain words (revision 1)
+
+*The problem.* The app has a **private key**, a file that proves to GitHub "this is the app". It
+never expires: whoever holds it can keep getting fresh access. So I must never be able to read it.
+
+*The idea.* A small program, the **broker**, holds the key for me, like a front desk that holds
+the master key and hands out day passes. It runs under its own hidden Mac account,
+`_forgebroker`, which nobody logs into. Every 45 minutes (and when the Mac starts) it:
+1. writes a short note, "I am app N, valid for the next 10 minutes", and signs it with the
+   private key. GitHub calls this a JWT; it must be signed with RS256 and expire within 10 minutes
+   (Confirmed, docs). Only the key's holder can make a valid signature;
+2. sends the signed note to GitHub and asks for an **installation token** (a day pass) for exactly
+   FORGE's repositories and exactly the four permissions above;
+3. checks GitHub's reply: the token's repositories and permissions must be exactly those, or it
+   throws the token away and writes nothing (fail closed);
+4. writes the token into one file that only `forge-agent` can read. GitHub expires it after one
+   hour (Confirmed, docs).
+
+*Who can get a token.* Nobody "asks" the broker: there is no network port or request to fake. The
+token sits in a file, and **macOS file permissions** decide who reads it: the file belongs to
+`_forgebroker`, its group contains only `forge-agent`, mode 640, in a folder mode 750. Other Mac
+users can't read it. You can, as Mac administrator (as you can read anything).
+
+*How GitHub authenticates the broker.* By the signature on the note: GitHub checks it against the
+app's public half of the key. No password, no login session.
+
+*How the limits are enforced, three layers deep:*
+1. **GitHub, the installation:** you choose, in your browser, which repositories and permissions
+   the app has. GitHub never issues a token beyond them: "cannot be granted access to
+   repositories that the installation was not granted access to" and "cannot be granted
+   permissions that the app was not granted" (Confirmed, docs). This holds even if the broker
+   were wrong or tampered with.
+2. **The broker's request:** it asks for less than the installation allows if you ever install the
+   app more widely: an exact repository list and the four permissions, from a settings file owned
+   by `root` that `forge-agent` can't change.
+3. **The broker's check:** it rejects any token GitHub returns with more than that.
+
+*Where the key lives.* A file mode 600 in a folder mode 700, both owned by `_forgebroker`.
+`forge-agent` isn't an administrator, so macOS refuses it (tests K1, K2). The broker's program and
+settings are owned by `root`, so `forge-agent` can't change what it does (K4).
+
+*What this does not stop.* **Automatic renewal means ongoing access:** as long as the broker runs
+and the app is installed, I always have a valid token, so the one-hour expiry does not limit what
+I can do over time; the four permissions and the selected repositories do. **Expiry limits only a
+copied token:** a token copied elsewhere stops working within an hour of being issued, and
+cancelling it (4.3) stops it sooner. Stopping ongoing access means stopping renewal or the app
+itself (4.3, emergency). If the
+broker stops, no new token appears and GitHub work stops (fails closed; you'd see it). Backups:
+Time Machine would copy the key file like any other; whether to exclude its folder is your call at
+stage 3.
+
+*Stage 1 has no broker yet.* Stage 1 uses a **separate throwaway app**, installed only on the
+throwaway repo, deleted at the end of stage 1. Its key is stored with a handoff under
+`work/owner-secrets/frg26/`, which I can still read until stage 3 (the same limitation the helper
+token had; accepted only for a throwaway app on a throwaway repo). The real app is created in
+stage 4 and its key goes only to the broker. Moving a downloaded key file needs a new handoff step
+in `.harness/lib/` (owner-only; you merge it).
+
+### 4.3 Key revocation vs token revocation (revision 2)
+
+| Action | Who, where | What it stops | What it doesn't |
+|---|---|---|---|
+| **Delete the private key** | You, app settings > Private keys (GitHub requires a second key before deleting the only one) | New tokens: a note signed with a deleted key should be refused (test A9) | Tokens already issued: GitHub's docs don't say. Expected to keep working until their hour runs out: Unconfirmed, test A9b records what happens |
+| **Revoke one token** | Whoever holds it: `DELETE /installation/token` with that token | That token at once: "invalidated and cannot be used" (Confirmed, docs) | Other tokens; new tokens |
+| **Suspend the installation** | You, Settings > Applications > Installed GitHub Apps > Configure > Suspend | The app's access to your account's resources (Confirmed, docs); whether already-issued tokens stop at once: Unconfirmed, test E1 | Reversible: Unsuspend |
+| **Uninstall** | You, same page > Uninstall | The app's access to your account's resources (Confirmed, docs); token deactivation is documented for organisations, Unconfirmed for personal accounts, test E2 | Reinstalling gives a new installation id (broker settings updated by handoff) |
+
+*Day to day:* the broker revokes the previous token a few minutes after writing a new one, so at
+most two tokens exist at any moment, and none older than about 50 minutes.
+
+*Emergency: stop access first, keys later.* Stopping access never needs a replacement key.
+GitHub requires a second key before the only key can be deleted (Confirmed, docs), so key
+deletion is a later clean-up step, not an emergency step.
+1. **Suspend** the installation in your browser (Settings > Applications > Installed GitHub Apps >
+   Configure > Suspend). No key, no script, works from your phone. The app is blocked from your
+   account's resources (Confirmed, docs); tokens already issued: test E1 records it.
+2. If suspension doesn't stop tokens already issued (E1), or you want it permanent: **Uninstall**
+   on the same page, or **delete the app** entirely in Developer settings; neither needs a key.
+   Tokens already issued: E2 and E3 record it.
+3. On the Mac: stop the broker (`launchctl bootout`, an owner handoff prepared in stage 3), so no
+   renewal is attempted.
+4. Later, calmly: look at what happened (the app's activity shows as its bot account); generate a
+   new key, install it in the broker by handoff, delete the old key; then unsuspend (or reinstall).
+
+*What happens to tokens already issued* is recorded for every way of revoking (A5 revoke, A9b key
+deletion, E1 suspend, E2 uninstall, E3 app deletion). Each result goes into this section with the
+date and GitHub's exact reply; where a token keeps working, the plan says so and the emergency
+order is adjusted. Nothing here is assumed until its test has run.
+
+### 4.4 Secrets: seeing values vs managing them (revision 5)
+
+- **Managing secrets** (create, change, delete, list names) needs the Secrets permission. The app
+  doesn't get it (test A8). Even with it, the REST API never returns a value: "Gets a single
+  repository secret without revealing its encrypted value" (Confirmed, docs).
+- **Seeing secret values** happens only **inside a GitHub Actions run**: a job receives the
+  secrets it uses. That is the real path, and it doesn't need any secrets permission:
+  - With Contents write the app can push a branch. Events from an app's installation token **do**
+    start workflows (Confirmed, docs: unlike `GITHUB_TOKEN`). A workflow running on that branch
+    runs the branch's own scripts (for example `tests/run.sh`), which the app can change without
+    the Workflows permission. So any repository-level secret such a workflow uses is reachable.
+  - Therefore: **no repository-level secrets, ever** (today 0: Confirmed, repo). Deploy secrets
+    only in a GitHub **Environment** with you as required reviewer and deployments limited to
+    `main`: jobs "can only access these secrets after any configured rules" pass (Confirmed, docs).
+    Environments are available on public repos with GitHub Free (Confirmed, docs).
+  - The default workflow token stays read-only and "Allow GitHub Actions to create and approve
+    pull requests" stays off (B15, read-only checks).
+- **Actions-secret restrictions, explicit:**
+  1. No repository-level or account-level Actions secrets on FORGE or project repos.
+  2. Every deploy secret lives in an Environment with: you as the only required reviewer;
+     "Prevent self-review" on; deployment branches limited to `main`.
+  3. The app gets no Secrets, Environments, Deployments or Actions permission, so it can neither
+     manage secrets nor approve a waiting deployment.
+  4. The workflow token's default permission is read-only; Actions may not approve PRs.
+- Tests: A8 (managing refused); S1 (read-only: 0 repository secrets; workflow token default
+  read-only); **S2 in stage 1, on the throwaway repo**, with an Environment `frg26-test` holding a
+  dummy, non-sensitive value (never a real secret):
+  - S2a: the app pushes a feature branch whose (unchanged) workflow targets the Environment: the
+    job must not get the value (deployment branches: `main` only);
+  - S2b: in the open phase (no protection yet, so the app may push `main`), the app's push to
+    `main` starts a run that waits for review; the app tries to **approve its own pending
+    deployment**: refused (it has no Deployments permission, and "users who initiate a deployment
+    cannot approve the deployment job" with Prevent self-review on: Confirmed, docs). Control: you
+    approve it, and the job reports only the value's length;
+  - S2c: the app tries to change the Environment's protection or its secret: refused. Control:
+    your token reads the same settings;
+  - S2d: a run you start yourself: your own approval is refused (shows Prevent self-review is
+    really on); the run is then cancelled.
+  The workflow file and the Environment are added by your handoff (the app can't). Actions on a
+  public repo: $0, "standard GitHub-hosted runners is free … In public repositories" (Confirmed,
+  docs).
+
+### 4.5 Cost (revision 5)
+
+| Item | Cost | Status |
+|---|---|---|
+| Creating and installing a GitHub App on your account | $0 | Confirmed (docs): registering has no pricing step (limit 100 apps per account); prices exist only for apps sold on GitHub Marketplace. GitHub doesn't say "free" in those words: if a billing step ever appears when you create it, we stop |
+| Rulesets, branch protection, Environments on public repos | $0 | Confirmed (docs): public repos on GitHub Free |
+| `_forgebroker` user, launchd, `openssl` | $0 | Built into macOS |
+| Actions runs for S2 on the public throwaway repo | $0 | Confirmed (docs): standard GitHub-hosted runners are free in public repositories |
+| Private repos later | GitHub Pro needed for these protections | Unchanged from the 2026-10-20 plan; decided when 5:00 needs it |
+
+## 5. How your approval is enforced (D5) and only you update `main` (D6)
+
+`dev` protection (applied by you): PR required, 1 approval, **review from Code Owners**
+(`.github/CODEOWNERS` = `* @Thebigtuna88`), **approval of the most recent push**, stale approvals
+dismissed, no force-push, no deletion, admins included.
+
+Why the app can't satisfy it (each a Goal until its test passes):
+- The app is the PR's author and its last pusher. GitHub: "Pull request authors cannot approve
+  their own pull requests", and the latest push "must be approved by someone other than the person
+  who pushed it" (Confirmed, docs).
+- The app isn't a code owner: CODEOWNERS names only you, is read from `dev`, and changing it needs
+  your approval (B2-B4).
+- The app has no Administration permission, so it can't change the protection (B12, B13).
+
+So a merge into `dev` needs **your** approval of the exact latest commit, from your own account.
+GitHub does **not** check that codex reviewed it or said CLEAN (L12, FRG-27).
+
+`main`: ruleset with Restrict updates, Restrict deletions, Block force pushes; bypass only the
+repository-admin role (you). The app isn't an admin or a bypass actor. Step 0 still looks first at
+what GitHub offers a personal repo; if "only you" isn't possible we stop and I explain the
+alternatives before anything changes.
+
+## 6. Protections and the tests that prove them (revision 3)
+
+**Two kinds of test, two kinds of proof.** A refusal counts only with a protection or permission
+reason from GitHub (BLOCKED, GH006/GH013, 403/404/401); anything else is inconclusive, a FAIL.
+
+- **Kind S, a setting we add** (branch protection, ruleset, CODEOWNERS): **fails first**. The test
+  runs before the setting exists and must get through, proving it can see the gap; after the
+  setting it must be refused.
+- **Kind P, forbidden by GitHub from the outset** (a permission the app never had, a repo it isn't
+  installed on, approving its own PR, an expired or revoked token): it can't get through first.
+  Each instead has a **control** that shows the test itself works:
+  - **same request, a credential that may do it:** your token makes the identical request and
+    succeeds. For writes the control is a **no-op** (setting a value to what it already is), so it
+    changes nothing;
+  - **neighbouring allowed action:** the app's token does the nearest permitted thing and succeeds
+    (an ordinary file pushes, a workflow file doesn't; a fresh token works, an old one doesn't);
+  - **the expected reason:** the refusal must be the documented one (for example 403 "Resource not
+    accessible by integration"), not a typo or a network error.
+
+| # | I must be unable to… | Enforced by | Docs | Tests (kind) |
 |---|---|---|---|---|
-| 1 | Push to `main`/`dev`, force-push, delete them | Branch protection; helper isn't admin | Protection **Confirmed (repo)**; that a collaborator can't edit it: **Unconfirmed** → tests B1, B12, B14, M1, M5 | Feature branches stay pushable and deletable (accepted) |
-| 2 | Update `main` | Ruleset "Restrict updates" with only you able to bypass, on top of protection and code-owner review | **Unconfirmed** for personal repos → section 6.2 | If not offered: alternatives first (D6) |
-| 3 | Merge into `dev` without your approval of the latest changes | Code-owner review + approval of the most recent push (section 6.1) | **Confirmed (docs)** → tests B1–B16 | GitHub checks **your approval, not codex** (section 6.1) |
-| 4 | Change settings, protection, rulesets, default branch, visibility, name; archive, transfer, delete | Write ≠ admin; token has no `delete_repo` | Delete, archive, visibility, default branch: **Confirmed (docs)**; the rest **Unconfirmed** → B12, B13, M4 | — |
-| 5 | Read or change Actions secrets/variables, deploy keys, webhooks, collaborators, apps | Write ≠ admin | Deploy keys, webhooks, collaborators: **Confirmed (docs)**; secrets **Unconfirmed** → test | Write access can still *use* a secret through a workflow. So deploy secrets go only in GitHub Environments that need your approval, and workflows on my branches get none. Today: 0 secrets, 0 workflows (**Confirmed, repo**) |
-| 6 | Change workflow files; run deploying workflows | No `workflow` scope; Environments need your approval; production deploys stay your scripts (rule 8) | Workflow files **Confirmed (docs)**; deploy gating **Goal** | A workflow file identical to one on another branch can be committed anyway (**Confirmed caveat**) |
-| 7 | Widen my access (tokens, SSH keys, scopes, other repos/orgs) | You create tokens in the web UI; no `admin:public_key`; invited only to FORGE and projects | **Confirmed (docs)**; accepting invitations with `public_repo`: **Unconfirmed** → test | Fine-grained tokens don't work for collaborators (**Confirmed, docs**), so the token reaches every repo the helper is invited to |
-| 8 | Act as you (your `gh` login, SSH keys, keychain, browser) | Separate Mac user + your home closed | **Goal**; gap **Confirmed (this Mac)** today | — |
-| 9 | Reach repos beyond FORGE and projects | Helper invited only there | **Confirmed (docs)** | Public repos are readable by anyone (accepted) |
-| 10 | Read your home, keychain, configs, browser profiles | macOS permissions: `chmod 700 /Users/atl` | **Goal** | Shared places (`/Users/Shared`, `/tmp`) stay readable: no secrets go there |
-| 11 | Change the hooks and owner-only limits, or switch hooks off | Block C | Mechanism **Confirmed (docs)**; FORGE's use **Goal** | `forge-agent` must never become admin |
-| 12 | Rewrite review replies | **Moved to FRG-27.** L12 stays open | — | — |
-| 13 | Become admin, use `sudo`, add system services, change system settings | Standard user | **Confirmed (standard macOS)** → test | It can add login items for itself (accepted) |
-| 14 | Read handoff secrets not given to me | `ho_secret_to_file` saves into a folder only you can read; giving me a file is an explicit step of yours | **Goal**; changes the handoff runtime (owner-only) | — |
+| 1 | Push, force-push or delete `dev`/`main` | Protection + ruleset; app not admin | Confirmed | B1, B14a, B14b, M1, M5a, M5b (S) |
+| 2 | Update `main` | Ruleset bypass = admin role only | Unconfirmed for personal repos | Step 0, M1-M6 (S) |
+| 3 | Merge into `dev` without your approval of the latest push | Code-owner review + last-push approval | Confirmed | B1-B4, B6-B11 (S); B5 own approval (P); B16 control |
+| 4 | Change settings, protection, rulesets; delete, archive, transfer | No Administration | Confirmed | B12, B13, M4, A6 (P) |
+| 5 | Manage secrets, variables, deploy keys, webhooks, collaborators | No such permissions | Confirmed | A8 (P) |
+| 5b | See secret values; approve its own deployment | No repo-level secrets; Environments need you, self-review prevented, `main` only | Confirmed (docs) | S1 (read-only), S2a-c (stage 1, P with controls) |
+| 6 | Change workflow files | No Workflows permission | Confirmed | A3 (P) |
+| 7 | Widen my access (permissions, repos, keys) | Only you change the app, in your browser | Confirmed | A1, A6 (P); A10 docs only (no API makes keys) |
+| 9 | Write to, or read private resources of, repos it isn't installed on | Selected repositories + narrowed tokens | Confirmed | A2 (P) |
+| 15 | Keep using an old, revoked or suspended token; mint with a deleted key | 1-hour expiry; revoke; suspend; uninstall; app deletion; key deletion | Partly Confirmed | A4, A5, A9, A9b, E1, E2, E3 (P) |
+| 16 | Read the app's private key or change the broker | Broker user owns key; root owns program and settings | Goal | K1-K4 (stage 3, P) |
+| 8, 10, 11, 13, 14 | Mac items | Unchanged | — | Unchanged (stage 3) |
+| 12 | Rewrite review replies | **FRG-27**; L12 stays open | — | — |
 
-## 6. GitHub branch rules and their bypass tests
+B1-B16 and M1-M6 run as in the 2026-10-20 plan, with the throwaway app's token. B5 moves to kind P
+(GitHub never lets an author approve): its control is you approving the same PR (B16).
 
-### 6.1 `dev`: your approval of the latest changes (D5)
+New tests (throwaway app, throwaway repo, run only from your handoffs):
 
-Settings, applied by you:
-- PR required, 1 approval, **review from Code Owners** (`.github/CODEOWNERS` = `* @Thebigtuna88`).
-- **Approval of the most recent push**, and stale approvals dismissed.
-- No force-push, no deletion.
-
-**What GitHub guarantees** (Confirmed, docs): nothing merges into `dev`, by any command, unless
-you approved its latest commit, and weren't its author. The helper can't count, for two reasons:
-- authors can't approve their own PRs;
-- it isn't a code owner.
-
-GitHub reads CODEOWNERS from `dev` itself, so a PR changing CODEOWNERS still needs your approval.
-CODEOWNERS also joins the owner-only paths.
-
-**What it doesn't guarantee:** that codex ran or said CLEAN. GitHub checks your approval.
-Until FRG-27, the review summary comes from files I could edit (L12).
-
-**Tests** (helper's real token, throwaway repo; GitHub's exact error saved as proof). A refusal
-counts only when GitHub gives a protection or permission reason: a PR still open, free of
-conflicts and reported BLOCKED; a push rejected with GH006/GH013; an admin call answered 403 or
-404. Anything else (network errors, validation errors, unreadable state) is *inconclusive*,
-which is a FAIL. The throwaway repo's default branch is `side`, not `dev`, so that deleting
-`dev` can be tested (GitHub never deletes a default branch).
-
-| # | Helper tries… | Must happen |
-|---|---|---|
-| B1 | Push straight to `dev` | Refused |
-| B2 | Push to `dev` editing `.github/CODEOWNERS` | Refused |
-| B3 | PR changing CODEOWNERS to itself, then merge | Refused |
-| B4a | Same with CODEOWNERS moved to the root | Refused |
-| B4b | Same with CODEOWNERS moved to `docs/` | Refused |
-| B5 | Approve its own PR | Refused |
-| B6 | Merge with no approval | Refused |
-| B7 | You approve → it pushes one more commit → merges | Refused |
-| B8 | You approve → it pulls `dev` into the PR ("update branch") → merges | Refused |
-| B9 | You approve a PR aimed elsewhere → it re-aims it at `dev` → merges | Refused; if GitHub allows it, recorded as a gap and you decide |
-| B10 | Merge with the admin override | Refused |
-| B11 | Auto-merge (switched on for the throwaway repo) on an unapproved PR | Armed, must not merge; control: after your approval it merges by itself |
-| B12 | Change or delete `dev`'s protection | Refused |
-| B13 | Create a ruleset or change settings | Refused |
-| B14a | Force-push `dev` | Refused |
-| B14b | Delete `dev` | Refused |
-| B15 | (Read-only) "Allow GitHub Actions to approve pull requests" | Off |
-| B16 | Control: you approve, nothing changes, it merges | **Allowed** |
-
-### 6.2 `main`: only you (D6)
-
-- **Step 0, look only:** your handoff reports which bypass choices GitHub offers a personal repo.
-  If "only you / repository admin" isn't one of them, **we stop and I explain the alternatives**:
-  - (a) move the repos into a free GitHub organisation (can restrict pushes on public repos);
-  - (b) rely on your approval alone;
-  - (c) a paid plan, price confirmed first.
-
-  Nothing on FORGE changes until you choose.
-- **Rule:** ruleset on `main` with Restrict updates, Restrict deletions and Block force pushes;
-  bypass only you.
-
-| # | Who tries | Must happen |
-|---|---|---|
-| M1 | Helper pushes to `main` | Refused |
-| M2 | Helper's `dev`→`main` PR, **approved by you**, merged by helper | Refused |
-| M3 | Helper merges with the admin override | Refused |
-| M4 | Helper changes (switch off, add itself as bypass) or deletes the ruleset, or changes or deletes `main`'s protection | Refused |
-| M5a | Helper force-pushes `main` | Refused |
-| M5b | Helper deletes `main` | Refused |
-| M6 | Control: **you** merge `dev`→`main` | **Allowed** |
+| # | Tries… | Must happen | Control |
+|---|---|---|---|
+| A1 | Mint a token; read what GitHub says it carries | Exactly the four permissions, only the throwaway repo | — (a reading) |
+| A2 | Push, open a PR, open an issue on a second public throwaway repo the app isn't installed on | Refused | Same three on the installed repo succeed |
+| A3 | Push a commit adding `.github/workflows/x.yml` to a feature branch | Refused | The same commit with an ordinary file succeeds |
+| A4 | Use a token over 1 hour old | 401 | A fresh token, same request, succeeds |
+| A5 | Revoke a token, then use it | 401 | A second token, same request, succeeds |
+| A6 | Change the repo's settings (no-op description write); change its own installation | Refused | Your token makes the same no-op write and succeeds |
+| A8 | Create a secret; list secrets, variables, deploy keys, webhooks, collaborators | Refused | Your token lists the same and succeeds (reads; no secret created) |
+| A9 | You delete the key; mint with it | Refused | The new key mints |
+| A9b | Use a token minted before the key's deletion | Recorded either way, and the plan is corrected | — (a finding) |
+| E3 | Delete the throwaway app at the end of stage 1; use a token issued before | Recorded | — |
+| S2a-c | Environment: branch limit, the app approving its own deployment, changing protection | Refused | You approve (S2b); your token reads (S2c) |
+| A11 | Read CI results on a public repo with no Checks/Actions permission | Decides whether a read permission is needed | — (a finding) |
+| A12 | Every `gh` command FORGE uses, with the app token | Works, or listed for you before any change | — |
+| E1 | You suspend the installation; use a token issued before | Recorded; then a new mint must be refused | Unsuspend; a new mint works |
+| E2 | Uninstall at the end of stage 1; use a token issued before | Recorded | — (the app is deleted next) |
+| S1 | (Read-only) repository secrets count; default workflow token permission | 0; read-only | — |
+| K1-K4 | (Stage 3) as `forge-agent`: read the key; list the broker's folder; change the broker's settings; read the token file | Refused, refused, refused, works | You (admin) can read the key: the check is valid |
 
 ## 7. Your home folder (D8)
 
-- **Today (Confirmed, this Mac):** `/Users/atl` is `drwxr-x---`, group `staff`, plus "everyone:
-  deny delete". Any account in `staff` can open it and read whatever inside is group-readable:
-  `~/code`, `~/.codex`, `~/.claude`, `~/Applications`, `~/Public`. New Mac users join `staff` by
-  default.
-- **Change:** `chmod 700 /Users/atl`. It touches the folder itself only and is **not recursive**.
-  Nothing inside changes. The deny-delete rule stays, and the script checks it before and after.
-- **Effects (Confirmed, this Mac):**
-  - You and your apps: none.
-  - Root services (Spotlight, Time Machine): none.
-  - The 37 running service accounts: none of them is in `staff`.
-  - Today `staff` holds only `root` and you, so nothing loses access. It takes effect once
-    `forge-agent` exists.
-  - File Sharing (your Public folder, guest access on): guests aren't in `staff`, so nothing
-    changes for them.
-- **Undo:** `chmod 750 /Users/atl` restores exactly today's state. Both scripts print
-  `ls -led /Users/atl` before and after.
+Unchanged: `chmod 700 /Users/atl`, not recursive, shown with effects and undo first.
 
-## 8. How it gets done: stages, in order
+## 8. Stages
 
-Every step that changes your Mac or GitHub is an **owner handoff**: you run
-`bash …/OWNER-RUN.sh` and paste back the result. Every step lists its check and its undo. I
-never run those scripts myself. The GitHub and Mac tests run inside your handoffs, outside Claude
-Code. If I ran "push to `main`" myself, even expecting a refusal, I'd be getting around a hook
-(rule 9). Read-only checks (permission level, token scopes, protection settings) I can run myself.
+Every change to your Mac or GitHub is an owner handoff; I never run them. Read-only checks I may
+run myself.
 
-**Stage 1: GitHub feasibility, on a throwaway repo only.** FORGE and your Mac are untouched.
-1. I write the stage-1 test scripts (they handle the helper's token). codex reviews them
-   (`code` + `security`) **before** you run anything.
-2. Handoff: create the helper account in your browser, turn on its 2-step login, save its
-   password and codes in your password manager. It reports the account name.
-3. Handoff: create the throwaway public repo (`dev`, `main`, CODEOWNERS), invite the helper with
-   write, accept as the helper. It saves the helper's classic token (`public_repo`, 90 days)
-   with `ho_secret_to_file`, into `work/owner-secrets/frg26/helper.env` (mode 600, folder 700,
-   gitignored).
-   *Limitation found while building:* `ho_secret_to_file` only writes inside a gitignored path
-   of a git checkout. Until stage 3, I run as your user, so I can read that file. It holds only
-   the helper's token, which has far less power than your own login (already reachable to me
-   today). Item 14 moves handoff secrets out of my reach in stage 3.
-4. Handoff: **fails-first** run of B1–B16 and M1–M6 with no protection.
-5. Handoff: apply the `dev` and `main` protection; run the tests again. Everything must be
-   refused except the controls and M2, which shows the gap the ruleset must close.
-6. Handoff: **Step 0** look at the ruleset bypass choices. If "only you" isn't offered → stop,
-   alternatives (D6). Otherwise add the `main` ruleset and run the tests a third time; all must
-   pass, M2 now refused.
+**Stage 1: GitHub feasibility, throwaway only.** FORGE and your Mac untouched.
+1. I rewrite `tests/permissions/github-throwaway.sh` for the app: JWT signed with `openssl`
+   (bash 3.2), identity from the token itself instead of `GET /user` (not expected to work with an
+   installation token: Unconfirmed), tests A1-A12, E1, E2, S1 with their controls. Unit tests that
+   fail first, then codex `code` + `security` + `spend` to CLEAN on draft PR #37.
+2. Handoff: you create the throwaway app (the four permissions, "Only on this account"), install
+   it on the throwaway repo only, generate a key; the handoff stores it and reports the app and
+   installation ids (no secret printed). You also create the second, empty public throwaway repo
+   for A2.
+3. Handoff: allowance gate, `unprotect`, reset, **open phase**: kind-S tests get through, kind-P
+   tests are refused with their controls passing.
+4. Handoff: protect; run again.
+5. Handoff: step 0, then the `main` ruleset; run a third time; all must pass.
+6. S2 runs inside the open phase (step 3): before it, your handoff adds the workflow and the
+   Environment with a dummy value.
+7. Handoff: A4, A5, A9, A9b, E1, E2, E3 (the last one deletes the throwaway app).
+8. **Checkpoint with you.** Stage 2 and every Mac change wait for it. *Undo for stage 1: delete
+   the throwaway app and both throwaway repos.*
 
-   **A failed phase stops the handoff** (the stop rule, section 3): nothing more is changed, and
-   I come back to you.
-   *Changed during the build (stricter, PR #37 review round 1):* the stop is per test, not per
-   phase. The first failed or inconclusive test ends the phase after tidying up its own PR; no
-   later test runs. Within B12 and M4, the first attempt to weaken protection that isn't refused
-   ends the test, so no later attempt is made. Once a phase's tests have started, however the
-   script ends (a pass, a failed test, or an error stop), every test PR still open (title
-   "FRG-26 ") is closed; a PR it can't confirm closed fails the phase and is named for you to
-   close (rounds 2 to 4; the error-stop part is your decision of 2026-10-30, "sweep on every
-   exit").
-   *Changed during the build (your decisions of 2026-10-31, review round 6):*
-   - **A fresh open phase on the final reviewed commit**, with no exception to "do not proceed
-     until verify passes". The 2026-10-20 open phase (commit 4d1741a, ALL PASS) isn't reused: its
-     handoff never verified. Since `protect` has already run, the run starts with `unprotect`,
-     which removes exactly that protection and only from that state, then reset, open, reset,
-     protect.
-   - **The allowance gate is executable and fail-closed:** `ruleset` refuses unless the helper has
-     enough allowance for the phase after it, and an `allowance` step stops a handoff before its
-     first change. (Before, the ruleset could be added and then sit untested.) It checks both the
-     GraphQL and the REST allowance (review round 7).
-   - *Stricter (review round 7):* the protected state is checked in full: every protection setting
-     GitHub returns must be exactly what `protect` applies, so no phase runs on, and `unprotect`
-     never deletes, a protection someone changed.
-   - B13 no longer puts the repo's description back after its attempts (stop rule; a refused helper
-     changed nothing, and after one that got through the repo is left for you to see).
+Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
+protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.
 
-   **How the handoffs run the script:** each step reads it from the reviewed git commit into
-   memory, checks its sha256, and runs that copy in an empty environment. No file can be swapped
-   between the check and the run.
-   *Limitation:* until stage 3 we share one Mac user, so the programs the script calls (`gh` in
-   `/opt/homebrew`) and your gh and git settings stay changeable by me. This is the same-user
-   limit FRG-26 exists to remove (L12, L13).
-7. **Checkpoint with you:** results, any gap (for example B9), and whether to carry on.
-   *Undo for stage 1: delete the throwaway repo; revoke the token.*
+**Stage 2: build and review.** As before, plus the broker, its install/uninstall scripts, and the
+key-file handoff step. You merge (owner-only paths).
 
-**Stage 2: build and review.** Nothing in your environment changes.
-- Install and uninstall scripts for block C (managed settings, hooks, owner-only config).
-- Hooks read owner-only config from the installed copy.
-- Launcher script.
-- The repeatable permissions test script.
-- Conformance updates: block C active, CODEOWNERS valid.
-- `.github/CODEOWNERS` and the owner-only paths entry.
-- The handoff secret-folder change (item 14).
-- Spec 11 updates: L2 and L13 narrowed by what the tests prove; **L12 stays open**; L1 and L4
-  unchanged.
-- `bash tests/run.sh` → `ALL PASS`; codex `code` + `security` rounds to CLEAN.
-- **You merge**, because this touches owner-only paths.
+**Stage 3: the Mac.** As before, plus: create `_forgebroker` (hidden service user; check: not
+admin; undo: delete it), install the broker (asks your Mac password), K1-K4.
 
-**Stage 3: the Mac.** Each step is a handoff, with check and undo.
-1. Create `forge-agent` (standard user). Check: not in `admin`. *Undo: delete the user.*
-2. **Fails-first:** as `forge-agent`, read `~atl/code` → succeeds (the gap exists). It's
-   harmless because nothing runs as `forge-agent` yet.
-3. Home folder `chmod 700` (section 7). Re-run → "Permission denied". *Undo: `chmod 750`.*
-4. **Fails-first** for block C: a `disableAllHooks` setting in `forge-agent`'s own settings
-   switches hooks off. Then install block C (asks your Mac password). Check: Claude Code reports
-   "Enterprise managed settings (file)", and the same setting no longer switches hooks off.
-   *Undo: the uninstall script.*
-5. Set up `forge-agent`:
-   - its own FORGE copy;
-   - the helper token;
-   - Claude Code and codex logins (on your existing plans);
-   - a one-time copy of my memory, `work/` evidence and CONTINUE.md from your copy.
-6. Mac tests as `forge-agent` (items 8, 10, 11, 13, 14) → all refused by macOS.
+**Stage 4: GitHub on FORGE.** You create the real app and install it on FORGE only; the key goes
+only to the broker; you apply the tested `dev` rules and `main` ruleset; S1 on FORGE; live proof:
+the first real PR, one refused attempt (B6) before your approval, then you approve and I merge as
+the app.
 
-**Stage 4: GitHub on FORGE.**
-1. Handoff: invite the helper to FORGE (write); apply the tested `dev` rules and `main` ruleset.
-2. My read-only checks on FORGE: helper permission = `write`, token scopes = `public_repo`,
-   protection and ruleset as tested, Actions approval setting off.
-3. **Live proof:** the first real PR through the new flow. You approve, I merge as the helper.
-   Plus one refused attempt (B6) on that PR before your approval.
+**Stage 5: close.** Done when every item in section 6 (except 12) is enforced and tested, or you've
+accepted it in writing as a known limit. **FRG-27 starts immediately.**
 
-**Stage 5: close.** FRG-26 is done when every item in section 5 (except 12) is enforced and
-tested, or you've accepted it in writing as a known limit. Then **FRG-27 starts immediately**.
-
-## 9. Before any 5:00 credential (D1–D3)
+## 9. Before any 5:00 credential (D1-D3): unchanged in substance
 
 | 5:00 access | Needs these items tested first |
 |---|---|
-| Real business credentials | 7, 8, 10, 11, 13, 14 |
-| Payment access, **test mode included** | the above + 5, 6 |
-| Production deployment access | the above + 1, 2, 3, 4 |
+| Real business credentials | 7, 8, 10, 11, 13, 14, 16 |
+| Payment access, test mode included | the above + 5, 5b, 6 |
+| Production deployment access | the above + 1, 2, 3, 4, 9, 15 |
 
-**Then I show you the remaining accepted risks, and you decide.** Today that list would include
-at least:
-- **L12:** review evidence I can edit, until FRG-27.
-- **L13:** disguised commands, reduced only as far as the tested items reach.
-- **L1:** commands inside script files.
-- **L4:** pasted results saved by me, until FRG-5.
-- Every item still Unconfirmed after the tests.
-- Any deferred findings.
+Then I show you every remaining accepted risk (at least L12, L13, L1, L4, anything still
+Unconfirmed, deferred findings), and you decide.
 
-## 10. Cost and what changes for you
+## 10. What changes for you
 
-- **Money: $0** while repos are public:
-  - the helper account is free (**Confirmed, terms**: one free machine account besides yours);
-  - tokens and Mac users are free;
-  - Claude Code and codex reuse your existing plans with a second login (**Unconfirmed**,
-    checked at login).
-
-  A **private** 5:00 repo would need GitHub Pro for these protections (**Confirmed, docs**).
-  Pro's price isn't on GitHub's own pages; other sites say about $4/month. That's a separate
-  decision, with a token change (`repo`), when 5:00 gets there.
-- **Your time:** roughly 2–3 hours over about 10 handoffs, across stages 1, 3 and 4 (an
-  estimate).
-- **Day to day:**
-  1. You start Claude Code with a launcher script that asks your Mac password.
-  2. You click **Approve** on each PR, instead of running a merge handoff. I then merge.
-  3. Merged changes to hooks or limits take effect only after you run the install script.
-  4. Commits and PRs show the helper account as author.
-  5. The permissions test runs again after any change to accounts or permissions.
-  6. The helper token is renewed every 90 days with a short handoff.
+- **Money:** $0 (section 4.5).
+- **Your time:** about the same number of handoffs as before, plus creating two apps and one extra
+  throwaway repo in your browser.
+- **Day to day:** PRs show the app's bot account as author; you click Approve; I merge as the app;
+  a new key every 90 days with a handoff; the emergency steps in 4.3 need only your browser.
 
 ## 11. Not in this ticket
 
-- **FRG-27:** review isolation (L12).
-- **Claude Code's sandbox:** an optional extra fence later. Anthropic says it isn't a complete
-  boundary.
-- **Private repos, GitHub Pro, the `repo` token scope:** decided when 5:00 needs them.
-- **File Sharing / guest access:** your call, outside FORGE.
+FRG-27 (review isolation, L12); Claude Code's sandbox; private repos / GitHub Pro; File Sharing.
 
-## Sources
+## 12. What this revision changed (2026-11-01)
 
-- [GitHub: collaborator permissions on personal repos](https://docs.github.com/en/account-and-profile/reference/permission-levels-for-a-personal-account-repository)
-- [GitHub: token limits](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
-- [GitHub roadmap #601](https://github.com/github/roadmap/issues/601)
-- [Fine-grained tokens GA changelog](https://github.blog/changelog/2025-03-18-fine-grained-pats-are-now-generally-available/)
-- [Classic token scopes](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps)
-- [gh auth login](https://cli.github.com/manual/gh_auth_login)
-- [Protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)
-- [Ruleset rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
-- [Approving PRs](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/reviewing-changes-in-pull-requests/approving-a-pull-request-with-required-reviews)
-- [Code owners](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners)
-- [GitHub plans](https://docs.github.com/en/get-started/learning-about-github/githubs-plans)
-- [GitHub pricing](https://github.com/pricing)
-- [Mandatory 2FA](https://docs.github.com/en/authentication/securing-your-account-with-two-factor-authentication-2fa/about-mandatory-two-factor-authentication)
-- [GitHub Terms (machine accounts)](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service)
-- [Claude Code managed settings](https://code.claude.com/docs/en/managed-settings)
-- [Claude Code settings reference](https://code.claude.com/docs/en/settings-reference)
-- [Claude Code sandbox](https://code.claude.com/docs/en/sandboxing)
+- Block B: GitHub App instead of the helper account (D4, D9, D10); token broker; items 5b, 15, 16
+  new; item 9 restated (writes and private resources, not public reads).
+- Kind S / kind P tests replace "every test fails first".
+- Stage-1 code on PR #37 changes again; the four frozen stage-1 handoffs and diagnose-7 are
+  superseded and never given out. The helper's restriction no longer blocks stage 1.
+
+## Sources (read 2026-11-01)
+
+Listed in `docs/decisions/2026-11-01-frg26-github-app.md`, plus:
+- https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps
+- https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app
+- https://docs.github.com/en/rest/apps/installations
+- https://docs.github.com/en/rest/apps/apps
+- https://docs.github.com/en/apps/using-github-apps/reviewing-and-modifying-installed-github-apps
+- https://docs.github.com/en/apps/creating-github-apps/about-creating-github-apps/best-practices-for-creating-a-github-app
+- https://docs.github.com/en/rest/actions/secrets
+- https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow
+- https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments
+- https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app
+- https://docs.github.com/en/apps/github-marketplace/selling-your-app-on-github-marketplace/pricing-plans-for-github-marketplace-apps
+- https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/token-expiration-and-revocation
