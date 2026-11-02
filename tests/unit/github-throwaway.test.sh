@@ -1315,4 +1315,514 @@ test_the_helper_commands_are_gone() {
   assert_eq "$(grep -c 'helper.env\|HELPER_TOKEN\|HELPER_LOGIN' "$GT" || true)" "0" "the helper's secrets are still read"
 }
 
+# --- Kind P: forbidden by GitHub from the outset, each with a control (plan section 6) ----------
+
+test_a_permission_test_needs_a_refusal_and_a_working_control() {
+  load
+  FAILS=0
+  local out
+  out="$(record_p A6 refused ok "403"; echo "fails=$FAILS")"
+  assert_contains "$out" "RESULT A6 permissions PASS attempt=refused control=ok"
+  assert_contains "$out" "fails=0"
+  # A refusal whose control failed proves nothing: the request may simply have been malformed.
+  out="$(record_p A6 refused failed "403"; echo "fails=$FAILS")"
+  assert_contains "$out" "RESULT A6 permissions FAIL"
+  out="$(record_p A6 allowed ok "200"; echo "fails=$FAILS")"
+  assert_contains "$out" "RESULT A6 permissions FAIL"
+  out="$(record_p A6 inconclusive ok "HTTP 502"; echo "fails=$FAILS")"
+  assert_contains "$out" "RESULT A6 permissions FAIL"
+  assert_contains "$out" "fails=1"
+}
+
+test_classify_push_perm() {
+  load
+  LAST_RC=1
+  LAST_OUT="remote: Permission to Thebigtuna88/forge-frg26-throwaway-2.git denied to frg26-test-app[bot].
+fatal: unable to access 'https://github.com/Thebigtuna88/forge-frg26-throwaway-2.git/': The requested URL returned error: 403"
+  assert_eq "$(classify_push_perm)" refused "permission denied"
+  LAST_OUT="! [remote rejected] HEAD -> x (refusing to allow a GitHub App to create or update workflow \`.github/workflows/x.yml\` without \`workflows\` permission)"
+  assert_eq "$(classify_push_perm)" refused "the workflows permission"
+  LAST_OUT="fatal: unable to access 'https://github.com/x/': Could not resolve host: github.com"
+  assert_eq "$(classify_push_perm)" inconclusive "a network error"
+  LAST_OUT="remote: error: GH006: Protected branch update failed"
+  assert_eq "$(classify_push_perm)" inconclusive "a protection refusal is not a permission refusal"
+  LAST_RC=0
+  assert_eq "$(classify_push_perm)" allowed
+}
+
+p_stubs() { # app and owner calls are logged; answers come from $T_TMP/answers (pattern|rc|text)
+  load
+  PHASE=permissions
+  FAILS=0
+  RUN_ID=r1
+  APP_ID=123456
+  INSTALLATION_ID=77
+  CLONE="$T_TMP/clone"
+  WORK="$T_TMP/work"
+  mkdir -p "$CLONE" "$WORK"
+  : >"$T_TMP/calls"
+  : >"$T_TMP/answers"
+  answer() { # <who> <args…>
+    local who="$1" line pat rc text
+    shift
+    echo "$who $*" >>"$T_TMP/calls"
+    while IFS='|' read -r pat rc text; do
+      [[ -n "$pat" ]] || continue
+      if [[ "$who $*" == *$pat* ]]; then
+        [[ -n "$text" ]] && printf '%s\n' "$text"
+        return "$rc"
+      fi
+    done <"$T_TMP/answers"
+    return 0
+  }
+  app_gh() { answer app_gh "$@"; }
+  app_git() { answer app_git "$@"; }
+  owner_gh() { answer owner_gh "$@"; }
+  fresh_from() { :; }
+  add_commit() { echo "commit $1" >>"$T_TMP/calls"; }
+  sleep() { :; }
+}
+
+test_a2_tries_a_repo_the_app_is_not_installed_on() {
+  p_stubs
+  cat >"$T_TMP/answers" <<EOF
+app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot].
+app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)
+app_gh api -X POST repos/$REPO/issues|0|{"number":5}
+app_gh api -X POST repos/$REPO/pulls|0|{"number":6}
+EOF
+  local out
+  out="$(t_A2)"
+  assert_contains "$out" "RESULT A2 permissions PASS attempt=refused control=ok"
+  local calls
+  calls="$(cat "$T_TMP/calls")"
+  assert_contains "$calls" "app_git -C $T_TMP/clone push https://github.com/$REPO2.git HEAD:refs/heads/frg26-a2-r1"
+  assert_contains "$calls" "app_gh api -X POST repos/$REPO2/issues"
+  assert_contains "$calls" "app_gh api -X POST repos/$REPO2/pulls"
+  assert_contains "$calls" "app_git -C $T_TMP/clone push origin HEAD:refs/heads/frg26/permissions/A2-r1"
+  assert_contains "$calls" "app_gh api -X POST repos/$REPO/issues"
+  assert_contains "$calls" "app_gh api -X POST repos/$REPO/pulls"
+  # A write that got through to the other repo fails the test, and nothing more is tried there.
+  cat >"$T_TMP/answers" <<EOF
+app_git -C $T_TMP/clone push https://github.com/$REPO2.git|0|
+EOF
+  : >"$T_TMP/calls"
+  out="$(t_A2)"
+  assert_contains "$out" "RESULT A2 permissions FAIL attempt=allowed"
+  assert_not_contains "$(cat "$T_TMP/calls")" "repos/$REPO2/issues" "attempts after one got through"
+}
+
+test_a3_pushes_a_workflow_file_and_a_plain_file() {
+  p_stubs
+  cat >"$T_TMP/answers" <<'EOF'
+push origin HEAD:refs/heads/frg26/permissions/A3-wf-r1|1|! [remote rejected] HEAD -> frg26/permissions/A3-wf-r1 (refusing to allow a GitHub App to create or update workflow `.github/workflows/frg26-a3-r1.yml` without `workflows` permission)
+EOF
+  local out
+  out="$(t_A3)"
+  assert_contains "$out" "RESULT A3 permissions PASS attempt=refused control=ok"
+  assert_contains "$(cat "$T_TMP/calls")" "commit .github/workflows/frg26-a3-r1.yml"
+  assert_contains "$(cat "$T_TMP/calls")" "commit tests/permissions-A3-r1.txt"
+  # The plain file must push, or the refusal proves nothing.
+  cat >"$T_TMP/answers" <<'EOF'
+push origin HEAD:refs/heads/frg26/permissions/A3-wf-r1|1|! [remote rejected] (refusing to allow a GitHub App to create or update workflow `x` without `workflows` permission)
+push origin HEAD:refs/heads/frg26/permissions/A3-plain-r1|1|fatal: unable to access: Could not resolve host
+EOF
+  out="$(t_A3)"
+  assert_contains "$out" "RESULT A3 permissions FAIL attempt=refused control=failed"
+}
+
+test_a5_a_revoked_token_stops_working() {
+  p_stubs
+  TOKEN="$(fake_token)"
+  local session="$TOKEN"
+  mint_token() { TOKEN="ghs_second$(printf 'Q%.0s' $(seq 1 30))"; }
+  revoke_token() { echo "revoke ${TOKEN:0:10}" >>"$T_TMP/calls"; REVOKED_TOKENS="$REVOKED_TOKENS $TOKEN"; TOKEN=""; }
+  app_gh() {
+    echo "app_gh ${TOKEN:0:10} $*" >>"$T_TMP/calls"
+    if [[ " $REVOKED_TOKENS " == *" $TOKEN "* ]]; then echo "gh: Bad credentials (HTTP 401)" >&2; return 1; fi
+    echo "$REPO"
+  }
+  local out
+  out="$(t_A5)"
+  assert_contains "$out" "RESULT A5 permissions PASS attempt=refused control=ok"
+  assert_eq "$(cat "$T_TMP/calls")" "app_gh ghs_second api repos/$REPO --jq .full_name
+revoke ghs_second
+app_gh ghs_second api repos/$REPO --jq .full_name"
+  t_A5 >/dev/null
+  assert_eq "$TOKEN" "$session" "the session token after A5"
+}
+
+test_a6_tries_settings_and_its_own_installation() {
+  p_stubs
+  cat >"$T_TMP/answers" <<EOF
+owner_gh api repos/$REPO --jq .id|0|4242
+app_gh api -X PATCH repos/$REPO|1|gh: Resource not accessible by integration (HTTP 403)
+app_gh api -X PUT user/installations/77/repositories/4242|1|gh: Resource not accessible by integration (HTTP 403)
+EOF
+  local out
+  out="$(t_A6)"
+  assert_contains "$out" "RESULT A6 permissions PASS attempt=refused control=ok"
+  local calls
+  calls="$(cat "$T_TMP/calls")"
+  # The control is the owner making the very same write, a no-op: the description it already has.
+  assert_contains "$calls" "app_gh api -X PATCH repos/$REPO -f description=$MARKER"
+  assert_contains "$calls" "owner_gh api -X PATCH repos/$REPO -f description=$MARKER"
+  assert_contains "$calls" "app_gh api -X PUT user/installations/77/repositories/4242"
+}
+
+test_a8_tries_secrets_variables_keys_hooks_and_collaborators() {
+  p_stubs
+  cat >"$T_TMP/answers" <<EOF
+app_gh api|1|gh: Resource not accessible by integration (HTTP 403)
+EOF
+  local out calls p
+  out="$(t_A8)"
+  assert_contains "$out" "RESULT A8 permissions PASS attempt=refused control=ok"
+  calls="$(cat "$T_TMP/calls")"
+  for p in actions/secrets actions/secrets/public-key actions/variables keys hooks; do
+    assert_contains "$calls" "app_gh api repos/$REPO/$p"
+  done
+  assert_contains "$calls" "app_gh api -X PUT repos/$REPO/collaborators/$OWNER -f permission=push"
+  for p in actions/secrets actions/variables keys hooks; do
+    assert_contains "$calls" "owner_gh api repos/$REPO/$p"
+  done
+  assert_not_contains "$calls" "owner_gh api -X" "the control writes"
+}
+
+test_s1_reads_secrets_and_the_workflow_token() {
+  p_stubs
+  cat >"$T_TMP/answers" <<EOF
+owner_gh api repos/$REPO/actions/secrets --jq .total_count|0|0
+owner_gh api repos/$REPO/actions/permissions/workflow --jq .default_workflow_permissions|0|read
+owner_gh api repos/$REPO/actions/permissions/workflow --jq .can_approve_pull_request_reviews|0|false
+EOF
+  local out
+  out="$(t_S1; echo "fails=$FAILS")"
+  assert_contains "$out" "RESULT S1 permissions PASS"
+  printf 'owner_gh api repos/%s/actions/permissions/workflow --jq .default_workflow_permissions|0|write\n' "$REPO" >"$T_TMP/a2"
+  cat "$T_TMP/answers" >>"$T_TMP/a2"
+  mv "$T_TMP/a2" "$T_TMP/answers"
+  out="$(t_S1; echo "fails=$FAILS")"
+  assert_contains "$out" "RESULT S1 permissions FAIL"
+  assert_contains "$out" "fails=1"
+}
+
+test_permission_tests_stop_at_the_first_failure() {
+  load
+  need_owner() { :; }
+  assert_throwaway() { :; }
+  assert_second() { :; }
+  app_session() { :; }
+  need_allowance() { :; }
+  app_git() { :; }
+  app_rate() { return 1; }
+  owner_gh() { :; }
+  WORK="$T_TMP/work"
+  mkdir -p "$WORK"
+  local id
+  for id in $P_TEST_ORDER; do eval "t_$id() { echo \"RAN $id\"; record_p $id refused ok stand-in; }"; done
+  local out rc=0
+  out="$(cmd_ptests 2>&1)" || rc=$?
+  assert_exit 0 "$rc"
+  for id in $P_TEST_ORDER; do assert_contains "$out" "RAN $id"; done
+  assert_contains "$out" "PERMISSION TESTS: ALL PASS"
+  t_A3() { echo "RAN A3"; record_p A3 allowed ok stand-in; }
+  rc=0; out="$(cmd_ptests 2>&1)" || rc=$?
+  assert_exit 1 "$rc"
+  assert_contains "$out" "STOPPED after A3"
+  assert_not_contains "$out" "RAN A2" "a test after the failure"
+}
+
+test_permission_tests_cover_the_plan() {
+  load
+  assert_eq "$P_TEST_ORDER" "S1 A6 A8 A5 A3 A2 A11 A12"
+  local id
+  for id in $P_TEST_ORDER; do assert_eq "$(type -t "t_$id")" function "t_$id"; done
+}
+
+test_a11_and_a12_are_readings_not_results() {
+  p_stubs
+  printf 'app_gh api repos/%s/commits/main/check-runs|1|gh: Resource not accessible by integration (HTTP 403)\n' "$REPO" >"$T_TMP/answers"
+  local out
+  out="$(t_A11; echo "fails=$FAILS")"
+  assert_contains "$out" "READING A11 check-runs: HTTP 403"
+  assert_contains "$out" "READING A11 status: allowed"
+  assert_contains "$out" "fails=0"
+  out="$(t_A12; echo "fails=$FAILS")"
+  assert_contains "$out" "READING A12 gh issue create: works"
+  assert_contains "$out" "READING A12 gh run list: works"
+  assert_contains "$out" "fails=0"
+}
+
+test_assert_second_refuses_another_repo() {
+  load
+  owner_gh() { printf '%s\t%s\t%s\tfalse\n' "$REPO2" "$OWNER" "something else"; }
+  local rc=0
+  (assert_second) >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc" "another description"
+  owner_gh() { printf '%s\t%s\t%s\tfalse\n' "$REPO2" "$OWNER" "$MARKER2"; }
+  rc=0; (assert_second) || rc=$?
+  assert_exit 0 "$rc" "the second throwaway"
+}
+
+test_a_permission_run_closes_its_test_issues() {
+  load
+  owner_gh() {
+    echo "$*" >>"$T_TMP/owner"
+    case "$*" in
+      *"/issues?state=open"*) printf '11\n12\n' ;;
+    esac
+  }
+  : >"$T_TMP/owner"
+  FAILS=0
+  sweep_issues
+  assert_contains "$(cat "$T_TMP/owner")" "issue close 11 --repo $REPO"
+  assert_contains "$(cat "$T_TMP/owner")" "issue close 12 --repo $REPO"
+  assert_contains "$(cat "$T_TMP/owner")" "repos/$REPO2/issues?state=open"
+}
+
+# --- S2: the Environment (plan 4.4) ----------------------------------------------------------
+
+# shellcheck disable=SC2016 # the workflow's own text, searched for literally
+test_s2_workflow_prints_only_the_values_length() {
+  load
+  local wf
+  wf="$(s2_workflow)"
+  assert_contains "$wf" 'environment: frg26-test'
+  assert_contains "$wf" 'echo "FRG26-S2 value length ${#V}"'
+  assert_contains "$wf" 'permissions: {}'
+  assert_not_contains "$wf" 'echo "$V"' "the value itself is printed"
+  assert_eq "$(grep -c 'secrets\.' <<<"$wf")" 1 "secrets the workflow reads"
+}
+
+test_env_setup_makes_exactly_the_environment_the_plan_names() {
+  owner_cmd_stubs
+  verify_phase() { :; }
+  owner_uid() { echo 42; }
+  env_summary() { want_env; }
+  local rc=0
+  cmd_env_setup >/dev/null 2>&1 || rc=$?
+  assert_exit 0 "$rc"
+  assert_eq "$(jq -S -c . "$WORK/env.json")" '{"deployment_branch_policy":{"custom_branch_policies":true,"protected_branches":false},"prevent_self_review":true,"reviewers":[{"id":42,"type":"User"}],"wait_timer":0}'
+  assert_contains "$(cat "$T_TMP/owner")" "api -X PUT repos/$REPO/environments/frg26-test --input $WORK/env.json"
+  assert_contains "$(cat "$T_TMP/owner")" "secret set FRG26_DUMMY --env frg26-test --repo $REPO --body frg26-dummy-not-a-secret"
+  env_summary() { echo "false User:$OWNER false true branch:main"; }
+  rc=0; (cmd_env_setup) >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc" "an Environment that lets the owner approve their own run"
+}
+
+s2_stubs() {
+  p_stubs
+  eid=9
+  env_id() { echo 9; }
+  run_log_has_value() { [[ "$(cat "$T_TMP/log-$1" 2>/dev/null)" == yes ]]; }
+  wait_run() { RUN="$(cat "$T_TMP/run-$1" 2>/dev/null)"; [[ -n "$RUN" ]]; }
+  approve_run() { echo "approve $1 $2" >>"$T_TMP/calls"; LAST_RC=0; LAST_OUT=ok
+    if [[ -f "$T_TMP/refuse-$1-$2" ]]; then LAST_RC=1; LAST_OUT="$(cat "$T_TMP/refuse-$1-$2")"; return 1; fi; }
+  cancel_waiting_runs() { :; }
+}
+
+test_s2b_the_app_cannot_approve_its_own_deployment() {
+  s2_stubs
+  app_git() { echo "app_git $*" >>"$T_TMP/calls"; [[ "$*" == *rev-parse* ]] && printf 'a%.0s' $(seq 1 40) && echo; return 0; }
+  local sha
+  sha="$(printf 'a%.0s' $(seq 1 40))"
+  echo "501 waiting null frg26-test-app[bot]" >"$T_TMP/run-$sha"
+  echo "gh: Resource not accessible by integration (HTTP 403)" >"$T_TMP/refuse-app_gh-501"
+  echo yes >"$T_TMP/log-501"
+  local out
+  out="$(t_S2b)"
+  assert_contains "$out" "RESULT S2b permissions PASS attempt=refused control=ok"
+  assert_contains "$(cat "$T_TMP/calls")" "approve app_gh 501"
+  assert_contains "$(cat "$T_TMP/calls")" "approve owner_gh 501"
+  assert_contains "$(cat "$T_TMP/calls")" "app_git -C $T_TMP/clone push origin HEAD:refs/heads/main"
+  # The control fails when the job never got the value after the owner's approval.
+  rm -f "$T_TMP/log-501"
+  out="$(t_S2b)"
+  assert_contains "$out" "RESULT S2b permissions FAIL attempt=refused control=failed"
+  # The app approving its own run is a FAIL however the rest goes.
+  rm -f "$T_TMP/refuse-app_gh-501"
+  out="$(t_S2b)"
+  assert_contains "$out" "RESULT S2b permissions FAIL attempt=allowed"
+}
+
+test_s2d_self_review_is_refused_and_its_control_is_s2b() {
+  s2_stubs
+  S2_OWNER_SHA="$(printf 'b%.0s' $(seq 1 40))"
+  echo "502 waiting null Thebigtuna88" >"$T_TMP/run-$S2_OWNER_SHA"
+  echo "gh: Can't approve your own deployment (HTTP 422)" >"$T_TMP/refuse-owner_gh-502"
+  local out
+  S2B_OWNER_APPROVAL=ok
+  out="$(t_S2d)"
+  assert_contains "$out" "RESULT S2d permissions PASS attempt=refused control=ok"
+  S2B_OWNER_APPROVAL=""
+  out="$(t_S2d)"
+  assert_contains "$out" "RESULT S2d permissions FAIL" "no S2b control"
+}
+
+test_s2a_a_feature_branch_never_gets_the_value() {
+  s2_stubs
+  app_git() { [[ "$*" == *rev-parse* ]] && printf 'c%.0s' $(seq 1 40) && echo; return 0; }
+  local sha
+  sha="$(printf 'c%.0s' $(seq 1 40))"
+  echo "503 completed failure frg26-test-app[bot]" >"$T_TMP/run-$sha"
+  local out
+  out="$(t_S2a)"
+  assert_contains "$out" "RESULT S2a permissions PASS attempt=refused"
+  echo "503 waiting null frg26-test-app[bot]" >"$T_TMP/run-$sha"
+  out="$(t_S2a)"
+  assert_contains "$out" "RESULT S2a permissions FAIL attempt=allowed" "a feature branch waiting to deploy"
+  echo "503 completed success frg26-test-app[bot]" >"$T_TMP/run-$sha"
+  echo yes >"$T_TMP/log-503"
+  out="$(t_S2a)"
+  assert_contains "$out" "RESULT S2a permissions FAIL attempt=allowed" "a feature branch that got the value"
+}
+
+test_s2c_the_app_cannot_change_the_environment() {
+  s2_stubs
+  WORK="$T_TMP/work"
+  printf 'app_gh api|1|gh: Resource not accessible by integration (HTTP 403)\n' >"$T_TMP/answers"
+  env_summary() { want_env; }
+  local out
+  out="$(t_S2c)"
+  assert_contains "$out" "RESULT S2c permissions PASS attempt=refused control=ok"
+  assert_contains "$(cat "$T_TMP/calls")" "app_gh api -X PUT repos/$REPO/environments/frg26-test"
+  assert_contains "$(cat "$T_TMP/calls")" "app_gh api -X DELETE repos/$REPO/environments/frg26-test/secrets/FRG26_DUMMY"
+}
+
+test_environment_tests_cover_the_plan() {
+  load
+  assert_eq "$S2_TEST_ORDER" "S2b S2d S2a S2c"
+  local id
+  for id in $S2_TEST_ORDER; do assert_eq "$(type -t "t_$id")" function "t_$id"; done
+}
+
+# --- Held tokens and revocation (plan 4.3) -----------------------------------------------------
+
+held_stubs() {
+  load
+  app_files 123456
+  SECRETS="$FRG26_SECRETS" APP_KEY="$FRG26_APP_KEY"
+  HELD="$T_TMP/held-tokens.env"
+  HELD_TIMES="$T_TMP/held-times"
+  STATE="$T_TMP/frg26-state"
+  WORK="$T_TMP/work"
+  mkdir -p "$WORK"
+  need_owner() { :; }
+  assert_throwaway() { :; }
+  : >"$T_TMP/calls"
+}
+
+test_a_held_token_is_kept_private_and_used_once() {
+  held_stubs
+  app_session() { TOKEN="ghs_session$(printf 'S%.0s' $(seq 1 30))"; }
+  mint_token() { TOKEN="$(fake_token)"; }
+  local out
+  out="$(cmd_hold_token age 2>&1)"
+  assert_not_contains "$out" "$(fake_token)" "the held token printed"
+  assert_file_mode "$HELD" 600
+  assert_file_mode "$HELD_TIMES" 600
+  assert_eq "$(cat "$HELD")" "HELD_AGE=$(fake_token)" "held tokens are VAR=value lines (ho_redact_file can hide them)"
+  assert_contains "$(cat "$HELD_TIMES")" "age "
+  assert_not_contains "$(cat "$HELD_TIMES")" "ghs_" "a token beside the issue times"
+  app_gh() { echo "$REPO"; }
+  revoke_token() { echo "revoke" >>"$T_TMP/calls"; TOKEN=""; }
+  use_held age
+  assert_eq "$HELD_RESULT" works
+  assert_eq "$(cat "$T_TMP/calls")" "revoke" "a held token that still works is revoked after its check"
+  assert_eq "$(grep -c '^HELD_AGE=' "$HELD")" 0 "the held token is removed after its check"
+  assert_eq "$(grep -c '^age ' "$HELD_TIMES")" 0 "its issue time is removed too"
+  local rc=0
+  (cmd_hold_token nonsense) >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc" "an unknown held-token name"
+}
+
+test_a4_needs_a_token_over_an_hour_old() {
+  held_stubs
+  printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"; printf 'age %s\n' "$(( $(date +%s) - 600 ))" >"$HELD_TIMES"
+  chmod 600 "$HELD" "$HELD_TIMES"
+  local rc=0 out
+  out="$(cmd_token_age_check 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a token ten minutes old"
+  assert_contains "$out" "not over an hour old yet"
+  printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"; printf 'age %s\n' "$(( $(date +%s) - 3700 ))" >"$HELD_TIMES"
+  app_session() { TOKEN="ghs_session$(printf 'S%.0s' $(seq 1 30))"; }
+  app_gh() { if [[ "$TOKEN" == ghs_session* ]]; then echo "$REPO"; else echo "gh: Bad credentials (HTTP 401)" >&2; return 1; fi; }
+  rc=0; out="$(cmd_token_age_check 2>&1)" || rc=$?
+  assert_exit 0 "$rc"
+  assert_contains "$out" "RESULT A4 permissions PASS attempt=refused control=ok"
+}
+
+test_a9_the_deleted_keys_jwt_is_refused_and_the_new_keys_works() {
+  held_stubs
+  openssl genrsa -out "$T_TMP/app-new.pem" 2048 2>/dev/null
+  chmod 600 "$T_TMP/app-new.pem"
+  local old_key="$APP_KEY"
+  jwt_call() {
+    if [[ "$APP_KEY_SIGNED" == "$old_key" ]]; then LAST_HTTP=401; LAST_OUT='{"message":"A JSON web token could not be decoded"}'; return 1; fi
+    LAST_HTTP=200; LAST_OUT='{"id":123456}'
+  }
+  make_jwt() { APP_KEY_SIGNED="$APP_KEY"; JWT=x; }
+  need_app_identity() { :; }
+  printf 'HELD_KEYOLD=%s\n' "$(fake_token)" >"$HELD"; printf 'keyold %s\n' "$(date +%s)" >"$HELD_TIMES"
+  chmod 600 "$HELD" "$HELD_TIMES"
+  app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  local out rc=0
+  out="$(cmd_key_check 2>&1)" || rc=$?
+  assert_exit 0 "$rc"
+  assert_contains "$out" "RESULT A9 permissions PASS attempt=refused control=ok"
+  assert_contains "$out" "READING A9b a token issued before the key was deleted"
+  assert_contains "$out" "HTTP 401"
+  [[ -f "$T_TMP/app.pem" && ! -f "$T_TMP/app-new.pem" ]] || _t_fail "the new key did not become app.pem"
+}
+
+test_e1_records_the_suspension_and_needs_the_control() {
+  held_stubs
+  jwt_call() {
+    case "$1 $2" in
+      "GET app/installations"*) LAST_HTTP=200; LAST_OUT='[{"id":77,"account":{"login":"Thebigtuna88"},"suspended_at":"2026-11-02T00:00:00Z"}]' ;;
+      "POST app/installations/77/access_tokens") LAST_HTTP=403; LAST_OUT='{"message":"This installation has been suspended"}'; return 1 ;;
+    esac
+  }
+  make_jwt() { JWT=x; }
+  printf 'HELD_SUSPEND=%s\n' "$(fake_token)" >"$HELD"; printf 'suspend %s\n' "$(date +%s)" >"$HELD_TIMES"
+  chmod 600 "$HELD" "$HELD_TIMES"
+  app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  local out
+  out="$(cmd_suspend_check 2>&1)"
+  assert_contains "$out" "E1 a new token while suspended: refused"
+  assert_contains "$out" "READING E1 a token issued before the suspension"
+  assert_eq "$(state_get E1)" "refused HTTP-403"
+  app_session() { :; }
+  local rc=0
+  out="$(cmd_unsuspend_check 2>&1)" || rc=$?
+  assert_exit 0 "$rc"
+  assert_contains "$out" "RESULT E1 permissions PASS attempt=refused control=ok"
+  app_session() { die "the app's installation is suspended"; }
+  rc=0; out="$(cmd_unsuspend_check 2>&1)" || rc=$?
+  assert_exit 1 "$rc" "no control after unsuspending"
+  assert_contains "$out" "RESULT E1 permissions FAIL"
+}
+
+test_e2_and_e3_record_what_issued_tokens_do() {
+  held_stubs
+  make_jwt() { JWT=x; }
+  jwt_call() {
+    case "$1 $2" in
+      "GET app/installations"*) LAST_HTTP=200; LAST_OUT='[]' ;;
+      "GET app") LAST_HTTP=404; LAST_OUT='{"message":"Integration not found"}'; return 1 ;;
+    esac
+  }
+  printf 'HELD_UNINSTALL=%s\nHELD_DELETE=%s\n' "$(fake_token)" "$(fake_token)" >"$HELD"
+  printf 'uninstall %s\ndelete %s\n' "$(date +%s)" "$(date +%s)" >"$HELD_TIMES"
+  chmod 600 "$HELD" "$HELD_TIMES"
+  app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  local out
+  out="$(cmd_uninstall_check 2>&1)"
+  assert_contains "$out" "READING E2 a token issued before the uninstall: HTTP 401"
+  out="$(cmd_delete_check 2>&1)"
+  assert_contains "$out" "READING E3 a token issued before the app was deleted: HTTP 401"
+  assert_contains "$out" "the app's own key now gets HTTP 404"
+}
+
 run_tests

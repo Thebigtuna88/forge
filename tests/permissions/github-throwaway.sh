@@ -18,7 +18,20 @@
 #   github-throwaway.sh unprotect         owner: remove exactly that protection (protected state only)
 #   github-throwaway.sh ruleset           owner: add the main ruleset (only the owner may bypass);
 #                                         first checks the app has enough allowance
-#   github-throwaway.sh tests <phase>     run the bypass tests; phase = open | protected | ruleset
+#   github-throwaway.sh tests <phase>     run the bypass tests (kind S); phase = open | protected | ruleset
+#   github-throwaway.sh create-second     owner: the second public throwaway, app not installed (A2)
+#   github-throwaway.sh ptests            the permission tests (kind P, each with a control):
+#                                         S1 A6 A8 A5 A3 A2, and the readings A11 A12
+#   github-throwaway.sh env-setup         owner: the Environment frg26-test, a dummy value (S2)
+#   github-throwaway.sh env-tests         S2b S2d S2a S2c, in the open phase (then reset)
+#   github-throwaway.sh hold-token <name> keep a token for a later check: age keyold suspend
+#                                         uninstall delete (plan 4.3)
+#   github-throwaway.sh token-age-check   A4: a token over an hour old is refused
+#   github-throwaway.sh key-check         A9, A9b: after the old key was deleted in the browser
+#   github-throwaway.sh suspend-check     E1 (first half): while the installation is suspended
+#   github-throwaway.sh unsuspend-check   E1 (verdict): a new token works again after unsuspending
+#   github-throwaway.sh uninstall-check   E2: after the app was uninstalled
+#   github-throwaway.sh delete-check      E3: after the app was deleted
 #   github-throwaway.sh actions-setting   B15: "Allow GitHub Actions to approve PRs" must be off
 #   github-throwaway.sh status            print the repo's protection and rulesets (read-only)
 #
@@ -38,6 +51,11 @@ readonly OWNER=Thebigtuna88
 readonly REPO_NAME=forge-frg26-throwaway
 readonly REPO="$OWNER/$REPO_NAME"
 readonly MARKER="FRG-26 throwaway: permission tests. Safe to delete."
+# A second public throwaway the app is NOT installed on (test A2), with one branch for a PR attempt.
+readonly REPO2_NAME=forge-frg26-throwaway-2
+readonly REPO2="$OWNER/$REPO2_NAME"
+readonly MARKER2="FRG-26 throwaway 2: the app is not installed here (test A2). Safe to delete."
+readonly A2_BRANCH=frg26-a2
 readonly BASELINE_TAG=frg26-baseline
 # The default branch is side, not dev as in FORGE, so that deleting dev can be tested (GitHub
 # never deletes a default branch, protected or not).
@@ -58,6 +76,7 @@ INSTALLATION_ID=""
 JWT=""
 TOKEN=""
 REVOKED_TOKENS=""
+REDACT_ONLY="" # tokens held for a later check: hidden like the others, never revoked by this run
 LAST_HTTP=""
 WORK=""
 CLONE=""
@@ -76,7 +95,7 @@ die() {
 
 redact() { # <text> — no token or JWT ever reaches the screen or a log
   local s="$1" t
-  for t in $TOKEN $REVOKED_TOKENS $JWT; do s="${s//"$t"/[REDACTED]}"; done
+  for t in $TOKEN $REVOKED_TOKENS $REDACT_ONLY $JWT; do s="${s//"$t"/[REDACTED]}"; done
   printf '%s' "$s"
 }
 
@@ -343,6 +362,14 @@ assert_throwaway() {
     || die "$REPO is not the public throwaway repo this script created (description must be: $MARKER)"
 }
 
+assert_second() { # writes to the second throwaway are attempts only, and only there
+  local info
+  info="$(owner_gh api "repos/$REPO2" --jq '[.full_name, .owner.login, .description, (.private|tostring)] | @tsv' 2>/dev/null)" \
+    || die "can't read $REPO2"
+  [[ "$info" == "$REPO2"$'\t'"$OWNER"$'\t'"$MARKER2"$'\t'false ]] \
+    || die "$REPO2 is not the public second throwaway this script created (description must be: $MARKER2)"
+}
+
 make_work() {
   WORK="$(mktemp -d "/private/tmp/frg26.XXXXXX")" || die "mktemp failed"
   chmod 700 "$WORK" || die "chmod failed"
@@ -473,6 +500,29 @@ cmd_create() {
   owner_gh api -X POST "repos/$REPO/git/refs" -f ref="refs/tags/$BASELINE_TAG" -f sha="$sha" >/dev/null || die "creating the baseline tag failed"
   repo_settings
   say "created $REPO (public), baseline $sha, branches main dev side, default $DEFAULT_BRANCH"
+}
+
+# The second throwaway (test A2): public, the app not installed, one branch to open a PR from.
+cmd_create_second() {
+  need_owner
+  if owner_gh api "repos/$REPO2" >/dev/null 2>&1; then
+    die "$REPO2 already exists; delete it in the browser first if you want a fresh one"
+  fi
+  owner_gh repo create "$REPO2" --public --description "$MARKER2" --add-readme >/dev/null || die "gh repo create failed"
+  assert_second
+  local first sha
+  first="$(owner_gh api "repos/$REPO2" --jq .default_branch)" || die "can't read the first branch's name"
+  if [[ "$first" != main ]]; then
+    owner_gh api -X POST "repos/$REPO2/branches/$first/rename" -f new_name=main >/dev/null \
+      || die "renaming the first branch '$first' to main failed"
+  fi
+  sha="$(owner_gh api "repos/$REPO2/branches/main" --jq .commit.sha)" || die "can't read main"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "unexpected main sha"
+  owner_gh api -X PUT "repos/$REPO2/contents/a2.txt" -f message="FRG-26 A2 branch" \
+    -f content="$(printf 'FRG-26 A2\n' | base64 | tr -d '\n')" -f branch=main >/dev/null || die "adding a2.txt failed"
+  sha="$(owner_gh api "repos/$REPO2/branches/main" --jq .commit.sha)" || die "can't read main"
+  owner_gh api -X POST "repos/$REPO2/git/refs" -f ref="refs/heads/$A2_BRANCH" -f sha="$sha" >/dev/null || die "creating $A2_BRANCH failed"
+  say "created $REPO2 (public; the app is not installed here), branch $A2_BRANCH"
 }
 
 repo_settings() {
@@ -1216,6 +1266,662 @@ t_M6() { # the owner merges dev into main
   close_if_open "$pr"
 }
 
+# --- Kind P: permission tests (plan section 6, revised 2026-11-01) -----------------------------
+# GitHub forbids these from the outset, so they can't "get through first". Each attempt must be
+# refused for a permission reason, and its control must succeed: the same request made by a
+# credential that may make it (a no-op where it writes), or the nearest action the app may take.
+# A refusal with a failed control proves nothing (the request may have been malformed): a FAIL.
+
+readonly P_TEST_ORDER="S1 A6 A8 A5 A3 A2 A11 A12"
+
+record_p() { # <id> <attempt allowed|refused|inconclusive> <control ok|failed> <evidence>
+  local verdict=PASS
+  if [[ "$2" != refused || "$3" != ok ]]; then
+    verdict=FAIL
+    FAILS=$((FAILS + 1))
+  fi
+  say "RESULT $1 permissions $verdict attempt=$2 control=$3 :: $4"
+}
+
+reading() { # <id> <text> — a finding for the owner, never a pass or a fail (A11, A12)
+  say "READING $1 $2"
+}
+
+classify_push_perm() { # after capture of an app git push: refused only for a permission reason
+  if [[ $LAST_RC -eq 0 ]]; then echo allowed; return; fi
+  # shellcheck disable=SC2016 # the backticks are GitHub's own words, not a command
+  if printf '%s' "$LAST_OUT" | grep -Eiq 'Permission to [^ ]+ denied|Write access to repository not granted|without `workflows` permission'; then
+    echo refused
+  else
+    echo inconclusive
+  fi
+}
+
+http_of() { # the HTTP status gh reported in LAST_OUT, or "allowed" after a success
+  if [[ $LAST_RC -eq 0 ]]; then echo allowed; return; fi
+  printf '%s' "$LAST_OUT" | grep -Eo 'HTTP [0-9]{3}' | tail -n 1 || echo "failed: $(evidence)"
+}
+
+# Attempts, in order; the first one not refused ends the list (the stop rule). Sets OBS and EV.
+p_attempts() { # <kind api|push> <args…> separated by ";;"
+  local kind="$1" c
+  shift
+  OBS=refused EV=""
+  while [[ $# -gt 0 && "$OBS" == refused ]]; do
+    c=()
+    while [[ $# -gt 0 && "$1" != ";;" ]]; do c+=("$1"); shift; done
+    [[ $# -gt 0 ]] && shift
+    capture "${c[@]}" || true
+    if [[ "$kind" == push ]]; then OBS="$(classify_push_perm)"; else OBS="$(classify_api)"; fi
+    EV="$EV ${c[*]:0:4}: $(evidence) |"
+  done
+}
+
+# Controls, all of which must succeed. Sets CTL (ok|failed) and adds to EV.
+p_controls() { # <args…> separated by ";;"
+  local c
+  CTL=ok
+  while [[ $# -gt 0 ]]; do
+    c=()
+    while [[ $# -gt 0 && "$1" != ";;" ]]; do c+=("$1"); shift; done
+    [[ $# -gt 0 ]] && shift
+    if ! capture "${c[@]}"; then CTL=failed; EV="$EV control ${c[*]:0:4}: $(evidence) |"; fi
+  done
+}
+
+# S1 (plan 4.4): read-only, as the owner: no repository secrets; the workflow token reads only;
+# Actions may not approve PRs.
+t_S1() {
+  local n d a
+  n="$(owner_gh api "repos/$REPO/actions/secrets" --jq .total_count 2>/dev/null)" || n=error
+  d="$(owner_gh api "repos/$REPO/actions/permissions/workflow" --jq .default_workflow_permissions 2>/dev/null)" || d=error
+  a="$(owner_gh api "repos/$REPO/actions/permissions/workflow" --jq .can_approve_pull_request_reviews 2>/dev/null)" || a=error
+  if [[ "$n" == 0 && "$d" == read && "$a" == false ]]; then
+    say "RESULT S1 permissions PASS :: repository secrets $n, workflow token $d, Actions may approve PRs: $a"
+  else
+    FAILS=$((FAILS + 1))
+    say "RESULT S1 permissions FAIL :: repository secrets $n (want 0), workflow token $d (want read), Actions may approve PRs: $a (want false)"
+  fi
+}
+
+# A6: the repository's settings (a no-op write: the description it already has) and the app's own
+# installation (adding the repository it already has). Control: the owner's same no-op write.
+t_A6() {
+  local rid
+  rid="$(owner_gh api "repos/$REPO" --jq .id 2>/dev/null)" || rid=""
+  [[ "$rid" =~ ^[0-9]+$ ]] || { setup_fail_p A6 "could not read the repository id"; return; }
+  p_attempts api app_gh api -X PATCH "repos/$REPO" -f description="$MARKER" ";;" \
+    app_gh api -X PUT "user/installations/$INSTALLATION_ID/repositories/$rid"
+  [[ "$OBS" == refused ]] || { record_p A6 "$OBS" "not run" "$EV"; return; }
+  p_controls owner_gh api -X PATCH "repos/$REPO" -f description="$MARKER"
+  record_p A6 "$OBS" "$CTL" "$EV (the installation attempt has no control: only the owner's browser changes it)"
+}
+
+# A8: managing secrets, variables, deploy keys, webhooks, collaborators. Control: the owner reads
+# the same lists (no secret is created, nothing is written).
+t_A8() {
+  p_attempts api app_gh api "repos/$REPO/actions/secrets" ";;" \
+    app_gh api "repos/$REPO/actions/secrets/public-key" ";;" \
+    app_gh api "repos/$REPO/actions/variables" ";;" \
+    app_gh api "repos/$REPO/keys" ";;" \
+    app_gh api "repos/$REPO/hooks" ";;" \
+    app_gh api -X PUT "repos/$REPO/collaborators/$OWNER" -f permission=push
+  [[ "$OBS" == refused ]] || { record_p A8 "$OBS" "not run" "$EV"; return; }
+  p_controls owner_gh api "repos/$REPO/actions/secrets" ";;" owner_gh api "repos/$REPO/actions/variables" ";;" \
+    owner_gh api "repos/$REPO/keys" ";;" owner_gh api "repos/$REPO/hooks"
+  record_p A8 "$OBS" "$CTL" "$EV"
+}
+
+# A5 (plan 4.3): a revoked token stops working at once. Control: the same read with that token
+# before it was revoked. The session's own token is put back afterwards.
+t_A5() {
+  local session="$TOKEN"
+  mint_token
+  OBS=inconclusive CTL=failed EV=""
+  if capture app_gh api "repos/$REPO" --jq .full_name && [[ "$LAST_OUT" == "$REPO" ]]; then CTL=ok; fi
+  EV="before revoking: $(evidence) |"
+  local second="$TOKEN"
+  revoke_token
+  TOKEN="$second"
+  capture app_gh api "repos/$REPO" --jq .full_name || true
+  if [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 401|Bad credentials'; then OBS=refused
+  elif [[ $LAST_RC -eq 0 ]]; then OBS=allowed
+  fi
+  EV="$EV after revoking: $(evidence)"
+  TOKEN="$session"
+  record_p A5 "$OBS" "$CTL" "$EV"
+}
+
+# A3: a commit adding a workflow file, on a feature branch. Control: the same push with a plain file.
+t_A3() {
+  fresh_from dev "a3-wf-$(stamp)"
+  add_commit ".github/workflows/frg26-a3-$(stamp).yml" "name: frg26 a3"
+  p_attempts push app_git -C "$CLONE" push origin "HEAD:refs/heads/frg26/permissions/A3-wf-$(stamp)"
+  [[ "$OBS" == refused ]] || { record_p A3 "$OBS" "not run" "$EV"; return; }
+  fresh_from dev "a3-plain-$(stamp)"
+  add_commit "tests/permissions-A3-$(stamp).txt" "FRG-26 A3 control"
+  p_controls app_git -C "$CLONE" push origin "HEAD:refs/heads/frg26/permissions/A3-plain-$(stamp)"
+  record_p A3 "$OBS" "$CTL" "$EV"
+}
+
+# A2 (plan 4.1, item 9): writes to a public repository the app is not installed on: a push, an
+# issue, a PR (from a branch the owner made there). Control: the same three on the throwaway.
+t_A2() {
+  fresh_from dev "a2-$(stamp)"
+  add_commit "tests/permissions-A2-$(stamp).txt" "FRG-26 A2"
+  # The push is judged by git's own words, the two API calls by GitHub's status.
+  p_attempts push app_git -C "$CLONE" push "https://github.com/$REPO2.git" "HEAD:refs/heads/frg26-a2-$(stamp)"
+  [[ "$OBS" == refused ]] || { record_p A2 "$OBS" "not run" "$EV"; return; }
+  local ev="$EV"
+  p_attempts api app_gh api -X POST "repos/$REPO2/issues" -f title="FRG-26 A2 ($(stamp))" ";;" \
+    app_gh api -X POST "repos/$REPO2/pulls" -f title="FRG-26 A2 ($(stamp))" -f head="$A2_BRANCH" -f base=main
+  EV="$ev$EV"
+  [[ "$OBS" == refused ]] || { record_p A2 "$OBS" "not run" "$EV"; return; }
+  p_controls app_git -C "$CLONE" push origin "HEAD:refs/heads/frg26/permissions/A2-$(stamp)" ";;" \
+    app_gh api -X POST "repos/$REPO/issues" -f title="FRG-26 A2 control ($(stamp))" ";;" \
+    app_gh api -X POST "repos/$REPO/pulls" -f title="FRG-26 A2 control ($(stamp))" -f head="frg26/permissions/A2-$(stamp)" -f base=dev
+  record_p A2 "$OBS" "$CTL" "$EV"
+}
+
+# A11: whether CI results on a public repo can be read with no Checks/Actions permission. A reading
+# for the owner (plan 4.1): if one can't be read, the owner decides before anything is added.
+t_A11() {
+  local p
+  for p in commits/main/check-runs commits/main/status "actions/runs?per_page=1"; do
+    capture app_gh api "repos/$REPO/$p" || true
+    reading A11 "${p%%\?*}: $(http_of)" | sed 's#commits/main/##'
+  done
+}
+
+try_reading() { # <id> <label> <command…> — "works" or "fails" with GitHub's words
+  local id="$1" label="$2"
+  shift 2
+  if capture "$@"; then reading "$id" "$label: works"; else reading "$id" "$label: fails: $(evidence)"; fi
+}
+
+# A12: the gh commands FORGE uses, with the app's token. Readings, not results.
+t_A12() {
+  local n
+  try_reading A12 "gh issue create" app_gh issue create --repo "$REPO" --title "FRG-26 A12 ($(stamp))" --body "FRG-26 throwaway test A12."
+  n="${LAST_OUT##*/}"
+  if [[ $LAST_RC -eq 0 && "$n" =~ ^[0-9]+$ ]]; then
+    try_reading A12 "gh issue comment" app_gh issue comment "$n" --repo "$REPO" --body "FRG-26 A12 comment."
+    try_reading A12 "gh issue view" app_gh issue view "$n" --repo "$REPO" --json title --jq .title
+  fi
+  try_reading A12 "gh issue list" app_gh issue list --repo "$REPO" --limit 1
+  try_reading A12 "gh pr list" app_gh pr list --repo "$REPO" --limit 1
+  try_reading A12 "gh run list" app_gh run list --repo "$REPO" --limit 1
+  try_reading A12 "gh api (read)" app_gh api "repos/$REPO" --jq .full_name
+}
+
+setup_fail_p() { # <id> <what failed>
+  FAILS=$((FAILS + 1))
+  say "RESULT $1 permissions FAIL attempt=setup-failed :: $2"
+}
+
+# Test issues ("FRG-26 " titles) are closed in both throwaway repos when the run ends.
+sweep_issues() {
+  local r open n
+  for r in "$REPO" "$REPO2"; do
+    if ! open="$(owner_gh api --paginate "repos/$r/issues?state=open&per_page=100" \
+      --jq '.[] | select(.pull_request == null) | select(.title | startswith("FRG-26 ")) | .number' 2>/dev/null)"; then
+      FAILS=$((FAILS + 1))
+      say "CLEANUP FAIL could not list the open issues in $r: close any \"FRG-26 \" test issue on GitHub"
+      continue
+    fi
+    for n in $open; do
+      [[ "$n" =~ ^[0-9]+$ ]] || continue
+      owner_gh issue close "$n" --repo "$r" >/dev/null 2>&1 || { FAILS=$((FAILS + 1)); say "CLEANUP FAIL issue #$n in $r may still be open"; }
+    done
+  done
+}
+
+cmd_ptests() {
+  need_owner
+  assert_throwaway
+  assert_second
+  app_session
+  need_allowance
+  PHASE=permissions
+  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  CLONE="$WORK/clone"
+  app_git clone -q --template="$WORK/template" "https://github.com/$REPO.git" "$CLONE" || die "clone failed"
+  say "== FRG-26 permission tests (kind P), app $APP_BOT, $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
+  local id
+  SWEEP_ON_EXIT=1
+  for id in $P_TEST_ORDER; do
+    "t_$id"
+    if [[ $FAILS -ne 0 ]]; then
+      SWEEP_ON_EXIT=""
+      sweep_prs
+      sweep_issues
+      say "PERMISSION TESTS: STOPPED after $id (a failed test stops the run; only test PRs and issues were closed after it)"
+      exit 1
+    fi
+  done
+  SWEEP_ON_EXIT=""
+  sweep_prs
+  sweep_issues
+  if [[ $FAILS -ne 0 ]]; then
+    say "PERMISSION TESTS: FAILED at the final cleanup"
+    exit 1
+  fi
+  say "PERMISSION TESTS: ALL PASS"
+  exit 0
+}
+
+# --- S2: an Environment keeps its secret from the app (plan 4.4, revised 2026-11-01) ------------
+# On the throwaway only, in the open phase (no protection, so the app may push main). The value is
+# a dummy, never a real secret; the workflow prints only its length.
+
+readonly ENV_NAME=frg26-test
+readonly DUMMY_NAME=FRG26_DUMMY
+readonly DUMMY_VALUE=frg26-dummy-not-a-secret
+readonly S2_WORKFLOW=.github/workflows/frg26-s2.yml
+
+s2_workflow() {
+  cat <<'EOF'
+name: frg26-s2
+on:
+  push:
+    branches: [main, 'frg26-s2-*']
+permissions: {}
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: frg26-test
+    steps:
+      - name: Report the dummy value's length only
+        env:
+          V: ${{ secrets.FRG26_DUMMY }}
+        run: echo "FRG26-S2 value length ${#V}"
+EOF
+}
+
+# The Environment exactly as env-setup makes it: the owner the only reviewer, self-review
+# prevented, only the branch main may deploy.
+env_summary() {
+  local e p
+  e="$(owner_gh api "repos/$REPO/environments/$ENV_NAME" --jq '[([.protection_rules[] | select(.type == "required_reviewers") | .prevent_self_review | tostring] | join(",")), ([.protection_rules[] | select(.type == "required_reviewers") | .reviewers[] | "\(.type):\(.reviewer.login)"] | join(",")), (.deployment_branch_policy.protected_branches | tostring), (.deployment_branch_policy.custom_branch_policies | tostring)] | join(" ")' 2>/dev/null)" || { echo error; return; }
+  p="$(owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" --jq '[.branch_policies[] | "\(.type // "branch"):\(.name)"] | join(",")' 2>/dev/null)" || { echo error; return; }
+  printf '%s %s\n' "$e" "$p"
+}
+
+want_env() { printf 'true User:%s false true branch:main\n' "$OWNER"; }
+
+cmd_env_setup() {
+  need_owner
+  assert_throwaway
+  verify_phase open
+  local uid
+  uid="$(owner_uid)" || die "can't read the owner's user id, so no Environment was made"
+  printf '{"wait_timer":0,"prevent_self_review":true,"reviewers":[{"type":"User","id":%s}],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}\n' "$uid" >"$WORK/env.json"
+  owner_gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input "$WORK/env.json" >/dev/null || die "making the Environment failed"
+  if ! owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" --jq '.branch_policies[].name' 2>/dev/null | grep -Fxq main; then
+    owner_gh api -X POST "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" -f name=main -f type=branch >/dev/null \
+      || die "limiting the Environment to main failed"
+  fi
+  # A dummy value, not a secret: gh encrypts it for GitHub. Only its length is ever printed.
+  owner_gh secret set "$DUMMY_NAME" --env "$ENV_NAME" --repo "$REPO" --body "$DUMMY_VALUE" >/dev/null \
+    || die "storing the dummy value failed"
+  local got
+  got="$(env_summary)"
+  [[ "$got" == "$(want_env)" ]] || die "the Environment is '$got', expected '$(want_env)'"
+  say "Environment $ENV_NAME: reviewer $OWNER only, self-review prevented, only main deploys; dummy value stored"
+}
+
+runs_for() { # <sha> — "id status conclusion actor" for each run of the S2 workflow on that commit
+  owner_gh api "repos/$REPO/actions/runs?head_sha=$1&per_page=20" \
+    --jq '.workflow_runs[] | select(.name == "frg26-s2") | "\(.id) \(.status) \(.conclusion) \(.actor.login)"' 2>/dev/null
+}
+
+wait_run() { # <sha> <status…> — sets RUN to "id status conclusion actor" once it has one of them
+  local sha="$1" _ line="" st want
+  shift
+  RUN=""
+  for _ in $(seq 1 60); do
+    line="$(runs_for "$sha" | head -n 1)" || line=""
+    st="$(printf '%s' "$line" | cut -d' ' -f2)"
+    for want in "$@"; do
+      if [[ -n "$line" && "$st" == "$want" ]]; then RUN="$line"; return 0; fi
+    done
+    sleep 5
+  done
+  RUN="$line"
+  return 1
+}
+
+env_id() { owner_gh api "repos/$REPO/environments/$ENV_NAME" --jq .id 2>/dev/null; }
+
+approve_run() { # <who owner_gh|app_gh> <run id> <env id>
+  capture "$1" api -X POST "repos/$REPO/actions/runs/$2/pending_deployments" \
+    -F "environment_ids[]=$3" -f state=approved -f comment="FRG-26 S2 approval attempt"
+}
+
+run_log_has_value() { # <run id> — 0 if the job printed the dummy value's length
+  owner_gh run view "$1" --repo "$REPO" --log 2>/dev/null | grep -Fq "FRG26-S2 value length ${#DUMMY_VALUE}"
+}
+
+cancel_waiting_runs() {
+  local id
+  for id in $(owner_gh api "repos/$REPO/actions/runs?status=waiting&per_page=50" --jq '.workflow_runs[] | select(.name == "frg26-s2") | .id' 2>/dev/null); do
+    [[ "$id" =~ ^[0-9]+$ ]] && owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1
+  done
+}
+
+# S2b: the app's push to main starts a run; the app tries to approve its own deployment. Control:
+# the owner approves the same run, and the job then reports the dummy value's length.
+t_S2b() {
+  fresh_from main "s2b-$(stamp)"
+  add_commit "tests/permissions-S2b-$(stamp).txt" "FRG-26 S2b"
+  capture app_git -C "$CLONE" push origin HEAD:refs/heads/main || { setup_fail_p S2b "the app could not push main in the open phase: $(evidence)"; return; }
+  local sha eid id
+  sha="$(app_git -C "$CLONE" rev-parse HEAD)" || sha=""
+  eid="$(env_id)" || eid=""
+  [[ "$sha" =~ ^[0-9a-f]{40}$ && "$eid" =~ ^[0-9]+$ ]] || { setup_fail_p S2b "could not read the commit or the Environment"; return; }
+  wait_run "$sha" waiting || { setup_fail_p S2b "the app's run never waited for review ($RUN)"; return; }
+  id="${RUN%% *}"
+  approve_run app_gh "$id" "$eid" || true
+  OBS="$(classify_api)"
+  EV="the app approving its own run: $(evidence) |"
+  if [[ "$OBS" != refused ]]; then record_p S2b "$OBS" "not run" "$EV"; cancel_waiting_runs; return; fi
+  CTL=failed
+  if approve_run owner_gh "$id" "$eid" && wait_run "$sha" completed && run_log_has_value "$id"; then CTL=ok; fi
+  EV="$EV owner approving: $(evidence), run $RUN"
+  S2B_OWNER_APPROVAL="$CTL"
+  record_p S2b "$OBS" "$CTL" "$EV"
+}
+
+# S2d: the run the owner's own workflow commit started (env-tests' first step): the owner's own
+# approval is refused, because Prevent self-review is on. Control: the very same request, by the
+# same owner, on the app's run in S2b, was accepted.
+t_S2d() {
+  local eid id
+  eid="$(env_id)" || eid=""
+  [[ "$eid" =~ ^[0-9]+$ ]] || { setup_fail_p S2d "could not read the Environment"; return; }
+  wait_run "$S2_OWNER_SHA" waiting || { setup_fail_p S2d "the owner's run never waited for review ($RUN)"; return; }
+  id="${RUN%% *}"
+  approve_run owner_gh "$id" "$eid" || true
+  OBS=inconclusive
+  if [[ $LAST_RC -ne 0 ]] && wait_run "$S2_OWNER_SHA" waiting; then OBS=refused; elif [[ $LAST_RC -eq 0 ]]; then OBS=allowed; fi
+  EV="the owner approving the owner's own run: $(evidence)"
+  owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
+  record_p S2d "$OBS" "${S2B_OWNER_APPROVAL:-failed}" "$EV (control: the owner's approval of the app's run in S2b)"
+}
+
+# S2a: a feature branch's run may not deploy (only main may): it never waits for review and its
+# job never gets the value. Control: S2b's run on main did.
+t_S2a() {
+  local br
+  br="frg26-s2-a-$(stamp)"
+  fresh_from main "$br"
+  add_commit "tests/permissions-S2a-$(stamp).txt" "FRG-26 S2a"
+  capture app_git -C "$CLONE" push origin "HEAD:refs/heads/$br" || { setup_fail_p S2a "pushing $br failed: $(evidence)"; return; }
+  local sha id
+  sha="$(app_git -C "$CLONE" rev-parse HEAD)" || sha=""
+  wait_run "$sha" completed waiting || { setup_fail_p S2a "no run finished for $br ($RUN)"; return; }
+  id="${RUN%% *}"
+  OBS=inconclusive
+  if [[ "$RUN" == *" completed failure "* ]] && ! run_log_has_value "$id"; then OBS=refused
+  elif [[ "$RUN" == *" waiting "* ]] || run_log_has_value "$id"; then OBS=allowed
+  fi
+  record_p S2a "$OBS" ok "feature-branch run $RUN (control: S2b's run on main got the value)"
+  cancel_waiting_runs
+}
+
+# S2c: the app tries to change the Environment's protection or its secret. Control: the owner reads
+# the same Environment, unchanged.
+t_S2c() {
+  printf '{"wait_timer":0,"prevent_self_review":false,"reviewers":[],"deployment_branch_policy":null}\n' >"$WORK/env-weak.json"
+  p_attempts api app_gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input "$WORK/env-weak.json" ";;" \
+    app_gh api "repos/$REPO/environments/$ENV_NAME/secrets/public-key" ";;" \
+    app_gh api -X DELETE "repos/$REPO/environments/$ENV_NAME/secrets/$DUMMY_NAME"
+  [[ "$OBS" == refused ]] || { record_p S2c "$OBS" "not run" "$EV"; return; }
+  CTL=failed
+  [[ "$(env_summary)" == "$(want_env)" ]] && CTL=ok
+  record_p S2c "$OBS" "$CTL" "$EV"
+}
+
+readonly S2_TEST_ORDER="S2b S2d S2a S2c"
+S2_OWNER_SHA=""
+S2B_OWNER_APPROVAL=""
+
+cmd_env_tests() {
+  need_owner
+  assert_throwaway
+  app_session
+  verify_phase open
+  need_allowance
+  [[ "$(env_summary)" == "$(want_env)" ]] || die "run env-setup first (the Environment reads '$(env_summary)')"
+  PHASE=permissions
+  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  CLONE="$WORK/clone"
+  say "== FRG-26 Environment tests (S2), app $APP_BOT, $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
+  # The owner adds the workflow to main: that commit starts the owner's own run (S2d's).
+  put_file "$S2_WORKFLOW" "$(s2_workflow)"
+  S2_OWNER_SHA="$(owner_gh api "repos/$REPO/branches/main" --jq .commit.sha 2>/dev/null)" || S2_OWNER_SHA=""
+  [[ "$S2_OWNER_SHA" =~ ^[0-9a-f]{40}$ ]] || die "can't read main after adding the S2 workflow"
+  local id
+  for id in $S2_TEST_ORDER; do
+    # A fresh clone each time: S2b moves main.
+    rm -rf "$CLONE"
+    app_git clone -q --template="$WORK/template" "https://github.com/$REPO.git" "$CLONE" || die "clone failed"
+    "t_$id"
+    if [[ $FAILS -ne 0 ]]; then
+      cancel_waiting_runs
+      say "ENVIRONMENT TESTS: STOPPED after $id"
+      exit 1
+    fi
+  done
+  cancel_waiting_runs
+  say "ENVIRONMENT TESTS: ALL PASS (run reset next: main holds the S2 workflow)"
+  exit 0
+}
+
+# --- Held tokens: A4, A9b, E1, E2, E3 (plan 4.3, revised 2026-11-01) --------------------------
+# Some tests need a token issued earlier: one over an hour old (A4), or one issued before a key is
+# deleted or the app is suspended, uninstalled or deleted. Such a token is "held": kept until its
+# check, then revoked (if it still works) and removed. Held tokens are VAR=value lines in a mode-600
+# file beside the app's key (HELD_AGE=…), so a handoff's ho_redact_file can hide them too; when each
+# was issued is kept apart, in HELD_TIMES (not a secret). What GitHub does with each is recorded;
+# where GitHub's docs are silent it is a reading.
+
+HELD="$(dirname "$SECRETS")/held-tokens.env"
+HELD_TIMES="$(dirname "$SECRETS")/held-times"
+STATE="$(dirname "$SECRETS")/frg26-state"
+
+held_var() { printf 'HELD_%s' "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"; }
+
+held_get() { # <name> — prints "token issued-epoch" or fails
+  [[ -f "$HELD" && ! -L "$HELD" && -f "$HELD_TIMES" && ! -L "$HELD_TIMES" ]] || return 1
+  local tok at
+  tok="$(sed -n "s/^$(held_var "$1")=\(ghs_[A-Za-z0-9]*\)$/\1/p" "$HELD" | tail -n 1)"
+  at="$(sed -n "s/^$1 \([0-9][0-9]*\)$/\1/p" "$HELD_TIMES" | tail -n 1)"
+  [[ -n "$tok" && -n "$at" ]] || return 1
+  printf '%s %s\n' "$tok" "$at"
+}
+
+drop_line() { # <file> <line prefix> — the file keeps mode 600
+  [[ -f "$1" ]] || return 0
+  (umask 077; grep -v "^$2" "$1" >"$1.new") || true
+  chmod 600 "$1.new" && mv "$1.new" "$1"
+}
+
+held_drop() { # <name>
+  drop_line "$HELD" "$(held_var "$1")="
+  drop_line "$HELD_TIMES" "$1 "
+}
+
+state_set() { # <key> <value>
+  (umask 077; touch "$STATE")
+  grep -v "^$1 " "$STATE" >"$STATE.new" || true
+  printf '%s %s\n' "$1" "$2" >>"$STATE.new"
+  chmod 600 "$STATE.new" && mv "$STATE.new" "$STATE"
+}
+
+state_get() { [[ -f "$STATE" ]] && sed -n "s/^$1 //p" "$STATE" | tail -n 1; }
+
+# hold-token <name>: a second narrowed token, kept for a later check; the session's own token is
+# revoked as usual when the script ends.
+cmd_hold_token() {
+  local name="${1:-}"
+  [[ "$name" =~ ^(age|keyold|suspend|uninstall|delete)$ ]] || die "usage: hold-token age|keyold|suspend|uninstall|delete"
+  need_owner
+  assert_throwaway
+  app_session
+  local session="$TOKEN" held
+  mint_token
+  held="$TOKEN"
+  TOKEN="$session"
+  REDACT_ONLY="$REDACT_ONLY $held"
+  held_drop "$name"
+  (umask 077; printf '%s=%s\n' "$(held_var "$name")" "$held" >>"$HELD") || die "storing the held token failed"
+  (umask 077; printf '%s %s\n' "$name" "$(date +%s)" >>"$HELD_TIMES") || die "storing when it was issued failed"
+  chmod 600 "$HELD" "$HELD_TIMES" || die "chmod failed"
+  say "held token '$name' stored (issued $(date -u +%Y-%m-%dT%H:%M:%SZ), used only by its check)"
+}
+
+use_held() { # <name> — sets HELD_RESULT to "works" or GitHub's status; the token is then dropped
+  local line tok
+  line="$(held_get "$1")" || die "no held token '$1': run hold-token $1 first"
+  tok="${line%% *}"
+  REDACT_ONLY="$REDACT_ONLY $tok"
+  local session="$TOKEN"
+  TOKEN="$tok"
+  capture app_gh api "repos/$REPO" --jq .full_name || true
+  if [[ $LAST_RC -eq 0 && "$LAST_OUT" == "$REPO" ]]; then HELD_RESULT=works; revoke_token; else
+    HELD_RESULT="$(http_of)"
+    TOKEN=""
+  fi
+  TOKEN="$session"
+  held_drop "$1"
+  HELD_AGE=$(( $(date +%s) - ${line##* } ))
+}
+
+# A4: a token over an hour old is refused. Control: a fresh token, the same read.
+cmd_token_age_check() {
+  need_owner
+  assert_throwaway
+  local line
+  line="$(held_get age)" || die "no held token 'age': run hold-token age first"
+  (( $(date +%s) - ${line##* } > 3660 )) || die "the held token is not over an hour old yet: run this later"
+  app_session
+  use_held age
+  local obs=inconclusive
+  case "$HELD_RESULT" in works) obs=allowed ;; "HTTP 401") obs=refused ;; esac
+  local ctl=failed
+  if capture app_gh api "repos/$REPO" --jq .full_name && [[ "$LAST_OUT" == "$REPO" ]]; then ctl=ok; fi
+  FAILS=0
+  record_p A4 "$obs" "$ctl" "a token issued $HELD_AGE s ago: $HELD_RESULT"
+  [[ $FAILS -eq 0 ]]
+}
+
+jwt_with() { # <key file> — a JWT signed with that key, for one request
+  local keep="$APP_KEY"
+  APP_KEY="$1"
+  make_jwt
+  APP_KEY="$keep"
+}
+
+# A9 and A9b: after the owner deleted the app's old key (app.pem) and installed a new one
+# (app-new.pem): a JWT signed with the old key is refused (control: the new key's is accepted);
+# what a token issued before the deletion does is recorded. The new key then becomes app.pem.
+cmd_key_check() {
+  need_owner
+  assert_throwaway
+  load_app
+  local new
+  new="$(dirname "$APP_KEY")/app-new.pem"
+  [[ -f "$new" && ! -L "$new" && "$(stat -f %Lp "$new")" == 600 ]] || die "missing $new (mode 600): the new key's handoff step stores it"
+  jwt_with "$APP_KEY"
+  jwt_call GET app || true
+  local obs=inconclusive old_http="$LAST_HTTP"
+  case "$old_http" in 2*) obs=allowed ;; 401) obs=refused ;; esac
+  jwt_with "$new"
+  local ctl=failed
+  if jwt_call GET app && [[ "$(jq -r .id <<<"$LAST_OUT")" == "$APP_ID" ]]; then ctl=ok; fi
+  FAILS=0
+  record_p A9 "$obs" "$ctl" "the deleted key's JWT: HTTP ${old_http:-none}; the new key's: HTTP ${LAST_HTTP:-none}"
+  APP_KEY="$new"
+  need_app_identity
+  use_held keyold
+  reading A9b "a token issued before the key was deleted, $HELD_AGE s later: $HELD_RESULT"
+  [[ $FAILS -eq 0 ]] || exit 1
+  mv "$new" "$(dirname "$new")/app.pem" || die "making the new key app.pem failed"
+}
+
+# E1, first half (the owner has just suspended the installation): a new token is refused; what a
+# token issued before the suspension does is recorded. The verdict waits for the control.
+cmd_suspend_check() {
+  need_owner
+  assert_throwaway
+  load_app
+  make_jwt
+  jwt_call GET "app/installations?per_page=100" || die "can't list the app's installations: $(evidence)"
+  local inst sus
+  inst="$(jq -c --arg o "$OWNER" '[.[] | select(.account.login == $o)] | if length == 1 then .[0] else empty end' <<<"$LAST_OUT" 2>/dev/null)" || inst=""
+  [[ -n "$inst" ]] || die "the app must still be installed (suspended) on $OWNER's account"
+  sus="$(jq -r .suspended_at <<<"$inst")"
+  [[ "$sus" != null ]] || die "the installation is not suspended: suspend it first"
+  INSTALLATION_ID="$(jq -r .id <<<"$inst")"
+  printf '%s\n' "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}" >"$WORK/token-request.json"
+  jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || true
+  local obs=inconclusive
+  if [[ "$LAST_HTTP" =~ ^2 ]]; then
+    obs=allowed
+    TOKEN="$(jq -r .token <<<"$LAST_OUT")"
+    revoke_token
+  elif [[ "$LAST_HTTP" =~ ^(401|403|404)$ ]]; then obs=refused
+  fi
+  state_set E1 "$obs HTTP-${LAST_HTTP:-none}"
+  use_held suspend
+  reading E1 "a token issued before the suspension (suspended at $sus): $HELD_RESULT"
+  say "E1 a new token while suspended: $obs (HTTP ${LAST_HTTP:-none}); the verdict follows after you unsuspend"
+}
+
+# E1, second half (the owner has unsuspended): the control, a new token, must work.
+cmd_unsuspend_check() {
+  need_owner
+  assert_throwaway
+  local first
+  first="$(state_get E1)" || first=""
+  [[ -n "$first" ]] || die "run suspend-check first"
+  local ctl=failed
+  if (app_session) >/dev/null 2>&1; then ctl=ok; fi
+  FAILS=0
+  record_p E1 "${first%% *}" "$ctl" "a new token while suspended: ${first#* }; after unsuspending: $ctl"
+  [[ $FAILS -eq 0 ]]
+}
+
+# E2 (the owner has just uninstalled the app): what a token issued before does is recorded, and
+# GitHub must list no installation for the owner.
+cmd_uninstall_check() {
+  need_owner
+  assert_throwaway
+  load_app
+  make_jwt
+  jwt_call GET "app/installations?per_page=100" || die "can't list the app's installations: $(evidence)"
+  local n
+  n="$(jq --arg o "$OWNER" '[.[] | select(.account.login == $o)] | length' <<<"$LAST_OUT" 2>/dev/null)" || n=error
+  [[ "$n" == 0 ]] || die "the app is still installed on $OWNER's account ($n installations): uninstall it first"
+  use_held uninstall
+  reading E2 "a token issued before the uninstall: $HELD_RESULT"
+}
+
+# E3 (the owner has just deleted the app): what a token issued before does is recorded, and the
+# app's own key must be refused.
+cmd_delete_check() {
+  need_owner
+  assert_throwaway
+  load_app
+  make_jwt
+  jwt_call GET app || true
+  [[ ! "$LAST_HTTP" =~ ^2 ]] || die "GitHub still knows the app: delete it first"
+  local gone="HTTP ${LAST_HTTP:-none}"
+  use_held delete
+  reading E3 "a token issued before the app was deleted: $HELD_RESULT; the app's own key now gets $gone"
+}
+
 cmd_tests() {
   PHASE="${1:-}"
   case "$PHASE" in open | protected | ruleset) ;; *) die "usage: tests open|protected|ruleset" ;; esac
@@ -1262,6 +1968,7 @@ main() {
   shift || true
   case "$cmd" in
     create) cmd_create ;;
+    create-second) cmd_create_second ;;
     check-app) cmd_check_app ;;
     rate) cmd_rate ;;
     allowance) cmd_allowance ;;
@@ -1270,9 +1977,19 @@ main() {
     unprotect) cmd_unprotect ;;
     ruleset) cmd_ruleset ;;
     tests) cmd_tests "$@" ;;
+    ptests) cmd_ptests ;;
+    env-setup) cmd_env_setup ;;
+    env-tests) cmd_env_tests ;;
+    hold-token) cmd_hold_token "$@" ;;
+    token-age-check) cmd_token_age_check ;;
+    key-check) cmd_key_check ;;
+    suspend-check) cmd_suspend_check ;;
+    unsuspend-check) cmd_unsuspend_check ;;
+    uninstall-check) cmd_uninstall_check ;;
+    delete-check) cmd_delete_check ;;
     actions-setting) cmd_actions_setting ;;
     status) cmd_status ;;
-    *) die "usage: github-throwaway.sh create|check-app|rate|allowance|reset|protect|unprotect|ruleset|tests <phase>|actions-setting|status" ;;
+    *) die "usage: github-throwaway.sh create|create-second|check-app|rate|allowance|reset|protect|unprotect|ruleset|tests <phase>|ptests|env-setup|env-tests|hold-token <name>|token-age-check|key-check|suspend-check|unsuspend-check|uninstall-check|delete-check|actions-setting|status" ;;
   esac
 }
 
