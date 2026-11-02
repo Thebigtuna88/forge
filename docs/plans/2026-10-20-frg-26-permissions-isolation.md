@@ -177,6 +177,12 @@ deletion, E1 suspend, E2 uninstall, E3 app deletion). Each result goes into this
 date and GitHub's exact reply; where a token keeps working, the plan says so and the emergency
 order is adjusted. Nothing here is assumed until its test has run.
 
+*Held tokens in the tests* (review round 13): revocation is tried whatever the token's read
+returned. A held token is removed only once that is settled (revoked, refused as bad credentials,
+or its installation or app is gone); if GitHub can't be read reliably (no answer, a server error,
+a rate limit) the step stops and keeps it for a retry. A token held over the suspension that
+couldn't be revoked while suspended is read again after unsuspending, then revoked.
+
 ### 4.4 Secrets: seeing values vs managing them (revision 5)
 
 - **Managing secrets** (create, change, delete, list names) needs the Secrets permission. The app
@@ -205,16 +211,23 @@ order is adjusted. Nothing here is assumed until its test has run.
   read-only); **S2 in stage 1, on the throwaway repo**, with an Environment `frg26-test` holding a
   dummy, non-sensitive value (never a real secret):
   - S2a: the app pushes a feature branch whose (unchanged) workflow targets the Environment: the
-    job must not get the value (deployment branches: `main` only);
+    job must not get the value (deployment branches: `main` only). It counts as refused only on
+    GitHub's own rejection: the deploy job failed without running a step, and its annotation says
+    the branch is not allowed to deploy (wording Unconfirmed: if it differs, S2a reads
+    inconclusive and the run stops). An unreadable run log is never taken as "no value";
   - S2b: in the open phase (no protection yet, so the app may push `main`), the app's push to
     `main` starts a run that waits for review; the app tries to **approve its own pending
     deployment**: refused (it has no Deployments permission, and "users who initiate a deployment
-    cannot approve the deployment job" with Prevent self-review on: Confirmed, docs). Control: you
-    approve it, and the job reports only the value's length;
+    cannot approve the deployment job" with Prevent self-review on: Confirmed, docs). Control:
+    GitHub says you can approve it (`current_user_can_approve`), you approve it, and the job
+    reports only the value's length;
   - S2c: the app tries to change the Environment's protection or its secret: refused. Control:
     your token reads the same settings;
   - S2d: a run you start yourself: your own approval is refused (shows Prevent self-review is
-    really on); the run is then cancelled.
+    really on). Refused needs all of: GitHub says you can't approve it (`current_user_can_approve`
+    false), GitHub itself answered the approval with a 4xx (not a network error or a rate limit),
+    and the run still waits. Control: your same request on the app's run in S2b worked. The run is
+    then cancelled.
   The workflow file and the Environment are added by your handoff (the app can't). Actions on a
   public repo: $0, "standard GitHub-hosted runners is free … In public repositories" (Confirmed,
   docs).
@@ -276,7 +289,7 @@ reason from GitHub (BLOCKED, GH006/GH013, 403/404/401); anything else is inconcl
 | 2 | Update `main` | Ruleset bypass = admin role only | Unconfirmed for personal repos | Step 0, M1-M6 (S) |
 | 3 | Merge into `dev` without your approval of the latest push | Code-owner review + last-push approval | Confirmed | B1-B4, B6-B11 (S); B5 own approval (P); B16 control |
 | 4 | Change settings, protection, rulesets; delete, archive, transfer | No Administration | Confirmed | B12, B13, M4, A6 (P) |
-| 5 | Manage secrets, variables, deploy keys, webhooks, collaborators | No such permissions | Confirmed | A8 (P) |
+| 5 | Manage secrets, variables, deploy keys, webhooks, collaborators | No such permissions (collaborators: Administration) | Confirmed | A8 (P); collaborator changes via A6's Administration refusal |
 | 5b | See secret values; approve its own deployment | No repo-level secrets; Environments need you, self-review prevented, `main` only | Confirmed (docs) | S1 (read-only), S2a-c (stage 1, P with controls) |
 | 6 | Change workflow files | No Workflows permission | Confirmed | A3 (P) |
 | 7 | Widen my access (permissions, repos, keys) | Only you change the app, in your browser | Confirmed | A1, A6 (P); A10 docs only (no API makes keys) |
@@ -299,7 +312,7 @@ New tests (throwaway app, throwaway repo, run only from your handoffs):
 | A4 | Use a token over 1 hour old | 401 | A fresh token, same request, succeeds |
 | A5 | Revoke a token, then use it | 401 | A second token, same request, succeeds |
 | A6 | Change the repo's settings (no-op description write); change its own installation | Refused | Your token makes the same no-op write and succeeds |
-| A8 | Create a secret; list secrets, variables, deploy keys, webhooks, collaborators | Refused | Your token lists the same and succeeds (reads; no secret created) |
+| A8 | Read the secrets' public key; list secrets, variables, deploy keys, webhooks, pending collaborator invitations | Refused | Your token lists the same and succeeds (reads; nothing created). Adding a collaborator is not tried: any valid target would invite a real person; it needs Administration, whose write A6 shows refused (review round 13) |
 | A9 | You delete the key; mint with it | Refused | The new key mints |
 | A9b | Use a token minted before the key's deletion | Recorded either way, and the plan is corrected | — (a finding) |
 | E3 | Delete the throwaway app at the end of stage 1; use a token issued before | Recorded | — |

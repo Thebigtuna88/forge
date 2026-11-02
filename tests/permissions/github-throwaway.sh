@@ -112,6 +112,7 @@ cleanup() {
     SWEEP_ON_EXIT=""
     say "PHASE $PHASE: STOPPED by an error (status $rc); closing the open test PRs"
     sweep_prs
+    if [[ "$PHASE" == permissions ]]; then sweep_issues; fi
   fi
   revoke_token
   if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf "$WORK"; fi
@@ -339,11 +340,15 @@ need_installation_scope() {
   [[ "$got" == "$REPO" ]] || die "the app must be installed on $REPO only (it reaches: $(printf '%s' "$got" | tr '\n' ' '))"
 }
 
-revoke_token() { # the current token stops working at once (DELETE /installation/token)
+revoke_token() { # the current token stops working at once (DELETE /installation/token); 1 if
+  # GitHub didn't confirm it
   [[ -n "$TOKEN" ]] || return 0
-  app_gh api -X DELETE installation/token >/dev/null 2>&1 || say "note: revoking a token failed; GitHub expires it within an hour"
+  local rc=0
+  app_gh api -X DELETE installation/token >/dev/null 2>&1 || rc=$?
+  if [[ $rc -ne 0 ]]; then say "note: revoking a token failed; GitHub expires it within an hour"; fi
   REVOKED_TOKENS="$REVOKED_TOKENS $TOKEN"
   TOKEN=""
+  return $rc
 }
 
 app_session() { # every command that acts as the app starts here
@@ -1357,19 +1362,20 @@ t_A6() {
   record_p A6 "$OBS" "$CTL" "$EV (the installation attempt has no control: only the owner's browser changes it)"
 }
 
-# A8: managing secrets, variables, deploy keys, webhooks, collaborators. Control: the owner reads
-# the same lists (no secret is created, nothing is written).
+# A8: secrets, variables, deploy keys, webhooks and pending collaborator invitations (settings
+# only an admin may read). Control: the owner reads the same lists (nothing is created or written).
+# Round 13 (SEC-5): no collaborator write; see the evidence line.
 t_A8() {
   p_attempts api app_gh api "repos/$REPO/actions/secrets" ";;" \
     app_gh api "repos/$REPO/actions/secrets/public-key" ";;" \
     app_gh api "repos/$REPO/actions/variables" ";;" \
     app_gh api "repos/$REPO/keys" ";;" \
     app_gh api "repos/$REPO/hooks" ";;" \
-    app_gh api -X PUT "repos/$REPO/collaborators/$OWNER" -f permission=push
+    app_gh api "repos/$REPO/invitations"
   [[ "$OBS" == refused ]] || { record_p A8 "$OBS" "not run" "$EV"; return; }
   p_controls owner_gh api "repos/$REPO/actions/secrets" ";;" owner_gh api "repos/$REPO/actions/variables" ";;" \
-    owner_gh api "repos/$REPO/keys" ";;" owner_gh api "repos/$REPO/hooks"
-  record_p A8 "$OBS" "$CTL" "$EV"
+    owner_gh api "repos/$REPO/keys" ";;" owner_gh api "repos/$REPO/hooks" ";;" owner_gh api "repos/$REPO/invitations"
+  record_p A8 "$OBS" "$CTL" "$EV (adding a collaborator is not tried: any valid target would invite a real person; it needs Administration, whose write A6 shows refused)"
 }
 
 # A5 (plan 4.3): a revoked token stops working at once. Control: the same read with that token
@@ -1459,21 +1465,29 @@ setup_fail_p() { # <id> <what failed>
   say "RESULT $1 permissions FAIL attempt=setup-failed :: $2"
 }
 
-# Test issues ("FRG-26 " titles) are closed in both throwaway repos when the run ends.
+# This run's test issues ("FRG-26 " titles carrying RUN_ID) are closed in the throwaway. The second
+# throwaway is only read (round 13, SEC-4): an "FRG-26 " issue there means A2's attempt got through,
+# and is reported for the owner to close; this script never writes there as the owner.
 sweep_issues() {
-  local r open n
-  for r in "$REPO" "$REPO2"; do
-    if ! open="$(owner_gh api --paginate "repos/$r/issues?state=open&per_page=100" \
-      --jq '.[] | select(.pull_request == null) | select(.title | startswith("FRG-26 ")) | .number' 2>/dev/null)"; then
-      FAILS=$((FAILS + 1))
-      say "CLEANUP FAIL could not list the open issues in $r: close any \"FRG-26 \" test issue on GitHub"
-      continue
-    fi
+  local open n mine
+  mine=".[] | select(.pull_request == null) | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number"
+  if ! open="$(owner_gh api --paginate "repos/$REPO/issues?state=open&per_page=100" --jq "$mine" 2>/dev/null)"; then
+    FAILS=$((FAILS + 1))
+    say "CLEANUP FAIL could not list the open issues in $REPO: close any \"FRG-26 \" test issue on GitHub"
+  else
     for n in $open; do
       [[ "$n" =~ ^[0-9]+$ ]] || continue
-      owner_gh issue close "$n" --repo "$r" >/dev/null 2>&1 || { FAILS=$((FAILS + 1)); say "CLEANUP FAIL issue #$n in $r may still be open"; }
+      owner_gh issue close "$n" --repo "$REPO" >/dev/null 2>&1 || { FAILS=$((FAILS + 1)); say "CLEANUP FAIL issue #$n in $REPO may still be open"; }
     done
-  done
+  fi
+  if ! open="$(owner_gh api --paginate "repos/$REPO2/issues?state=open&per_page=100" \
+    --jq '.[] | select(.title | startswith("FRG-26 ")) | .number' 2>/dev/null)"; then
+    FAILS=$((FAILS + 1))
+    say "CLEANUP FAIL could not list the open issues in $REPO2: check it on GitHub for \"FRG-26 \" issues"
+  elif [[ -n "$open" ]]; then
+    FAILS=$((FAILS + 1))
+    say "CLEANUP FAIL $REPO2 has open \"FRG-26 \" issues or PRs (#$(printf '%s' "$open" | tr '\n' ' ')): the app wrote there; close them on GitHub"
+  fi
 }
 
 cmd_ptests() {
@@ -1598,8 +1612,34 @@ approve_run() { # <who owner_gh|app_gh> <run id> <env id>
     -F "environment_ids[]=$3" -f state=approved -f comment="FRG-26 S2 approval attempt"
 }
 
-run_log_has_value() { # <run id> — 0 if the job printed the dummy value's length
-  owner_gh run view "$1" --repo "$REPO" --log 2>/dev/null | grep -Fq "FRG26-S2 value length ${#DUMMY_VALUE}"
+run_log_value() { # <run id> — yes (the job printed the dummy value's length), no, or error (the
+  # log couldn't be read: that is not "no value", round 13)
+  local log
+  log="$(owner_gh run view "$1" --repo "$REPO" --log 2>/dev/null)" || { echo error; return; }
+  if grep -Fq "FRG26-S2 value length ${#DUMMY_VALUE}" <<<"$log"; then echo yes; else echo no; fi
+}
+
+# GitHub's own word on whether the owner may approve the run's waiting deployment.
+can_approve() { # <run id> — true | false | error
+  owner_gh api "repos/$REPO/actions/runs/$1/pending_deployments" --jq '.[0].current_user_can_approve' 2>/dev/null || echo error
+}
+
+github_refused() { # after capture: GitHub itself answered with a 4xx that isn't a rate limit
+  [[ $LAST_RC -ne 0 ]] || return 1
+  printf '%s' "$LAST_OUT" | grep -Eiq 'rate limit|abuse detection|secondary rate' && return 1
+  printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 4[0-9][0-9]'
+}
+
+deploy_job() { # <run id> — "job-id steps-run conclusion" of the run's deploy job, or error
+  local j
+  j="$(owner_gh api "repos/$REPO/actions/runs/$1/jobs" --jq '.jobs[] | select(.name == "deploy") | "\(.id) \(.steps | length) \(.conclusion)"' 2>/dev/null | head -n 1)" || j=""
+  printf '%s\n' "${j:-error}"
+}
+
+# GitHub's annotation when an Environment's deployment branches leave a branch out. The wording is
+# Unconfirmed (the docs don't quote it): if it differs, S2a reads inconclusive and stops the run.
+policy_rejected() { # <job id>
+  owner_gh api "repos/$REPO/check-runs/$1/annotations" --jq '.[].message' 2>/dev/null | grep -Eiq 'not allowed to deploy'
 }
 
 cancel_waiting_runs() {
@@ -1626,8 +1666,10 @@ t_S2b() {
   EV="the app approving its own run: $(evidence) |"
   if [[ "$OBS" != refused ]]; then record_p S2b "$OBS" "not run" "$EV"; cancel_waiting_runs; return; fi
   CTL=failed
-  if approve_run owner_gh "$id" "$eid" && wait_run "$sha" completed && run_log_has_value "$id"; then CTL=ok; fi
-  EV="$EV owner approving: $(evidence), run $RUN"
+  local can
+  can="$(can_approve "$id")"
+  if [[ "$can" == true ]] && approve_run owner_gh "$id" "$eid" && wait_run "$sha" completed && [[ "$(run_log_value "$id")" == yes ]]; then CTL=ok; fi
+  EV="$EV GitHub says the owner can approve it: $can; owner approving: $(evidence), run $RUN"
   S2B_OWNER_APPROVAL="$CTL"
   record_p S2b "$OBS" "$CTL" "$EV"
 }
@@ -1641,10 +1683,16 @@ t_S2d() {
   [[ "$eid" =~ ^[0-9]+$ ]] || { setup_fail_p S2d "could not read the Environment"; return; }
   wait_run "$S2_OWNER_SHA" waiting || { setup_fail_p S2d "the owner's run never waited for review ($RUN)"; return; }
   id="${RUN%% *}"
+  # Refused needs all three (round 13, C2/SEC-2): GitHub says the owner can't approve this run, GitHub
+  # itself refused the approval (a 4xx, not a network error or a rate limit), and it still waits.
+  local can
+  can="$(can_approve "$id")"
   approve_run owner_gh "$id" "$eid" || true
   OBS=inconclusive
-  if [[ $LAST_RC -ne 0 ]] && wait_run "$S2_OWNER_SHA" waiting; then OBS=refused; elif [[ $LAST_RC -eq 0 ]]; then OBS=allowed; fi
-  EV="the owner approving the owner's own run: $(evidence)"
+  if [[ $LAST_RC -eq 0 ]]; then OBS=allowed
+  elif [[ "$can" == false ]] && github_refused && wait_run "$S2_OWNER_SHA" waiting; then OBS=refused
+  fi
+  EV="GitHub says the owner can approve it: $can; the owner approving the owner's own run: $(evidence)"
   owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
   record_p S2d "$OBS" "${S2B_OWNER_APPROVAL:-failed}" "$EV (control: the owner's approval of the app's run in S2b)"
 }
@@ -1661,11 +1709,20 @@ t_S2a() {
   sha="$(app_git -C "$CLONE" rev-parse HEAD)" || sha=""
   wait_run "$sha" completed waiting || { setup_fail_p S2a "no run finished for $br ($RUN)"; return; }
   id="${RUN%% *}"
+  # Refused needs GitHub's own rejection (round 13, C3/SEC-1): the deploy job failed without running
+  # a step, and its annotation says the branch may not deploy. A run that failed for another reason,
+  # or that can't be read, proves nothing.
+  local job jid steps concl
   OBS=inconclusive
-  if [[ "$RUN" == *" completed failure "* ]] && ! run_log_has_value "$id"; then OBS=refused
-  elif [[ "$RUN" == *" waiting "* ]] || run_log_has_value "$id"; then OBS=allowed
+  if [[ "$RUN" == *" waiting "* ]]; then OBS=allowed
+  else
+    job="$(deploy_job "$id")"
+    read -r jid steps concl <<<"$job"
+    if [[ "$concl" == failure && "$steps" == 0 && "$jid" =~ ^[0-9]+$ ]] && policy_rejected "$jid"; then OBS=refused
+    elif [[ "$(run_log_value "$id")" == yes ]]; then OBS=allowed
+    fi
   fi
-  record_p S2a "$OBS" ok "feature-branch run $RUN (control: S2b's run on main got the value)"
+  record_p S2a "$OBS" ok "feature-branch run $RUN, deploy job ${job:-unread} (control: S2b's run on main got the value)"
   cancel_waiting_runs
 }
 
@@ -1781,21 +1838,33 @@ cmd_hold_token() {
   say "held token '$name' stored (issued $(date -u +%Y-%m-%dT%H:%M:%SZ), used only by its check)"
 }
 
-use_held() { # <name> — sets HELD_RESULT to "works" or GitHub's status; the token is then dropped
+# Sets HELD_RESULT ("works" or GitHub's status) and HELD_AGE. Revocation is tried whatever the read
+# says (round 13, C4/SEC-6); the token is removed only once that is settled: revoked, refused as bad
+# credentials (401), or ("final") its installation or app is gone. If GitHub couldn't be read
+# reliably (no HTTP answer, a server error, a rate limit), the step stops and keeps the token.
+use_held() { # <name> [final]
   local line tok
   line="$(held_get "$1")" || die "no held token '$1': run hold-token $1 first"
   tok="${line%% *}"
   REDACT_ONLY="$REDACT_ONLY $tok"
+  HELD_AGE=$(( $(date +%s) - ${line##* } ))
   local session="$TOKEN"
   TOKEN="$tok"
   capture app_gh api "repos/$REPO" --jq .full_name || true
-  if [[ $LAST_RC -eq 0 && "$LAST_OUT" == "$REPO" ]]; then HELD_RESULT=works; revoke_token; else
-    HELD_RESULT="$(http_of)"
-    TOKEN=""
+  if [[ $LAST_RC -eq 0 && "$LAST_OUT" == "$REPO" ]]; then HELD_RESULT=works
+  elif github_refused; then HELD_RESULT="$(http_of)"
+  else
+    TOKEN="$session"
+    die "GitHub couldn't be read reliably with the held token '$1' ($(evidence)); it is kept: run this step again"
+  fi
+  local settled=no
+  if revoke_token; then settled=yes
+  elif [[ "$HELD_RESULT" == "HTTP 401" || "${2:-}" == final ]]; then settled=yes
   fi
   TOKEN="$session"
-  held_drop "$1"
-  HELD_AGE=$(( $(date +%s) - ${line##* } ))
+  if [[ $settled == yes ]]; then held_drop "$1"; else
+    say "note: the held token '$1' read $HELD_RESULT and couldn't be revoked now; it stays held for a later step (it expires within an hour of $(date -u -r "${line##* }" +%H:%M:%SZ) anyway)"
+  fi
 }
 
 # A4: a token over an hour old is refused. Control: a fresh token, the same read.
@@ -1871,7 +1940,7 @@ cmd_suspend_check() {
     obs=allowed
     TOKEN="$(jq -r .token <<<"$LAST_OUT")"
     revoke_token
-  elif [[ "$LAST_HTTP" =~ ^(401|403|404)$ ]]; then obs=refused
+  elif [[ "$LAST_HTTP" =~ ^(401|403|404)$ ]] && ! grep -Eiq 'rate limit|abuse detection' <<<"$LAST_OUT"; then obs=refused
   fi
   state_set E1 "$obs HTTP-${LAST_HTTP:-none}"
   use_held suspend
@@ -1887,7 +1956,13 @@ cmd_unsuspend_check() {
   first="$(state_get E1)" || first=""
   [[ -n "$first" ]] || die "run suspend-check first"
   local ctl=failed
-  if (app_session) >/dev/null 2>&1; then ctl=ok; fi
+  # In a subshell (a failed session must not end this step), which revokes its own token when it
+  # ends: the EXIT trap isn't inherited (round 13, C1/SEC-3).
+  if (trap revoke_token EXIT; app_session) >/dev/null 2>&1; then ctl=ok; fi
+  if held_get suspend >/dev/null; then
+    use_held suspend final
+    reading E1 "the token issued before the suspension, after unsuspending: $HELD_RESULT"
+  fi
   FAILS=0
   record_p E1 "${first%% *}" "$ctl" "a new token while suspended: ${first#* }; after unsuspending: $ctl"
   [[ $FAILS -eq 0 ]]
@@ -1904,7 +1979,7 @@ cmd_uninstall_check() {
   local n
   n="$(jq --arg o "$OWNER" '[.[] | select(.account.login == $o)] | length' <<<"$LAST_OUT" 2>/dev/null)" || n=error
   [[ "$n" == 0 ]] || die "the app is still installed on $OWNER's account ($n installations): uninstall it first"
-  use_held uninstall
+  use_held uninstall final
   reading E2 "a token issued before the uninstall: $HELD_RESULT"
 }
 
@@ -1916,9 +1991,12 @@ cmd_delete_check() {
   load_app
   make_jwt
   jwt_call GET app || true
+  # Only GitHub's own answer counts (round 13, C5/SEC-7): 401 or 404. No answer or a server error
+  # proves nothing, and the held token is kept.
   [[ ! "$LAST_HTTP" =~ ^2 ]] || die "GitHub still knows the app: delete it first"
-  local gone="HTTP ${LAST_HTTP:-none}"
-  use_held delete
+  [[ "$LAST_HTTP" == 401 || "$LAST_HTTP" == 404 ]] || die "GitHub didn't confirm the app is gone (HTTP ${LAST_HTTP:-none}): run this step again"
+  local gone="HTTP $LAST_HTTP"
+  use_held delete final
   reading E3 "a token issued before the app was deleted: $HELD_RESULT; the app's own key now gets $gone"
 }
 

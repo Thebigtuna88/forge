@@ -1482,8 +1482,9 @@ EOF
   for p in actions/secrets actions/secrets/public-key actions/variables keys hooks; do
     assert_contains "$calls" "app_gh api repos/$REPO/$p"
   done
-  assert_contains "$calls" "app_gh api -X PUT repos/$REPO/collaborators/$OWNER -f permission=push"
-  for p in actions/secrets actions/variables keys hooks; do
+  assert_contains "$calls" "app_gh api repos/$REPO/invitations"
+  assert_not_contains "$calls" "collaborators" "a collaborator write with no valid target or control (round 13, SEC-5)"
+  for p in actions/secrets actions/variables keys hooks invitations; do
     assert_contains "$calls" "owner_gh api repos/$REPO/$p"
   done
   assert_not_contains "$calls" "owner_gh api -X" "the control writes"
@@ -1575,10 +1576,17 @@ test_a_permission_run_closes_its_test_issues() {
   }
   : >"$T_TMP/owner"
   FAILS=0
-  sweep_issues
+  RUN_ID=20261102T010203Z-77
+  local out
+  out="$(sweep_issues; echo "fails=$FAILS")"
   assert_contains "$(cat "$T_TMP/owner")" "issue close 11 --repo $REPO"
   assert_contains "$(cat "$T_TMP/owner")" "issue close 12 --repo $REPO"
+  assert_contains "$(grep "repos/$REPO/issues" "$T_TMP/owner")" "20261102T010203Z-77" "only this run's issues are closed"
+  # Round 13, SEC-4: the second throwaway is only read; an issue there is reported, never closed.
   assert_contains "$(cat "$T_TMP/owner")" "repos/$REPO2/issues?state=open"
+  assert_not_contains "$(cat "$T_TMP/owner")" "--repo $REPO2" "an owner write to the second throwaway"
+  assert_contains "$out" "CLEANUP FAIL"
+  assert_contains "$out" "fails=1"
 }
 
 # --- S2: the Environment (plan 4.4) ----------------------------------------------------------
@@ -1615,7 +1623,7 @@ s2_stubs() {
   p_stubs
   eid=9
   env_id() { echo 9; }
-  run_log_has_value() { [[ "$(cat "$T_TMP/log-$1" 2>/dev/null)" == yes ]]; }
+  run_log_value() { cat "$T_TMP/log-$1" 2>/dev/null || echo no; }
   wait_run() { RUN="$(cat "$T_TMP/run-$1" 2>/dev/null)"; [[ -n "$RUN" ]]; }
   approve_run() { echo "approve $1 $2" >>"$T_TMP/calls"; LAST_RC=0; LAST_OUT=ok
     if [[ -f "$T_TMP/refuse-$1-$2" ]]; then LAST_RC=1; LAST_OUT="$(cat "$T_TMP/refuse-$1-$2")"; return 1; fi; }
@@ -1624,6 +1632,7 @@ s2_stubs() {
 
 test_s2b_the_app_cannot_approve_its_own_deployment() {
   s2_stubs
+  can_approve() { echo true; }
   app_git() { echo "app_git $*" >>"$T_TMP/calls"; [[ "$*" == *rev-parse* ]] && printf 'a%.0s' $(seq 1 40) && echo; return 0; }
   local sha
   sha="$(printf 'a%.0s' $(seq 1 40))"
@@ -1650,6 +1659,8 @@ test_s2d_self_review_is_refused_and_its_control_is_s2b() {
   s2_stubs
   S2_OWNER_SHA="$(printf 'b%.0s' $(seq 1 40))"
   echo "502 waiting null Thebigtuna88" >"$T_TMP/run-$S2_OWNER_SHA"
+  can_approve() { cat "$T_TMP/can-$1" 2>/dev/null || echo error; }
+  echo false >"$T_TMP/can-502"
   echo "gh: Can't approve your own deployment (HTTP 422)" >"$T_TMP/refuse-owner_gh-502"
   local out
   S2B_OWNER_APPROVAL=ok
@@ -1658,6 +1669,19 @@ test_s2d_self_review_is_refused_and_its_control_is_s2b() {
   S2B_OWNER_APPROVAL=""
   out="$(t_S2d)"
   assert_contains "$out" "RESULT S2d permissions FAIL" "no S2b control"
+  # Round 13, C2/SEC-2: a request that never reached GitHub, or a rate limit, proves nothing.
+  S2B_OWNER_APPROVAL=ok
+  echo "gh: dial tcp: lookup api.github.com: no such host" >"$T_TMP/refuse-owner_gh-502"
+  out="$(t_S2d)"
+  assert_contains "$out" "RESULT S2d permissions FAIL attempt=inconclusive" "a network error"
+  echo "gh: API rate limit exceeded (HTTP 403)" >"$T_TMP/refuse-owner_gh-502"
+  out="$(t_S2d)"
+  assert_contains "$out" "RESULT S2d permissions FAIL attempt=inconclusive" "a rate limit"
+  # GitHub must itself say the owner can't approve this run (Prevent self-review).
+  echo "gh: Can't approve your own deployment (HTTP 422)" >"$T_TMP/refuse-owner_gh-502"
+  echo true >"$T_TMP/can-502"
+  out="$(t_S2d)"
+  assert_contains "$out" "RESULT S2d permissions FAIL attempt=inconclusive" "GitHub says the owner could approve"
 }
 
 test_s2a_a_feature_branch_never_gets_the_value() {
@@ -1666,16 +1690,41 @@ test_s2a_a_feature_branch_never_gets_the_value() {
   local sha
   sha="$(printf 'c%.0s' $(seq 1 40))"
   echo "503 completed failure frg26-test-app[bot]" >"$T_TMP/run-$sha"
+  deploy_job() { cat "$T_TMP/job-$1" 2>/dev/null || echo error; }
+  policy_rejected() { [[ -f "$T_TMP/policy-$1" ]]; }
+  echo "9001 0 failure" >"$T_TMP/job-503"
+  touch "$T_TMP/policy-9001"
   local out
   out="$(t_S2a)"
   assert_contains "$out" "RESULT S2a permissions PASS attempt=refused"
+  # Round 13, C3/SEC-1: a run that failed for another reason proves nothing.
+  echo "9001 3 failure" >"$T_TMP/job-503"
+  out="$(t_S2a)"
+  assert_contains "$out" "RESULT S2a permissions FAIL attempt=inconclusive" "a job that ran and failed"
+  echo "9001 0 failure" >"$T_TMP/job-503"
+  rm -f "$T_TMP/policy-9001"
+  out="$(t_S2a)"
+  assert_contains "$out" "RESULT S2a permissions FAIL attempt=inconclusive" "no branch-policy rejection from GitHub"
+  touch "$T_TMP/policy-9001"
   echo "503 waiting null frg26-test-app[bot]" >"$T_TMP/run-$sha"
   out="$(t_S2a)"
   assert_contains "$out" "RESULT S2a permissions FAIL attempt=allowed" "a feature branch waiting to deploy"
   echo "503 completed success frg26-test-app[bot]" >"$T_TMP/run-$sha"
+  echo "9001 1 success" >"$T_TMP/job-503"
   echo yes >"$T_TMP/log-503"
   out="$(t_S2a)"
   assert_contains "$out" "RESULT S2a permissions FAIL attempt=allowed" "a feature branch that got the value"
+}
+
+test_an_unreadable_run_log_is_not_an_absent_value() {
+  # Round 13, C3/SEC-1: run_log_value tells "no such line" from "the log couldn't be read".
+  load
+  owner_gh() { echo "  deploy  Report  FRG26-S2 value length 24"; }
+  assert_eq "$(run_log_value 5)" yes
+  owner_gh() { echo "  deploy  Report  nothing here"; }
+  assert_eq "$(run_log_value 5)" no
+  owner_gh() { echo "failed to get run log: HTTP 404" >&2; return 1; }
+  assert_eq "$(run_log_value 5)" error
 }
 
 test_s2c_the_app_cannot_change_the_environment() {
@@ -1793,15 +1842,100 @@ test_e1_records_the_suspension_and_needs_the_control() {
   assert_contains "$out" "E1 a new token while suspended: refused"
   assert_contains "$out" "READING E1 a token issued before the suspension"
   assert_eq "$(state_get E1)" "refused HTTP-403"
-  app_session() { :; }
+  app_session() { TOKEN="ghs_control$(printf 'C%.0s' $(seq 1 30))"; }
+  revoke_token() { echo "revoke ${TOKEN:0:11}" >>"$T_TMP/calls"; TOKEN=""; }
   local rc=0
   out="$(cmd_unsuspend_check 2>&1)" || rc=$?
   assert_exit 0 "$rc"
   assert_contains "$out" "RESULT E1 permissions PASS attempt=refused control=ok"
+  # Round 13, C1/SEC-3: the control ran in a subshell; its token must not outlive it.
+  assert_contains "$(cat "$T_TMP/calls")" "revoke ghs_control" "the control's token was revoked"
   app_session() { die "the app's installation is suspended"; }
   rc=0; out="$(cmd_unsuspend_check 2>&1)" || rc=$?
   assert_exit 1 "$rc" "no control after unsuspending"
   assert_contains "$out" "RESULT E1 permissions FAIL"
+}
+
+test_a_held_token_is_revoked_whatever_its_read_says() {
+  # Round 13, C4/SEC-6: revocation is tried whatever the read says. The token is removed only once
+  # that is settled (revoked, or refused as bad credentials); an unreachable or rate-limited GitHub
+  # stops the step and keeps the token for a retry.
+  held_stubs
+  local rc out
+  put_held() { printf 'HELD_SUSPEND=%s\n' "$(fake_token)" >"$HELD"; printf 'suspend %s\n' "$(date +%s)" >"$HELD_TIMES"; chmod 600 "$HELD" "$HELD_TIMES"; }
+  revoke_token() { echo "revoke" >>"$T_TMP/calls"; TOKEN=""; return "${REVOKE_RC:-0}"; }
+
+  put_held
+  app_gh() { echo "gh: This installation has been suspended (HTTP 403)" >&2; return 1; }
+  REVOKE_RC=1
+  use_held suspend >/dev/null
+  assert_eq "$HELD_RESULT" "HTTP 403"
+  assert_eq "$(cat "$T_TMP/calls")" "revoke" "revocation tried after a refused read"
+  assert_contains "$(cat "$HELD")" "HELD_SUSPEND=" "kept: not revoked, and it may work again"
+
+  : >"$T_TMP/calls"
+  REVOKE_RC=0
+  use_held suspend >/dev/null
+  assert_eq "$(cat "$T_TMP/calls")" "revoke"
+  assert_eq "$(grep -c HELD_SUSPEND "$HELD")" 0 "removed once revoked"
+
+  put_held
+  app_gh() { echo "gh: HTTP 503 Service Unavailable" >&2; return 1; }
+  rc=0; out="$(use_held suspend 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "GitHub unavailable"
+  assert_contains "$out" "kept"
+  assert_contains "$(cat "$HELD")" "HELD_SUSPEND=" "kept after a server error"
+
+  app_gh() { echo "gh: API rate limit exceeded (HTTP 403)" >&2; return 1; }
+  rc=0; out="$(use_held suspend 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a rate limit is not GitHub's answer about the token"
+  assert_contains "$(cat "$HELD")" "HELD_SUSPEND=" "kept after a rate limit"
+
+  # Final (the installation or the app is gone): removed even when revocation can't be confirmed.
+  app_gh() { echo "gh: Not Found (HTTP 404)" >&2; return 1; }
+  REVOKE_RC=1
+  use_held suspend final >/dev/null
+  assert_eq "$(grep -c HELD_SUSPEND "$HELD")" 0 "removed after a final check"
+}
+
+test_suspend_check_does_not_count_a_rate_limit_as_a_refusal() {
+  # Round 13, class check of C2/SEC-2: a rate-limited 403 is not GitHub refusing a suspended app.
+  held_stubs
+  make_jwt() { JWT=x; }
+  jwt_call() {
+    case "$1 $2" in
+      "GET app/installations"*) LAST_HTTP=200; LAST_OUT='[{"id":77,"account":{"login":"Thebigtuna88"},"suspended_at":"2026-11-02T00:00:00Z"}]' ;;
+      "POST app/installations/77/access_tokens") LAST_HTTP=403; LAST_OUT='{"message":"API rate limit exceeded for installation ID 77."}'; return 1 ;;
+    esac
+  }
+  printf 'HELD_SUSPEND=%s\n' "$(fake_token)" >"$HELD"
+  printf 'suspend %s\n' "$(date +%s)" >"$HELD_TIMES"
+  chmod 600 "$HELD" "$HELD_TIMES"
+  app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  cmd_suspend_check >/dev/null 2>&1
+  assert_eq "$(state_get E1)" "inconclusive HTTP-403"
+}
+
+test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
+  # Round 13, C5/SEC-7: an outage or a server error is not proof that the app was deleted.
+  held_stubs
+  make_jwt() { JWT=x; }
+  printf 'HELD_DELETE=%s\n' "$(fake_token)" >"$HELD"
+  printf 'delete %s\n' "$(date +%s)" >"$HELD_TIMES"
+  chmod 600 "$HELD" "$HELD_TIMES"
+  app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  local rc out code
+  for code in 500 502 ""; do
+    jwt_call() { LAST_HTTP="$FAKE_CODE"; LAST_OUT='{"message":"oops"}'; return 1; }
+    FAKE_CODE="$code"
+    rc=0; out="$(cmd_delete_check 2>&1)" || rc=$?
+    assert_exit 2 "$rc" "HTTP '${code:-none}'"
+    assert_contains "$(cat "$HELD")" "HELD_DELETE=" "the held token was used after HTTP '${code:-none}'"
+  done
+  FAKE_CODE=404
+  rc=0; out="$(cmd_delete_check 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "HTTP 404"
+  assert_contains "$out" "the app's own key now gets HTTP 404"
 }
 
 test_e2_and_e3_record_what_issued_tokens_do() {
