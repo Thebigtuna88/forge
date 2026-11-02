@@ -2056,7 +2056,7 @@ test_environment_cleanup_confirms_no_run_still_waits() {
   owner_gh() {
     echo "$*" >>"$T_TMP/owner"
     case "$*" in
-      *"status=waiting"*) [[ -f "$T_TMP/list-fails" ]] && return 1
+      *"actions/runs?per_page=100"*) [[ -f "$T_TMP/list-fails" ]] && return 1
         if [[ -f "$T_TMP/cancelled" && ! -f "$T_TMP/stuck" ]]; then return 0; fi
         printf '701\n702\n' ;;
       *"/cancel"*) touch "$T_TMP/cancelled" ;;
@@ -2076,6 +2076,37 @@ test_environment_cleanup_confirms_no_run_still_waits() {
   touch "$T_TMP/list-fails"
   rc=0; cancel_waiting_runs >/dev/null || rc=$?
   assert_exit 1 "$rc" "an unreadable list"
+}
+
+test_cleanup_waits_for_the_runs_this_run_started() {
+  # Round 22, C2: a run still queued (not yet waiting) when env-tests stops must not be missed: the
+  # clean-up gives each commit env-tests made time to register its run, then cancels every
+  # unfinished S2 run, whatever its status.
+  load
+  sleep() { :; }
+  S2_SHAS="$(printf 'a%.0s' $(seq 1 40))"
+  : >"$T_TMP/owner"
+  owner_gh() {
+    echo "$*" >>"$T_TMP/owner"
+    case "$*" in
+      *"head_sha="*)
+        local n
+        n=$(grep -c 'head_sha=' "$T_TMP/owner")
+        [[ $n -ge 3 ]] && echo "901 queued null Thebigtuna88"
+        ;;
+      *"actions/runs?per_page=100"*)
+        if [[ $(grep -c 'head_sha=' "$T_TMP/owner") -ge 3 && ! -f "$T_TMP/cancelled" ]]; then echo 901; fi
+        ;;
+      *"/cancel"*) touch "$T_TMP/cancelled" ;;
+    esac
+    return 0
+  }
+  local rc=0
+  cancel_waiting_runs >/dev/null || rc=$?
+  assert_exit 0 "$rc"
+  assert_contains "$(cat "$T_TMP/owner")" "actions/runs/901/cancel" "the queued run was not cancelled"
+  [[ $(grep -c 'head_sha=' "$T_TMP/owner") -ge 3 ]] || _t_fail "the clean-up did not wait for the run to register"
+  assert_not_contains "$(cat "$T_TMP/owner")" "status=waiting" "only waiting runs were listed"
 }
 
 test_environment_tests_fail_when_their_cleanup_fails() {
@@ -2294,11 +2325,12 @@ test_a_held_token_near_expiry_gives_no_revocation_reading() {
   rc=0; out="$(cmd_uninstall_check 2>&1)" || rc=$?
   assert_exit 1 "$rc" "a refused token 58 minutes old"
   assert_contains "$out" "READING E2 INCONCLUSIVE"
-  assert_contains "$out" "3500"
+  # The age is read a moment after it was written: a second or two may have passed.
+  [[ "$out" =~ "the token was 350"[0-9]" s old" ]] || _t_fail "the token's age in: $out"
   put 600
   rc=0; out="$(cmd_uninstall_check 2>&1)" || rc=$?
   assert_exit 0 "$rc" "a refused token 10 minutes old"
-  assert_contains "$out" "READING E2 a token issued before the uninstall: HTTP 401 (issued 600 s earlier)"
+  [[ "$out" =~ "READING E2 a token issued before the uninstall: HTTP 401 (issued 60"[0-9]" s earlier)" ]] || _t_fail "the reading in: $out"
   put 3500
   app_gh() { echo "$REPO"; }
   rc=0; out="$(cmd_uninstall_check 2>&1)" || rc=$?
@@ -2398,6 +2430,32 @@ test_an_inconclusive_e1_reading_survives_a_retry() {
   chmod 600 "$HELD"
   (cmd_suspend_check) >/dev/null 2>&1 || true
   assert_eq "$(state_get E1_HELD)" inconclusive
+}
+
+test_unsuspend_check_marks_e1_pending_before_using_the_held_token() {
+  # Round 22, SEC-1: with a held token to read again, E1_HELD is "pending" before it is used; if that
+  # can't be written nothing is used, and an earlier "ok" can't survive a run that read the token.
+  held_stubs
+  app_session() { :; }
+  state_set E1 "refused HTTP-403"
+  state_set E1_HELD ok
+  printf 'HELD_SUSPEND=%s\nHELD_SUSPEND_AT=%s\n' "$(fake_token)" "$(( $(date +%s) - 3500 ))" >"$HELD"
+  chmod 600 "$HELD"
+  app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  local rc=0
+  (cmd_unsuspend_check) >/dev/null 2>&1 || rc=$?
+  assert_exit 1 "$rc" "a near-expiry reading"
+  assert_eq "$(state_get E1_HELD)" inconclusive
+  rc=0
+  (cmd_unsuspend_check) >/dev/null 2>&1 || rc=$?
+  assert_exit 1 "$rc" "the retry, with the held token gone"
+  # A state file that can't be written: the held token is not used.
+  printf 'HELD_SUSPEND=%s\nHELD_SUSPEND_AT=%s\n' "$(fake_token)" "$(date +%s)" >"$HELD"
+  state_set() { return 1; }
+  rc=0
+  (cmd_unsuspend_check) >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc" "an unwritable state file"
+  assert_contains "$(cat "$HELD")" "HELD_SUSPEND=" "the held token was used without its pending mark"
 }
 
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {

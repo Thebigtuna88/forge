@@ -1686,17 +1686,27 @@ policy_rejected() { # <check-run id>
   owner_gh api "repos/$REPO/check-runs/$1/annotations" --jq '.[].message' 2>/dev/null | grep -Eiq 'not allowed to deploy'
 }
 
-waiting_runs() { # the ids of S2 runs still waiting, every page; fails if the list can't be read
-  owner_gh api --paginate "repos/$REPO/actions/runs?status=waiting&per_page=100" \
-    --jq '.workflow_runs[] | select(.name == "frg26-s2") | .id' 2>/dev/null
+# The ids of S2 runs not yet completed (queued, in progress, waiting…), every page; fails if the
+# list can't be read. Not only waiting ones: a queued run reaches the approval gate later (round 22).
+unfinished_runs() {
+  owner_gh api --paginate "repos/$REPO/actions/runs?per_page=100" \
+    --jq '.workflow_runs[] | select(.name == "frg26-s2" and .status != "completed") | .id' 2>/dev/null
 }
 
-# Every waiting S2 run is cancelled, and confirmed no longer waiting (round 14, C4); 1 otherwise.
+# Every unfinished S2 run is cancelled, and confirmed finished (rounds 14 and 22); 1 otherwise.
+# First, each commit env-tests made (S2_SHAS) gets up to a minute to register its run, so a run
+# GitHub hasn't listed yet isn't missed (round 22, C2).
 cancel_waiting_runs() {
-  local ids id _
+  local ids id _ sha
+  for sha in $S2_SHAS; do
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+      [[ -n "$(runs_for "$sha")" ]] && break
+      sleep 5
+    done
+  done
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    if ! ids="$(waiting_runs)"; then
-      say "CLEANUP FAIL could not list the waiting S2 runs in $REPO: cancel any on GitHub (Actions)"
+    if ! ids="$(unfinished_runs)"; then
+      say "CLEANUP FAIL could not list the unfinished S2 runs in $REPO: cancel any on GitHub (Actions)"
       return 1
     fi
     [[ -z "$ids" ]] && return 0
@@ -1706,7 +1716,7 @@ cancel_waiting_runs() {
     done
     sleep 5
   done
-  say "CLEANUP FAIL S2 runs still waiting in $REPO ($(printf '%s' "$ids" | tr '\n' ' ')): cancel them on GitHub (Actions)"
+  say "CLEANUP FAIL S2 runs still unfinished in $REPO ($(printf '%s' "$ids" | tr '\n' ' ')): cancel them on GitHub (Actions)"
   return 1
 }
 
@@ -1718,6 +1728,7 @@ t_S2b() {
   capture app_git -C "$CLONE" push origin HEAD:refs/heads/main || { setup_fail_p S2b "the app could not push main in the open phase: $(evidence)"; return; }
   local sha eid id
   sha="$(app_git -C "$CLONE" rev-parse HEAD)" || sha=""
+  S2_SHAS="$S2_SHAS $sha"
   eid="$(env_id)" || eid=""
   [[ "$sha" =~ ^[0-9a-f]{40}$ && "$eid" =~ ^[0-9]+$ ]] || { setup_fail_p S2b "could not read the commit or the Environment"; return; }
   wait_run "$sha" waiting || { setup_fail_p S2b "the app's run never waited for review ($RUN)"; return; }
@@ -1768,6 +1779,7 @@ t_S2a() {
   capture app_git -C "$CLONE" push origin "HEAD:refs/heads/$br" || { setup_fail_p S2a "pushing $br failed: $(evidence)"; return; }
   local sha id
   sha="$(app_git -C "$CLONE" rev-parse HEAD)" || sha=""
+  S2_SHAS="$S2_SHAS $sha"
   wait_run "$sha" completed waiting || { setup_fail_p S2a "no run finished for $br ($RUN)"; return; }
   id="${RUN%% *}"
   # Refused needs GitHub's own rejection (round 13, C3/SEC-1): the deploy job failed without running
@@ -1816,6 +1828,7 @@ t_S2c() {
 
 readonly S2_TEST_ORDER="S2b S2d S2a S2c"
 S2_OWNER_SHA=""
+S2_SHAS="" # every commit env-tests made that starts an S2 run (round 22, C2)
 S2B_OWNER_APPROVAL=""
 
 cmd_env_tests() {
@@ -1834,6 +1847,7 @@ cmd_env_tests() {
   put_file "$S2_WORKFLOW" "$(s2_workflow)"
   S2_OWNER_SHA="$(owner_gh api "repos/$REPO/branches/main" --jq .commit.sha 2>/dev/null)" || S2_OWNER_SHA=""
   [[ "$S2_OWNER_SHA" =~ ^[0-9a-f]{40}$ ]] || die "can't read main after adding the S2 workflow"
+  S2_SHAS="$S2_SHAS $S2_OWNER_SHA"
   local id
   for id in $S2_TEST_ORDER; do
     # A fresh clone each time: S2b moves main.
@@ -2132,9 +2146,13 @@ cmd_unsuspend_check() {
   # The installation exists again, so this is not "final" (round 14, SEC-1): a token that can't be
   # revoked stays held, and the step fails so it is run again.
   if held_get suspend >/dev/null; then
+    # Before the held token is used: "pending", so a failed run or a failed write never leaves an
+    # earlier "ok" for a retry to accept (round 22, SEC-1).
+    state_set E1_HELD pending || die "can't write $STATE, where E1's reading is kept: nothing was used; run this step again"
     use_held suspend
     held_reading E1 "the token issued before the suspension, after unsuspending: $HELD_RESULT (issued $HELD_AGE s earlier)"
-    if [[ $INCONCLUSIVE -ne 0 ]]; then state_set E1_HELD inconclusive || true; fi
+    if [[ $INCONCLUSIVE -ne 0 ]]; then state_set E1_HELD inconclusive; else state_set E1_HELD ok; fi \
+      || die "can't store E1's reading in $STATE: do E1 again"
     if held_get suspend >/dev/null; then die "the token held over the suspension couldn't be revoked: run this step again"; fi
   fi
   FAILS=0
