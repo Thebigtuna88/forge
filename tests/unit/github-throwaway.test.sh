@@ -2634,6 +2634,32 @@ test_key_check_installs_the_new_key_at_the_configured_path() {
   [[ ! -e "$T_TMP/app.pem" && ! -e "$T_TMP/app-new.pem" ]] || _t_fail "the new key went somewhere else"
 }
 
+test_a_token_issued_while_suspended_is_retried_on_exit() {
+  # Round 27, SEC-1: a token the suspended installation issues anyway is on the exit clean-up's list
+  # before its revocation, so a failed revocation is tried again on exit.
+  local out
+  out="$(held_stubs
+    make_jwt() { JWT=jwt.stand-in.value; }
+    jwt_call() {
+      case "$1 $2" in
+        ("GET app/installations"*) LAST_HTTP=200; LAST_OUT='[{"id":77,"account":{"login":"Thebigtuna88"},"suspended_at":"2026-11-02T00:00:00Z"}]' ;;
+        ("POST app/installations/77/access_tokens") LAST_HTTP=201; LAST_OUT="$(token_fixture)" ;;
+      esac
+    }
+    printf 'HELD_SUSPEND=%s\nHELD_SUSPEND_AT=%s\n' "ghs_heldtoken$(printf 'H%.0s' $(seq 1 30))" "$(date +%s)" >"$HELD"
+    chmod 600 "$HELD"
+    app_gh() {
+      echo "app_gh ${TOKEN:0:12} $*" >>"$T_TMP/app-gh.log"
+      [[ "$*" == *DELETE* ]] && return 1
+      echo "gh: Bad credentials (HTTP 401)" >&2
+      return 1
+    }
+    trap cleanup EXIT
+    cmd_suspend_check 2>&1)" || true
+  assert_contains "$out" "a new token while suspended: allowed"
+  assert_eq "$(grep -c "app_gh $(fake_token | cut -c1-12) api -X DELETE installation/token" "$T_TMP/app-gh.log")" 2 "the issued token was not retried on exit"
+}
+
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
   # Round 13, C5/SEC-7: an outage or a server error is not proof that the app was deleted.
   held_stubs

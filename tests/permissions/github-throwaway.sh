@@ -2154,8 +2154,12 @@ cmd_suspend_check() {
   local obs=inconclusive
   if [[ "$LAST_HTTP" =~ ^2 ]]; then
     obs=allowed
-    TOKEN="$(jq -r .token <<<"$LAST_OUT")"
-    revoke_token
+    # On the exit clean-up's list before it is revoked, so a failed revocation is tried again
+    # (round 27, SEC-1; as key-check does).
+    local t
+    t="$(jq -r .token <<<"$LAST_OUT" 2>/dev/null)" || t=""
+    LAST_OUT=""
+    if [[ "$t" =~ ^ghs_ ]]; then TOKEN="$t"; OUTSTANDING="$OUTSTANDING $t"; revoke_token; fi
   elif [[ "$LAST_HTTP" =~ ^(401|403|404)$ ]] && ! grep -Eiq 'rate limit|abuse detection' <<<"$LAST_OUT"; then obs=refused
   fi
   state_set E1 "$obs HTTP-${LAST_HTTP:-none}" || die "can't store this step's observation in $STATE: run it again"
