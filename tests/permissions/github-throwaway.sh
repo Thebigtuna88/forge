@@ -1860,6 +1860,10 @@ cmd_env_tests() {
 # recorded; where GitHub's docs are silent it is a reading.
 
 HELD="$(dirname "$SECRETS")/held-tokens.env"
+# A held token this old (55 minutes) is near its hour: if it is refused, plain expiry could explain it,
+# so A9b, E1, E2 and E3 give no reading then (round 18, C1). A4 is the expiry test.
+readonly FRESH_MAX=3300
+INCONCLUSIVE=0
 STATE="$(dirname "$SECRETS")/frg26-state"
 
 held_var() { printf 'HELD_%s' "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"; }
@@ -1888,8 +1892,17 @@ held_write() { # <name> [token]
   if ! chmod 600 "$tmp" || ! mv -f "$tmp" "$HELD"; then rm -f "$tmp"; return 1; fi
 }
 
-held_drop() { # <name>
-  held_write "$1" || say "note: couldn't remove the held record '$1' from $HELD (its token is settled)"
+held_drop() { # <name> — 1 if the record couldn't be removed (round 18, C2)
+  held_write "$1"
+}
+
+held_reading() { # <id> <text> — what a revocation did to a held token, unless expiry could explain it
+  if [[ "$HELD_RESULT" != works && $HELD_AGE -ge $FRESH_MAX ]]; then
+    INCONCLUSIVE=1
+    say "READING $1 INCONCLUSIVE: $2 (the token was $HELD_AGE s old, near its hour: expiry alone could explain the refusal, so this doesn't correct the plan)"
+  else
+    reading "$1" "$2"
+  fi
 }
 
 state_set() { # <key> <value> — the file is rewritten whole; 1 if that failed (round 17, C1)
@@ -1956,7 +1969,7 @@ use_held() { # <name> [final]
     ev="$(evidence)"
     if revoke_token; then
       TOKEN="$session"
-      held_drop "$1"
+      held_drop "$1" || die "couldn't remove the held record '$1' from $HELD (its token was revoked): delete its $(held_var "$1") lines by hand"
       die "GitHub couldn't be read reliably with the held token '$1' ($ev); it was revoked, so this reading is lost: hold a new token and check again"
     fi
     TOKEN="$session"
@@ -1967,7 +1980,9 @@ use_held() { # <name> [final]
   elif [[ "$HELD_RESULT" == "HTTP 401" || "${2:-}" == final ]]; then settled=yes
   fi
   TOKEN="$session"
-  if [[ $settled == yes ]]; then held_drop "$1"; else
+  if [[ $settled == yes ]]; then
+    held_drop "$1" || die "couldn't remove the held record '$1' from $HELD (its token is settled): delete its $(held_var "$1") lines by hand before going on"
+  else
     say "note: the held token '$1' read $HELD_RESULT and couldn't be revoked now; it stays held for a later step (it expires within an hour of $(date -u -r "${line##* }" +%H:%M:%SZ) anyway)"
   fi
 }
@@ -2019,12 +2034,13 @@ cmd_key_check() {
   APP_KEY="$new"
   need_app_identity
   use_held keyold
-  reading A9b "a token issued before the key was deleted, $HELD_AGE s later: $HELD_RESULT"
+  held_reading A9b "a token issued before the key was deleted, $HELD_AGE s later: $HELD_RESULT"
   [[ $FAILS -eq 0 ]] || exit 1
   # Not before the old key's token is settled (round 16, SEC-1): app-new.pem stays where it is, so
   # running this step again retries the revocation.
   if held_get keyold >/dev/null; then die "the token held over the key change couldn't be revoked: run this step again"; fi
   mv "$new" "$(dirname "$new")/app.pem" || die "making the new key app.pem failed"
+  [[ $INCONCLUSIVE -eq 0 ]] || exit 1
 }
 
 # E1, first half (the owner has just suspended the installation): a new token is refused; what a
@@ -2055,8 +2071,12 @@ cmd_suspend_check() {
   fi
   state_set E1 "$obs HTTP-${LAST_HTTP:-none}" || die "can't store this step's observation in $STATE: run it again"
   use_held suspend
-  reading E1 "a token issued before the suspension (suspended at $sus): $HELD_RESULT"
+  held_reading E1 "a token issued before the suspension (suspended at $sus): $HELD_RESULT (issued $HELD_AGE s earlier)"
   say "E1 a new token while suspended: $obs (HTTP ${LAST_HTTP:-none}); the verdict follows after you unsuspend"
+  if [[ $INCONCLUSIVE -ne 0 ]]; then
+    say "stopping here: unsuspend the app in your browser (Settings, Applications, Installed GitHub Apps, Configure, Unsuspend)"
+    exit 1
+  fi
 }
 
 # E1, second half (the owner has unsuspended): the control, a new token, must work.
@@ -2074,12 +2094,12 @@ cmd_unsuspend_check() {
   # revoked stays held, and the step fails so it is run again.
   if held_get suspend >/dev/null; then
     use_held suspend
-    reading E1 "the token issued before the suspension, after unsuspending: $HELD_RESULT"
+    held_reading E1 "the token issued before the suspension, after unsuspending: $HELD_RESULT (issued $HELD_AGE s earlier)"
     if held_get suspend >/dev/null; then die "the token held over the suspension couldn't be revoked: run this step again"; fi
   fi
   FAILS=0
   record_p E1 "${first%% *}" "$ctl" "a new token while suspended: ${first#* }; after unsuspending: $ctl"
-  [[ $FAILS -eq 0 ]]
+  [[ $FAILS -eq 0 && $INCONCLUSIVE -eq 0 ]]
 }
 
 # E2 (the owner has just uninstalled the app): what a token issued before does is recorded, and
@@ -2094,7 +2114,8 @@ cmd_uninstall_check() {
   n="$(jq --arg o "$OWNER" '[.[] | select(.account.login == $o)] | length' <<<"$LAST_OUT" 2>/dev/null)" || n=error
   [[ "$n" == 0 ]] || die "the app is still installed on $OWNER's account ($n installations): uninstall it first"
   use_held uninstall final
-  reading E2 "a token issued before the uninstall: $HELD_RESULT"
+  held_reading E2 "a token issued before the uninstall: $HELD_RESULT (issued $HELD_AGE s earlier)"
+  [[ $INCONCLUSIVE -eq 0 ]] || exit 1
 }
 
 # E3 (the owner has just deleted the app): what a token issued before does is recorded, and the
@@ -2111,7 +2132,8 @@ cmd_delete_check() {
   [[ "$LAST_HTTP" == 401 || "$LAST_HTTP" == 404 ]] || die "GitHub didn't confirm the app is gone (HTTP ${LAST_HTTP:-none}): run this step again"
   local gone="HTTP $LAST_HTTP"
   use_held delete final
-  reading E3 "a token issued before the app was deleted: $HELD_RESULT; the app's own key now gets $gone"
+  held_reading E3 "a token issued before the app was deleted: $HELD_RESULT (issued $HELD_AGE s earlier); the app's own key now gets $gone"
+  [[ $INCONCLUSIVE -eq 0 ]] || exit 1
 }
 
 cmd_tests() {

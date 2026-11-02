@@ -2261,6 +2261,49 @@ test_suspend_check_stops_if_its_observation_cannot_be_stored() {
   assert_eq "$(state_get E1)" "allowed HTTP-201" "the stored observation is this run's"
 }
 
+test_a_held_token_near_expiry_gives_no_revocation_reading() {
+  # Round 18, C1: a refused token close to its hour proves nothing about uninstalling (or a key's
+  # deletion, a suspension, the app's deletion): expiry alone could explain it. Such a reading is
+  # INCONCLUSIVE and the step fails; a fresh refused token, or one that still works, is a reading.
+  held_stubs
+  make_jwt() { JWT=jwt.stand-in.value; }
+  jwt_call() { LAST_HTTP=200; LAST_OUT='[]'; }
+  app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  put() { printf 'HELD_UNINSTALL=%s\nHELD_UNINSTALL_AT=%s\n' "$(fake_token)" "$(( $(date +%s) - $1 ))" >"$HELD"; chmod 600 "$HELD"; }
+  local rc out
+  put 3500
+  rc=0; out="$(cmd_uninstall_check 2>&1)" || rc=$?
+  assert_exit 1 "$rc" "a refused token 58 minutes old"
+  assert_contains "$out" "READING E2 INCONCLUSIVE"
+  assert_contains "$out" "3500"
+  put 600
+  rc=0; out="$(cmd_uninstall_check 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "a refused token 10 minutes old"
+  assert_contains "$out" "READING E2 a token issued before the uninstall: HTTP 401 (issued 600 s earlier)"
+  put 3500
+  app_gh() { echo "$REPO"; }
+  rc=0; out="$(cmd_uninstall_check 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "an old token that still works is a reading"
+  assert_contains "$out" "works"
+}
+
+test_a_held_record_that_cannot_be_removed_stops_the_step() {
+  # Round 18, C2: a settled token whose record can't be removed must not let the step succeed (a
+  # later check could reuse it).
+  held_stubs
+  mkdir -m 700 "$T_TMP/ro"
+  HELD="$T_TMP/ro/held-tokens.env"
+  printf 'HELD_AGE=%s\nHELD_AGE_AT=%s\n' "$(fake_token)" "$(date +%s)" >"$HELD"
+  chmod 600 "$HELD"
+  chmod 500 "$T_TMP/ro"
+  app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  local rc=0 out
+  out="$(use_held age 2>&1)" || rc=$?
+  chmod 700 "$T_TMP/ro"
+  assert_exit 2 "$rc"
+  assert_contains "$out" "couldn't remove the held record"
+}
+
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
   # Round 13, C5/SEC-7: an outage or a server error is not proof that the app was deleted.
   held_stubs

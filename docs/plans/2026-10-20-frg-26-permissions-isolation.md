@@ -177,6 +177,11 @@ deletion, E1 suspend, E2 uninstall, E3 app deletion). Each result goes into this
 date and GitHub's exact reply; where a token keeps working, the plan says so and the emergency
 order is adjusted. Nothing here is assumed until its test has run.
 
+*Freshness* (review round 18): a held token refused when it is 55 minutes old or more gives no
+reading for A9b, E1, E2 or E3 (plain expiry could explain it); the step reads INCONCLUSIVE and
+stops, and the plan is not corrected from it. A4 is the expiry test. The revocation handoff asks for
+each browser step within about 30 minutes of the one before.
+
 *Held tokens in the tests* (review round 13): revocation is tried whatever the token's read
 returned. A held token is removed only once that is settled (revoked, refused as bad credentials,
 or its installation or app is gone); if GitHub can't be read reliably (no answer, a server error,
