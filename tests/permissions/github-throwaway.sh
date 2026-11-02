@@ -511,6 +511,14 @@ put_file() { # <path> <content> — the owner commits a file to main through the
     -f content="$b64" -f branch=main >/dev/null || die "adding $1 failed"
 }
 
+# The owner commits a file to main and prints the new commit's sha, from the write's own answer.
+put_file_commit() { # <path> <content>
+  local b64
+  b64="$(printf '%s' "$2" | base64 | tr -d '\n')"
+  owner_gh api -X PUT "repos/$REPO/contents/$1" -f message="FRG-26 throwaway: $1" \
+    -f content="$b64" -f branch=main --jq .commit.sha
+}
+
 cmd_create() {
   need_owner
   if owner_gh api "repos/$REPO" >/dev/null 2>&1; then
@@ -1706,7 +1714,16 @@ cancel_waiting_runs() {
     done
     [[ -n "$seen" ]] || unseen="$unseen ${sha:0:7}"
   done
-  # A run GitHub never showed may still appear and wait for approval (round 23, C1/SEC-1).
+  # A run GitHub never showed may still appear and wait for approval (round 23, C1/SEC-1); so may the
+  # run of a workflow commit whose sha is unknown (round 24, SEC-1). What can be seen is still
+  # cancelled first.
+  if [[ -n "$S2_UNKNOWN" ]]; then
+    local any
+    any="$(unfinished_runs)" || any=""
+    for id in $any; do [[ "$id" =~ ^[0-9]+$ ]] && owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1; done
+    say "CLEANUP FAIL the S2 workflow commit's outcome is unknown, so its run may appear later: check $REPO's Actions on GitHub and cancel any S2 run there"
+    return 1
+  fi
   if [[ -n "$unseen" ]]; then
     say "CLEANUP FAIL the S2 runs for commit(s)$unseen never appeared within a minute: check $REPO's Actions on GitHub and cancel any S2 run there"
     return 1
@@ -1836,6 +1853,7 @@ t_S2c() {
 readonly S2_TEST_ORDER="S2b S2d S2a S2c"
 S2_OWNER_SHA=""
 S2_SHAS="" # every commit env-tests made that starts an S2 run (round 22, C2)
+S2_UNKNOWN="" # set while the owner's workflow commit may have happened but its sha isn't known
 S2B_OWNER_APPROVAL=""
 
 cmd_env_tests() {
@@ -1849,12 +1867,15 @@ cmd_env_tests() {
   RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   CLONE="$WORK/clone"
   say "== FRG-26 Environment tests (S2), app $APP_BOT, $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
-  # The owner adds the workflow to main: that commit starts the owner's own run (S2d's).
+  # The owner adds the workflow to main: that commit starts the owner's own run (S2d's). Its sha comes
+  # from the write's own answer; until it is known the outcome counts as unknown, which the clean-up
+  # can't reconcile and reports (round 24, SEC-1).
   CANCEL_ON_EXIT=1
-  put_file "$S2_WORKFLOW" "$(s2_workflow)"
-  S2_OWNER_SHA="$(owner_gh api "repos/$REPO/branches/main" --jq .commit.sha 2>/dev/null)" || S2_OWNER_SHA=""
-  [[ "$S2_OWNER_SHA" =~ ^[0-9a-f]{40}$ ]] || die "can't read main after adding the S2 workflow"
+  S2_UNKNOWN=1
+  S2_OWNER_SHA="$(put_file_commit "$S2_WORKFLOW" "$(s2_workflow)" 2>/dev/null)" || S2_OWNER_SHA=""
+  [[ "$S2_OWNER_SHA" =~ ^[0-9a-f]{40}$ ]] || die "adding the S2 workflow failed, or its commit is unknown"
   S2_SHAS="$S2_SHAS $S2_OWNER_SHA"
+  S2_UNKNOWN=""
   local id
   for id in $S2_TEST_ORDER; do
     # A fresh clone each time: S2b moves main.

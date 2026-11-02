@@ -2109,6 +2109,52 @@ test_cleanup_waits_for_the_runs_this_run_started() {
   assert_not_contains "$(cat "$T_TMP/owner")" "status=waiting" "only waiting runs were listed"
 }
 
+test_the_workflow_commit_is_known_from_its_own_answer() {
+  # Round 24, SEC-1: the owner's workflow commit is read from the write's own answer, not from a
+  # later read of main that could fail after the run had started.
+  local out rc=0 sha
+  sha="$(printf 'f%.0s' $(seq 1 40))"
+  out="$(load
+    need_owner() { :; }
+    assert_throwaway() { :; }
+    app_session() { :; }
+    verify_phase() { :; }
+    need_allowance() { :; }
+    env_summary() { want_env; }
+    app_git() { :; }
+    owner_gh() {
+      # (pattern) form: bash 3.2 misparses a bare "pattern)" inside $( ).
+      case "$*" in
+        (*"contents/.github/workflows/frg26-s2.yml"*) echo "$sha" ;;
+        (*"branches/main"*) return 1 ;;
+      esac
+      return 0
+    }
+    WORK="$T_TMP/work"
+    mkdir -p "$WORK"
+    for id in $S2_TEST_ORDER; do eval "t_$id() { record_p $id refused ok stand-in; }"; done
+    cancel_waiting_runs() { echo "CLEANUP S2_SHAS=$S2_SHAS UNKNOWN=${S2_UNKNOWN:-no}"; }
+    cmd_env_tests 2>&1)" || rc=$?
+  assert_exit 0 "$rc"
+  assert_contains "$out" "CLEANUP S2_SHAS= $sha UNKNOWN=no"
+}
+
+test_an_unknown_workflow_commit_fails_the_cleanup() {
+  # Round 24, SEC-1: a workflow commit that may have happened, but whose sha isn't known, can't be
+  # reconciled: the clean-up still cancels what it sees, and fails.
+  load
+  sleep() { :; }
+  S2_UNKNOWN=1
+  S2_SHAS=""
+  : >"$T_TMP/owner"
+  owner_gh() { echo "$*" >>"$T_TMP/owner"; return 0; }
+  local rc=0 out
+  out="$(cancel_waiting_runs)" || rc=$?
+  assert_exit 1 "$rc"
+  assert_contains "$out" "unknown"
+  assert_contains "$(cat "$T_TMP/owner")" "actions/runs?per_page=100" "it still cancels what it sees"
+}
+
 test_environment_tests_fail_when_their_cleanup_fails() {
   load
   need_owner() { :; }
@@ -2241,7 +2287,7 @@ test_an_error_in_env_tests_still_cancels_waiting_runs() {
     mkdir -p "$WORK"
     cmd_env_tests 2>&1)" || rc=$?
   assert_exit 2 "$rc"
-  assert_contains "$out" "can't read main after adding the S2 workflow"
+  assert_contains "$out" "adding the S2 workflow"
   assert_contains "$out" "CANCELLED-WAITING-RUNS"
 }
 
