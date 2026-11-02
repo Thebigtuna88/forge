@@ -1370,11 +1370,12 @@ p_attempts() { # <kind api|push> <args…> separated by ";;"
   done
 }
 
-# Controls, all of which must succeed. Sets CTL (ok|failed) and adds to EV.
+# Controls, all of which must succeed. Sets CTL (ok|failed) and adds to EV. The first one that fails
+# ends the list: no later control (some write) runs after it, the stop rule (round 29).
 p_controls() { # <args…> separated by ";;"
   local c
   CTL=ok
-  while [[ $# -gt 0 ]]; do
+  while [[ $# -gt 0 && "$CTL" == ok ]]; do
     c=()
     while [[ $# -gt 0 && "$1" != ";;" ]]; do c+=("$1"); shift; done
     [[ $# -gt 0 ]] && shift

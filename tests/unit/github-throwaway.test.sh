@@ -2675,6 +2675,31 @@ test_s2c_changes_nothing_after_an_attempt_that_got_through() {
   assert_contains "$out" "FRG26_DISPOSABLE is left"
 }
 
+test_controls_stop_at_their_first_failure() {
+  # Round 29, C1/SEC-1: the stop rule holds for controls too: after a control fails, no later control
+  # (a write among them) runs.
+  s2_stubs
+  WORK="$T_TMP/work"
+  owner_uid() { echo 42; }
+  printf 'app_gh api|1|gh: Resource not accessible by integration (HTTP 403)\nowner_gh api -X PUT repos/%s/environments|1|gh: HTTP 502\n' "$REPO" >"$T_TMP/answers"
+  env_summary() { want_env; }
+  local out
+  out="$(t_S2c)"
+  assert_contains "$out" "RESULT S2c permissions FAIL attempt=refused control=failed"
+  assert_not_contains "$(cat "$T_TMP/calls")" "owner_gh api -X DELETE" "the disposable secret was deleted after a failed control"
+  # A2: a failed push control stops the issue and PR controls.
+  p_stubs
+  cat >"$T_TMP/answers" <<EOF
+owner_gh api repos/$REPO2/compare/main...frg26-a2 --jq .ahead_by|0|1
+app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot].
+app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)
+app_git -C $T_TMP/clone push origin|1|fatal: unable to access: Could not resolve host
+EOF
+  out="$(t_A2)"
+  assert_contains "$out" "RESULT A2 permissions FAIL attempt=refused control=failed"
+  assert_not_contains "$(cat "$T_TMP/calls")" "app_gh api -X POST repos/$REPO/issues" "a control after the failed one"
+}
+
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
   # Round 13, C5/SEC-7: an outage or a server error is not proof that the app was deleted.
   held_stubs
