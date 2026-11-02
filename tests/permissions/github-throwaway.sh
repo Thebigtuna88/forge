@@ -1701,11 +1701,12 @@ unfinished_runs() {
     --jq '.workflow_runs[] | select(.name == "frg26-s2" and .status != "completed") | .id' 2>/dev/null
 }
 
-# Every unfinished S2 run is cancelled, and confirmed finished (rounds 14 and 22); 1 otherwise.
-# First, each commit env-tests made (S2_SHAS) gets up to a minute to register its run, so a run
-# GitHub hasn't listed yet isn't missed (round 22, C2).
+# Every unfinished S2 run GitHub shows is cancelled, and confirmed finished (rounds 14, 22, 25); then
+# the clean-up fails if a run may still be missing: a commit env-tests made whose run never showed
+# within a minute (round 23), or a workflow commit whose sha is unknown (round 24). The visible runs
+# are always dealt with first, whatever else failed (round 25, SEC-1). 1 on any failure.
 cancel_waiting_runs() {
-  local ids id _ sha seen unseen=""
+  local ids id _ sha seen unseen="" ok=""
   for sha in $S2_SHAS; do
     seen=""
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
@@ -1714,13 +1715,23 @@ cancel_waiting_runs() {
     done
     [[ -n "$seen" ]] || unseen="$unseen ${sha:0:7}"
   done
-  # A run GitHub never showed may still appear and wait for approval (round 23, C1/SEC-1); so may the
-  # run of a workflow commit whose sha is unknown (round 24, SEC-1). What can be seen is still
-  # cancelled first.
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if ! ids="$(unfinished_runs)"; then
+      say "CLEANUP FAIL could not list the unfinished S2 runs in $REPO: cancel any on GitHub (Actions)"
+      return 1
+    fi
+    if [[ -z "$ids" ]]; then ok=1; break; fi
+    for id in $ids; do
+      if [[ ! "$id" =~ ^[0-9]+$ ]]; then say "CLEANUP FAIL unexpected run id in $REPO: cancel any unfinished S2 run on GitHub"; return 1; fi
+      owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
+    done
+    sleep 5
+  done
+  if [[ -z "$ok" ]]; then
+    say "CLEANUP FAIL S2 runs still unfinished in $REPO ($(printf '%s' "$ids" | tr '\n' ' ')): cancel them on GitHub (Actions)"
+    return 1
+  fi
   if [[ -n "$S2_UNKNOWN" ]]; then
-    local any
-    any="$(unfinished_runs)" || any=""
-    for id in $any; do [[ "$id" =~ ^[0-9]+$ ]] && owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1; done
     say "CLEANUP FAIL the S2 workflow commit's outcome is unknown, so its run may appear later: check $REPO's Actions on GitHub and cancel any S2 run there"
     return 1
   fi
@@ -1728,20 +1739,7 @@ cancel_waiting_runs() {
     say "CLEANUP FAIL the S2 runs for commit(s)$unseen never appeared within a minute: check $REPO's Actions on GitHub and cancel any S2 run there"
     return 1
   fi
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    if ! ids="$(unfinished_runs)"; then
-      say "CLEANUP FAIL could not list the unfinished S2 runs in $REPO: cancel any on GitHub (Actions)"
-      return 1
-    fi
-    [[ -z "$ids" ]] && return 0
-    for id in $ids; do
-      if [[ ! "$id" =~ ^[0-9]+$ ]]; then say "CLEANUP FAIL unexpected run id in $REPO: cancel any waiting S2 run on GitHub"; return 1; fi
-      owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
-    done
-    sleep 5
-  done
-  say "CLEANUP FAIL S2 runs still unfinished in $REPO ($(printf '%s' "$ids" | tr '\n' ' ')): cancel them on GitHub (Actions)"
-  return 1
+  return 0
 }
 
 # S2b: the app's push to main starts a run; the app tries to approve its own deployment. Control:
@@ -1749,10 +1747,13 @@ cancel_waiting_runs() {
 t_S2b() {
   fresh_from main "s2b-$(stamp)"
   add_commit "tests/permissions-S2b-$(stamp).txt" "FRG-26 S2b"
-  capture app_git -C "$CLONE" push origin HEAD:refs/heads/main || { setup_fail_p S2b "the app could not push main in the open phase: $(evidence)"; return; }
+  # Recorded before the push: GitHub may accept it, and start its run, even if the push reports a
+  # failure (round 25, C2).
   local sha eid id
   sha="$(app_git -C "$CLONE" rev-parse HEAD)" || sha=""
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { setup_fail_p S2b "could not read the local commit"; return; }
   S2_SHAS="$S2_SHAS $sha"
+  capture app_git -C "$CLONE" push origin HEAD:refs/heads/main || { setup_fail_p S2b "the app could not push main in the open phase: $(evidence)"; return; }
   eid="$(env_id)" || eid=""
   [[ "$sha" =~ ^[0-9a-f]{40}$ && "$eid" =~ ^[0-9]+$ ]] || { setup_fail_p S2b "could not read the commit or the Environment"; return; }
   wait_run "$sha" waiting || { setup_fail_p S2b "the app's run never waited for review ($RUN)"; return; }
@@ -1800,10 +1801,12 @@ t_S2a() {
   br="frg26-s2-a-$(stamp)"
   fresh_from main "$br"
   add_commit "tests/permissions-S2a-$(stamp).txt" "FRG-26 S2a"
-  capture app_git -C "$CLONE" push origin "HEAD:refs/heads/$br" || { setup_fail_p S2a "pushing $br failed: $(evidence)"; return; }
   local sha id
+  # Recorded before the push, as in S2b (round 25, C2).
   sha="$(app_git -C "$CLONE" rev-parse HEAD)" || sha=""
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { setup_fail_p S2a "could not read the local commit"; return; }
   S2_SHAS="$S2_SHAS $sha"
+  capture app_git -C "$CLONE" push origin "HEAD:refs/heads/$br" || { setup_fail_p S2a "pushing $br failed: $(evidence)"; return; }
   wait_run "$sha" completed waiting || { setup_fail_p S2a "no run finished for $br ($RUN)"; return; }
   id="${RUN%% *}"
   # Refused needs GitHub's own rejection (round 13, C3/SEC-1): the deploy job failed without running

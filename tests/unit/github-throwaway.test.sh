@@ -2155,6 +2155,51 @@ test_an_unknown_workflow_commit_fails_the_cleanup() {
   assert_contains "$(cat "$T_TMP/owner")" "actions/runs?per_page=100" "it still cancels what it sees"
 }
 
+test_an_unseen_run_does_not_stop_the_visible_ones_being_cancelled() {
+  # Round 25, SEC-1: one commit's run that never showed still fails the clean-up, but only after every
+  # visible unfinished run was cancelled and confirmed.
+  load
+  sleep() { :; }
+  S2_SHAS="$(printf 'b%.0s' $(seq 1 40))"
+  : >"$T_TMP/owner"
+  owner_gh() {
+    echo "$*" >>"$T_TMP/owner"
+    case "$*" in
+      *"head_sha="*) return 1 ;;
+      *"actions/runs?per_page=100"*) if [[ ! -f "$T_TMP/cancelled" ]]; then echo 902; fi ;;
+      *"/cancel"*) touch "$T_TMP/cancelled" ;;
+    esac
+    return 0
+  }
+  local rc=0 out
+  out="$(cancel_waiting_runs)" || rc=$?
+  assert_exit 1 "$rc"
+  assert_contains "$out" "never appeared"
+  assert_contains "$(cat "$T_TMP/owner")" "actions/runs/902/cancel" "a visible run was left"
+}
+
+test_the_apps_s2_commits_are_recorded_before_they_are_pushed() {
+  # Round 25, C2: GitHub can accept a push (and start its run) although the push reports a failure,
+  # so S2b's and S2a's commits are recorded for the clean-up before they are pushed.
+  local id out
+  for id in S2b S2a; do
+    out="$(s2_stubs
+      # Not named sha: the local sha in t_S2b and t_S2a would hide it from this stand-in.
+      fake_sha="$(printf 'c%.0s' $(seq 1 40))"
+      app_git() {
+        case "$*" in
+          (*rev-parse*) echo "$fake_sha" ;;
+          (*push*) echo "fatal: the remote end hung up unexpectedly" >&2; return 1 ;;
+        esac
+        return 0
+      }
+      S2_SHAS=""
+      "t_$id" >/dev/null 2>&1
+      echo "SHAS=$S2_SHAS")"
+    assert_contains "$out" "SHAS= $(printf 'c%.0s' $(seq 1 40))" "$id's commit after a failed push"
+  done
+}
+
 test_environment_tests_fail_when_their_cleanup_fails() {
   load
   need_owner() { :; }
