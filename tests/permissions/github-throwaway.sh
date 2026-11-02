@@ -1849,8 +1849,8 @@ t_S2c() {
     app_gh api "repos/$REPO/environments/$ENV_NAME/secrets/public-key" ";;" \
     app_gh api -X DELETE "repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME"
   if [[ "$OBS" != refused ]]; then
-    owner_gh api -X DELETE "repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME" >/dev/null 2>&1 || true
-    record_p S2c "$OBS" "not run" "$EV"
+    # The stop rule (round 28, C1): nothing more is written after an attempt that wasn't refused.
+    record_p S2c "$OBS" "not run" "$EV (the disposable dummy secret $DISPOSABLE_NAME is left in the Environment for you to see and delete)"
     return
   fi
   p_controls owner_gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input "$WORK/env.json" ";;" \

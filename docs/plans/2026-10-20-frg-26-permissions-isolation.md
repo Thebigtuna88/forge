@@ -359,6 +359,11 @@ run myself.
 8. **Checkpoint with you.** Stage 2 and every Mac change wait for it. *Undo for stage 1: delete
    the throwaway app and both throwaway repos.*
 
+Clean-up the stop rule allows after a failed test (review rounds 13-28): closing this run's test PRs
+and issues, and cancelling S2 runs still unfinished (a waiting run, like an open PR with auto-merge
+armed, could otherwise go ahead later). Nothing else is written: the disposable dummy secret, a
+changed setting or description, or a ruleset stays for you to see.
+
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.
 

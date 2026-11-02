@@ -2660,6 +2660,21 @@ test_a_token_issued_while_suspended_is_retried_on_exit() {
   assert_eq "$(grep -c "app_gh $(fake_token | cut -c1-12) api -X DELETE installation/token" "$T_TMP/app-gh.log")" 2 "the issued token was not retried on exit"
 }
 
+test_s2c_changes_nothing_after_an_attempt_that_got_through() {
+  # Round 28, C1: the stop rule. After an S2c attempt that wasn't refused, nothing more is written:
+  # the disposable dummy secret is left for the owner, and the evidence says so.
+  s2_stubs
+  WORK="$T_TMP/work"
+  owner_uid() { echo 42; }
+  printf 'app_gh api -X PUT|0|{}\n' >"$T_TMP/answers"
+  env_summary() { want_env; }
+  local out
+  out="$(t_S2c)"
+  assert_contains "$out" "RESULT S2c permissions FAIL attempt=allowed"
+  assert_not_contains "$(cat "$T_TMP/calls")" "owner_gh api -X DELETE" "an owner write after the failed attempt"
+  assert_contains "$out" "FRG26_DISPOSABLE is left"
+}
+
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
   # Round 13, C5/SEC-7: an outage or a server error is not proof that the app was deleted.
   held_stubs
