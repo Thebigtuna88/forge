@@ -2415,6 +2415,7 @@ test_an_inconclusive_e1_reading_survives_a_retry() {
     assert_contains "$out" "E1 again" "E1_HELD '${held:-missing}'"
   done
   state_set E1_HELD ok
+  state_set E1_AFTER none
   rc=0; out="$(cmd_unsuspend_check 2>&1)" || rc=$?
   assert_exit 0 "$rc" "a conclusive reading"
   # suspend-check stores its reading's state: a near-expiry refusal is "inconclusive".
@@ -2445,7 +2446,8 @@ test_unsuspend_check_marks_e1_pending_before_using_the_held_token() {
   local rc=0
   (cmd_unsuspend_check) >/dev/null 2>&1 || rc=$?
   assert_exit 1 "$rc" "a near-expiry reading"
-  assert_eq "$(state_get E1_HELD)" inconclusive
+  assert_eq "$(state_get E1_AFTER)" inconclusive
+  assert_eq "$(state_get E1_HELD)" ok "the suspension's own reading was overwritten"
   rc=0
   (cmd_unsuspend_check) >/dev/null 2>&1 || rc=$?
   assert_exit 1 "$rc" "the retry, with the held token gone"
@@ -2456,6 +2458,42 @@ test_unsuspend_check_marks_e1_pending_before_using_the_held_token() {
   (cmd_unsuspend_check) >/dev/null 2>&1 || rc=$?
   assert_exit 2 "$rc" "an unwritable state file"
   assert_contains "$(cat "$HELD")" "HELD_SUSPEND=" "the held token was used without its pending mark"
+}
+
+test_unsuspending_never_overwrites_the_suspensions_reading() {
+  # Round 23, C2: a token that works after unsuspending says nothing about what the suspension did:
+  # an inconclusive suspension reading still means doing E1 again.
+  held_stubs
+  app_session() { :; }
+  state_set E1 "refused HTTP-403"
+  state_set E1_HELD inconclusive
+  state_set E1_AFTER none
+  printf 'HELD_SUSPEND=%s\nHELD_SUSPEND_AT=%s\n' "$(fake_token)" "$(date +%s)" >"$HELD"
+  chmod 600 "$HELD"
+  app_gh() { echo "$REPO"; }
+  revoke_token() { TOKEN=""; return 0; }
+  local rc=0 out
+  out="$(cmd_unsuspend_check 2>&1)" || rc=$?
+  assert_exit 1 "$rc" "an inconclusive suspension reading, then a working token"
+  assert_eq "$(state_get E1_HELD)" inconclusive
+  assert_eq "$(state_get E1_AFTER)" ok
+  assert_contains "$out" "E1 again"
+}
+
+test_cleanup_fails_when_a_started_run_never_shows() {
+  # Round 23, C1/SEC-1: a commit env-tests made whose run never appears within the minute is not
+  # "nothing to cancel": it may appear later and wait for approval, so the clean-up fails.
+  load
+  sleep() { :; }
+  S2_SHAS="$(printf 'b%.0s' $(seq 1 40))"
+  owner_gh() { return 0; }
+  local rc=0 out
+  out="$(cancel_waiting_runs)" || rc=$?
+  assert_exit 1 "$rc" "a run that never registered"
+  assert_contains "$out" "never appeared"
+  owner_gh() { return 1; }
+  rc=0; out="$(cancel_waiting_runs)" || rc=$?
+  assert_exit 1 "$rc" "runs that can't be read"
 }
 
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {

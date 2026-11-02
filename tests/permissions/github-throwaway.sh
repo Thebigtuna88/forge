@@ -1697,13 +1697,20 @@ unfinished_runs() {
 # First, each commit env-tests made (S2_SHAS) gets up to a minute to register its run, so a run
 # GitHub hasn't listed yet isn't missed (round 22, C2).
 cancel_waiting_runs() {
-  local ids id _ sha
+  local ids id _ sha seen unseen=""
   for sha in $S2_SHAS; do
+    seen=""
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-      [[ -n "$(runs_for "$sha")" ]] && break
+      if [[ -n "$(runs_for "$sha")" ]]; then seen=1; break; fi
       sleep 5
     done
+    [[ -n "$seen" ]] || unseen="$unseen ${sha:0:7}"
   done
+  # A run GitHub never showed may still appear and wait for approval (round 23, C1/SEC-1).
+  if [[ -n "$unseen" ]]; then
+    say "CLEANUP FAIL the S2 runs for commit(s)$unseen never appeared within a minute: check $REPO's Actions on GitHub and cancel any S2 run there"
+    return 1
+  fi
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
     if ! ids="$(unfinished_runs)"; then
       say "CLEANUP FAIL could not list the unfinished S2 runs in $REPO: cancel any on GitHub (Actions)"
@@ -2109,6 +2116,7 @@ cmd_suspend_check() {
   # be stored, or the step stops (round 17, C1).
   state_set E1 "pending HTTP-none" || die "can't write $STATE, where this step's observation is kept"
   state_set E1_HELD pending || die "can't write $STATE, where this step's observation is kept"
+  state_set E1_AFTER none || die "can't write $STATE, where this step's observation is kept"
   printf '%s\n' "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}" >"$WORK/token-request.json"
   jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || true
   local obs=inconclusive
@@ -2148,10 +2156,12 @@ cmd_unsuspend_check() {
   if held_get suspend >/dev/null; then
     # Before the held token is used: "pending", so a failed run or a failed write never leaves an
     # earlier "ok" for a retry to accept (round 22, SEC-1).
-    state_set E1_HELD pending || die "can't write $STATE, where E1's reading is kept: nothing was used; run this step again"
+    # Its own record, E1_AFTER: a token that works after unsuspending says nothing about what the
+    # suspension did, so it never replaces the suspension's reading (round 23, C2).
+    state_set E1_AFTER pending || die "can't write $STATE, where E1's reading is kept: nothing was used; run this step again"
     use_held suspend
     held_reading E1 "the token issued before the suspension, after unsuspending: $HELD_RESULT (issued $HELD_AGE s earlier)"
-    if [[ $INCONCLUSIVE -ne 0 ]]; then state_set E1_HELD inconclusive; else state_set E1_HELD ok; fi \
+    if [[ $INCONCLUSIVE -ne 0 ]]; then state_set E1_AFTER inconclusive; else state_set E1_AFTER ok; fi \
       || die "can't store E1's reading in $STATE: do E1 again"
     if held_get suspend >/dev/null; then die "the token held over the suspension couldn't be revoked: run this step again"; fi
   fi
@@ -2159,10 +2169,11 @@ cmd_unsuspend_check() {
   record_p E1 "${first%% *}" "$ctl" "a new token while suspended: ${first#* }; after unsuspending: $ctl"
   # E1 is complete only with a conclusive held-token reading from this suspension cycle (round 21,
   # C1): an inconclusive, unfinished or missing one means doing E1 again.
-  local held_state
+  local held_state after_state
   held_state="$(state_get E1_HELD)" || held_state=""
-  if [[ "$held_state" != ok ]]; then
-    say "E1's held-token reading is '${held_state:-missing}': do E1 again (hold-token suspend, suspend in your browser, suspend-check, unsuspend, unsuspend-check)"
+  after_state="$(state_get E1_AFTER)" || after_state=""
+  if [[ "$held_state" != ok || ( "$after_state" != ok && "$after_state" != none ) ]]; then
+    say "E1's held-token readings are '${held_state:-missing}' (while suspended) and '${after_state:-missing}' (after): do E1 again (hold-token suspend, suspend in your browser, suspend-check, unsuspend, unsuspend-check)"
     return 1
   fi
   [[ $FAILS -eq 0 && $INCONCLUSIVE -eq 0 ]]
