@@ -125,6 +125,7 @@ cleanup() {
     cancel_waiting_runs || true
   fi
   revoke_outstanding
+  if [[ -n "$HELD_LOCKED" ]]; then rmdir "$HELD.lock" 2>/dev/null || true; HELD_LOCKED=""; fi
   if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
@@ -1868,6 +1869,16 @@ STATE="$(dirname "$SECRETS")/frg26-state"
 
 held_var() { printf 'HELD_%s' "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"; }
 
+# One step at a time reads and rewrites the held file (round 19, C1): mkdir either makes the lock or
+# fails, atomically. The exit clean-up releases it.
+HELD_LOCKED=""
+held_lock() {
+  [[ -n "$HELD_LOCKED" ]] && return 0
+  mkdir "$HELD.lock" 2>/dev/null \
+    || die "another FRG-26 step is using the held tokens (if none is running, one stopped uncleanly: remove $HELD.lock, then run this step again)"
+  HELD_LOCKED=1
+}
+
 held_get() { # <name> — prints "token issued-epoch" or fails
   [[ -f "$HELD" && ! -L "$HELD" ]] || return 1
   local v tok at
@@ -1922,6 +1933,7 @@ cmd_hold_token() {
   [[ "$name" =~ ^(age|keyold|suspend|uninstall|delete)$ ]] || die "usage: hold-token age|keyold|suspend|uninstall|delete"
   need_owner
   assert_throwaway
+  held_lock
   app_session
   # A retried step must not abandon the token it held before (round 14, SEC-2): settle that one
   # first, and hold nothing new while it is unsettled.
@@ -1977,7 +1989,7 @@ use_held() { # <name> [final]
   fi
   local settled=no
   if revoke_token; then settled=yes
-  elif [[ "$HELD_RESULT" == "HTTP 401" || "${2:-}" == final ]]; then settled=yes
+  elif [[ "$HELD_RESULT" == "HTTP 401" ]] || [[ "${2:-}" == final && "$HELD_RESULT" != works ]]; then settled=yes
   fi
   TOKEN="$session"
   if [[ $settled == yes ]]; then
@@ -1991,6 +2003,7 @@ use_held() { # <name> [final]
 cmd_token_age_check() {
   need_owner
   assert_throwaway
+  held_lock
   local line
   line="$(held_get age)" || die "no held token 'age': run hold-token age first"
   (( $(date +%s) - ${line##* } > 3660 )) || die "the held token is not over an hour old yet: run this later"
@@ -2018,21 +2031,36 @@ jwt_with() { # <key file> — a JWT signed with that key, for one request
 cmd_key_check() {
   need_owner
   assert_throwaway
+  held_lock
   load_app
   local new
   new="$(dirname "$APP_KEY")/app-new.pem"
   [[ -f "$new" && ! -L "$new" && "$(stat -f %Lp "$new")" == 600 ]] || die "missing $new (mode 600): the new key's handoff step stores it"
-  jwt_with "$APP_KEY"
-  jwt_call GET app || true
-  local obs=inconclusive old_http="$LAST_HTTP"
-  case "$old_http" in 2*) obs=allowed ;; 401) obs=refused ;; esac
-  jwt_with "$new"
-  local ctl=failed
-  if jwt_call GET app && [[ "$(jq -r .id <<<"$LAST_OUT")" == "$APP_ID" ]]; then ctl=ok; fi
-  FAILS=0
-  record_p A9 "$obs" "$ctl" "the deleted key's JWT: HTTP ${old_http:-none}; the new key's: HTTP ${LAST_HTTP:-none}"
+  local old="$APP_KEY"
+  # The installation, read with the new key (the old one is deleted).
   APP_KEY="$new"
   need_app_identity
+  # A9 (round 19, C2): a token request signed with the deleted key must be refused; the control is
+  # the same request signed with the new key, whose token is then revoked.
+  jwt_with "$old"
+  printf '%s\n' "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}" >"$WORK/token-request.json" \
+    || die "writing the token request failed"
+  jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || true
+  local obs=inconclusive old_http="$LAST_HTTP" t
+  case "$old_http" in
+    2*)
+      obs=allowed
+      t="$(jq -r .token <<<"$LAST_OUT" 2>/dev/null)" || t=""
+      if [[ "$t" =~ ^ghs_ ]]; then TOKEN="$t"; OUTSTANDING="$OUTSTANDING $t"; revoke_token; fi
+      ;;
+    401) obs=refused ;;
+  esac
+  LAST_OUT=""
+  make_jwt
+  local ctl=failed
+  if (trap revoke_outstanding EXIT; mint_token) >/dev/null 2>&1; then ctl=ok; fi
+  FAILS=0
+  record_p A9 "$obs" "$ctl" "a token request signed with the deleted key: HTTP ${old_http:-none}; with the new key: $ctl"
   use_held keyold
   held_reading A9b "a token issued before the key was deleted, $HELD_AGE s later: $HELD_RESULT"
   [[ $FAILS -eq 0 ]] || exit 1
@@ -2048,6 +2076,7 @@ cmd_key_check() {
 cmd_suspend_check() {
   need_owner
   assert_throwaway
+  held_lock
   load_app
   make_jwt
   jwt_call GET "app/installations?per_page=100" || die "can't list the app's installations: $(evidence)"
@@ -2083,6 +2112,7 @@ cmd_suspend_check() {
 cmd_unsuspend_check() {
   need_owner
   assert_throwaway
+  held_lock
   local first
   first="$(state_get E1)" || first=""
   [[ -n "$first" ]] || die "run suspend-check first"
@@ -2107,6 +2137,7 @@ cmd_unsuspend_check() {
 cmd_uninstall_check() {
   need_owner
   assert_throwaway
+  held_lock
   load_app
   make_jwt
   jwt_call GET "app/installations?per_page=100" || die "can't list the app's installations: $(evidence)"
@@ -2115,6 +2146,8 @@ cmd_uninstall_check() {
   [[ "$n" == 0 ]] || die "the app is still installed on $OWNER's account ($n installations): uninstall it first"
   use_held uninstall final
   held_reading E2 "a token issued before the uninstall: $HELD_RESULT (issued $HELD_AGE s earlier)"
+  # A token that still works stays held if it couldn't be revoked (round 19, SEC-1).
+  if held_get uninstall >/dev/null; then die "the token issued before the uninstall still works and couldn't be revoked: it stays held; run this step again"; fi
   [[ $INCONCLUSIVE -eq 0 ]] || exit 1
 }
 
@@ -2123,6 +2156,7 @@ cmd_uninstall_check() {
 cmd_delete_check() {
   need_owner
   assert_throwaway
+  held_lock
   load_app
   make_jwt
   jwt_call GET app || true
@@ -2133,6 +2167,7 @@ cmd_delete_check() {
   local gone="HTTP $LAST_HTTP"
   use_held delete final
   held_reading E3 "a token issued before the app was deleted: $HELD_RESULT (issued $HELD_AGE s earlier); the app's own key now gets $gone"
+  if held_get delete >/dev/null; then die "the token issued before the app was deleted still works and couldn't be revoked: it stays held; run this step again"; fi
   [[ $INCONCLUSIVE -eq 0 ]] || exit 1
 }
 

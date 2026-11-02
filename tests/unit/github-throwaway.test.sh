@@ -1802,6 +1802,9 @@ held_stubs() {
   SECRETS="$FRG26_SECRETS" APP_KEY="$FRG26_APP_KEY"
   HELD="$T_TMP/held-tokens.env"
   STATE="$T_TMP/frg26-state"
+  # Steps run in subshells here, which don't run the exit clean-up that releases the lock: the lock
+  # counts as held, and is tested on its own (test_only_one_step_uses_the_held_tokens_at_a_time).
+  HELD_LOCKED=1
   WORK="$T_TMP/work"
   mkdir -p "$WORK"
   need_owner() { :; }
@@ -1853,11 +1856,15 @@ test_a9_the_deleted_keys_jwt_is_refused_and_the_new_keys_works() {
   chmod 600 "$T_TMP/app-new.pem"
   local old_key="$APP_KEY"
   jwt_call() {
+    echo "jwt $1 $2 $([[ "$APP_KEY_SIGNED" == "$old_key" ]] && echo old || echo new)" >>"$T_TMP/jwt-calls"
     if [[ "$APP_KEY_SIGNED" == "$old_key" ]]; then LAST_HTTP=401; LAST_OUT='{"message":"A JSON web token could not be decoded"}'; return 1; fi
-    LAST_HTTP=200; LAST_OUT='{"id":123456}'
+    case "$1 $2" in
+      "POST app/installations/77/access_tokens") LAST_HTTP=201; LAST_OUT="$(token_fixture)" ;;
+      *) LAST_HTTP=200; LAST_OUT='{"id":123456}' ;;
+    esac
   }
-  make_jwt() { APP_KEY_SIGNED="$APP_KEY"; JWT=x; }
-  need_app_identity() { :; }
+  make_jwt() { APP_KEY_SIGNED="$APP_KEY"; JWT=jwt.stand-in.value; }
+  need_app_identity() { INSTALLATION_ID=77; }
   printf 'HELD_KEYOLD=%s\n' "$(fake_token)" >"$HELD"; printf 'HELD_KEYOLD_AT=%s\n' "$(date +%s)" >>"$HELD"
   chmod 600 "$HELD"
   app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
@@ -1865,6 +1872,9 @@ test_a9_the_deleted_keys_jwt_is_refused_and_the_new_keys_works() {
   out="$(cmd_key_check 2>&1)" || rc=$?
   assert_exit 0 "$rc"
   assert_contains "$out" "RESULT A9 permissions PASS attempt=refused control=ok"
+  # Round 19, C2: the attempt and the control are token requests, signed with each key.
+  assert_contains "$(cat "$T_TMP/jwt-calls")" "jwt POST app/installations/77/access_tokens old"
+  assert_contains "$(cat "$T_TMP/jwt-calls")" "jwt POST app/installations/77/access_tokens new"
   assert_contains "$out" "READING A9b a token issued before the key was deleted"
   assert_contains "$out" "HTTP 401"
   [[ -f "$T_TMP/app.pem" && ! -f "$T_TMP/app-new.pem" ]] || _t_fail "the new key did not become app.pem"
@@ -2130,11 +2140,15 @@ test_key_check_keeps_the_new_key_aside_while_the_old_token_is_unsettled() {
   chmod 600 "$T_TMP/app-new.pem"
   local old_key="$APP_KEY"
   jwt_call() {
+    echo "jwt $1 $2 $([[ "$APP_KEY_SIGNED" == "$old_key" ]] && echo old || echo new)" >>"$T_TMP/jwt-calls"
     if [[ "$APP_KEY_SIGNED" == "$old_key" ]]; then LAST_HTTP=401; LAST_OUT='{"message":"A JSON web token could not be decoded"}'; return 1; fi
-    LAST_HTTP=200; LAST_OUT='{"id":123456}'
+    case "$1 $2" in
+      "POST app/installations/77/access_tokens") LAST_HTTP=201; LAST_OUT="$(token_fixture)" ;;
+      *) LAST_HTTP=200; LAST_OUT='{"id":123456}' ;;
+    esac
   }
-  make_jwt() { APP_KEY_SIGNED="$APP_KEY"; JWT=x; }
-  need_app_identity() { :; }
+  make_jwt() { APP_KEY_SIGNED="$APP_KEY"; JWT=jwt.stand-in.value; }
+  need_app_identity() { INSTALLATION_ID=77; }
   printf 'HELD_KEYOLD=%s\nHELD_KEYOLD_AT=%s\n' "$(fake_token)" "$(date +%s)" >"$HELD"
   chmod 600 "$HELD"
   app_gh() { echo "$REPO"; }
@@ -2302,6 +2316,49 @@ test_a_held_record_that_cannot_be_removed_stops_the_step() {
   chmod 700 "$T_TMP/ro"
   assert_exit 2 "$rc"
   assert_contains "$out" "couldn't remove the held record"
+}
+
+test_a_final_check_keeps_a_token_that_still_works_and_cannot_be_revoked() {
+  # Round 19, SEC-1: "final" (uninstall, deletion) settles only a token that is refused; one that
+  # still works stays held if it can't be revoked, and the step fails after its reading.
+  held_stubs
+  make_jwt() { JWT=jwt.stand-in.value; }
+  jwt_call() { LAST_HTTP=200; LAST_OUT='[]'; }
+  printf 'HELD_UNINSTALL=%s\nHELD_UNINSTALL_AT=%s\n' "$(fake_token)" "$(date +%s)" >"$HELD"
+  chmod 600 "$HELD"
+  app_gh() { echo "$REPO"; }
+  revoke_token() { TOKEN=""; return 1; }
+  local rc=0 out
+  out="$(cmd_uninstall_check 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a working token that couldn't be revoked"
+  assert_contains "$out" "READING E2 a token issued before the uninstall: works"
+  assert_contains "$(cat "$HELD")" "HELD_UNINSTALL=" "the working token's record was removed"
+  revoke_token() { TOKEN=""; return 0; }
+  rc=0; out="$(cmd_uninstall_check 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "revoked this time"
+  assert_eq "$(grep -c HELD_UNINSTALL "$HELD")" 0
+}
+
+test_only_one_step_uses_the_held_tokens_at_a_time() {
+  # Round 19, C1: the held file's read-modify-write is serialized: a step that finds another one
+  # holding the lock stops before touching any token, and the lock is released when a step ends.
+  held_stubs
+  app_session() { TOKEN="ghs_session$(printf 'S%.0s' $(seq 1 30))"; }
+  mint_token() { TOKEN="ghs_newheld$(printf 'N%.0s' $(seq 1 30))"; }
+  app_gh() { echo "app_gh $*" >>"$T_TMP/calls"; }
+  HELD_LOCKED=""
+  mkdir "$HELD.lock"
+  local rc=0 out
+  out="$(cmd_hold_token age 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a second step while the lock is held"
+  assert_contains "$out" "another FRG-26 step"
+  [[ ! -e "$HELD" ]] || _t_fail "a held record was written without the lock"
+  rmdir "$HELD.lock"
+  rc=0
+  (cmd_hold_token age; cleanup) >/dev/null 2>&1 || rc=$?
+  assert_exit 0 "$rc"
+  [[ ! -e "$HELD.lock" ]] || _t_fail "the lock was left behind"
+  assert_contains "$(cat "$HELD")" "HELD_AGE=ghs_newheld"
 }
 
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
