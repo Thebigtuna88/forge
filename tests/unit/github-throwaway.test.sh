@@ -2587,6 +2587,53 @@ test_cleanup_fails_when_a_started_run_never_shows() {
   assert_exit 1 "$rc" "runs that can't be read"
 }
 
+test_a_failed_revocation_is_reported_and_retried_on_exit() {
+  # Round 26, SEC-1: a rejected (overprivileged) token whose revocation fails is not reported as
+  # revoked, and stays on the list the exit clean-up revokes.
+  local out
+  out="$(app_stubs
+    INSTALLATION_ID=77
+    app_gh() {
+      echo "app_gh ${TOKEN:0:12} $*" >>"$T_TMP/app-gh.log"
+      [[ "$TOKEN" == ghs_secondQQ* ]] && return 1
+      return 0
+    }
+    mint_token >/dev/null
+    token_fixture | jq -c '.token = "ghs_second'"$(printf 'Q%.0s' $(seq 1 30))"'" | .permissions.administration = "write"' >"$T_TMP/token.json"
+    mint_token 2>&1)" || true
+  assert_not_contains "$out" "it was revoked" "a failed revocation reported as done"
+  assert_contains "$out" "until it expires"
+  assert_eq "$(grep -c 'app_gh ghs_secondQQ api -X DELETE installation/token' "$T_TMP/app-gh.log")" 2 "the exit clean-up did not retry it"
+}
+
+test_key_check_installs_the_new_key_at_the_configured_path() {
+  # Round 26, C1: the replacement key goes where FRG26_APP_KEY points, not always to app.pem.
+  held_stubs
+  mv "$T_TMP/app.pem" "$T_TMP/custom.pem"
+  APP_KEY="$T_TMP/custom.pem"
+  openssl genrsa -out "$T_TMP/app-new.pem" 2048 2>/dev/null
+  chmod 600 "$T_TMP/app-new.pem"
+  local want old_key="$APP_KEY"
+  want="$(shasum -a 256 <"$T_TMP/app-new.pem")"
+  jwt_call() {
+    if [[ "$APP_KEY_SIGNED" == "$old_key" && "$(shasum -a 256 <"$old_key")" != "$want" ]]; then LAST_HTTP=401; LAST_OUT='{"message":"bad"}'; return 1; fi
+    case "$1 $2" in
+      "POST app/installations/77/access_tokens") LAST_HTTP=201; LAST_OUT="$(token_fixture)" ;;
+      *) LAST_HTTP=200; LAST_OUT='{"id":123456}' ;;
+    esac
+  }
+  make_jwt() { APP_KEY_SIGNED="$APP_KEY"; JWT=jwt.stand-in.value; }
+  need_app_identity() { INSTALLATION_ID=77; }
+  printf 'HELD_KEYOLD=%s\nHELD_KEYOLD_AT=%s\n' "$(fake_token)" "$(date +%s)" >"$HELD"
+  chmod 600 "$HELD"
+  app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  local rc=0
+  (cmd_key_check) >/dev/null 2>&1 || rc=$?
+  assert_exit 0 "$rc"
+  assert_eq "$(shasum -a 256 <"$T_TMP/custom.pem")" "$want" "the configured key path holds the new key"
+  [[ ! -e "$T_TMP/app.pem" && ! -e "$T_TMP/app-new.pem" ]] || _t_fail "the new key went somewhere else"
+}
+
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
   # Round 13, C5/SEC-7: an outage or a server error is not proof that the app was deleted.
   held_stubs

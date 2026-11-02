@@ -98,7 +98,7 @@ die() {
 
 redact() { # <text> — no token or JWT ever reaches the screen or a log
   local s="$1" t
-  for t in $TOKEN $REVOKED_TOKENS $REDACT_ONLY $JWT; do s="${s//"$t"/[REDACTED]}"; done
+  for t in $TOKEN $REVOKED_TOKENS $OUTSTANDING $REDACT_ONLY $JWT; do s="${s//"$t"/[REDACTED]}"; done
   printf '%s' "$s"
 }
 
@@ -340,8 +340,10 @@ mint() { # <request json> <narrowed|whole>
   sel="$(jq -r .repository_selection <<<"$ans" 2>/dev/null)" || sel=error
   repos="$(jq -c '[.repositories[]?.full_name]' <<<"$ans" 2>/dev/null)" || repos=error
   if [[ "$perms" != "$WANT_PERMS" || "$sel" != selected ]] || [[ "$2" == narrowed && "$repos" != "[\"$REPO\"]" ]]; then
-    revoke_token
-    die "the token GitHub issued carries more than was asked (permissions $perms, repositories $sel $repos): it was revoked"
+    if revoke_token; then
+      die "the token GitHub issued carries more than was asked (permissions $perms, repositories $sel $repos): it was revoked"
+    fi
+    die "the token GitHub issued carries more than was asked (permissions $perms, repositories $sel $repos), and revoking it failed: it may work until it expires, within an hour; the exit clean-up tries once more"
   fi
 }
 
@@ -364,7 +366,8 @@ revoke_token() { # the current token stops working at once (DELETE /installation
   app_gh api -X DELETE installation/token >/dev/null 2>&1 || rc=$?
   if [[ $rc -ne 0 ]]; then say "note: revoking a token failed; GitHub expires it within an hour"; fi
   REVOKED_TOKENS="$REVOKED_TOKENS $TOKEN"
-  outstanding_drop "$TOKEN"
+  # Only a confirmed revocation leaves the list: a failed one is tried again on exit (round 26).
+  if [[ $rc -eq 0 ]]; then outstanding_drop "$TOKEN"; fi
   TOKEN=""
   return $rc
 }
@@ -375,12 +378,16 @@ outstanding_drop() { # <token> — revoked or held: no longer this run's to revo
 }
 
 revoke_outstanding() { # the current token, then every other token this run minted and still owns
-  local t
+  local t n=0
   revoke_token
   for t in $OUTSTANDING; do
     TOKEN="$t"
     revoke_token
   done
+  for t in $OUTSTANDING; do n=$((n + 1)); done
+  if [[ $n -gt 0 ]]; then
+    say "note: $n token(s) of this run could not be revoked; GitHub expires each within an hour of its issue"
+  fi
 }
 
 app_session() { # every command that acts as the app starts here
@@ -2117,7 +2124,8 @@ cmd_key_check() {
   # Not before the old key's token is settled (round 16, SEC-1): app-new.pem stays where it is, so
   # running this step again retries the revocation.
   if held_get keyold >/dev/null; then die "the token held over the key change couldn't be revoked: run this step again"; fi
-  mv "$new" "$(dirname "$new")/app.pem" || die "making the new key app.pem failed"
+  # The configured key path, whatever its name (round 26, C1).
+  mv "$new" "$old" || die "putting the new key at $old failed"
   [[ $INCONCLUSIVE -eq 0 ]] || exit 1
 }
 
