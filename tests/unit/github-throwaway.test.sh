@@ -2122,6 +2122,79 @@ test_an_incomplete_held_record_is_never_dropped_unrevoked() {
   assert_eq "$(cat "$HELD")" "HELD_AGE=$(fake_token)" "the incomplete record was replaced"
 }
 
+test_key_check_keeps_the_new_key_aside_while_the_old_token_is_unsettled() {
+  # Round 16, SEC-1: if the keyold token still works and can't be revoked, key-check stops before
+  # the new key replaces app.pem, so running it again can settle the token.
+  held_stubs
+  openssl genrsa -out "$T_TMP/app-new.pem" 2048 2>/dev/null
+  chmod 600 "$T_TMP/app-new.pem"
+  local old_key="$APP_KEY"
+  jwt_call() {
+    if [[ "$APP_KEY_SIGNED" == "$old_key" ]]; then LAST_HTTP=401; LAST_OUT='{"message":"A JSON web token could not be decoded"}'; return 1; fi
+    LAST_HTTP=200; LAST_OUT='{"id":123456}'
+  }
+  make_jwt() { APP_KEY_SIGNED="$APP_KEY"; JWT=x; }
+  need_app_identity() { :; }
+  printf 'HELD_KEYOLD=%s\nHELD_KEYOLD_AT=%s\n' "$(fake_token)" "$(date +%s)" >"$HELD"
+  chmod 600 "$HELD"
+  app_gh() { echo "$REPO"; }
+  revoke_token() { TOKEN=""; return 1; }
+  local rc=0
+  (cmd_key_check) >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc" "an old-key token still working and unrevoked"
+  [[ -f "$T_TMP/app-new.pem" ]] || _t_fail "the new key replaced app.pem before the old token was settled"
+  assert_contains "$(cat "$HELD")" "HELD_KEYOLD=" "the unsettled token was dropped"
+  # Run again, the revocation now works: settled, then the new key becomes app.pem.
+  revoke_token() { TOKEN=""; return 0; }
+  rc=0
+  (cmd_key_check) >/dev/null 2>&1 || rc=$?
+  assert_exit 0 "$rc" "the retry"
+  [[ -f "$T_TMP/app.pem" && ! -f "$T_TMP/app-new.pem" ]] || _t_fail "the retry did not install the new key"
+}
+
+test_s2a_reads_the_annotation_of_the_jobs_check_run() {
+  # Round 16, C1: an Actions job id is not a check-run id; the check run comes from check_run_url.
+  load
+  owner_gh() {
+    echo "$*" >>"$T_TMP/owner"
+    local q="" path=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in --jq) q="$2"; shift ;; repos/*) path="$1" ;; esac
+      shift
+    done
+    case "$path" in
+      */actions/runs/503/jobs) jq -r "$q" <<<'{"jobs":[{"id":111,"name":"deploy","conclusion":"failure","steps":[],"check_run_url":"https://api.github.com/repos/x/y/check-runs/222"}]}' ;;
+      */check-runs/222/annotations) jq -r "$q" <<<'[{"message":"Branch \"frg26-s2-a-1\" is not allowed to deploy to frg26-test due to environment protection rules."}]' ;;
+      *) return 1 ;;
+    esac
+  }
+  : >"$T_TMP/owner"
+  assert_eq "$(deploy_job 503)" "222 0 failure" "the deploy job's check-run id, steps run, conclusion"
+  policy_rejected 222 || _t_fail "the branch-policy annotation was not found"
+  assert_not_contains "$(cat "$T_TMP/owner")" "check-runs/111" "the job id used as a check-run id"
+}
+
+test_an_error_in_env_tests_still_cancels_waiting_runs() {
+  # Round 16, C2: once the owner's workflow commit has started a run, any exit cancels waiting runs.
+  local out rc=0
+  out="$(load
+    need_owner() { :; }
+    assert_throwaway() { :; }
+    app_session() { :; }
+    verify_phase() { :; }
+    need_allowance() { :; }
+    env_summary() { want_env; }
+    put_file() { :; }
+    owner_gh() { return 1; }
+    cancel_waiting_runs() { echo "CANCELLED-WAITING-RUNS"; }
+    WORK="$T_TMP/work"
+    mkdir -p "$WORK"
+    cmd_env_tests 2>&1)" || rc=$?
+  assert_exit 2 "$rc"
+  assert_contains "$out" "can't read main after adding the S2 workflow"
+  assert_contains "$out" "CANCELLED-WAITING-RUNS"
+}
+
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
   # Round 13, C5/SEC-7: an outage or a server error is not proof that the app was deleted.
   held_stubs

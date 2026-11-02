@@ -105,6 +105,9 @@ say() { redact "$*"; printf '\n'; }
 # other way out (die, or bash stopping on an error) closes the open test PRs first, so a PR (B11's
 # with auto-merge armed) is never left behind. Subshells don't run this trap.
 SWEEP_ON_EXIT=""
+# Set by env-tests before the owner's workflow commit starts a run: any exit then cancels the S2 runs
+# still waiting for review (round 16, C2).
+CANCEL_ON_EXIT=""
 
 cleanup() {
   local rc=$?
@@ -113,6 +116,10 @@ cleanup() {
     say "PHASE $PHASE: STOPPED by an error (status $rc); closing the open test PRs"
     sweep_prs
     if [[ "$PHASE" == permissions ]]; then sweep_issues; fi
+  fi
+  if [[ -n "$CANCEL_ON_EXIT" ]]; then
+    CANCEL_ON_EXIT=""
+    cancel_waiting_runs || true
   fi
   revoke_token
   if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf "$WORK"; fi
@@ -1640,15 +1647,17 @@ github_refused() { # after capture: GitHub itself answered with a 4xx that isn't
   printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 4[0-9][0-9]'
 }
 
-deploy_job() { # <run id> — "job-id steps-run conclusion" of the run's deploy job, or error
+# The check run's id is the last part of the job's check_run_url: an Actions job id is not a
+# check-run id (round 16, C1).
+deploy_job() { # <run id> — "check-run-id steps-run conclusion" of the run's deploy job, or error
   local j
-  j="$(owner_gh api "repos/$REPO/actions/runs/$1/jobs" --jq '.jobs[] | select(.name == "deploy") | "\(.id) \(.steps | length) \(.conclusion)"' 2>/dev/null | head -n 1)" || j=""
+  j="$(owner_gh api "repos/$REPO/actions/runs/$1/jobs" --jq '.jobs[] | select(.name == "deploy") | "\(.check_run_url | split("/") | last) \(.steps | length) \(.conclusion)"' 2>/dev/null | head -n 1)" || j=""
   printf '%s\n' "${j:-error}"
 }
 
 # GitHub's annotation when an Environment's deployment branches leave a branch out. The wording is
 # Unconfirmed (the docs don't quote it): if it differs, S2a reads inconclusive and stops the run.
-policy_rejected() { # <job id>
+policy_rejected() { # <check-run id>
   owner_gh api "repos/$REPO/check-runs/$1/annotations" --jq '.[].message' 2>/dev/null | grep -Eiq 'not allowed to deploy'
 }
 
@@ -1796,6 +1805,7 @@ cmd_env_tests() {
   CLONE="$WORK/clone"
   say "== FRG-26 Environment tests (S2), app $APP_BOT, $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
   # The owner adds the workflow to main: that commit starts the owner's own run (S2d's).
+  CANCEL_ON_EXIT=1
   put_file "$S2_WORKFLOW" "$(s2_workflow)"
   S2_OWNER_SHA="$(owner_gh api "repos/$REPO/branches/main" --jq .commit.sha 2>/dev/null)" || S2_OWNER_SHA=""
   [[ "$S2_OWNER_SHA" =~ ^[0-9a-f]{40}$ ]] || die "can't read main after adding the S2 workflow"
@@ -1806,11 +1816,13 @@ cmd_env_tests() {
     app_git clone -q --template="$WORK/template" "https://github.com/$REPO.git" "$CLONE" || die "clone failed"
     "t_$id"
     if [[ $FAILS -ne 0 ]]; then
+      CANCEL_ON_EXIT=""
       cancel_waiting_runs || true
       say "ENVIRONMENT TESTS: STOPPED after $id"
       exit 1
     fi
   done
+  CANCEL_ON_EXIT=""
   if ! cancel_waiting_runs; then
     say "ENVIRONMENT TESTS: FAILED at the final clean-up (a run may still wait for review)"
     exit 1
@@ -1988,6 +2000,9 @@ cmd_key_check() {
   use_held keyold
   reading A9b "a token issued before the key was deleted, $HELD_AGE s later: $HELD_RESULT"
   [[ $FAILS -eq 0 ]] || exit 1
+  # Not before the old key's token is settled (round 16, SEC-1): app-new.pem stays where it is, so
+  # running this step again retries the revocation.
+  if held_get keyold >/dev/null; then die "the token held over the key change couldn't be revoked: run this step again"; fi
   mv "$new" "$(dirname "$new")/app.pem" || die "making the new key app.pem failed"
 }
 
