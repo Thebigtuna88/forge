@@ -2094,6 +2094,7 @@ cmd_suspend_check() {
   # An earlier observation must never be judged as this one: it is cleared first, and this one must
   # be stored, or the step stops (round 17, C1).
   state_set E1 "pending HTTP-none" || die "can't write $STATE, where this step's observation is kept"
+  state_set E1_HELD pending || die "can't write $STATE, where this step's observation is kept"
   printf '%s\n' "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}" >"$WORK/token-request.json"
   jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || true
   local obs=inconclusive
@@ -2106,6 +2107,9 @@ cmd_suspend_check() {
   state_set E1 "$obs HTTP-${LAST_HTTP:-none}" || die "can't store this step's observation in $STATE: run it again"
   use_held suspend
   held_reading E1 "a token issued before the suspension (suspended at $sus): $HELD_RESULT (issued $HELD_AGE s earlier)"
+  # Stored, so a later or repeated unsuspend-check can't pass without it (round 21, C1).
+  if [[ $INCONCLUSIVE -ne 0 ]]; then state_set E1_HELD inconclusive; else state_set E1_HELD ok; fi \
+    || die "can't store this step's held-token reading in $STATE: run the E1 steps again"
   say "E1 a new token while suspended: $obs (HTTP ${LAST_HTTP:-none}); the verdict follows after you unsuspend"
   if [[ $INCONCLUSIVE -ne 0 ]]; then
     say "stopping here: unsuspend the app in your browser (Settings, Applications, Installed GitHub Apps, Configure, Unsuspend)"
@@ -2130,10 +2134,19 @@ cmd_unsuspend_check() {
   if held_get suspend >/dev/null; then
     use_held suspend
     held_reading E1 "the token issued before the suspension, after unsuspending: $HELD_RESULT (issued $HELD_AGE s earlier)"
+    if [[ $INCONCLUSIVE -ne 0 ]]; then state_set E1_HELD inconclusive || true; fi
     if held_get suspend >/dev/null; then die "the token held over the suspension couldn't be revoked: run this step again"; fi
   fi
   FAILS=0
   record_p E1 "${first%% *}" "$ctl" "a new token while suspended: ${first#* }; after unsuspending: $ctl"
+  # E1 is complete only with a conclusive held-token reading from this suspension cycle (round 21,
+  # C1): an inconclusive, unfinished or missing one means doing E1 again.
+  local held_state
+  held_state="$(state_get E1_HELD)" || held_state=""
+  if [[ "$held_state" != ok ]]; then
+    say "E1's held-token reading is '${held_state:-missing}': do E1 again (hold-token suspend, suspend in your browser, suspend-check, unsuspend, unsuspend-check)"
+    return 1
+  fi
   [[ $FAILS -eq 0 && $INCONCLUSIVE -eq 0 ]]
 }
 

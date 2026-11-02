@@ -1984,6 +1984,7 @@ test_unsuspend_check_keeps_a_token_it_could_not_revoke() {
   printf 'HELD_SUSPEND_AT=%s\n' "$(date +%s)" >>"$HELD"
   chmod 600 "$HELD"
   state_set E1 "refused HTTP-403"
+  state_set E1_HELD ok
   app_session() { :; }
   app_gh() { echo "$REPO"; }
   revoke_token() { TOKEN=""; return 1; }
@@ -2363,6 +2364,40 @@ test_only_one_step_uses_the_held_tokens_at_a_time() {
   assert_exit 0 "$rc"
   [[ ! -e "$HELD.lock" ]] || _t_fail "the lock was left behind"
   assert_contains "$(cat "$HELD")" "HELD_AGE=ghs_newheld"
+}
+
+test_an_inconclusive_e1_reading_survives_a_retry() {
+  # Round 21, C1: an inconclusive held-token reading is stored, so retrying unsuspend-check (or
+  # running it after suspend-check stopped) can't pass on the new-token record alone; E1 completes
+  # only after a whole new suspension cycle gives a reading.
+  held_stubs
+  app_session() { :; }
+  state_set E1 "refused HTTP-403"
+  local rc out
+  for held in inconclusive pending ""; do
+    if [[ -n "$held" ]]; then state_set E1_HELD "$held"; else
+      grep -v '^E1_HELD ' "$STATE" >"$STATE.x"; mv "$STATE.x" "$STATE"
+    fi
+    rc=0; out="$(cmd_unsuspend_check 2>&1)" || rc=$?
+    assert_exit 1 "$rc" "E1_HELD '${held:-missing}'"
+    assert_contains "$out" "E1 again" "E1_HELD '${held:-missing}'"
+  done
+  state_set E1_HELD ok
+  rc=0; out="$(cmd_unsuspend_check 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "a conclusive reading"
+  # suspend-check stores its reading's state: a near-expiry refusal is "inconclusive".
+  make_jwt() { JWT=jwt.stand-in.value; }
+  jwt_call() {
+    case "$1 $2" in
+      "GET app/installations"*) LAST_HTTP=200; LAST_OUT='[{"id":77,"account":{"login":"Thebigtuna88"},"suspended_at":"2026-11-02T00:00:00Z"}]' ;;
+      "POST app/installations/77/access_tokens") LAST_HTTP=403; LAST_OUT='{"message":"suspended"}'; return 1 ;;
+    esac
+  }
+  app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  printf 'HELD_SUSPEND=%s\nHELD_SUSPEND_AT=%s\n' "$(fake_token)" "$(( $(date +%s) - 3500 ))" >"$HELD"
+  chmod 600 "$HELD"
+  (cmd_suspend_check) >/dev/null 2>&1 || true
+  assert_eq "$(state_get E1_HELD)" inconclusive
 }
 
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
