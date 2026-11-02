@@ -221,8 +221,10 @@ couldn't be revoked while suspended is read again after unsuspending, then revok
     cannot approve the deployment job" with Prevent self-review on: Confirmed, docs). Control:
     GitHub says you can approve it (`current_user_can_approve`), you approve it, and the job
     reports only the value's length;
-  - S2c: the app tries to change the Environment's protection or its secret: refused. Control:
-    your token reads the same settings;
+  - S2c: the app tries to change the Environment (a no-op update with exactly its settings), read
+    its secrets' public key, and delete a disposable dummy secret made for this test: refused.
+    Control: your token makes the very same three requests and they succeed; the Environment then
+    reads unchanged (review round 15);
   - S2d: a run you start yourself: your own approval is refused (shows Prevent self-review is
     really on). Refused needs all of: GitHub says you can't approve it (`current_user_can_approve`
     false), GitHub itself answered the approval with a 4xx (not a network error or a rate limit),
@@ -307,7 +309,7 @@ New tests (throwaway app, throwaway repo, run only from your handoffs):
 | # | Tries… | Must happen | Control |
 |---|---|---|---|
 | A1 | Mint a token; read what GitHub says it carries | Exactly the four permissions, only the throwaway repo | — (a reading) |
-| A2 | Push, open a PR, open an issue on a second public throwaway repo the app isn't installed on | Refused | Same three on the installed repo succeed |
+| A2 | Push, open a PR, open an issue on a second public throwaway repo the app isn't installed on | Refused | Same three on the installed repo succeed. The PR's branch there must be ahead of main (checked first), or no one could open it (review round 15) |
 | A3 | Push a commit adding `.github/workflows/x.yml` to a feature branch | Refused | The same commit with an ordinary file succeeds |
 | A4 | Use a token over 1 hour old | 401 | A fresh token, same request, succeeds |
 | A5 | Revoke a token, then use it | 401 | A second token, same request, succeeds |
@@ -316,7 +318,7 @@ New tests (throwaway app, throwaway repo, run only from your handoffs):
 | A9 | You delete the key; mint with it | Refused | The new key mints |
 | A9b | Use a token minted before the key's deletion | Recorded either way, and the plan is corrected | — (a finding) |
 | E3 | Delete the throwaway app at the end of stage 1; use a token issued before | Recorded | — |
-| S2a-c | Environment: branch limit, the app approving its own deployment, changing protection | Refused | You approve (S2b); your token reads (S2c) |
+| S2a-c | Environment: branch limit, the app approving its own deployment, changing it or its secrets | Refused | You approve (S2b); your token makes S2c's same three requests (S2c) |
 | A11 | Read CI results on a public repo with no Checks/Actions permission | Decides whether a read permission is needed | — (a finding) |
 | A12 | Every `gh` command FORGE uses, with the app token | Works, or listed for you before any change | — |
 | E1 | You suspend the installation; use a token issued before | Recorded; then a new mint must be refused | Unsuspend; a new mint works |

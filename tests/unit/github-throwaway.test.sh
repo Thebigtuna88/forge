@@ -1386,6 +1386,7 @@ p_stubs() { # app and owner calls are logged; answers come from $T_TMP/answers (
 test_a2_tries_a_repo_the_app_is_not_installed_on() {
   p_stubs
   cat >"$T_TMP/answers" <<EOF
+owner_gh api repos/$REPO2/compare/main...frg26-a2 --jq .ahead_by|0|1
 app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot].
 app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)
 app_gh api -X POST repos/$REPO/issues|0|{"number":5}
@@ -1404,6 +1405,7 @@ EOF
   assert_contains "$calls" "app_gh api -X POST repos/$REPO/pulls"
   # A write that got through to the other repo fails the test, and nothing more is tried there.
   cat >"$T_TMP/answers" <<EOF
+owner_gh api repos/$REPO2/compare/main...frg26-a2 --jq .ahead_by|0|1
 app_git -C $T_TMP/clone push https://github.com/$REPO2.git|0|
 EOF
   : >"$T_TMP/calls"
@@ -1484,9 +1486,13 @@ EOF
   done
   assert_contains "$calls" "app_gh api repos/$REPO/invitations"
   assert_not_contains "$calls" "collaborators" "a collaborator write with no valid target or control (round 13, SEC-5)"
-  for p in actions/secrets actions/variables keys hooks invitations; do
+  for p in actions/secrets actions/secrets/public-key actions/variables keys hooks invitations; do
     assert_contains "$calls" "owner_gh api repos/$REPO/$p"
   done
+  # Round 15, C2: each attempt has its own control; one failing fails A8.
+  printf 'app_gh api|1|gh: Resource not accessible by integration (HTTP 403)\nowner_gh api repos/%s/actions/secrets/public-key|1|gh: HTTP 502\n' "$REPO" >"$T_TMP/answers"
+  out="$(t_A8)"
+  assert_contains "$out" "RESULT A8 permissions FAIL attempt=refused control=failed"
   assert_not_contains "$calls" "owner_gh api -X" "the control writes"
 }
 
@@ -1553,6 +1559,35 @@ test_a11_and_a12_are_readings_not_results() {
   assert_contains "$out" "READING A12 gh issue create: works"
   assert_contains "$out" "READING A12 gh run list: works"
   assert_contains "$out" "fails=0"
+}
+
+test_the_second_throwaways_branch_is_ahead_of_main() {
+  # Round 15, SEC-1: a PR from a branch equal to main can't be opened by anyone, so a refusal would
+  # prove nothing. The branch is made first, the commit goes on it, and A2 checks it is ahead.
+  load
+  : >"$T_TMP/owner"
+  owner_gh() {
+    echo "$*" >>"$T_TMP/owner"
+    case "$*" in
+      "api repos/$REPO2") [[ -f "$T_TMP/made" ]] || return 1 ;;
+      "repo create"*) touch "$T_TMP/made" ;;
+      *"--jq [.full_name"*) printf '%s\t%s\t%s\tfalse\n' "$REPO2" "$OWNER" "$MARKER2" ;;
+      *"--jq .default_branch") echo main ;;
+      *"--jq .commit.sha") printf 'e%.0s' $(seq 1 40); echo ;;
+    esac
+  }
+  need_owner() { :; }
+  cmd_create_second >/dev/null
+  local refs contents
+  refs="$(grep -n "git/refs" "$T_TMP/owner" | cut -d: -f1)"
+  contents="$(grep -n "contents/a2.txt" "$T_TMP/owner" | cut -d: -f1)"
+  [[ -n "$refs" && -n "$contents" && "$refs" -lt "$contents" ]] || _t_fail "the branch must be made before its commit"
+  assert_contains "$(grep "contents/a2.txt" "$T_TMP/owner")" "branch=frg26-a2"
+  p_stubs
+  printf 'owner_gh api repos/%s/compare/main...frg26-a2 --jq .ahead_by|0|0\n' "$REPO2" >"$T_TMP/answers"
+  local out
+  out="$(t_A2)"
+  assert_contains "$out" "RESULT A2 permissions FAIL attempt=setup-failed" "a branch not ahead of main"
 }
 
 test_assert_second_refuses_another_repo() {
@@ -1730,13 +1765,26 @@ test_an_unreadable_run_log_is_not_an_absent_value() {
 test_s2c_the_app_cannot_change_the_environment() {
   s2_stubs
   WORK="$T_TMP/work"
+  owner_uid() { echo 42; }
   printf 'app_gh api|1|gh: Resource not accessible by integration (HTTP 403)\n' >"$T_TMP/answers"
   env_summary() { want_env; }
-  local out
+  local out calls
   out="$(t_S2c)"
   assert_contains "$out" "RESULT S2c permissions PASS attempt=refused control=ok"
-  assert_contains "$(cat "$T_TMP/calls")" "app_gh api -X PUT repos/$REPO/environments/frg26-test"
-  assert_contains "$(cat "$T_TMP/calls")" "app_gh api -X DELETE repos/$REPO/environments/frg26-test/secrets/FRG26_DUMMY"
+  calls="$(cat "$T_TMP/calls")"
+  # Round 15, SEC-2: the app's write is the same no-op update the owner then makes as the control.
+  assert_contains "$calls" "app_gh api -X PUT repos/$REPO/environments/frg26-test --input $WORK/env.json"
+  assert_contains "$calls" "owner_gh api -X PUT repos/$REPO/environments/frg26-test --input $WORK/env.json"
+  assert_eq "$(jq -c .prevent_self_review "$WORK/env.json")" true "the attempt weakens the Environment"
+  assert_contains "$calls" "owner_gh api repos/$REPO/environments/frg26-test/secrets/public-key"
+  # A disposable secret: the owner makes it, the app tries to delete it, the owner deletes it.
+  assert_contains "$calls" "owner_gh secret set FRG26_DISPOSABLE --env frg26-test --repo $REPO"
+  assert_contains "$calls" "app_gh api -X DELETE repos/$REPO/environments/frg26-test/secrets/FRG26_DISPOSABLE"
+  assert_contains "$calls" "owner_gh api -X DELETE repos/$REPO/environments/frg26-test/secrets/FRG26_DISPOSABLE"
+  assert_not_contains "$calls" "secrets/FRG26_DUMMY" "the real dummy value is never a target"
+  printf 'app_gh api|1|gh: Resource not accessible by integration (HTTP 403)\nowner_gh api -X DELETE|1|gh: HTTP 500\n' >"$T_TMP/answers"
+  out="$(t_S2c)"
+  assert_contains "$out" "RESULT S2c permissions FAIL attempt=refused control=failed"
 }
 
 test_environment_tests_cover_the_plan() {
@@ -1753,7 +1801,6 @@ held_stubs() {
   app_files 123456
   SECRETS="$FRG26_SECRETS" APP_KEY="$FRG26_APP_KEY"
   HELD="$T_TMP/held-tokens.env"
-  HELD_TIMES="$T_TMP/held-times"
   STATE="$T_TMP/frg26-state"
   WORK="$T_TMP/work"
   mkdir -p "$WORK"
@@ -1770,17 +1817,15 @@ test_a_held_token_is_kept_private_and_used_once() {
   out="$(cmd_hold_token age 2>&1)"
   assert_not_contains "$out" "$(fake_token)" "the held token printed"
   assert_file_mode "$HELD" 600
-  assert_file_mode "$HELD_TIMES" 600
-  assert_eq "$(cat "$HELD")" "HELD_AGE=$(fake_token)" "held tokens are VAR=value lines (ho_redact_file can hide them)"
-  assert_contains "$(cat "$HELD_TIMES")" "age "
-  assert_not_contains "$(cat "$HELD_TIMES")" "ghs_" "a token beside the issue times"
+  assert_eq "$(sed -n 1p "$HELD")" "HELD_AGE=$(fake_token)" "held tokens are VAR=value lines (ho_redact_file can hide them)"
+  assert_contains "$(sed -n 2p "$HELD")" "HELD_AGE_AT=" "its issue time, in the same file (written whole)"
   app_gh() { echo "$REPO"; }
   revoke_token() { echo "revoke" >>"$T_TMP/calls"; TOKEN=""; }
   use_held age
   assert_eq "$HELD_RESULT" works
   assert_eq "$(cat "$T_TMP/calls")" "revoke" "a held token that still works is revoked after its check"
   assert_eq "$(grep -c '^HELD_AGE=' "$HELD")" 0 "the held token is removed after its check"
-  assert_eq "$(grep -c '^age ' "$HELD_TIMES")" 0 "its issue time is removed too"
+  assert_eq "$(grep -c '^HELD_AGE_AT=' "$HELD")" 0 "its issue time is removed too"
   local rc=0
   (cmd_hold_token nonsense) >/dev/null 2>&1 || rc=$?
   assert_exit 2 "$rc" "an unknown held-token name"
@@ -1788,13 +1833,13 @@ test_a_held_token_is_kept_private_and_used_once() {
 
 test_a4_needs_a_token_over_an_hour_old() {
   held_stubs
-  printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"; printf 'age %s\n' "$(( $(date +%s) - 600 ))" >"$HELD_TIMES"
-  chmod 600 "$HELD" "$HELD_TIMES"
+  printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"; printf 'HELD_AGE_AT=%s\n' "$(( $(date +%s) - 600 ))" >>"$HELD"
+  chmod 600 "$HELD"
   local rc=0 out
   out="$(cmd_token_age_check 2>&1)" || rc=$?
   assert_exit 2 "$rc" "a token ten minutes old"
   assert_contains "$out" "not over an hour old yet"
-  printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"; printf 'age %s\n' "$(( $(date +%s) - 3700 ))" >"$HELD_TIMES"
+  printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"; printf 'HELD_AGE_AT=%s\n' "$(( $(date +%s) - 3700 ))" >>"$HELD"
   app_session() { TOKEN="ghs_session$(printf 'S%.0s' $(seq 1 30))"; }
   app_gh() { if [[ "$TOKEN" == ghs_session* ]]; then echo "$REPO"; else echo "gh: Bad credentials (HTTP 401)" >&2; return 1; fi; }
   rc=0; out="$(cmd_token_age_check 2>&1)" || rc=$?
@@ -1813,8 +1858,8 @@ test_a9_the_deleted_keys_jwt_is_refused_and_the_new_keys_works() {
   }
   make_jwt() { APP_KEY_SIGNED="$APP_KEY"; JWT=x; }
   need_app_identity() { :; }
-  printf 'HELD_KEYOLD=%s\n' "$(fake_token)" >"$HELD"; printf 'keyold %s\n' "$(date +%s)" >"$HELD_TIMES"
-  chmod 600 "$HELD" "$HELD_TIMES"
+  printf 'HELD_KEYOLD=%s\n' "$(fake_token)" >"$HELD"; printf 'HELD_KEYOLD_AT=%s\n' "$(date +%s)" >>"$HELD"
+  chmod 600 "$HELD"
   app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
   local out rc=0
   out="$(cmd_key_check 2>&1)" || rc=$?
@@ -1834,8 +1879,8 @@ test_e1_records_the_suspension_and_needs_the_control() {
     esac
   }
   make_jwt() { JWT=x; }
-  printf 'HELD_SUSPEND=%s\n' "$(fake_token)" >"$HELD"; printf 'suspend %s\n' "$(date +%s)" >"$HELD_TIMES"
-  chmod 600 "$HELD" "$HELD_TIMES"
+  printf 'HELD_SUSPEND=%s\n' "$(fake_token)" >"$HELD"; printf 'HELD_SUSPEND_AT=%s\n' "$(date +%s)" >>"$HELD"
+  chmod 600 "$HELD"
   app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
   local out
   out="$(cmd_suspend_check 2>&1)"
@@ -1862,7 +1907,7 @@ test_a_held_token_is_revoked_whatever_its_read_says() {
   # stops the step and keeps the token for a retry.
   held_stubs
   local rc out
-  put_held() { printf 'HELD_SUSPEND=%s\n' "$(fake_token)" >"$HELD"; printf 'suspend %s\n' "$(date +%s)" >"$HELD_TIMES"; chmod 600 "$HELD" "$HELD_TIMES"; }
+  put_held() { printf 'HELD_SUSPEND=%s\n' "$(fake_token)" >"$HELD"; printf 'HELD_SUSPEND_AT=%s\n' "$(date +%s)" >>"$HELD"; chmod 600 "$HELD"; }
   revoke_token() { echo "revoke" >>"$T_TMP/calls"; TOKEN=""; return "${REVOKE_RC:-0}"; }
 
   put_held
@@ -1910,8 +1955,8 @@ test_suspend_check_does_not_count_a_rate_limit_as_a_refusal() {
     esac
   }
   printf 'HELD_SUSPEND=%s\n' "$(fake_token)" >"$HELD"
-  printf 'suspend %s\n' "$(date +%s)" >"$HELD_TIMES"
-  chmod 600 "$HELD" "$HELD_TIMES"
+  printf 'HELD_SUSPEND_AT=%s\n' "$(date +%s)" >>"$HELD"
+  chmod 600 "$HELD"
   app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
   cmd_suspend_check >/dev/null 2>&1
   assert_eq "$(state_get E1)" "inconclusive HTTP-403"
@@ -1922,8 +1967,8 @@ test_unsuspend_check_keeps_a_token_it_could_not_revoke() {
   # if it can't be revoked, it stays held and the step fails.
   held_stubs
   printf 'HELD_SUSPEND=%s\n' "$(fake_token)" >"$HELD"
-  printf 'suspend %s\n' "$(date +%s)" >"$HELD_TIMES"
-  chmod 600 "$HELD" "$HELD_TIMES"
+  printf 'HELD_SUSPEND_AT=%s\n' "$(date +%s)" >>"$HELD"
+  chmod 600 "$HELD"
   state_set E1 "refused HTTP-403"
   app_session() { :; }
   app_gh() { echo "$REPO"; }
@@ -1944,8 +1989,8 @@ test_holding_a_name_again_settles_the_earlier_token_first() {
   app_session() { TOKEN="ghs_session$(printf 'S%.0s' $(seq 1 30))"; }
   mint_token() { TOKEN="ghs_newheld$(printf 'N%.0s' $(seq 1 30))"; }
   printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"
-  printf 'age %s\n' "$(date +%s)" >"$HELD_TIMES"
-  chmod 600 "$HELD" "$HELD_TIMES"
+  printf 'HELD_AGE_AT=%s\n' "$(date +%s)" >>"$HELD"
+  chmod 600 "$HELD"
   app_gh() { echo "$REPO"; }
   revoke_token() { echo "revoke ${TOKEN:0:8}" >>"$T_TMP/calls"; TOKEN=""; return "${REVOKE_RC:-0}"; }
   local rc=0
@@ -1955,20 +2000,20 @@ test_holding_a_name_again_settles_the_earlier_token_first() {
   assert_contains "$(cat "$HELD")" "HELD_AGE=ghs_newheld"
   # If the earlier token can't be settled, nothing new is held and the step fails.
   printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"
-  printf 'age %s\n' "$(date +%s)" >"$HELD_TIMES"
+  printf 'HELD_AGE_AT=%s\n' "$(date +%s)" >>"$HELD"
   : >"$T_TMP/calls"
   REVOKE_RC=1
   rc=0
   (cmd_hold_token age) >/dev/null 2>&1 || rc=$?
   assert_exit 2 "$rc"
-  assert_eq "$(cat "$HELD")" "HELD_AGE=$(fake_token)" "the earlier token was replaced while still unsettled"
+  assert_eq "$(grep '^HELD_AGE=' "$HELD")" "HELD_AGE=$(fake_token)" "the earlier token was replaced while still unsettled"
 }
 
 test_an_unreliable_read_still_tries_to_revoke_the_held_token() {
   # Round 14, C2: revocation is tried even when the read was unreliable. Revoked: removed (that
   # reading is lost, the step fails). Not revoked: kept for a retry, the step fails.
   held_stubs
-  put_held() { printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"; printf 'age %s\n' "$(date +%s)" >"$HELD_TIMES"; chmod 600 "$HELD" "$HELD_TIMES"; }
+  put_held() { printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"; printf 'HELD_AGE_AT=%s\n' "$(date +%s)" >>"$HELD"; chmod 600 "$HELD"; }
   revoke_token() { echo "revoke" >>"$T_TMP/calls"; TOKEN=""; return "${REVOKE_RC:-0}"; }
   app_gh() { echo "gh: HTTP 503 Service Unavailable" >&2; return 1; }
   local rc out
@@ -2044,13 +2089,46 @@ test_environment_tests_fail_when_their_cleanup_fails() {
   assert_contains "$out" "ENVIRONMENT TESTS: ALL PASS"
 }
 
+test_a_held_token_that_cannot_be_stored_is_revoked() {
+  # Round 15, C1/SEC-3: if its record can't be written, the newly held token is revoked at once, and
+  # no partial record is left.
+  held_stubs
+  mkdir -m 700 "$T_TMP/ro"
+  HELD="$T_TMP/ro/held-tokens.env"
+  chmod 500 "$T_TMP/ro"
+  app_session() { TOKEN="ghs_session$(printf 'S%.0s' $(seq 1 30))"; }
+  mint_token() { TOKEN="ghs_newheld$(printf 'N%.0s' $(seq 1 30))"; }
+  revoke_token() { echo "revoke ${TOKEN:0:11}" >>"$T_TMP/calls"; TOKEN=""; return 0; }
+  local rc=0 out
+  out="$(cmd_hold_token age 2>&1)" || rc=$?
+  chmod 700 "$T_TMP/ro"
+  assert_exit 2 "$rc"
+  assert_contains "$(cat "$T_TMP/calls")" "revoke ghs_newheld" "the unstored token was revoked"
+  assert_contains "$out" "revoked"
+  [[ ! -e "$HELD" ]] || _t_fail "a partial held record was left"
+}
+
+test_an_incomplete_held_record_is_never_dropped_unrevoked() {
+  # Round 15, C1: a token line without its time (written by hand, or by an older version) stops
+  # hold-token instead of being replaced.
+  held_stubs
+  app_session() { TOKEN="ghs_session$(printf 'S%.0s' $(seq 1 30))"; }
+  mint_token() { TOKEN="ghs_newheld$(printf 'N%.0s' $(seq 1 30))"; }
+  printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"
+  chmod 600 "$HELD"
+  local rc=0
+  (cmd_hold_token age) >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc"
+  assert_eq "$(cat "$HELD")" "HELD_AGE=$(fake_token)" "the incomplete record was replaced"
+}
+
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
   # Round 13, C5/SEC-7: an outage or a server error is not proof that the app was deleted.
   held_stubs
   make_jwt() { JWT=x; }
   printf 'HELD_DELETE=%s\n' "$(fake_token)" >"$HELD"
-  printf 'delete %s\n' "$(date +%s)" >"$HELD_TIMES"
-  chmod 600 "$HELD" "$HELD_TIMES"
+  printf 'HELD_DELETE_AT=%s\n' "$(date +%s)" >>"$HELD"
+  chmod 600 "$HELD"
   app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
   local rc out code
   for code in 500 502 ""; do
@@ -2076,8 +2154,8 @@ test_e2_and_e3_record_what_issued_tokens_do() {
     esac
   }
   printf 'HELD_UNINSTALL=%s\nHELD_DELETE=%s\n' "$(fake_token)" "$(fake_token)" >"$HELD"
-  printf 'uninstall %s\ndelete %s\n' "$(date +%s)" "$(date +%s)" >"$HELD_TIMES"
-  chmod 600 "$HELD" "$HELD_TIMES"
+  printf 'HELD_UNINSTALL_AT=%s\nHELD_DELETE_AT=%s\n' "$(date +%s)" "$(date +%s)" >>"$HELD"
+  chmod 600 "$HELD"
   app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
   local out
   out="$(cmd_uninstall_check 2>&1)"

@@ -523,10 +523,11 @@ cmd_create_second() {
   fi
   sha="$(owner_gh api "repos/$REPO2/branches/main" --jq .commit.sha)" || die "can't read main"
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "unexpected main sha"
-  owner_gh api -X PUT "repos/$REPO2/contents/a2.txt" -f message="FRG-26 A2 branch" \
-    -f content="$(printf 'FRG-26 A2\n' | base64 | tr -d '\n')" -f branch=main >/dev/null || die "adding a2.txt failed"
-  sha="$(owner_gh api "repos/$REPO2/branches/main" --jq .commit.sha)" || die "can't read main"
+  # The branch first, then a commit on it: A2's PR attempt needs a branch ahead of main, or no one
+  # could open it and its refusal would prove nothing (round 15, SEC-1).
   owner_gh api -X POST "repos/$REPO2/git/refs" -f ref="refs/heads/$A2_BRANCH" -f sha="$sha" >/dev/null || die "creating $A2_BRANCH failed"
+  owner_gh api -X PUT "repos/$REPO2/contents/a2.txt" -f message="FRG-26 A2 branch" \
+    -f content="$(printf 'FRG-26 A2\n' | base64 | tr -d '\n')" -f branch="$A2_BRANCH" >/dev/null || die "adding a2.txt to $A2_BRANCH failed"
   say "created $REPO2 (public; the app is not installed here), branch $A2_BRANCH"
 }
 
@@ -1373,7 +1374,8 @@ t_A8() {
     app_gh api "repos/$REPO/hooks" ";;" \
     app_gh api "repos/$REPO/invitations"
   [[ "$OBS" == refused ]] || { record_p A8 "$OBS" "not run" "$EV"; return; }
-  p_controls owner_gh api "repos/$REPO/actions/secrets" ";;" owner_gh api "repos/$REPO/actions/variables" ";;" \
+  p_controls owner_gh api "repos/$REPO/actions/secrets" ";;" owner_gh api "repos/$REPO/actions/secrets/public-key" ";;" \
+    owner_gh api "repos/$REPO/actions/variables" ";;" \
     owner_gh api "repos/$REPO/keys" ";;" owner_gh api "repos/$REPO/hooks" ";;" owner_gh api "repos/$REPO/invitations"
   record_p A8 "$OBS" "$CTL" "$EV (adding a collaborator is not tried: any valid target would invite a real person; it needs Administration, whose write A6 shows refused)"
 }
@@ -1413,6 +1415,9 @@ t_A3() {
 # A2 (plan 4.1, item 9): writes to a public repository the app is not installed on: a push, an
 # issue, a PR (from a branch the owner made there). Control: the same three on the throwaway.
 t_A2() {
+  local ahead
+  ahead="$(owner_gh api "repos/$REPO2/compare/main...$A2_BRANCH" --jq .ahead_by 2>/dev/null)" || ahead=""
+  [[ "$ahead" =~ ^[1-9][0-9]*$ ]] || { setup_fail_p A2 "$REPO2's $A2_BRANCH is not ahead of main (ahead by '${ahead:-unreadable}'): no PR could be opened from it"; return; }
   fresh_from dev "a2-$(stamp)"
   add_commit "tests/permissions-A2-$(stamp).txt" "FRG-26 A2"
   # The push is judged by git's own words, the two API calls by GitHub's status.
@@ -1531,6 +1536,7 @@ cmd_ptests() {
 readonly ENV_NAME=frg26-test
 readonly DUMMY_NAME=FRG26_DUMMY
 readonly DUMMY_VALUE=frg26-dummy-not-a-secret
+readonly DISPOSABLE_NAME=FRG26_DISPOSABLE # made and deleted by S2c (its delete control)
 readonly S2_WORKFLOW=.github/workflows/frg26-s2.yml
 
 s2_workflow() {
@@ -1563,13 +1569,17 @@ env_summary() {
 
 want_env() { printf 'true User:%s false true branch:main\n' "$OWNER"; }
 
+env_json() { # <owner's user id> — the Environment's settings, as env-setup applies them
+  printf '{"wait_timer":0,"prevent_self_review":true,"reviewers":[{"type":"User","id":%s}],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}\n' "$1"
+}
+
 cmd_env_setup() {
   need_owner
   assert_throwaway
   verify_phase open
   local uid
   uid="$(owner_uid)" || die "can't read the owner's user id, so no Environment was made"
-  printf '{"wait_timer":0,"prevent_self_review":true,"reviewers":[{"type":"User","id":%s}],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}\n' "$uid" >"$WORK/env.json"
+  env_json "$uid" >"$WORK/env.json"
   owner_gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input "$WORK/env.json" >/dev/null || die "making the Environment failed"
   if ! owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" --jq '.branch_policies[].name' 2>/dev/null | grep -Fxq main; then
     owner_gh api -X POST "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" -f name=main -f type=branch >/dev/null \
@@ -1743,16 +1753,30 @@ t_S2a() {
   cancel_waiting_runs || true
 }
 
-# S2c: the app tries to change the Environment's protection or its secret. Control: the owner reads
-# the same Environment, unchanged.
+# S2c: the app tries to change the Environment or its secrets. Each attempt's control is the same
+# request by the owner (round 15, SEC-2): a no-op update (exactly env-setup's settings), the secrets'
+# public key, and deleting a disposable dummy secret made for this test. The Environment must read
+# unchanged afterwards.
 t_S2c() {
-  printf '{"wait_timer":0,"prevent_self_review":false,"reviewers":[],"deployment_branch_policy":null}\n' >"$WORK/env-weak.json"
-  p_attempts api app_gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input "$WORK/env-weak.json" ";;" \
+  local uid
+  uid="$(owner_uid)" || { setup_fail_p S2c "could not read the owner's user id"; return; }
+  env_json "$uid" >"$WORK/env.json"
+  if ! capture owner_gh secret set "$DISPOSABLE_NAME" --env "$ENV_NAME" --repo "$REPO" --body "$DUMMY_VALUE"; then
+    setup_fail_p S2c "could not make the disposable dummy secret: $(evidence)"
+    return
+  fi
+  p_attempts api app_gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input "$WORK/env.json" ";;" \
     app_gh api "repos/$REPO/environments/$ENV_NAME/secrets/public-key" ";;" \
-    app_gh api -X DELETE "repos/$REPO/environments/$ENV_NAME/secrets/$DUMMY_NAME"
-  [[ "$OBS" == refused ]] || { record_p S2c "$OBS" "not run" "$EV"; return; }
-  CTL=failed
-  [[ "$(env_summary)" == "$(want_env)" ]] && CTL=ok
+    app_gh api -X DELETE "repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME"
+  if [[ "$OBS" != refused ]]; then
+    owner_gh api -X DELETE "repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME" >/dev/null 2>&1 || true
+    record_p S2c "$OBS" "not run" "$EV"
+    return
+  fi
+  p_controls owner_gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input "$WORK/env.json" ";;" \
+    owner_gh api "repos/$REPO/environments/$ENV_NAME/secrets/public-key" ";;" \
+    owner_gh api -X DELETE "repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME"
+  [[ "$(env_summary)" == "$(want_env)" ]] || { CTL=failed; EV="$EV the Environment reads '$(env_summary)' afterwards |"; }
   record_p S2c "$OBS" "$CTL" "$EV"
 }
 
@@ -1799,34 +1823,42 @@ cmd_env_tests() {
 # Some tests need a token issued earlier: one over an hour old (A4), or one issued before a key is
 # deleted or the app is suspended, uninstalled or deleted. Such a token is "held": kept until its
 # check, then revoked (if it still works) and removed. Held tokens are VAR=value lines in a mode-600
-# file beside the app's key (HELD_AGE=…), so a handoff's ho_redact_file can hide them too; when each
-# was issued is kept apart, in HELD_TIMES (not a secret). What GitHub does with each is recorded;
-# where GitHub's docs are silent it is a reading.
+# file beside the app's key, HELD_AGE=<token> with HELD_AGE_AT=<when it was issued>, so a handoff's
+# ho_redact_file can hide them too. The file is always rewritten whole (a temp file, then a move), so
+# a token is never recorded without its time (round 15, C1/SEC-3). What GitHub does with each is
+# recorded; where GitHub's docs are silent it is a reading.
 
 HELD="$(dirname "$SECRETS")/held-tokens.env"
-HELD_TIMES="$(dirname "$SECRETS")/held-times"
 STATE="$(dirname "$SECRETS")/frg26-state"
 
 held_var() { printf 'HELD_%s' "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"; }
 
 held_get() { # <name> — prints "token issued-epoch" or fails
-  [[ -f "$HELD" && ! -L "$HELD" && -f "$HELD_TIMES" && ! -L "$HELD_TIMES" ]] || return 1
-  local tok at
-  tok="$(sed -n "s/^$(held_var "$1")=\(ghs_[A-Za-z0-9]*\)$/\1/p" "$HELD" | tail -n 1)"
-  at="$(sed -n "s/^$1 \([0-9][0-9]*\)$/\1/p" "$HELD_TIMES" | tail -n 1)"
+  [[ -f "$HELD" && ! -L "$HELD" ]] || return 1
+  local v tok at
+  v="$(held_var "$1")"
+  tok="$(sed -n "s/^$v=\(ghs_[A-Za-z0-9]*\)$/\1/p" "$HELD" | tail -n 1)"
+  at="$(sed -n "s/^${v}_AT=\([0-9][0-9]*\)$/\1/p" "$HELD" | tail -n 1)"
   [[ -n "$tok" && -n "$at" ]] || return 1
   printf '%s %s\n' "$tok" "$at"
 }
 
-drop_line() { # <file> <line prefix> — the file keeps mode 600
-  [[ -f "$1" ]] || return 0
-  (umask 077; grep -v "^$2" "$1" >"$1.new") || true
-  chmod 600 "$1.new" && mv "$1.new" "$1"
+held_present() { # <name> — any line for it, complete or not
+  [[ -f "$HELD" ]] && grep -Eq "^$(held_var "$1")(_AT)?=" "$HELD"
+}
+
+# Rewrites the held file whole: every other name's lines, plus (with a token) this name's two.
+held_write() { # <name> [token]
+  local v tmp
+  v="$(held_var "$1")"
+  tmp="$(umask 077 && mktemp "$HELD.XXXXXX" 2>/dev/null)" || return 1
+  if [[ -f "$HELD" ]]; then grep -Ev "^$v(_AT)?=" "$HELD" >"$tmp"; [[ $? -le 1 ]] || { rm -f "$tmp"; return 1; }; fi
+  if [[ -n "${2:-}" ]]; then printf '%s=%s\n%s_AT=%s\n' "$v" "$2" "$v" "$(date +%s)" >>"$tmp" || { rm -f "$tmp"; return 1; }; fi
+  if ! chmod 600 "$tmp" || ! mv -f "$tmp" "$HELD"; then rm -f "$tmp"; return 1; fi
 }
 
 held_drop() { # <name>
-  drop_line "$HELD" "$(held_var "$1")="
-  drop_line "$HELD_TIMES" "$1 "
+  held_write "$1" || say "note: couldn't remove the held record '$1' from $HELD (its token is settled)"
 }
 
 state_set() { # <key> <value>
@@ -1852,16 +1884,20 @@ cmd_hold_token() {
     use_held "$name"
     if held_get "$name" >/dev/null; then die "the token held earlier as '$name' couldn't be revoked: run this step again"; fi
     say "the token held earlier as '$name' was settled first ($HELD_RESULT)"
+  elif held_present "$name"; then
+    die "$HELD has an incomplete record for '$name' (a token without its time, or the reverse): check it before holding another"
   fi
   local session="$TOKEN" held
   mint_token
   held="$TOKEN"
-  TOKEN="$session"
   REDACT_ONLY="$REDACT_ONLY $held"
-  held_drop "$name"
-  (umask 077; printf '%s=%s\n' "$(held_var "$name")" "$held" >>"$HELD") || die "storing the held token failed"
-  (umask 077; printf '%s %s\n' "$name" "$(date +%s)" >>"$HELD_TIMES") || die "storing when it was issued failed"
-  chmod 600 "$HELD" "$HELD_TIMES" || die "chmod failed"
+  # Stored whole, or revoked at once: a token is never left without its record (round 15, C1/SEC-3).
+  if ! held_write "$name" "$held"; then
+    if revoke_token; then TOKEN="$session"; die "storing the held token failed; it was revoked"; fi
+    TOKEN="$session"
+    die "storing the held token failed, and revoking it failed too: GitHub expires it within an hour"
+  fi
+  TOKEN="$session"
   say "held token '$name' stored (issued $(date -u +%Y-%m-%dT%H:%M:%SZ), used only by its check)"
 }
 
