@@ -1881,6 +1881,7 @@ test_a_held_token_is_revoked_whatever_its_read_says() {
 
   put_held
   app_gh() { echo "gh: HTTP 503 Service Unavailable" >&2; return 1; }
+  REVOKE_RC=1
   rc=0; out="$(use_held suspend 2>&1)" || rc=$?
   assert_exit 2 "$rc" "GitHub unavailable"
   assert_contains "$out" "kept"
@@ -1914,6 +1915,133 @@ test_suspend_check_does_not_count_a_rate_limit_as_a_refusal() {
   app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
   cmd_suspend_check >/dev/null 2>&1
   assert_eq "$(state_get E1)" "inconclusive HTTP-403"
+}
+
+test_unsuspend_check_keeps_a_token_it_could_not_revoke() {
+  # Round 14, SEC-1: after unsuspending the installation exists, so the held token is not "final":
+  # if it can't be revoked, it stays held and the step fails.
+  held_stubs
+  printf 'HELD_SUSPEND=%s\n' "$(fake_token)" >"$HELD"
+  printf 'suspend %s\n' "$(date +%s)" >"$HELD_TIMES"
+  chmod 600 "$HELD" "$HELD_TIMES"
+  state_set E1 "refused HTTP-403"
+  app_session() { :; }
+  app_gh() { echo "$REPO"; }
+  revoke_token() { TOKEN=""; return 1; }
+  local rc=0 out
+  out="$(cmd_unsuspend_check 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a working token that couldn't be revoked"
+  assert_contains "$(cat "$HELD")" "HELD_SUSPEND=" "the token was discarded"
+  revoke_token() { echo "revoke" >>"$T_TMP/calls"; TOKEN=""; return 0; }
+  rc=0; out="$(cmd_unsuspend_check 2>&1)" || rc=$?
+  assert_exit 0 "$rc"
+  assert_eq "$(grep -c HELD_SUSPEND "$HELD")" 0 "removed once revoked"
+}
+
+test_holding_a_name_again_settles_the_earlier_token_first() {
+  # Round 14, SEC-2: a retried hold-token must not abandon the token it held before.
+  held_stubs
+  app_session() { TOKEN="ghs_session$(printf 'S%.0s' $(seq 1 30))"; }
+  mint_token() { TOKEN="ghs_newheld$(printf 'N%.0s' $(seq 1 30))"; }
+  printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"
+  printf 'age %s\n' "$(date +%s)" >"$HELD_TIMES"
+  chmod 600 "$HELD" "$HELD_TIMES"
+  app_gh() { echo "$REPO"; }
+  revoke_token() { echo "revoke ${TOKEN:0:8}" >>"$T_TMP/calls"; TOKEN=""; return "${REVOKE_RC:-0}"; }
+  local rc=0
+  cmd_hold_token age >/dev/null 2>&1 || rc=$?
+  assert_exit 0 "$rc"
+  assert_eq "$(cat "$T_TMP/calls")" "revoke ghs_ZZZZ" "the earlier token was revoked first"
+  assert_contains "$(cat "$HELD")" "HELD_AGE=ghs_newheld"
+  # If the earlier token can't be settled, nothing new is held and the step fails.
+  printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"
+  printf 'age %s\n' "$(date +%s)" >"$HELD_TIMES"
+  : >"$T_TMP/calls"
+  REVOKE_RC=1
+  rc=0
+  (cmd_hold_token age) >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc"
+  assert_eq "$(cat "$HELD")" "HELD_AGE=$(fake_token)" "the earlier token was replaced while still unsettled"
+}
+
+test_an_unreliable_read_still_tries_to_revoke_the_held_token() {
+  # Round 14, C2: revocation is tried even when the read was unreliable. Revoked: removed (that
+  # reading is lost, the step fails). Not revoked: kept for a retry, the step fails.
+  held_stubs
+  put_held() { printf 'HELD_AGE=%s\n' "$(fake_token)" >"$HELD"; printf 'age %s\n' "$(date +%s)" >"$HELD_TIMES"; chmod 600 "$HELD" "$HELD_TIMES"; }
+  revoke_token() { echo "revoke" >>"$T_TMP/calls"; TOKEN=""; return "${REVOKE_RC:-0}"; }
+  app_gh() { echo "gh: HTTP 503 Service Unavailable" >&2; return 1; }
+  local rc out
+  put_held
+  REVOKE_RC=0
+  rc=0; out="$(use_held age 2>&1)" || rc=$?
+  assert_exit 2 "$rc"
+  assert_eq "$(cat "$T_TMP/calls")" "revoke" "revocation tried after an unreliable read"
+  assert_eq "$(grep -c HELD_AGE "$HELD")" 0 "a revoked token is removed"
+  assert_contains "$out" "revoked"
+  : >"$T_TMP/calls"
+  put_held
+  REVOKE_RC=1
+  rc=0; out="$(use_held age 2>&1)" || rc=$?
+  assert_exit 2 "$rc"
+  assert_eq "$(cat "$T_TMP/calls")" "revoke"
+  assert_contains "$(cat "$HELD")" "HELD_AGE=" "kept when it couldn't be revoked"
+}
+
+test_environment_cleanup_confirms_no_run_still_waits() {
+  # Round 14, C4: listing every page, cancelling, and confirming none still waits; any failure fails.
+  load
+  sleep() { :; }
+  : >"$T_TMP/owner"
+  owner_gh() {
+    echo "$*" >>"$T_TMP/owner"
+    case "$*" in
+      *"status=waiting"*) [[ -f "$T_TMP/list-fails" ]] && return 1
+        if [[ -f "$T_TMP/cancelled" && ! -f "$T_TMP/stuck" ]]; then return 0; fi
+        printf '701\n702\n' ;;
+      *"/cancel"*) touch "$T_TMP/cancelled" ;;
+    esac
+  }
+  local rc=0
+  cancel_waiting_runs >/dev/null || rc=$?
+  assert_exit 0 "$rc" "both runs cancelled"
+  assert_contains "$(cat "$T_TMP/owner")" "--paginate"
+  assert_contains "$(cat "$T_TMP/owner")" "actions/runs/701/cancel"
+  assert_contains "$(cat "$T_TMP/owner")" "actions/runs/702/cancel"
+  rm -f "$T_TMP/cancelled"
+  touch "$T_TMP/stuck"
+  rc=0; cancel_waiting_runs >/dev/null || rc=$?
+  assert_exit 1 "$rc" "a run that still waits"
+  rm -f "$T_TMP/stuck"
+  touch "$T_TMP/list-fails"
+  rc=0; cancel_waiting_runs >/dev/null || rc=$?
+  assert_exit 1 "$rc" "an unreadable list"
+}
+
+test_environment_tests_fail_when_their_cleanup_fails() {
+  load
+  need_owner() { :; }
+  assert_throwaway() { :; }
+  app_session() { :; }
+  verify_phase() { :; }
+  need_allowance() { :; }
+  env_summary() { want_env; }
+  put_file() { :; }
+  owner_gh() { printf '%s\n' "$(printf 'd%.0s' $(seq 1 40))"; }
+  app_git() { :; }
+  WORK="$T_TMP/work"
+  mkdir -p "$WORK"
+  local id
+  for id in $S2_TEST_ORDER; do eval "t_$id() { record_p $id refused ok stand-in; }"; done
+  cancel_waiting_runs() { return 1; }
+  local rc=0 out
+  out="$(cmd_env_tests 2>&1)" || rc=$?
+  assert_exit 1 "$rc"
+  assert_not_contains "$out" "ENVIRONMENT TESTS: ALL PASS"
+  cancel_waiting_runs() { return 0; }
+  rc=0; out="$(cmd_env_tests 2>&1)" || rc=$?
+  assert_exit 0 "$rc"
+  assert_contains "$out" "ENVIRONMENT TESTS: ALL PASS"
 }
 
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {

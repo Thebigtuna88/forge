@@ -1642,11 +1642,28 @@ policy_rejected() { # <job id>
   owner_gh api "repos/$REPO/check-runs/$1/annotations" --jq '.[].message' 2>/dev/null | grep -Eiq 'not allowed to deploy'
 }
 
+waiting_runs() { # the ids of S2 runs still waiting, every page; fails if the list can't be read
+  owner_gh api --paginate "repos/$REPO/actions/runs?status=waiting&per_page=100" \
+    --jq '.workflow_runs[] | select(.name == "frg26-s2") | .id' 2>/dev/null
+}
+
+# Every waiting S2 run is cancelled, and confirmed no longer waiting (round 14, C4); 1 otherwise.
 cancel_waiting_runs() {
-  local id
-  for id in $(owner_gh api "repos/$REPO/actions/runs?status=waiting&per_page=50" --jq '.workflow_runs[] | select(.name == "frg26-s2") | .id' 2>/dev/null); do
-    [[ "$id" =~ ^[0-9]+$ ]] && owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1
+  local ids id _
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if ! ids="$(waiting_runs)"; then
+      say "CLEANUP FAIL could not list the waiting S2 runs in $REPO: cancel any on GitHub (Actions)"
+      return 1
+    fi
+    [[ -z "$ids" ]] && return 0
+    for id in $ids; do
+      if [[ ! "$id" =~ ^[0-9]+$ ]]; then say "CLEANUP FAIL unexpected run id in $REPO: cancel any waiting S2 run on GitHub"; return 1; fi
+      owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
+    done
+    sleep 5
   done
+  say "CLEANUP FAIL S2 runs still waiting in $REPO ($(printf '%s' "$ids" | tr '\n' ' ')): cancel them on GitHub (Actions)"
+  return 1
 }
 
 # S2b: the app's push to main starts a run; the app tries to approve its own deployment. Control:
@@ -1664,7 +1681,7 @@ t_S2b() {
   approve_run app_gh "$id" "$eid" || true
   OBS="$(classify_api)"
   EV="the app approving its own run: $(evidence) |"
-  if [[ "$OBS" != refused ]]; then record_p S2b "$OBS" "not run" "$EV"; cancel_waiting_runs; return; fi
+  if [[ "$OBS" != refused ]]; then record_p S2b "$OBS" "not run" "$EV"; cancel_waiting_runs || true; return; fi
   CTL=failed
   local can
   can="$(can_approve "$id")"
@@ -1723,7 +1740,7 @@ t_S2a() {
     fi
   fi
   record_p S2a "$OBS" ok "feature-branch run $RUN, deploy job ${job:-unread} (control: S2b's run on main got the value)"
-  cancel_waiting_runs
+  cancel_waiting_runs || true
 }
 
 # S2c: the app tries to change the Environment's protection or its secret. Control: the owner reads
@@ -1765,12 +1782,15 @@ cmd_env_tests() {
     app_git clone -q --template="$WORK/template" "https://github.com/$REPO.git" "$CLONE" || die "clone failed"
     "t_$id"
     if [[ $FAILS -ne 0 ]]; then
-      cancel_waiting_runs
+      cancel_waiting_runs || true
       say "ENVIRONMENT TESTS: STOPPED after $id"
       exit 1
     fi
   done
-  cancel_waiting_runs
+  if ! cancel_waiting_runs; then
+    say "ENVIRONMENT TESTS: FAILED at the final clean-up (a run may still wait for review)"
+    exit 1
+  fi
   say "ENVIRONMENT TESTS: ALL PASS (run reset next: main holds the S2 workflow)"
   exit 0
 }
@@ -1826,6 +1846,13 @@ cmd_hold_token() {
   need_owner
   assert_throwaway
   app_session
+  # A retried step must not abandon the token it held before (round 14, SEC-2): settle that one
+  # first, and hold nothing new while it is unsettled.
+  if held_get "$name" >/dev/null; then
+    use_held "$name"
+    if held_get "$name" >/dev/null; then die "the token held earlier as '$name' couldn't be revoked: run this step again"; fi
+    say "the token held earlier as '$name' was settled first ($HELD_RESULT)"
+  fi
   local session="$TOKEN" held
   mint_token
   held="$TOKEN"
@@ -1854,8 +1881,17 @@ use_held() { # <name> [final]
   if [[ $LAST_RC -eq 0 && "$LAST_OUT" == "$REPO" ]]; then HELD_RESULT=works
   elif github_refused; then HELD_RESULT="$(http_of)"
   else
+    # Revocation is still tried (round 14, C2). Revoked: removed, and this reading is lost.
+    # Not revoked: kept for a retry. Either way the step stops.
+    local ev
+    ev="$(evidence)"
+    if revoke_token; then
+      TOKEN="$session"
+      held_drop "$1"
+      die "GitHub couldn't be read reliably with the held token '$1' ($ev); it was revoked, so this reading is lost: hold a new token and check again"
+    fi
     TOKEN="$session"
-    die "GitHub couldn't be read reliably with the held token '$1' ($(evidence)); it is kept: run this step again"
+    die "GitHub couldn't be read reliably with the held token '$1' ($ev), nor could it be revoked; it is kept: run this step again"
   fi
   local settled=no
   if revoke_token; then settled=yes
@@ -1959,9 +1995,12 @@ cmd_unsuspend_check() {
   # In a subshell (a failed session must not end this step), which revokes its own token when it
   # ends: the EXIT trap isn't inherited (round 13, C1/SEC-3).
   if (trap revoke_token EXIT; app_session) >/dev/null 2>&1; then ctl=ok; fi
+  # The installation exists again, so this is not "final" (round 14, SEC-1): a token that can't be
+  # revoked stays held, and the step fails so it is run again.
   if held_get suspend >/dev/null; then
-    use_held suspend final
+    use_held suspend
     reading E1 "the token issued before the suspension, after unsuspending: $HELD_RESULT"
+    if held_get suspend >/dev/null; then die "the token held over the suspension couldn't be revoked: run this step again"; fi
   fi
   FAILS=0
   record_p E1 "${first%% *}" "$ctl" "a new token while suspended: ${first#* }; after unsuspending: $ctl"
