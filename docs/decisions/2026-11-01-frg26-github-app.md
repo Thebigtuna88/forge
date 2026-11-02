@@ -80,16 +80,19 @@ official docs on 2026-11-01, follows.
 - A: fails D5 and D6 at GitHub level; only FORGE's hooks would stop merges and `main` updates
   (the L13 gap FRG-26 exists to close). Not a fit.
 - B:
-  - The private key is a credential that never expires, held by `forge-agent`; stolen, it mints
-    tokens until the owner deletes it (fine-grained, selected repos, 1 hour each). Revoke: delete
-    the key in the app's settings.
+  - The private key is a credential that never expires; stolen, it mints tokens until the owner
+    deletes it (fine-grained, selected repos, 1 hour each). As accepted (D10, the owner's words
+    above): it is held by a token broker running as its own Mac user (`_forgebroker`), never by
+    `forge-agent`; the agent only reads the current 1-hour token. Revoke: delete the key in the
+    app's settings; to stop access at once, suspend the installation (plan 4.3). (This comparison
+    first said "held by `forge-agent`"; corrected in review round 17.)
   - New code: a token-minting step (JWT, owner-only paths likely) and changes to
     github-throwaway.sh (e.g. `need_helper_identity` reads `GET /user`, which an installation token
     is not expected to serve: Unconfirmed). Every `gh` command FORGE uses must work with an
     installation token: Unconfirmed, a test decides. Then a full review cycle and new handoffs.
   - Owner work: create the app in the web UI (permissions: Contents, Pull requests, Issues
-    read/write; Metadata read; nothing else), install it on selected repos, generate the key
-    through a handoff (`ho_secret_to_file`).
+    read/write; Metadata read; nothing else), install it on selected repos, generate the key and
+    give it to the broker through a handoff (plan 4.2).
   - No second account, no Terms question, and no wait on GitHub Support.
 - C:
   - The account is restricted by GitHub today (diagnose-5, 2026-10-31); the stage-1 tests wait on

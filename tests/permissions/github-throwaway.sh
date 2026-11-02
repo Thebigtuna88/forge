@@ -77,6 +77,9 @@ JWT=""
 TOKEN=""
 REVOKED_TOKENS=""
 REDACT_ONLY="" # tokens held for a later check: hidden like the others, never revoked by this run
+# Every token this run minted that is neither revoked nor held: all of them are revoked on exit, so
+# a session token set aside while a second token is minted is never abandoned (round 17, C2).
+OUTSTANDING=""
 LAST_HTTP=""
 WORK=""
 CLONE=""
@@ -121,7 +124,7 @@ cleanup() {
     CANCEL_ON_EXIT=""
     cancel_waiting_runs || true
   fi
-  revoke_token
+  revoke_outstanding
   if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
@@ -326,6 +329,7 @@ mint() { # <request json> <narrowed|whole>
   t="$(jq -r .token <<<"$ans" 2>/dev/null)" || t=""
   [[ "$t" =~ ^ghs_[A-Za-z0-9]{30,250}$ ]] || die "GitHub's answer holds no installation token"
   TOKEN="$t"
+  OUTSTANDING="$OUTSTANDING $t"
   perms="$(jq -S -c .permissions <<<"$ans" 2>/dev/null)" || perms=error
   sel="$(jq -r .repository_selection <<<"$ans" 2>/dev/null)" || sel=error
   repos="$(jq -c '[.repositories[]?.full_name]' <<<"$ans" 2>/dev/null)" || repos=error
@@ -354,8 +358,23 @@ revoke_token() { # the current token stops working at once (DELETE /installation
   app_gh api -X DELETE installation/token >/dev/null 2>&1 || rc=$?
   if [[ $rc -ne 0 ]]; then say "note: revoking a token failed; GitHub expires it within an hour"; fi
   REVOKED_TOKENS="$REVOKED_TOKENS $TOKEN"
+  outstanding_drop "$TOKEN"
   TOKEN=""
   return $rc
+}
+
+outstanding_drop() { # <token> — revoked or held: no longer this run's to revoke on exit
+  local s=" $OUTSTANDING "
+  OUTSTANDING="${s// $1 / }"
+}
+
+revoke_outstanding() { # the current token, then every other token this run minted and still owns
+  local t
+  revoke_token
+  for t in $OUTSTANDING; do
+    TOKEN="$t"
+    revoke_token
+  done
 }
 
 app_session() { # every command that acts as the app starts here
@@ -1873,11 +1892,12 @@ held_drop() { # <name>
   held_write "$1" || say "note: couldn't remove the held record '$1' from $HELD (its token is settled)"
 }
 
-state_set() { # <key> <value>
-  (umask 077; touch "$STATE")
-  grep -v "^$1 " "$STATE" >"$STATE.new" || true
-  printf '%s %s\n' "$1" "$2" >>"$STATE.new"
-  chmod 600 "$STATE.new" && mv "$STATE.new" "$STATE"
+state_set() { # <key> <value> — the file is rewritten whole; 1 if that failed (round 17, C1)
+  local tmp
+  tmp="$(umask 077 && mktemp "$STATE.XXXXXX" 2>/dev/null)" || return 1
+  if [[ -f "$STATE" ]]; then grep -v "^$1 " "$STATE" >"$tmp"; [[ $? -le 1 ]] || { rm -f "$tmp"; return 1; }; fi
+  printf '%s %s\n' "$1" "$2" >>"$tmp" || { rm -f "$tmp"; return 1; }
+  if ! chmod 600 "$tmp" || ! mv -f "$tmp" "$STATE"; then rm -f "$tmp"; return 1; fi
 }
 
 state_get() { [[ -f "$STATE" ]] && sed -n "s/^$1 //p" "$STATE" | tail -n 1; }
@@ -1909,6 +1929,7 @@ cmd_hold_token() {
     TOKEN="$session"
     die "storing the held token failed, and revoking it failed too: GitHub expires it within an hour"
   fi
+  outstanding_drop "$held"
   TOKEN="$session"
   say "held token '$name' stored (issued $(date -u +%Y-%m-%dT%H:%M:%SZ), used only by its check)"
 }
@@ -2020,6 +2041,9 @@ cmd_suspend_check() {
   sus="$(jq -r .suspended_at <<<"$inst")"
   [[ "$sus" != null ]] || die "the installation is not suspended: suspend it first"
   INSTALLATION_ID="$(jq -r .id <<<"$inst")"
+  # An earlier observation must never be judged as this one: it is cleared first, and this one must
+  # be stored, or the step stops (round 17, C1).
+  state_set E1 "pending HTTP-none" || die "can't write $STATE, where this step's observation is kept"
   printf '%s\n' "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}" >"$WORK/token-request.json"
   jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || true
   local obs=inconclusive
@@ -2029,7 +2053,7 @@ cmd_suspend_check() {
     revoke_token
   elif [[ "$LAST_HTTP" =~ ^(401|403|404)$ ]] && ! grep -Eiq 'rate limit|abuse detection' <<<"$LAST_OUT"; then obs=refused
   fi
-  state_set E1 "$obs HTTP-${LAST_HTTP:-none}"
+  state_set E1 "$obs HTTP-${LAST_HTTP:-none}" || die "can't store this step's observation in $STATE: run it again"
   use_held suspend
   reading E1 "a token issued before the suspension (suspended at $sus): $HELD_RESULT"
   say "E1 a new token while suspended: $obs (HTTP ${LAST_HTTP:-none}); the verdict follows after you unsuspend"
@@ -2045,7 +2069,7 @@ cmd_unsuspend_check() {
   local ctl=failed
   # In a subshell (a failed session must not end this step), which revokes its own token when it
   # ends: the EXIT trap isn't inherited (round 13, C1/SEC-3).
-  if (trap revoke_token EXIT; app_session) >/dev/null 2>&1; then ctl=ok; fi
+  if (trap revoke_outstanding EXIT; app_session) >/dev/null 2>&1; then ctl=ok; fi
   # The installation exists again, so this is not "final" (round 14, SEC-1): a token that can't be
   # revoked stays held, and the step fails so it is run again.
   if held_get suspend >/dev/null; then

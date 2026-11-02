@@ -2195,6 +2195,72 @@ test_an_error_in_env_tests_still_cancels_waiting_runs() {
   assert_contains "$out" "CANCELLED-WAITING-RUNS"
 }
 
+test_a_rejected_second_token_leaves_the_session_token_to_the_exit() {
+  # Round 17, C2: when a second token (A5, hold-token) is rejected, the session token minted before
+  # it is still revoked on exit.
+  local out
+  out="$(app_stubs
+    INSTALLATION_ID=77
+    app_gh() { echo "app_gh ${TOKEN:0:12} $*" >>"$T_TMP/app-gh.log"; }
+    mint_token >/dev/null
+    token_fixture | jq -c '.token = "ghs_second'"$(printf 'Q%.0s' $(seq 1 30))"'" | .permissions.administration = "write"' >"$T_TMP/token.json"
+    mint_token 2>&1)" || true
+  assert_contains "$out" "revoked"
+  assert_contains "$(cat "$T_TMP/app-gh.log")" "app_gh ghs_secondQQ api -X DELETE installation/token" "the rejected token"
+  assert_contains "$(cat "$T_TMP/app-gh.log")" "app_gh ghs_ZZZZZZZZ api -X DELETE installation/token" "the session token, on exit"
+}
+
+test_a_held_token_is_not_revoked_on_exit_but_the_session_is() {
+  held_stubs
+  app_stubs
+  HELD="$T_TMP/held-tokens.env"
+  need_owner() { :; }
+  assert_throwaway() { :; }
+  app_session() { INSTALLATION_ID=77; mint_token; }
+  need_installation_scope() { :; }
+  app_gh() { echo "app_gh ${TOKEN:0:12} $*" >>"$T_TMP/app-gh.log"; }
+  local n=0
+  jwt_call() {
+    LAST_HTTP=201
+    n=$((n + 1))
+    printf '%s' "$(token_fixture | jq -c --arg t "ghs_tok${n}$(printf 'T%.0s' $(seq 1 30))" '.token = $t')" >"$T_TMP/ans"
+    LAST_OUT="$(cat "$T_TMP/ans")"
+  }
+  (cmd_hold_token age; cleanup) >/dev/null 2>&1
+  assert_contains "$(cat "$T_TMP/app-gh.log")" "app_gh ghs_tok1TTTT api -X DELETE installation/token" "the session token"
+  assert_not_contains "$(cat "$T_TMP/app-gh.log")" "ghs_tok2" "the held token was revoked on exit"
+  assert_contains "$(cat "$HELD")" "HELD_AGE=ghs_tok2"
+}
+
+test_suspend_check_stops_if_its_observation_cannot_be_stored() {
+  # Round 17, C1: suspend-check's observation is what unsuspend-check judges; if it can't be stored
+  # (or an old one cleared) the step fails, so no stale observation can be judged.
+  held_stubs
+  make_jwt() { JWT=x; }
+  jwt_call() {
+    case "$1 $2" in
+      "GET app/installations"*) LAST_HTTP=200; LAST_OUT='[{"id":77,"account":{"login":"Thebigtuna88"},"suspended_at":"2026-11-02T00:00:00Z"}]' ;;
+      "POST app/installations/77/access_tokens") LAST_HTTP=201; LAST_OUT="$(token_fixture)" ;;
+    esac
+  }
+  app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  printf 'HELD_SUSPEND=%s\nHELD_SUSPEND_AT=%s\n' "$(fake_token)" "$(date +%s)" >"$HELD"
+  chmod 600 "$HELD"
+  mkdir -m 700 "$T_TMP/ro"
+  printf 'E1 refused HTTP-403\n' >"$T_TMP/ro/frg26-state"
+  STATE="$T_TMP/ro/frg26-state"
+  chmod 500 "$T_TMP/ro"
+  local rc=0
+  (cmd_suspend_check) >/dev/null 2>&1 || rc=$?
+  chmod 700 "$T_TMP/ro"
+  assert_exit 2 "$rc" "an observation that couldn't be stored"
+  rc=0
+  STATE="$T_TMP/frg26-state"
+  printf 'E1 refused HTTP-403\n' >"$STATE"
+  (cmd_suspend_check) >/dev/null 2>&1 || rc=$?
+  assert_eq "$(state_get E1)" "allowed HTTP-201" "the stored observation is this run's"
+}
+
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
   # Round 13, C5/SEC-7: an outage or a server error is not proof that the app was deleted.
   held_stubs
