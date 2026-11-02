@@ -1028,8 +1028,8 @@ test_only_the_throwaway_repo_is_named() {
 
 # --- The GitHub App (plan section 4, revised 2026-11-01) ------------------------------------------
 
-app_fixture() { # GET /app for the owner's throwaway app
-  printf '{"id":123456,"slug":"frg26-test-app","owner":{"login":"Thebigtuna88"}}'
+app_fixture() { # GET /app for the owner's throwaway app (its own permissions, as GitHub lists them)
+  printf '{"id":123456,"slug":"frg26-test-app","owner":{"login":"Thebigtuna88"},"permissions":{"contents":"write","issues":"write","metadata":"read","pull_requests":"write"}}'
 }
 
 installations_fixture() { # GET /app/installations: one installation, the four permissions
@@ -1177,7 +1177,11 @@ test_app_identity_needs_the_owners_app_and_one_selected_installation() {
   assert_eq "$INSTALLATION_ID" 77
   assert_eq "$APP_BOT" "frg26-test-app[bot]"
   local name json rc
+  # Round 20, C1: the app's own permissions too (a change awaiting the installation's approval).
   for name in "someone else's app|app|.owner.login = \"someone\"" \
+    "the app asks for an extra permission|app|.permissions.administration = \"read\"" \
+    "the app asks for a wider permission|app|.permissions.metadata = \"write\"" \
+    "the app lists no permissions|app|del(.permissions)" \
     "another app id|app|.id = 999" \
     "two installations|inst|. + ." \
     "all repositories|inst|.[0].repository_selection = \"all\"" \

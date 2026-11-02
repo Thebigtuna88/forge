@@ -84,7 +84,10 @@ official docs on 2026-11-01, follows.
     deletes it (fine-grained, selected repos, 1 hour each). As accepted (D10, the owner's words
     above): it is held by a token broker running as its own Mac user (`_forgebroker`), never by
     `forge-agent`; the agent only reads the current 1-hour token. Revoke: delete the key in the
-    app's settings; to stop access at once, suspend the installation (plan 4.3). (This comparison
+    app's settings (stops new tokens); suspend or uninstall the installation to block the app's
+    access to the account. Whether tokens already issued stop at once is Unconfirmed until tests
+    A9b, E1, E2 and E3 have run (plan 4.3); until then, assume an issued token may work for up to
+    its hour. (Qualified in review round 20.) (This comparison
     first said "held by `forge-agent`"; corrected in review round 17.)
   - New code: a token-minting step (JWT, owner-only paths likely) and changes to
     github-throwaway.sh (e.g. `need_helper_identity` reads `GET /user`, which an installation token

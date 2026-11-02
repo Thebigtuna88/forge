@@ -292,8 +292,9 @@ jwt_call() { # <method> <path> [json body file]
   [[ "$LAST_HTTP" =~ ^2[0-9][0-9]$ ]]
 }
 
-# The key must belong to the owner's app, installed exactly once (on the owner's account), on
-# selected repositories only, not suspended, with exactly the four permissions.
+# The key must belong to the owner's app, which asks for exactly the four permissions, installed
+# exactly once (on the owner's account), on selected repositories only, not suspended, with exactly
+# the four permissions.
 need_app_identity() {
   make_jwt
   jwt_call GET app || die "GitHub refused the app's signed request (HTTP ${LAST_HTTP:-none}): $(evidence)"
@@ -305,6 +306,10 @@ need_app_identity() {
   [[ "$id" == "$APP_ID" ]] || die "the key belongs to app '$id', not APP_ID $APP_ID"
   [[ "$owner" == "$OWNER" ]] || die "the app belongs to '$owner', not $OWNER"
   [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die "unexpected app name '$slug'"
+  # The app's own permissions too, not only the installation's: a change the owner made to the app
+  # that awaits the installation's approval shows here first (round 20, C1).
+  got="$(jq -S -c .permissions <<<"$app" 2>/dev/null)" || got=error
+  [[ "$got" == "$WANT_PERMS" ]] || die "the app itself must ask for exactly $WANT_PERMS (it asks for $got)"
   APP_SLUG="$slug"
   APP_BOT="${slug}[bot]"
   jwt_call GET "app/installations?per_page=100" || die "can't list the app's installations: $(evidence)"
