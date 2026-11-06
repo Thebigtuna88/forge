@@ -151,7 +151,7 @@ in `.harness/lib/` (owner-only; you merge it).
 | Action | Who, where | What it stops | What it doesn't |
 |---|---|---|---|
 | **Delete the private key** | You, app settings > Private keys (GitHub requires a second key before deleting the only one) | New tokens: a note signed with a deleted key should be refused (test A9) | Tokens already issued: GitHub's docs don't say. Expected to keep working until their hour runs out: Unconfirmed, test A9b records what happens |
-| **Revoke one token** | Whoever holds it: `DELETE /installation/token` with that token | That token at once: "invalidated and cannot be used" (Confirmed, docs) | Other tokens; new tokens |
+| **Revoke one token** | Whoever holds it: `DELETE /installation/token` with that token | That token at once: "invalidated and cannot be used" (docs). For GitHub's stateless tokens, which this app now receives: Unconfirmed until A5 runs (see *Stateless tokens* below) | Other tokens; new tokens |
 | **Suspend the installation** | You, Settings > Applications > Installed GitHub Apps > Configure > Suspend | The app's access to your account's resources (Confirmed, docs); whether already-issued tokens stop at once: Unconfirmed, test E1 | Reversible: Unsuspend |
 | **Uninstall** | You, same page > Uninstall | The app's access to your account's resources (Confirmed, docs); token deactivation is documented for organisations, Unconfirmed for personal accounts, test E2 | Reinstalling gives a new installation id (broker settings updated by handoff) |
 

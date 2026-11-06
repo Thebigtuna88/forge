@@ -1234,6 +1234,17 @@ test_a_token_mint_refuses_is_still_revoked() {
     assert_not_contains "$out" "$tok" "the token printed ($name)"
     assert_eq "$(cat "$T_TMP/app-gh.log")" "api -X DELETE installation/token" "revoked ($name)"
   done
+  # Round 32 (C1, SEC-1): when the first revocation fails, the exit clean-up tries again.
+  app_stubs
+  INSTALLATION_ID=77
+  tok="ghx_$(printf 'Q%.0s' $(seq 1 40))"
+  token_fixture | jq -c --arg t "$tok" '.token = $t' >"$T_TMP/token.json"
+  app_gh() { echo "${TOKEN:0:8} $*" >>"$T_TMP/app-gh.log"; [[ -f "$T_TMP/deleted-once" ]] || { : >"$T_TMP/deleted-once"; return 1; }; }
+  # The real run's exit clean-up calls revoke_outstanding; die exits the subshell, so the trap runs.
+  rc=0; out="$(trap revoke_outstanding EXIT; mint_token 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a refused token whose revocation failed"
+  assert_eq "$(grep -c "^ghx_QQQQ api -X DELETE installation/token$" "$T_TMP/app-gh.log")" 2 "the first revocation of a refused token fails, then the exit retries it"
+  assert_not_contains "$out" "$tok" "the token printed (failed revocation)"
   # Control: an answer with no token at all has nothing to revoke.
   app_stubs
   INSTALLATION_ID=77

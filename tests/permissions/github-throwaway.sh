@@ -337,15 +337,16 @@ mint() { # <request json> <narrowed|whole>
   # Whatever GitHub issued is revoked if it isn't kept (round 31: the owner's run refused a real
   # token and left it working until it expired). GitHub's stateless format is ghs_APPID_JWT, about
   # 520 characters, base64url parts joined by dots (changelog 2026-04-24). The length is checked on
-  # its own: macOS regex allows at most 255 repeats.
+  # its own: macOS regex allows at most 255 repeats. It is on the exit list before it is judged, so a
+  # failed revocation is tried again on exit (round 32, C1).
   TOKEN="$t"
+  OUTSTANDING="$OUTSTANDING $t"
   if [[ ! "$t" =~ ^ghs_[A-Za-z0-9._-]+$ ]] || [[ ${#t} -lt 30 || ${#t} -gt 4096 ]]; then
     if revoke_token; then
       die "GitHub's answer holds a token in a form this script doesn't expect: it was revoked"
     fi
-    die "GitHub's answer holds a token in a form this script doesn't expect, and revoking it failed: it may work until it expires, within an hour"
+    die "GitHub's answer holds a token in a form this script doesn't expect, and revoking it failed: it may work until it expires, within an hour; the exit clean-up tries once more"
   fi
-  OUTSTANDING="$OUTSTANDING $t"
   perms="$(jq -S -c .permissions <<<"$ans" 2>/dev/null)" || perms=error
   sel="$(jq -r .repository_selection <<<"$ans" 2>/dev/null)" || sel=error
   repos="$(jq -c '[.repositories[]?.full_name]' <<<"$ans" 2>/dev/null)" || repos=error
@@ -369,8 +370,8 @@ need_installation_scope() {
   [[ "$got" == "$REPO" ]] || die "the app must be installed on $REPO only (it reaches: $(printf '%s' "$got" | tr '\n' ' '))"
 }
 
-revoke_token() { # the current token stops working at once (DELETE /installation/token); 1 if
-  # GitHub didn't confirm it
+revoke_token() { # DELETE /installation/token, which GitHub documents as stopping the token at once
+  # (for stateless tokens Unconfirmed until A5, plan 4.3); 1 if GitHub didn't confirm it
   [[ -n "$TOKEN" ]] || return 0
   local rc=0
   app_gh api -X DELETE installation/token >/dev/null 2>&1 || rc=$?
@@ -1438,7 +1439,8 @@ t_A8() {
   record_p A8 "$OBS" "$CTL" "$EV (adding a collaborator is not tried: any valid target would invite a real person; it needs Administration, whose write A6 shows refused)"
 }
 
-# A5 (plan 4.3): a revoked token stops working at once. Control: the same read with that token
+# A5 (plan 4.3): does a revoked token stop working at once (documented; for stateless tokens
+# Unconfirmed until this runs)? Control: the same read with that token
 # before it was revoked. The session's own token is put back afterwards.
 t_A5() {
   local session="$TOKEN"
