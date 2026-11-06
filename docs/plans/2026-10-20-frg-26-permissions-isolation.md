@@ -133,7 +133,8 @@ settings are owned by `root`, so `forge-agent` can't change what it does (K4).
 and the app is installed, I always have a valid token, so the one-hour expiry does not limit what
 I can do over time; the four permissions and the selected repositories do. **Expiry limits only a
 copied token:** a token copied elsewhere stops working within an hour of being issued, and
-cancelling it (4.3) stops it sooner. Stopping ongoing access means stopping renewal or the app
+cancelling it (4.3) is documented to stop it sooner (for GitHub's stateless tokens Unconfirmed
+until A5 runs; until then, count on the hour). Stopping ongoing access means stopping renewal or the app
 itself (4.3, emergency). If the
 broker stops, no new token appears and GitHub work stops (fails closed; you'd see it). Backups:
 Time Machine would copy the key file like any other; whether to exclude its folder is your call at
@@ -155,8 +156,11 @@ in `.harness/lib/` (owner-only; you merge it).
 | **Suspend the installation** | You, Settings > Applications > Installed GitHub Apps > Configure > Suspend | The app's access to your account's resources (Confirmed, docs); whether already-issued tokens stop at once: Unconfirmed, test E1 | Reversible: Unsuspend |
 | **Uninstall** | You, same page > Uninstall | The app's access to your account's resources (Confirmed, docs); token deactivation is documented for organisations, Unconfirmed for personal accounts, test E2 | Reinstalling gives a new installation id (broker settings updated by handoff) |
 
-*Day to day:* the broker revokes the previous token a few minutes after writing a new one, so at
-most two tokens exist at any moment, and none older than about 50 minutes.
+*Day to day:* the broker revokes the previous token a few minutes after writing a new one. If
+revocation stops a token at once, at most two tokens work at any moment, none older than about 50
+minutes. That holds only once A5 confirms it for stateless tokens and each revocation succeeds;
+otherwise every token issued in the last hour may still work (about two at the broker's 45-minute
+renewal), and the stage 2 design is corrected before it starts.
 
 *Emergency: stop access first, keys later.* Stopping access never needs a replacement key.
 GitHub requires a second key before the only key can be deleted (Confirmed, docs), so key

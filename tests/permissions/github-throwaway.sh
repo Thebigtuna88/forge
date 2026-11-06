@@ -2124,8 +2124,9 @@ cmd_key_check() {
   case "$old_http" in
     2*)
       obs=allowed
-      t="$(jq -r .token <<<"$LAST_OUT" 2>/dev/null)" || t=""
-      if [[ "$t" =~ ^ghs_ ]]; then TOKEN="$t"; OUTSTANDING="$OUTSTANDING $t"; revoke_token; fi
+      # Whatever GitHub issued, in any form, is revoked (round 33, C1).
+      t="$(jq -r '.token // empty' <<<"$LAST_OUT" 2>/dev/null)" || t=""
+      if [[ -n "$t" ]]; then TOKEN="$t"; OUTSTANDING="$OUTSTANDING $t"; revoke_token; fi
       ;;
     401) obs=refused ;;
   esac
@@ -2174,9 +2175,10 @@ cmd_suspend_check() {
     # On the exit clean-up's list before it is revoked, so a failed revocation is tried again
     # (round 27, SEC-1; as key-check does).
     local t
-    t="$(jq -r .token <<<"$LAST_OUT" 2>/dev/null)" || t=""
+    t="$(jq -r '.token // empty' <<<"$LAST_OUT" 2>/dev/null)" || t=""
     LAST_OUT=""
-    if [[ "$t" =~ ^ghs_ ]]; then TOKEN="$t"; OUTSTANDING="$OUTSTANDING $t"; revoke_token; fi
+    # Whatever GitHub issued, in any form (round 33, C1).
+    if [[ -n "$t" ]]; then TOKEN="$t"; OUTSTANDING="$OUTSTANDING $t"; revoke_token; fi
   elif [[ "$LAST_HTTP" =~ ^(401|403|404)$ ]] && ! grep -Eiq 'rate limit|abuse detection' <<<"$LAST_OUT"; then obs=refused
   fi
   state_set E1 "$obs HTTP-${LAST_HTTP:-none}" || die "can't store this step's observation in $STATE: run it again"

@@ -2745,6 +2745,66 @@ test_a_token_issued_while_suspended_is_retried_on_exit() {
   assert_eq "$(grep -c "app_gh $(fake_token | cut -c1-12) api -X DELETE installation/token" "$T_TMP/app-gh.log")" 2 "the issued token was not retried on exit"
 }
 
+# Round 33, C1: the other two token requests revoke whatever GitHub issued, not only ghs_ tokens.
+test_suspend_check_revokes_an_issued_token_of_any_form() {
+  local out
+  out="$(held_stubs
+    make_jwt() { JWT=jwt.stand-in.value; }
+    jwt_call() {
+      case "$1 $2" in
+        ("GET app/installations"*) LAST_HTTP=200; LAST_OUT='[{"id":77,"account":{"login":"Thebigtuna88"},"suspended_at":"2026-11-02T00:00:00Z"}]' ;;
+        ("POST app/installations/77/access_tokens") LAST_HTTP=201; LAST_OUT="$(token_fixture | jq -c --arg t "ghx_$(printf 'Q%.0s' $(seq 1 40))" '.token = $t')" ;;
+      esac
+    }
+    printf 'HELD_SUSPEND=%s\nHELD_SUSPEND_AT=%s\n' "ghs_heldtoken$(printf 'H%.0s' $(seq 1 30))" "$(date +%s)" >"$HELD"
+    chmod 600 "$HELD"
+    app_gh() {
+      echo "app_gh ${TOKEN:0:8} $*" >>"$T_TMP/app-gh.log"
+      [[ "$*" == *DELETE* ]] && return 1
+      echo "gh: Bad credentials (HTTP 401)" >&2
+      return 1
+    }
+    trap cleanup EXIT
+    cmd_suspend_check 2>&1)" || true
+  assert_contains "$out" "a new token while suspended: allowed"
+  assert_eq "$(grep -c "^app_gh ghx_QQQQ api -X DELETE installation/token$" "$T_TMP/app-gh.log")" 2 "the issued ghx_ token revoked, and retried on exit"
+  assert_not_contains "$out" "ghx_QQQQ" "the token printed"
+}
+
+test_key_check_revokes_an_issued_token_of_any_form() {
+  local out
+  out="$(held_stubs
+    openssl genrsa -out "$T_TMP/app-new.pem" 2048 2>/dev/null
+    chmod 600 "$T_TMP/app-new.pem"
+    local old_key="$APP_KEY"
+    # Only the request signed with the deleted key gets the odd token; the control (new key) gets a normal one,
+    # which mint revokes on its own.
+    jwt_call() {
+      case "$1 $2" in
+        ("POST app/installations/77/access_tokens")
+          LAST_HTTP=201
+          if [[ "$APP_KEY_SIGNED" == "$old_key" ]]; then LAST_OUT="$(token_fixture | jq -c --arg t "ghx_$(printf 'Q%.0s' $(seq 1 40))" '.token = $t')"
+          else LAST_OUT="$(token_fixture)"; fi ;;
+        (*) LAST_HTTP=200; LAST_OUT='{"id":123456}' ;;
+      esac
+    }
+    make_jwt() { APP_KEY_SIGNED="$APP_KEY"; JWT=jwt.stand-in.value; }
+    need_app_identity() { INSTALLATION_ID=77; }
+    printf 'HELD_KEYOLD=%s\nHELD_KEYOLD_AT=%s\n' "$(fake_token)" "$(date +%s)" >"$HELD"
+    chmod 600 "$HELD"
+    app_gh() {
+      echo "app_gh ${TOKEN:0:8} $*" >>"$T_TMP/app-gh.log"
+      [[ "$*" == *DELETE* ]] && return 1
+      echo "gh: Bad credentials (HTTP 401)" >&2
+      return 1
+    }
+    trap cleanup EXIT
+    cmd_key_check 2>&1)" || true
+  assert_contains "$out" "RESULT A9 permissions FAIL attempt=allowed"
+  assert_contains "$(cat "$T_TMP/app-gh.log")" "app_gh ghx_QQQQ api -X DELETE installation/token" "the old key's ghx_ token revoked"
+  assert_not_contains "$out" "ghx_QQQQ" "the token printed"
+}
+
 test_s2c_changes_nothing_after_an_attempt_that_got_through() {
   # Round 28, C1: the stop rule. After an S2c attempt that wasn't refused, nothing more is written:
   # the disposable dummy secret is left for the owner, and the evidence says so.
