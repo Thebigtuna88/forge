@@ -182,6 +182,14 @@ reading for A9b, E1, E2 or E3 (plain expiry could explain it); the step reads IN
 stops, and the plan is not corrected from it. A4 is the expiry test. The revocation handoff asks for
 each browser step within about 30 minutes of the one before.
 
+*Stateless tokens* (found 2026-11-06, the owner's first app run): GitHub now issues installation
+tokens as `ghs_APPID_JWT`, about 520 characters, a token GitHub signs itself (changelog 2026-04-24,
+rollout complete 2026-10-02). Permissions, repository scoping, the hour and the token endpoint are
+unchanged (Confirmed, changelog). Neither changelog says whether `DELETE /installation/token` still
+stops such a token at once: Unconfirmed until A5 runs. If A5 shows a revoked token still works, the
+broker's "revoke the previous token" and the emergency steps are corrected before stage 2. Every
+token GitHub issues is revoked unless kept, including one the script refuses (round 31).
+
 *Held tokens in the tests* (review round 13): revocation is tried whatever the token's read
 returned. A held token is removed only once that is settled (revoked, refused as bad credentials,
 or its installation or app is gone); if GitHub can't be read reliably (no answer, a server error,
@@ -427,3 +435,5 @@ Listed in `docs/decisions/2026-11-01-frg26-github-app.md`, plus:
 - https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app
 - https://docs.github.com/en/apps/github-marketplace/selling-your-app-on-github-marketplace/pricing-plans-for-github-marketplace-apps
 - https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/token-expiration-and-revocation
+- https://github.blog/changelog/2026-04-24-notice-about-upcoming-new-format-for-github-app-installation-tokens/ (read 2026-11-06)
+- https://github.blog/changelog/2026-10-02-stateless-github-app-installation-tokens-rolled-out/ (read 2026-11-06)

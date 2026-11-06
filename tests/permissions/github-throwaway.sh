@@ -332,9 +332,19 @@ mint() { # <request json> <narrowed|whole>
     || die "GitHub refused the token request (HTTP ${LAST_HTTP:-none}): $(evidence)"
   local ans="$LAST_OUT" t perms sel repos
   LAST_OUT=""
-  t="$(jq -r .token <<<"$ans" 2>/dev/null)" || t=""
-  [[ "$t" =~ ^ghs_[A-Za-z0-9]{30,250}$ ]] || die "GitHub's answer holds no installation token"
+  t="$(jq -r '.token // empty' <<<"$ans" 2>/dev/null)" || t=""
+  [[ -n "$t" ]] || die "GitHub's answer holds no installation token"
+  # Whatever GitHub issued is revoked if it isn't kept (round 31: the owner's run refused a real
+  # token and left it working until it expired). GitHub's stateless format is ghs_APPID_JWT, about
+  # 520 characters, base64url parts joined by dots (changelog 2026-04-24). The length is checked on
+  # its own: macOS regex allows at most 255 repeats.
   TOKEN="$t"
+  if [[ ! "$t" =~ ^ghs_[A-Za-z0-9._-]+$ ]] || [[ ${#t} -lt 30 || ${#t} -gt 4096 ]]; then
+    if revoke_token; then
+      die "GitHub's answer holds a token in a form this script doesn't expect: it was revoked"
+    fi
+    die "GitHub's answer holds a token in a form this script doesn't expect, and revoking it failed: it may work until it expires, within an hour"
+  fi
   OUTSTANDING="$OUTSTANDING $t"
   perms="$(jq -S -c .permissions <<<"$ans" 2>/dev/null)" || perms=error
   sel="$(jq -r .repository_selection <<<"$ans" 2>/dev/null)" || sel=error
@@ -1629,7 +1639,11 @@ cmd_env_setup() {
   uid="$(owner_uid)" || die "can't read the owner's user id, so no Environment was made"
   env_json "$uid" >"$WORK/env.json"
   owner_gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input "$WORK/env.json" >/dev/null || die "making the Environment failed"
-  if ! owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" --jq '.branch_policies[].name' 2>/dev/null | grep -Fxq main; then
+  # Only a listing GitHub actually returned decides whether main is missing (round 31, C1).
+  local names
+  names="$(owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" --jq '.branch_policies[].name' 2>/dev/null)" \
+    || die "can't read the Environment's branch policies, so nothing more was changed"
+  if ! printf '%s\n' "$names" | grep -Fxq main; then
     owner_gh api -X POST "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" -f name=main -f type=branch >/dev/null \
       || die "limiting the Environment to main failed"
   fi
@@ -1941,7 +1955,7 @@ held_get() { # <name> — prints "token issued-epoch" or fails
   [[ -f "$HELD" && ! -L "$HELD" ]] || return 1
   local v tok at
   v="$(held_var "$1")"
-  tok="$(sed -n "s/^$v=\(ghs_[A-Za-z0-9]*\)$/\1/p" "$HELD" | tail -n 1)"
+  tok="$(sed -n "s/^$v=\(ghs_[A-Za-z0-9._-]*\)$/\1/p" "$HELD" | tail -n 1)"
   at="$(sed -n "s/^${v}_AT=\([0-9][0-9]*\)$/\1/p" "$HELD" | tail -n 1)"
   [[ -n "$tok" && -n "$at" ]] || return 1
   printf '%s %s\n' "$tok" "$at"

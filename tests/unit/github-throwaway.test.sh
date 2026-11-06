@@ -12,6 +12,9 @@ source "$(dirname "$0")/../lib/assert.sh"
 GT="$(cd "$(dirname "$0")/.." && pwd)/permissions/github-throwaway.sh"
 
 # A fake installation token, built at run time so no token-shaped text sits in the repository.
+# GitHub's stateless format (ghs_APPID_JWT, about 520 characters, changelog 2026-04-24): base64url
+# parts joined by dots, so - _ and . all appear.
+new_token() { printf 'ghs_123456_eyJhbGciOiJSUzI1NiJ9.%s.%s' "$(printf 'eyJ-_x%.0s' $(seq 1 40))" "$(printf 'S1g_-n%.0s' $(seq 1 40))"; }
 fake_token() { printf 'gh%s_%s' s "$(printf 'Z%.0s' $(seq 1 36))"; }
 
 load() { # source the script (main doesn't run when sourced)
@@ -1206,6 +1209,41 @@ test_mint_asks_for_exactly_the_throwaway_and_four_permissions() {
   assert_eq "$(cat "$T_TMP/app-gh.log")" "" "a good token was revoked"
 }
 
+# Round 31 (the owner's run, 2026-11-06): GitHub now issues stateless tokens; mint must take them.
+test_mint_takes_githubs_stateless_token_format() {
+  app_stubs
+  INSTALLATION_ID=77
+  token_fixture | jq -c --arg t "$(new_token)" '.token = $t' >"$T_TMP/token.json"
+  [[ $(new_token | wc -c) -gt 500 ]] || _t_fail "the stand-in is not about 520 characters"
+  mint_token >/dev/null 2>&1 || _t_fail "a stateless token for exactly what was asked was refused"
+  assert_eq "$TOKEN" "$(new_token)"
+  assert_contains "$OUTSTANDING" "$(new_token)" "the token is revoked on exit"
+  assert_eq "$(cat "$T_TMP/app-gh.log")" "" "a good token was revoked"
+}
+
+# Round 31: a token GitHub issued but the script refuses is still revoked, and never shown.
+test_a_token_mint_refuses_is_still_revoked() {
+  local name tok rc out
+  for name in "an unexpected character|ghs_abc!def$(printf 'Q%.0s' $(seq 1 30))" "another prefix|ghx_$(printf 'Q%.0s' $(seq 1 40))"; do
+    IFS='|' read -r name tok <<<"$name"
+    app_stubs
+    INSTALLATION_ID=77
+    token_fixture | jq -c --arg t "$tok" '.token = $t' >"$T_TMP/token.json"
+    rc=0; out="$(mint_token 2>&1)" || rc=$?
+    assert_exit 2 "$rc" "$name"
+    assert_not_contains "$out" "$tok" "the token printed ($name)"
+    assert_eq "$(cat "$T_TMP/app-gh.log")" "api -X DELETE installation/token" "revoked ($name)"
+  done
+  # Control: an answer with no token at all has nothing to revoke.
+  app_stubs
+  INSTALLATION_ID=77
+  token_fixture | jq -c 'del(.token)' >"$T_TMP/token.json"
+  rc=0; out="$(mint_token 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "no token"
+  assert_contains "$out" "holds no installation token"
+  assert_eq "$(cat "$T_TMP/app-gh.log")" "" "a revocation with no token"
+}
+
 test_mint_throws_away_a_token_with_more_than_asked() {
   # Plan 4.2 step 3: a token with more than was asked for is revoked, never used.
   local name filter rc out
@@ -1658,6 +1696,33 @@ test_env_setup_makes_exactly_the_environment_the_plan_names() {
   assert_exit 2 "$rc" "an Environment that lets the owner approve their own run"
 }
 
+# Round 31, C1: only a successful read of the branch policies may decide whether to add main.
+test_env_setup_writes_nothing_more_when_the_policy_read_fails() {
+  owner_cmd_stubs
+  verify_phase() { :; }
+  env_summary() { want_env; }
+  owner_gh() { echo "$*" >>"$T_TMP/owner"
+    if [[ "$1 $2" == "api repos/$REPO/environments/frg26-test/deployment-branch-policies" ]]; then
+      [[ -f "$T_TMP/policies" ]] || return 1
+      cat "$T_TMP/policies"
+    fi; }
+  local rc=0 out
+  out="$(cmd_env_setup 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a failed policy read"
+  assert_contains "$out" "can't read the Environment's branch policies"
+  assert_not_contains "$(cat "$T_TMP/owner")" "-X POST" "a policy added after a failed read"
+  assert_not_contains "$(cat "$T_TMP/owner")" "secret set" "the dummy value stored after a failed read"
+  # Controls: main already listed adds nothing; an empty listing adds main once.
+  echo main >"$T_TMP/policies"; : >"$T_TMP/owner"
+  rc=0; cmd_env_setup >/dev/null 2>&1 || rc=$?
+  assert_exit 0 "$rc"
+  assert_not_contains "$(cat "$T_TMP/owner")" "-X POST" "a second main policy"
+  : >"$T_TMP/policies"; : >"$T_TMP/owner"
+  rc=0; cmd_env_setup >/dev/null 2>&1 || rc=$?
+  assert_exit 0 "$rc"
+  assert_eq "$(grep -c -- '-X POST' "$T_TMP/owner")" 1 "policies added to an empty listing"
+}
+
 s2_stubs() {
   p_stubs
   eid=9
@@ -1996,6 +2061,15 @@ test_unsuspend_check_keeps_a_token_it_could_not_revoke() {
   rc=0; out="$(cmd_unsuspend_check 2>&1)" || rc=$?
   assert_exit 0 "$rc"
   assert_eq "$(grep -c HELD_SUSPEND "$HELD")" 0 "removed once revoked"
+}
+
+# Round 31: a stateless token survives the held file's write and read.
+test_a_held_token_in_githubs_stateless_format_reads_back() {
+  held_stubs
+  held_write age "$(new_token)" || _t_fail "the held file was not written"
+  local got
+  got="$(held_get age)" || _t_fail "the held token did not read back"
+  assert_eq "${got%% *}" "$(new_token)"
 }
 
 test_holding_a_name_again_settles_the_earlier_token_first() {
