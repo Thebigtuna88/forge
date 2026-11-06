@@ -40,8 +40,10 @@
 # The app's id comes from FRG26_SECRETS (default below), a mode-600 file with an APP_ID=... line;
 # its private key from FRG26_APP_KEY, a mode-600 PEM file in the same mode-700 folder. The key only
 # signs a JWT (RS256, valid at most 10 minutes) to ask GitHub for an installation token (1 hour).
-# Neither the JWT nor a token is ever printed or put in a command's arguments; each token is
-# revoked when the script ends.
+# Neither the JWT nor a token is ever printed or put in a command's arguments. When the script
+# ends it tries to revoke every token it got, except one held on purpose for a later check
+# (hold-token); a revocation that fails is reported, and that token works until its hour runs out.
+# Whether a revocation stops GitHub's stateless tokens at once is Unconfirmed until A5 (plan 4.3).
 # Must run on macOS /bin/bash 3.2.
 set -uo pipefail
 PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin
@@ -77,7 +79,7 @@ JWT=""
 TOKEN=""
 REVOKED_TOKENS=""
 REDACT_ONLY="" # tokens held for a later check: hidden like the others, never revoked by this run
-# Every token this run minted that is neither revoked nor held: all of them are revoked on exit, so
+# Every token this run got that is neither revoked nor held: revocation of each is tried on exit, so
 # a session token set aside while a second token is minted is never abandoned (round 17, C2).
 OUTSTANDING=""
 LAST_HTTP=""
