@@ -6,7 +6,11 @@
 #   owner   the owner's own gh login: creates the repo, approves PRs, applies protection, resets
 #   app     the owner's throwaway GitHub App (plan section 4, revised 2026-11-01): every bypass
 #           attempt, with an installation token limited to the throwaway repo and four permissions
-# It touches only github.com/Thebigtuna88/forge-frg26-throwaway and refuses any other repository.
+# It touches only two public throwaway repositories and refuses any other (review round 37):
+#   github.com/Thebigtuna88/forge-frg26-throwaway     the tests: both parties write here
+#   github.com/Thebigtuna88/forge-frg26-throwaway-2   test A2: the owner creates it once (one
+#       branch, one file; create-second); after that only the app tries a push, an issue and a PR,
+#       which must be refused (the app is not installed there); the owner only reads it
 #
 #   github-throwaway.sh create            owner: create the throwaway repo (public; main dev side)
 #   github-throwaway.sh check-app         the app, its installation and its token carry exactly the
