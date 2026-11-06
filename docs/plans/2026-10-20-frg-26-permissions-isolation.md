@@ -321,7 +321,9 @@ reason from GitHub (BLOCKED, GH006/GH013, 403/404/401); anything else is inconcl
 | 12 | Rewrite review replies | **FRG-27**; L12 stays open | — | — |
 
 B1-B16 and M1-M6 run as in the 2026-10-20 plan, with the throwaway app's token. B5 moves to kind P
-(GitHub never lets an author approve): its control is you approving the same PR (B16).
+(GitHub never lets an author approve): its control is B16, in the same phase: a separate PR the app
+opens into dev, which you approve and the app then merges (review round 36: not the same PR, which
+B5 closes).
 
 New tests (throwaway app, throwaway repo, run only from your handoffs):
 
@@ -331,7 +333,7 @@ New tests (throwaway app, throwaway repo, run only from your handoffs):
 | A2 | Push, open a PR, open an issue on a second public throwaway repo the app isn't installed on | Refused | Same three on the installed repo succeed. The PR's branch there must be ahead of main (checked first), or no one could open it (review round 15) |
 | A3 | Push a commit adding `.github/workflows/x.yml` to a feature branch | Refused | The same commit with an ordinary file succeeds |
 | A4 | Use a token over 1 hour old | 401 | A fresh token, same request, succeeds |
-| A5 | Revoke a token, then use it | 401 | A second token, same request, succeeds |
+| A5 | Revoke a token, then use it | 401 | The same token makes the same request successfully just before it is revoked (review round 36) |
 | A6 | Change the repo's settings (no-op description write); change its own installation | Refused | Your token makes the same no-op write and succeeds |
 | A8 | Read the secrets' public key; list secrets, variables, deploy keys, webhooks, pending collaborator invitations | Refused | Your token lists the same and succeeds (reads; nothing created). Adding a collaborator is not tried: any valid target would invite a real person; it needs Administration, whose write A6 shows refused (review round 13) |
 | A9 | You delete the key; mint with it | Refused | The new key mints |
