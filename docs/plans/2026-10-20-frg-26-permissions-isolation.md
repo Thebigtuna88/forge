@@ -3,7 +3,12 @@
 - **Status:** **Revised plan approved by the owner for stage 1 implementation and independent
   reviews, 2026-11-01** (draft 2 plus the owner's clarifications of the same day). It replaces the
   2026-10-20 plan (helper account), which stays in git history; section 12 lists what changed.
-  Nothing on GitHub or the Mac has changed for it.
+  Done so far (2026-11-06, from the owner's handoff): the throwaway app `frg26-throwaway-test-atl`
+  was created and installed on the first throwaway only, its App ID and key were stored in
+  `work/owner-secrets/frg26/` (mode 600), and the second throwaway `forge-frg26-throwaway-2` was
+  created; an earlier app from 2026-11-02 (no key, never installed) is to be deleted in the next
+  handoff. No feasibility test has run yet (the app check failed on GitHub's new token format,
+  since fixed), and nothing on the Mac or in FORGE's settings has changed.
 - **Ticket:** FRG-26 (#26). Branch `feature/FRG-26-permissions-isolation`, draft PR #37.
 - **Follow-up:** FRG-27 (#27), review isolation, starts immediately after this one.
 - **Why revised:** the owner asked (2026-11-01) whether FRG-26 needs a separate GitHub account.
