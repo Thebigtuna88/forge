@@ -2805,6 +2805,37 @@ test_key_check_revokes_an_issued_token_of_any_form() {
   assert_not_contains "$out" "ghx_QQQQ" "the token printed"
 }
 
+# Round 35, C1 / SEC-1: a control mints in a subshell whose output is hidden; a token it could not
+# revoke is still reported, and the control result is unchanged.
+test_a_controls_token_that_cannot_be_revoked_is_reported() {
+  load
+  local tok rc out
+  tok="ghs_control$(printf 'C%.0s' $(seq 1 30))"
+  mint_ok() { TOKEN="$tok"; OUTSTANDING="$OUTSTANDING $tok"; }
+  mint_bad() { TOKEN="$tok"; OUTSTANDING="$OUTSTANDING $tok"; die "refused"; }
+  app_gh() { echo "${TOKEN:0:11} $*" >>"$T_TMP/app-gh.log"; return 1; }
+  : >"$T_TMP/app-gh.log"
+  rc=0; out="$(control_token mint_ok 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "a control that minted, revocation failed"
+  assert_contains "$out" "a control's token could not be revoked"
+  assert_not_contains "$out" "$tok" "the token printed"
+  assert_contains "$(cat "$T_TMP/app-gh.log")" "ghs_control api -X DELETE installation/token"
+  rc=0; out="$(control_token mint_bad 2>&1)" || rc=$?
+  assert_exit 1 "$rc" "a control that failed, revocation failed"
+  assert_contains "$out" "a control's token could not be revoked"
+  # Controls: revocation works, so nothing is reported either way.
+  app_gh() { echo "${TOKEN:0:11} $*" >>"$T_TMP/app-gh.log"; }
+  rc=0; out="$(control_token mint_ok 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "a control that minted"
+  assert_eq "$out" "" "output from a control that settled"
+  rc=0; out="$(control_token mint_bad 2>&1)" || rc=$?
+  assert_exit 1 "$rc" "a control that failed"
+  assert_eq "$out" "" "output from a failed control that settled"
+  # Both controls (A9 and E1) use it; no control hides its own clean-up any more.
+  assert_eq "$(grep -c 'if control_token ' "$GT")" 2 "controls using control_token"
+  assert_eq "$(grep -c 'trap revoke_outstanding EXIT' "$GT")" 0 "a control trap that hides its clean-up"
+}
+
 test_s2c_changes_nothing_after_an_attempt_that_got_through() {
   # Round 28, C1: the stop rule. After an S2c attempt that wasn't refused, nothing more is written:
   # the disposable dummy secret is left for the owner, and the evidence says so.

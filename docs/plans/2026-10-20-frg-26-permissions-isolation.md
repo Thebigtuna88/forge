@@ -191,8 +191,10 @@ tokens as `ghs_APPID_JWT`, about 520 characters, a token GitHub signs itself (ch
 rollout complete 2026-10-02). Permissions, repository scoping, the hour and the token endpoint are
 unchanged (Confirmed, changelog). Neither changelog says whether `DELETE /installation/token` still
 stops such a token at once: Unconfirmed until A5 runs. If A5 shows a revoked token still works, the
-broker's "revoke the previous token" and the emergency steps are corrected before stage 2. Every
-token GitHub issues is revoked unless kept, including one the script refuses (round 31).
+broker's "revoke the previous token" and the emergency steps are corrected before stage 2. The
+script tries to revoke every token GitHub issues unless it is kept, including one it refuses
+(round 31) and a control's own token (round 35); a revocation that fails is reported, and that
+token works until its hour runs out.
 
 *Held tokens in the tests* (review round 13): revocation is tried whatever the token's read
 returned. A held token is removed only once that is settled (revoked, refused as bad credentials,

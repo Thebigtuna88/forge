@@ -403,6 +403,27 @@ revoke_outstanding() { # the current token, then every other token this run mint
   fi
 }
 
+# A control's own token request (A9, E1) runs in a subshell whose output is hidden, and its tokens
+# are revoked as it ends. Its exit list dies with it, so a token it could not revoke is reported
+# here (round 35, C1/SEC-1): status 3 (the request worked) or 4 (it failed) from its exit trap.
+control_exit() {
+  local rc=$?
+  revoke_outstanding >/dev/null 2>&1
+  if [[ -n "${OUTSTANDING// /}" ]]; then
+    if [[ $rc -eq 0 ]]; then exit 3; fi
+    exit 4
+  fi
+}
+
+control_token() { # <command> — 0 if it got its token; reports a token left unrevoked
+  local rc=0
+  (trap control_exit EXIT; "$@") >/dev/null 2>&1 || rc=$?
+  if [[ $rc -eq 3 || $rc -eq 4 ]]; then
+    say "note: a control's token could not be revoked; GitHub expires it within an hour of its issue"
+  fi
+  [[ $rc -eq 0 || $rc -eq 3 ]]
+}
+
 app_session() { # every command that acts as the app starts here
   load_app
   need_app_identity
@@ -2135,7 +2156,7 @@ cmd_key_check() {
   LAST_OUT=""
   make_jwt
   local ctl=failed
-  if (trap revoke_outstanding EXIT; mint_token) >/dev/null 2>&1; then ctl=ok; fi
+  if control_token mint_token; then ctl=ok; fi
   FAILS=0
   record_p A9 "$obs" "$ctl" "a token request signed with the deleted key: HTTP ${old_http:-none}; with the new key: $ctl"
   use_held keyold
@@ -2207,7 +2228,7 @@ cmd_unsuspend_check() {
   local ctl=failed
   # In a subshell (a failed session must not end this step), which revokes its own token when it
   # ends: the EXIT trap isn't inherited (round 13, C1/SEC-3).
-  if (trap revoke_outstanding EXIT; app_session) >/dev/null 2>&1; then ctl=ok; fi
+  if control_token app_session; then ctl=ok; fi
   # The installation exists again, so this is not "final" (round 14, SEC-1): a token that can't be
   # revoked stays held, and the step fails so it is run again.
   if held_get suspend >/dev/null; then
