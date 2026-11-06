@@ -1874,7 +1874,8 @@ t_S2a() {
     fi
   fi
   record_p S2a "$OBS" ok "feature-branch run $RUN, deploy job ${job:-unread} (control: S2b's run on main got the value)"
-  cancel_waiting_runs || true
+  # A clean-up that failed stops the phase before S2c writes anything (round 38, C1).
+  cancel_waiting_runs || FAILS=$((FAILS + 1))
 }
 
 # S2c: the app tries to change the Environment or its secrets. Each attempt's control is the same

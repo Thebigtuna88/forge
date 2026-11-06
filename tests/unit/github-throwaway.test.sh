@@ -2378,6 +2378,25 @@ test_key_check_keeps_the_new_key_aside_while_the_old_token_is_unsettled() {
   [[ -f "$T_TMP/app.pem" && ! -f "$T_TMP/app-new.pem" ]] || _t_fail "the retry did not install the new key"
 }
 
+# Round 38, C1: S2a passes, but the clean-up after it fails: that counts, so S2c (which writes a
+# disposable secret) never runs. Control: the clean-up works and FAILS stays 0.
+test_a_failed_cleanup_after_s2a_stops_the_environment_tests() {
+  s2_stubs
+  app_git() { [[ "$*" == *rev-parse* ]] && printf 'c%.0s' $(seq 1 40) && echo; return 0; }
+  local sha out
+  sha="$(printf 'c%.0s' $(seq 1 40))"
+  echo "503 completed failure frg26-test-app[bot]" >"$T_TMP/run-$sha"
+  deploy_job() { echo "9001 0 failure"; }
+  policy_rejected() { :; }
+  cancel_waiting_runs() { echo "CLEANUP FAIL stand-in"; return 1; }
+  out="$(FAILS=0; t_S2a; echo "fails=$FAILS")"
+  assert_contains "$out" "RESULT S2a permissions PASS attempt=refused"
+  assert_contains "$out" "fails=1" "a failed clean-up after a passing S2a"
+  cancel_waiting_runs() { :; }
+  out="$(FAILS=0; t_S2a; echo "fails=$FAILS")"
+  assert_contains "$out" "fails=0" "a clean-up that worked"
+}
+
 test_s2a_reads_the_annotation_of_the_jobs_check_run() {
   # Round 16, C1: an Actions job id is not a check-run id; the check run comes from check_run_url.
   load
