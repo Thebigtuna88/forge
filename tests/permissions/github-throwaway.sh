@@ -728,27 +728,45 @@ protection_json() { # <enforce_admins true|false>
 EOF
 }
 
+# One branch, for protect and unprotect: sets BRANCH_PROTECTION to unprotected, or protected when
+# it carries exactly protect's protection; anything else stops.
+branch_protection() { # <branch>
+  local s ea=false
+  [[ "$1" == dev ]] && ea=true
+  s="$(branch_state "$1")"
+  case "$s" in
+    unprotected | protected) ;;
+    *) die "$1 reads $s: stopped before changing it" ;;
+  esac
+  if [[ "$s" == protected && "$(protection_full "$1")" != "$(want_protection "$ea")" ]]; then
+    die "$1 is protected, but not exactly as protect applies it: stopped before changing it"
+  fi
+  BRANCH_PROTECTION="$s"
+}
+
 # Which of dev and main protect or unprotect must change, in PROTECTION_TODO. Each branch must be
 # unprotected or carry exactly protect's protection; one already in the wanted state is left as it
 # is, so a run that changed dev and then failed on main can be run again (review rounds 41 and 43,
-# C1). Anything else, an unreadable branch or a ruleset, stops before any write.
+# C1). Anything else, an unreadable branch or a ruleset, stops before any write. Each branch is
+# read again right before its own write (protection_write), as reset does (review round 44, C1).
 protection_todo() { # <protected|unprotected>: the state wanted
-  local b s ea
+  local b
   PROTECTION_TODO=""
   [[ "$(ruleset_count)" == 0 ]] || die "protect and unprotect only run while there is no ruleset"
   for b in dev main; do
-    ea=false
-    [[ "$b" == dev ]] && ea=true
-    s="$(branch_state "$b")"
-    case "$s" in
-      unprotected | protected) ;;
-      *) die "$b reads $s, so nothing was changed" ;;
-    esac
-    if [[ "$s" == protected && "$(protection_full "$b")" != "$(want_protection "$ea")" ]]; then
-      die "$b is protected, but not exactly as protect applies it, so nothing was changed"
-    fi
-    [[ "$s" == "$1" ]] || PROTECTION_TODO="$PROTECTION_TODO $b"
+    branch_protection "$b"
+    [[ "$BRANCH_PROTECTION" == "$1" ]] || PROTECTION_TODO="$PROTECTION_TODO $b"
   done
+}
+
+# Reads the branch again; writes only if it still needs it (GitHub has no conditional write, so a
+# change in the moment between this read and the write can't be caught).
+protection_write() { # <branch> <protected|unprotected> <gh api args…>
+  local b="$1" want="$2"
+  shift 2
+  branch_protection "$b"
+  [[ "$BRANCH_PROTECTION" != "$want" ]] || return 0
+  owner_gh api "$@" >/dev/null
 }
 
 cmd_protect() {
@@ -762,7 +780,7 @@ cmd_protect() {
   # dev into main (M6). Who may update main at all is the ruleset's job (D6).
   protection_json false >"$WORK/main.json"
   for b in $PROTECTION_TODO; do
-    owner_gh api -X PUT "repos/$REPO/branches/$b/protection" --input "$WORK/$b.json" >/dev/null || die "protecting $b failed"
+    protection_write "$b" protected -X PUT "repos/$REPO/branches/$b/protection" --input "$WORK/$b.json" || die "protecting $b failed"
   done
   verify_phase protected
   say "dev protection:  $(protection_of dev)   (approvals codeowners last-push stale enforce-admins force deletions)"
@@ -777,7 +795,7 @@ cmd_unprotect() {
   protection_todo unprotected
   local b
   for b in $PROTECTION_TODO; do
-    owner_gh api -X DELETE "repos/$REPO/branches/$b/protection" >/dev/null || die "unprotecting $b failed"
+    protection_write "$b" unprotected -X DELETE "repos/$REPO/branches/$b/protection" || die "unprotecting $b failed"
   done
   verify_phase open
   say "dev and main unprotected; no ruleset"

@@ -855,14 +855,22 @@ test_allowance_check_fails_closed() {
 protect_stubs() { # <dev state> <main state>: a stand-in repository protect and unprotect change
   # Each branch's state is a file, so it survives the subshell a failing command runs in. A PUT
   # protects a branch, a DELETE unprotects it; the write named in $T_TMP/fail fails once. A
-  # protected branch reads protect's own settings.
+  # protected branch reads protect's own settings, or more once $T_TMP/extra-<branch> exists. After
+  # dev's write, main's state becomes what $T_TMP/then-main holds, with more settings (someone
+  # changing it meanwhile).
   owner_cmd_stubs
   echo "$1" >"$T_TMP/state-dev"
   echo "$2" >"$T_TMP/state-main"
   : >"$T_TMP/fail"
+  rm -f "$T_TMP/extra-dev" "$T_TMP/extra-main" "$T_TMP/then-main"
   branch_state() { cat "$T_TMP/state-$1"; }
   ruleset_count() { echo 0; }
-  protection_full() { if [[ "$1" == dev ]]; then want_protection true; else want_protection false; fi; }
+  protection_full() {
+    if [[ -e "$T_TMP/extra-$1" ]]; then echo '{"owner-extra":true}'
+    elif [[ "$1" == dev ]]; then want_protection true
+    else want_protection false
+    fi
+  }
   protection_of() { echo stub; }
   owner_gh() {
     echo "$*" >>"$T_TMP/owner"
@@ -874,7 +882,12 @@ protect_stubs() { # <dev state> <main state>: a stand-in repository protect and 
     esac
     if [[ "$w" == "$(cat "$T_TMP/fail")" ]]; then : >"$T_TMP/fail"; return 1; fi
     b="${4#repos/"$REPO"/branches/}"
-    echo "$st" >"$T_TMP/state-${b%/protection}"
+    b="${b%/protection}"
+    echo "$st" >"$T_TMP/state-$b"
+    if [[ "$b" == dev && -s "$T_TMP/then-main" ]]; then
+      cp "$T_TMP/then-main" "$T_TMP/state-main"
+      touch "$T_TMP/extra-main"
+    fi
   }
   verify_phase() { # the real rule on the stand-in's state, logged
     echo "verify $1" >>"$T_TMP/owner"
@@ -937,6 +950,29 @@ verify protected" "protect run again"
   assert_exit 0 "$rc" "unprotect run again"
   assert_eq "$(cat "$T_TMP/owner")" "api -X DELETE repos/$REPO/branches/main/protection
 verify open" "unprotect run again"
+}
+
+test_protect_and_unprotect_read_each_branch_again_right_before_its_write() {
+  # Round 44 C1: main changing while dev is written (more settings, or unreadable) stops the
+  # command before main's write, as reset reads each branch again before rewriting it.
+  local rc out cmd from st
+  for cmd in protect unprotect; do
+    from=unprotected
+    [[ "$cmd" == unprotect ]] && from=protected
+    for st in protected error; do
+      protect_stubs "$from" "$from"
+      echo "$st" >"$T_TMP/then-main"
+      rc=0; out="$( ("cmd_$cmd") 2>&1)" || rc=$?
+      assert_exit 2 "$rc" "$cmd, main $st with more settings after dev's write"
+      if [[ "$st" == protected ]]; then
+        assert_contains "$out" "main is protected, but not exactly as protect applies it"
+      else
+        assert_contains "$out" "main reads error"
+      fi
+      assert_eq "$(grep -c 'branches/main/protection' "$T_TMP/owner")" 0 "$cmd's writes to main after it changed to $st"
+      assert_eq "$(grep -c 'branches/dev/protection' "$T_TMP/owner")" 1 "$cmd's write to dev"
+    done
+  done
 }
 
 test_protect_and_unprotect_change_nothing_unless_each_branch_is_unprotected_or_exactly_protected() {
