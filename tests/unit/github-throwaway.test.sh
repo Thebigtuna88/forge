@@ -3109,6 +3109,7 @@ probe_stubs() {
     n=$(($(cat "$T_TMP/minted") + 1))
     echo "$n" >"$T_TMP/minted"
     cp "$3" "$T_TMP/request-$n.json"
+    if [[ -f "$T_TMP/fail-$n" ]]; then LAST_HTTP=502; LAST_OUT='{"message":"Server Error"}'; return 1; fi
     p="$(jq -c '.permissions // empty' "$3")"
     [[ -n "$p" ]] || p="$WANT_PERMS"
     LAST_HTTP=201
@@ -3136,7 +3137,7 @@ probe_stubs() {
     fi
     if [[ -f "$T_TMP/refs-change" && "$*" == *"repos/$REPO2/git/refs"* ]]; then echo "refs/heads/frg26-probe-r1 $(printf 'c%.0s' $(seq 1 40))" >>"$T_TMP/refs"; fi
     case "$*" in
-      "api -X DELETE installation/token") return 0 ;;
+      "api -X DELETE installation/token") probe_answer "app_gh $tag $*"; return ;;
       "api installation/repositories"*) cat "$T_TMP/reach-$tag" 2>/dev/null || echo "$REPO"; return 0 ;;
       "api rate_limit") rate_fixture 0; return 0 ;;
     esac
@@ -3167,6 +3168,13 @@ app_gh tok4 api -i -X POST repos/$REPO2/issues|0|HTTP/2.0 201 Created\n\n{"numbe
 EOF
 }
 
+run_probe() { # a2-probe as the owner's run has it: the script's exit clean-up runs (a subshell has no trap)
+  (
+    trap cleanup EXIT
+    cmd_a2_probe
+  ) 2>&1
+}
+
 probe_answer_first() { # <line> — put an answer ahead of the defaults (the first match wins)
   printf '%s\n' "$1" | cat - "$T_TMP/answers" >"$T_TMP/answers.new"
   mv "$T_TMP/answers.new" "$T_TMP/answers"
@@ -3175,7 +3183,7 @@ probe_answer_first() { # <line> — put an answer ahead of the defaults (the fir
 test_a2_probe_runs_each_attempt_with_its_own_token_and_keeps_what_got_through() {
   probe_stubs
   local out rc=0 calls
-  out="$(cmd_a2_probe 2>&1)" || rc=$?
+  out="$(run_probe)" || rc=$?
   assert_exit 0 "$rc" "a probe whose code changes were refused"
   calls="$(cat "$T_TMP/calls")"
   # Four tokens, each asked for exactly what its attempts need, each limited to the throwaway.
@@ -3216,7 +3224,7 @@ test_a2_probe_stops_when_a_code_change_is_not_refused() {
     IFS='|' read -r name line <<<"$name"
     probe_stubs
     probe_answer_first "${line%|*}"
-    rc=0; out="$(cmd_a2_probe 2>&1)" || rc=$?
+    rc=0; out="$(run_probe)" || rc=$?
     assert_exit 1 "$rc" "$name"
     assert_contains "$out" "PROBE STOP: P5" "$name"
     assert_contains "$out" "${line##*|}" "$name"
@@ -3232,7 +3240,7 @@ test_a2_probe_needs_its_code_change_controls() {
   probe_stubs
   probe_answer_first "app_gh tok2 api -X POST repos/$REPO/git/refs|1|gh: Server Error (HTTP 502)"
   local out rc=0
-  out="$(cmd_a2_probe 2>&1)" || rc=$?
+  out="$(run_probe)" || rc=$?
   assert_exit 1 "$rc" "a failed control"
   assert_contains "$out" "PROBE STOP: control"
   assert_not_contains "$(cat "$T_TMP/calls")" "issues/1/comments" "a public attempt after a failed control"
@@ -3242,7 +3250,7 @@ test_a2_probe_stops_when_the_second_throwaways_branches_change() {
   probe_stubs
   : >"$T_TMP/refs-change"
   local out rc=0
-  out="$(cmd_a2_probe 2>&1)" || rc=$?
+  out="$(run_probe)" || rc=$?
   assert_exit 1 "$rc" "a branch appeared after refused attempts"
   assert_contains "$out" "PROBE STOP: $REPO2's branches or tags changed"
   assert_contains "$out" "refs/heads/frg26-probe-r1"
@@ -3253,7 +3261,7 @@ test_a2_probe_checks_each_tokens_scope_before_using_it() {
   probe_stubs
   printf '%s\nThebigtuna88/forge\n' "$REPO" >"$T_TMP/reach-tok3"
   local out rc=0 calls
-  out="$(cmd_a2_probe 2>&1)" || rc=$?
+  out="$(run_probe)" || rc=$?
   assert_exit 1 "$rc" "a token that reaches another repo"
   assert_contains "$out" "PROBE STOP: token P1 reaches more than $REPO"
   assert_contains "$out" "TOKEN P1 revoked: a read with it now gets HTTP 401"
@@ -3263,12 +3271,44 @@ test_a2_probe_checks_each_tokens_scope_before_using_it() {
   # A token GitHub issued with more permissions than asked is revoked, never used.
   probe_stubs
   echo '.permissions.issues = "write"' >"$T_TMP/extra-3"
-  rc=0; out="$(cmd_a2_probe 2>&1)" || rc=$?
+  rc=0; out="$(run_probe)" || rc=$?
   assert_exit 2 "$rc" "P1's token with Issues"
   assert_contains "$out" "carries more than was asked"
   calls="$(cat "$T_TMP/calls")"
   assert_contains "$calls" "app_gh tok3 api -X DELETE installation/token"
   assert_not_contains "$calls" "app_gh tok3 api -i" "an attempt with that token"
+  # Round 47 (C1, SEC-1): that token's revocation is checked too, on the way out after the error.
+  assert_contains "$calls" "app_gh tok3 api repos/$REPO --jq .full_name" "the rejected token's revocation was not checked"
+  assert_contains "$out" "TOKEN (one not yet checked, after P1 was asked for) revoked: a read with it now gets HTTP 401"
+  assert_contains "$out" "KEPT comment 901" "objects made before the error are read back"
+  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "A2 PROBE: STOPPED by an error"
+}
+
+# Round 47 (C2): a token request that fails after objects were made still reads them back.
+test_a2_probe_reads_back_what_it_made_when_a_later_token_request_fails() {
+  probe_stubs
+  : >"$T_TMP/fail-3"
+  local out rc=0
+  out="$(run_probe)" || rc=$?
+  assert_exit 2 "$rc" "P1's token request refused"
+  assert_contains "$out" "GitHub refused the token request (HTTP 502)"
+  assert_contains "$out" "KEPT comment 901"
+  assert_contains "$out" "KEPT pr 3"
+  assert_eq "$(printf '%s\n' "$out" | grep -c 'revoked: a read with it now gets HTTP 401')" 2 "the two tokens issued, both checked"
+  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "A2 PROBE: STOPPED by an error"
+}
+
+# Round 47 (C1): a revocation GitHub didn't confirm is tried again on the way out, then checked.
+test_a2_probe_retries_and_checks_a_revocation_that_failed() {
+  probe_stubs
+  probe_answer_first "app_gh tok2 api -X DELETE installation/token|1|gh: Server Error (HTTP 502)"
+  local out rc=0 calls
+  out="$(run_probe)" || rc=$?
+  assert_exit 1 "$rc" "a failed revocation"
+  assert_contains "$out" "TOKEN full revocation FAILED"
+  calls="$(cat "$T_TMP/calls")"
+  assert_contains "$calls" "app_gh tok2 api repos/$REPO --jq .full_name" "the failed revocation was never checked"
+  assert_contains "$out" "TOKEN (one not yet checked, after P2 was asked for)"
 }
 
 test_a2_probe_reports_a_token_that_still_works_after_revocation() {
@@ -3277,7 +3317,7 @@ test_a2_probe_reports_a_token_that_still_works_after_revocation() {
   printf '%s\n' "app_gh tok1 api repos/$REPO --jq .full_name|0|$REPO" "app_gh tok2 api repos/$REPO --jq .full_name|0|$REPO" \
     "app_gh tok3 api repos/$REPO --jq .full_name|0|$REPO" "app_gh tok4 api repos/$REPO --jq .full_name|0|$REPO" >>"$T_TMP/answers"
   local out rc=0
-  out="$(cmd_a2_probe 2>&1)" || rc=$?
+  out="$(run_probe)" || rc=$?
   assert_exit 1 "$rc" "revoked tokens that still work"
   assert_contains "$out" "TOKEN whole revoked, but a read with it did not get HTTP 401"
   assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "A2 PROBE: DONE WITH"

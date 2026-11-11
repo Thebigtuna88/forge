@@ -92,6 +92,8 @@ REDACT_ONLY="" # tokens held for a later check: hidden like the others, never re
 # Every token this run got that is neither revoked nor held: revocation of each is tried on exit, so
 # a session token set aside while a second token is minted is never abandoned (round 17, C2).
 OUTSTANDING=""
+MINTED=0 # tokens GitHub issued to this run, kept or not
+PROBE_ACTIVE="" # set while a2-probe runs: an error exit settles its tokens and reads back its objects
 LAST_HTTP=""
 WORK=""
 CLONE=""
@@ -135,6 +137,14 @@ cleanup() {
   if [[ -n "$CANCEL_ON_EXIT" ]]; then
     CANCEL_ON_EXIT=""
     cancel_waiting_runs || true
+  fi
+  # a2-probe stopped by an error (die, or bash stopping): its tokens are settled and checked, and
+  # what it made is read back, as on its own ways out (round 47, C1, C2, SEC-1).
+  if [[ -n "$PROBE_ACTIVE" ]]; then
+    PROBE_ACTIVE=""
+    probe_settle_tokens
+    probe_read_back
+    say "A2 PROBE: STOPPED by an error (status $rc), see above; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
   fi
   revoke_outstanding
   if [[ -n "$HELD_LOCKED" ]]; then rmdir "$HELD.lock" 2>/dev/null || true; HELD_LOCKED=""; fi
@@ -356,6 +366,7 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
   # failed revocation is tried again on exit (round 32, C1).
   TOKEN="$t"
   OUTSTANDING="$OUTSTANDING $t"
+  MINTED=$((MINTED + 1))
   if [[ ! "$t" =~ ^ghs_[A-Za-z0-9._-]+$ ]] || [[ ${#t} -lt 30 || ${#t} -gt 4096 ]]; then
     if revoke_token; then
       die "GitHub's answer holds a token in a form this script doesn't expect: it was revoked"
@@ -1691,23 +1702,47 @@ PROBE_MADE=""     # kind:number of each object an attempt created
 PROBE_READINGS=""
 OBS_KEPT=""
 PROBE_REVOKED=0
-PROBE_ISSUED=0
+PROBE_CONFIRMED="" # tokens a read showed revoked (HTTP 401)
 REFS_BEFORE=""
 
 probe_stop() { # <why> — revoke the current token, read back what was made, and stop
   PROBE_FAILS=$((PROBE_FAILS + 1))
   say "PROBE STOP: $1"
   if [[ -n "$TOKEN" ]]; then revoke_confirmed "$PROBE_LABEL"; fi
+  PROBE_ACTIVE=""
+  probe_settle_tokens
   if [[ -n "$REFS_BEFORE" ]]; then probe_refs_same || true; fi
   probe_read_back
-  say "A2 PROBE: STOPPED: $1"
+  say "A2 PROBE: STOPPED: $1; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
   exit 1
+}
+
+# Every token GitHub issued to this run that no read has yet shown revoked, whatever happened to it
+# (refused by mint, a revocation GitHub didn't confirm, an error exit): revoked (again), then a read
+# with it must get HTTP 401. Run on every way out of a2-probe (round 47, C1, SEC-1).
+probe_settle_tokens() {
+  local t seen=" $PROBE_CONFIRMED "
+  revoke_outstanding
+  for t in $REVOKED_TOKENS $OUTSTANDING; do
+    [[ "$seen" != *" $t "* ]] || continue
+    seen="$seen$t "
+    TOKEN="$t"
+    capture app_gh api "repos/$REPO" --jq .full_name || true
+    TOKEN=""
+    if [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 401|Bad credentials'; then
+      PROBE_REVOKED=$((PROBE_REVOKED + 1))
+      PROBE_CONFIRMED="$PROBE_CONFIRMED $t"
+      say "TOKEN (one not yet checked, after $PROBE_LABEL was asked for) revoked: a read with it now gets HTTP 401"
+    else
+      PROBE_FAILS=$((PROBE_FAILS + 1))
+      say "TOKEN (one not yet checked, after $PROBE_LABEL was asked for) still answers a read after its revocation was tried ($(evidence)): GitHub expires it within an hour of its issue"
+    fi
+  done
 }
 
 probe_token() { # <label> <request json> <narrowed|whole> <permissions json> — a token, its scope read back
   PROBE_LABEL="$1"
   mint "$2" "$3" "$4"
-  PROBE_ISSUED=$((PROBE_ISSUED + 1))
   say "TOKEN $1 issued: $MINT_ANSWER"
   local got
   got="$(app_gh api installation/repositories --paginate --jq '.repositories[].full_name' 2>&1)" || got="unreadable: $got"
@@ -1727,6 +1762,7 @@ revoke_confirmed() { # <label> — revoke the current token; a read with it afte
   TOKEN=""
   if [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 401|Bad credentials'; then
     PROBE_REVOKED=$((PROBE_REVOKED + 1))
+    PROBE_CONFIRMED="$PROBE_CONFIRMED $t"
     say "TOKEN $1 revoked: a read with it now gets HTTP 401"
   else
     PROBE_FAILS=$((PROBE_FAILS + 1))
@@ -1876,6 +1912,7 @@ cmd_a2_probe() {
   load_app
   need_app_identity
   RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  PROBE_ACTIVE=1
   say "== FRG-26 A2 investigation, app $APP_BOT (id $APP_ID, installation $INSTALLATION_ID), run $RUN_ID =="
   REFS_BEFORE="$(probe_refs)"
   if [[ "$REFS_BEFORE" == error || "$REFS_BEFORE" != *"refs/heads/$A2_BRANCH "* ]]; then
@@ -1901,13 +1938,15 @@ cmd_a2_probe() {
   probe_issue P2 "with metadata read only"
   revoke_confirmed P2
   probe_refs_same || probe_stop "$REPO2's branches or tags changed"
+  PROBE_ACTIVE=""
+  probe_settle_tokens
   probe_read_back
-  say "TOKENS $PROBE_ISSUED issued, $PROBE_REVOKED revoked and confirmed by HTTP 401"
-  if [[ $PROBE_FAILS -eq 0 ]]; then
-    say "A2 PROBE: DONE: code changes refused (P5, controls ok, branches and tags unchanged); readings$PROBE_READINGS; $PROBE_REVOKED of $PROBE_ISSUED tokens revoked (confirmed)"
+  say "TOKENS $MINTED issued, $PROBE_REVOKED revoked and confirmed by HTTP 401"
+  if [[ $PROBE_FAILS -eq 0 && $PROBE_REVOKED -eq $MINTED ]]; then
+    say "A2 PROBE: DONE: code changes refused (P5, controls ok, branches and tags unchanged); readings$PROBE_READINGS; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
     exit 0
   fi
-  say "A2 PROBE: DONE WITH $PROBE_FAILS PROBLEM(S), see above; readings$PROBE_READINGS; $PROBE_REVOKED of $PROBE_ISSUED tokens revoked (confirmed)"
+  say "A2 PROBE: DONE WITH $PROBE_FAILS PROBLEM(S), see above; readings$PROBE_READINGS; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
   exit 1
 }
 
