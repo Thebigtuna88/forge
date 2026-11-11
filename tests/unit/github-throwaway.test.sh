@@ -3094,6 +3094,9 @@ probe_stubs() {
   APP_BOT="frg26-test-app[bot]"
   WORK="$T_TMP/work"
   [[ -d "$WORK" ]] || mkdir -m 700 "$WORK"
+  # A test may set up several runs: no stand-in state carries over from the one before.
+  rm -f "$T_TMP/revoked" "$T_TMP/revoked-still-works" "$T_TMP/refs-change" "$T_TMP"/delete-fails-* \
+    "$T_TMP"/extra-* "$T_TMP"/fail-* "$T_TMP"/reach-* "$T_TMP"/request-*.json
   : >"$T_TMP/calls"
   : >"$T_TMP/answers"
   echo 0 >"$T_TMP/minted"
@@ -3131,13 +3134,25 @@ probe_stubs() {
   app_gh() {
     local tag="${TOKEN:4:4}"
     echo "app_gh $tag $*" >>"$T_TMP/calls"
-    if [[ " $REVOKED_TOKENS " == *" $TOKEN "* && ! -f "$T_TMP/revoked-still-works" ]]; then
+    # GitHub's own state: only a DELETE that succeeded revokes (round 48, C1), never the script's
+    # lists. $T_TMP/delete-fails-<tag> holds how many DELETEs of that token fail first.
+    if grep -qx "$tag" "$T_TMP/revoked" 2>/dev/null && [[ ! -f "$T_TMP/revoked-still-works" ]]; then
       echo "gh: Bad credentials (HTTP 401)" >&2
       return 1
     fi
     if [[ -f "$T_TMP/refs-change" && "$*" == *"repos/$REPO2/git/refs"* ]]; then echo "refs/heads/frg26-probe-r1 $(printf 'c%.0s' $(seq 1 40))" >>"$T_TMP/refs"; fi
     case "$*" in
-      "api -X DELETE installation/token") probe_answer "app_gh $tag $*"; return ;;
+      "api -X DELETE installation/token")
+        local left
+        left="$(cat "$T_TMP/delete-fails-$tag" 2>/dev/null || echo 0)"
+        if [[ "$left" -gt 0 ]]; then
+          echo $((left - 1)) >"$T_TMP/delete-fails-$tag"
+          echo "gh: Server Error (HTTP 502)" >&2
+          return 1
+        fi
+        echo "$tag" >>"$T_TMP/revoked"
+        return 0
+        ;;
       "api installation/repositories"*) cat "$T_TMP/reach-$tag" 2>/dev/null || echo "$REPO"; return 0 ;;
       "api rate_limit") rate_fixture 0; return 0 ;;
     esac
@@ -3301,14 +3316,24 @@ test_a2_probe_reads_back_what_it_made_when_a_later_token_request_fails() {
 # Round 47 (C1): a revocation GitHub didn't confirm is tried again on the way out, then checked.
 test_a2_probe_retries_and_checks_a_revocation_that_failed() {
   probe_stubs
-  probe_answer_first "app_gh tok2 api -X DELETE installation/token|1|gh: Server Error (HTTP 502)"
+  echo 1 >"$T_TMP/delete-fails-tok2"
   local out rc=0 calls
   out="$(run_probe)" || rc=$?
   assert_exit 1 "$rc" "a failed revocation"
   assert_contains "$out" "TOKEN full revocation FAILED"
   calls="$(cat "$T_TMP/calls")"
-  assert_contains "$calls" "app_gh tok2 api repos/$REPO --jq .full_name" "the failed revocation was never checked"
-  assert_contains "$out" "TOKEN (one not yet checked, after P2 was asked for)"
+  # Round 48 (C1): the retry revokes it (a second DELETE), and only then does a read get 401.
+  assert_eq "$(printf '%s\n' "$calls" | grep -c '^app_gh tok2 api -X DELETE installation/token$')" 2 "the failed revocation was not retried"
+  assert_eq "$(printf '%s\n' "$calls" | grep -A1 '^app_gh tok2 api -X DELETE installation/token$' | tail -n 1)" "app_gh tok2 api repos/$REPO --jq .full_name" "the read right after the retry"
+  assert_contains "$out" "TOKEN (one not yet checked, after P2 was asked for) revoked: a read with it now gets HTTP 401"
+  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "4 of 4 tokens revoked (confirmed)"
+  # A token whose every DELETE fails still works: reported, and the run does not pass.
+  probe_stubs
+  echo 99 >"$T_TMP/delete-fails-tok2"
+  rc=0; out="$(run_probe)" || rc=$?
+  assert_exit 1 "$rc" "a token that could never be revoked"
+  assert_contains "$out" "after P2 was asked for) still answers a read after its revocation was tried"
+  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "3 of 4 tokens revoked (confirmed)"
 }
 
 test_a2_probe_reports_a_token_that_still_works_after_revocation() {

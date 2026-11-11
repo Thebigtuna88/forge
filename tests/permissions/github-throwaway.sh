@@ -94,6 +94,7 @@ REDACT_ONLY="" # tokens held for a later check: hidden like the others, never re
 OUTSTANDING=""
 MINTED=0 # tokens GitHub issued to this run, kept or not
 PROBE_ACTIVE="" # set while a2-probe runs: an error exit settles its tokens and reads back its objects
+PROBE_SUMMARY="" # a2-probe's last line, printed by the exit clean-up after everything else
 LAST_HTTP=""
 WORK=""
 CLONE=""
@@ -144,11 +145,13 @@ cleanup() {
     PROBE_ACTIVE=""
     probe_settle_tokens
     probe_read_back
-    say "A2 PROBE: STOPPED by an error (status $rc), see above; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
+    PROBE_SUMMARY="A2 PROBE: STOPPED by an error (status $rc), see above; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
   fi
   revoke_outstanding
   if [[ -n "$HELD_LOCKED" ]]; then rmdir "$HELD.lock" 2>/dev/null || true; HELD_LOCKED=""; fi
   if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf "$WORK"; fi
+  # a2-probe's summary is the last line, which the owner's handoff result shows (round 48).
+  if [[ -n "$PROBE_SUMMARY" ]]; then say "$PROBE_SUMMARY"; fi
 }
 trap cleanup EXIT
 
@@ -1713,7 +1716,7 @@ probe_stop() { # <why> — revoke the current token, read back what was made, an
   probe_settle_tokens
   if [[ -n "$REFS_BEFORE" ]]; then probe_refs_same || true; fi
   probe_read_back
-  say "A2 PROBE: STOPPED: $1; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
+  PROBE_SUMMARY="A2 PROBE: STOPPED: $1; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
   exit 1
 }
 
@@ -1943,10 +1946,10 @@ cmd_a2_probe() {
   probe_read_back
   say "TOKENS $MINTED issued, $PROBE_REVOKED revoked and confirmed by HTTP 401"
   if [[ $PROBE_FAILS -eq 0 && $PROBE_REVOKED -eq $MINTED ]]; then
-    say "A2 PROBE: DONE: code changes refused (P5, controls ok, branches and tags unchanged); readings$PROBE_READINGS; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
+    PROBE_SUMMARY="A2 PROBE: DONE: code changes refused (P5, controls ok, branches and tags unchanged); readings$PROBE_READINGS; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
     exit 0
   fi
-  say "A2 PROBE: DONE WITH $PROBE_FAILS PROBLEM(S), see above; readings$PROBE_READINGS; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
+  PROBE_SUMMARY="A2 PROBE: DONE WITH $PROBE_FAILS PROBLEM(S), see above; readings$PROBE_READINGS; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
   exit 1
 }
 
