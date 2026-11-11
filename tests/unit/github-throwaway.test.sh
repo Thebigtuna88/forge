@@ -1440,6 +1440,26 @@ test_the_installation_reaches_only_the_throwaway() {
   assert_contains "$(cat "$T_TMP/app-gh.log")" "api -X DELETE installation/token" "revoked after a refusal too"
 }
 
+# Round 51 (SEC-1): closing the Terminal (HUP), Ctrl-C (INT) or a kill (TERM) ends the script through
+# its clean-up too, so tokens are revoked and checked: with the shell the handoffs use (/bin/bash -p),
+# whether the signal comes while it runs or while it waits on a command (a gh call).
+test_a_termination_signal_still_runs_the_clean_up() {
+  local sig want out rc
+  for sig in HUP:129 INT:130 TERM:143; do
+    want="${sig#*:}" sig="${sig%%:*}"
+    rc=0
+    out="$(/bin/bash -p -c 'source "$1"; cleanup() { echo "cleanup-ran"; }; kill -s "$2" $$; sleep 2; echo not-stopped' _ "$GT" "$sig" 2>&1)" || rc=$?
+    assert_exit "$want" "$rc" "SIG$sig"
+    assert_contains "$out" "cleanup-ran" "SIG$sig"
+    assert_not_contains "$out" "not-stopped" "SIG$sig"
+    rc=0
+    out="$(/bin/bash -p -c 'source "$1"; cleanup() { echo "cleanup-ran"; }; me=$$; ( /bin/sleep 1; kill -s "$2" $me ) & /bin/sleep 3; echo not-stopped' _ "$GT" "$sig" 2>&1)" || rc=$?
+    assert_exit "$want" "$rc" "SIG$sig while waiting on a command"
+    assert_contains "$out" "cleanup-ran" "SIG$sig while waiting on a command"
+    assert_not_contains "$out" "not-stopped" "SIG$sig while waiting on a command"
+  done
+}
+
 test_the_token_is_revoked_on_exit() {
   load
   TOKEN="$(fake_token)"

@@ -154,6 +154,12 @@ cleanup() {
   if [[ -n "$PROBE_SUMMARY" ]]; then say "$PROBE_SUMMARY"; fi
 }
 trap cleanup EXIT
+# Closing the Terminal, Ctrl-C or a kill also end through cleanup, with the usual status (round 51,
+# SEC-1): an explicit exit, so it holds whatever the signal finds bash doing. A force-kill (KILL)
+# or a power loss can't be caught: a token not revoked then expires within an hour of its issue.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --- The two identities -------------------------------------------------------------------------
 
