@@ -9,8 +9,9 @@
   created; the earlier app from 2026-11-02 (no key, never installed) was deleted (2026-11-07, app
   check passed). **Stage 1 part 0 ran on 2026-11-11 and stopped: test A2 failed, a failed
   protection** (section 6, "A2, 2026-11-11"). Item 9 is unresolved until the owner approves a
-  revised protection claim; the later stage 1 handoffs wait. Nothing on the Mac or in FORGE's
-  settings has changed.
+  revised protection claim; the later stage 1 handoffs wait. The owner approved an investigation
+  on the throwaway repos (2026-11-11, section 6). Nothing on the Mac or in FORGE's settings has
+  changed.
 - **Ticket:** FRG-26 (#26). Branch `feature/FRG-26-permissions-isolation`, draft PR #37.
 - **Follow-up:** FRG-27 (#27), review isolation, starts immediately after this one.
 - **Why revised:** the owner asked (2026-11-01) whether FRG-26 needs a separate GitHub account.
@@ -377,7 +378,32 @@ run (S1, A6, A8, A5, A3) gave their expected results; they are recorded, not acc
 run did not finish. Evidence, kept unchanged: the handoff's folder in `work/owner/`, and read-only
 byte-for-byte copies in `work/FRG-26-permissions-isolation/evidence/` 36-39 (the paste, the log,
 issue #1 and its timeline as GitHub returned them). Issue #1 stays open: this script never writes
-to the second throwaway.
+to the second throwaway as the owner. The first throwaway's dev and main protection was put back
+by a reviewed handoff (`2026-11-11-frg26-restore-protection`, run 2026-11-11T17:01:18Z, verified),
+with issue #1 checked open before and after.
+
+**A2 investigation, approved by the owner 2026-11-11 (without P6, the throwaway repos only).** One
+reviewed owner handoff runs `github-throwaway.sh a2-probe` once, every attempt made as the app
+against the second throwaway:
+- Each token's permissions and repositories are printed from GitHub's answer (without the token)
+  and read back with `GET /installation/repositories`: a token for the whole installation (C1),
+  the full token (four permissions), P1's (contents write, metadata read: no Issues) and P2's
+  (metadata read only). Each is revoked as soon as its attempts end, and a read with it must then
+  get HTTP 401.
+- Claim 9a, code changes: P5, a file and a branch created through the API, each must be refused,
+  with the same two writes on the first throwaway as controls (a new branch `frg26/probe/…`).
+  The first that isn't refused, or any change to the second throwaway's branches or tags, stops
+  the run for the owner.
+- Claim 9b, public activity, readings only: a comment on issue #1 (P3), a PR from `frg26-a2` (P4),
+  an issue with P1's token and with P2's. GitHub's whole answer is kept, headers included
+  (`X-Accepted-GitHub-Permissions`).
+- Nothing is closed or deleted: each object made is read back by the number GitHub returned (the
+  fix for the exit check that missed issue #1). The second throwaway is deleted at the end of
+  stage 1.
+
+The proposed split of item 9 into 9a and 9b is not yet a claim: item 9 stays failed and unresolved,
+the remaining stage 1 handoffs stay paused, and the findings come to the owner with a
+recommendation before the broker is extended or any risk is accepted.
 
 ## 7. Your home folder (D8)
 

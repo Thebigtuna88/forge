@@ -3077,4 +3077,222 @@ test_e2_and_e3_record_what_issued_tokens_do() {
   assert_contains "$out" "the app's own key now gets HTTP 404"
 }
 
+# --- A2 investigation (owner-approved 2026-11-11): a2-probe ----------------------------------------
+
+# A stand-in GitHub for a2-probe. Token n (1 whole, 2 full, 3 P1, 4 P2) is issued with exactly the
+# permissions asked for, unless $T_TMP/extra-<n> holds a jq filter applied to GitHub's answer; app
+# calls are logged with the token's tag (tok<n>). A revoked token gets HTTP 401 (unless
+# $T_TMP/revoked-still-works), and $T_TMP/reach-tok<n> replaces what that token reaches. Other
+# answers come from $T_TMP/answers: pattern|status|text, text read with printf %b, first match wins.
+# The second throwaway's branches and tags live in $T_TMP/refs; $T_TMP/refs-change makes the app's
+# branch attempt there add one.
+probe_stubs() {
+  load
+  APP_ID=123456
+  INSTALLATION_ID=77
+  APP_SLUG=frg26-test-app
+  APP_BOT="frg26-test-app[bot]"
+  WORK="$T_TMP/work"
+  [[ -d "$WORK" ]] || mkdir -m 700 "$WORK"
+  : >"$T_TMP/calls"
+  : >"$T_TMP/answers"
+  echo 0 >"$T_TMP/minted"
+  printf 'refs/heads/frg26-a2 %s\nrefs/heads/main %s\n' "$(printf 'a%.0s' $(seq 1 40))" "$(printf 'b%.0s' $(seq 1 40))" >"$T_TMP/refs"
+  need_owner() { :; }
+  assert_throwaway() { :; }
+  assert_second() { :; }
+  load_app() { :; }
+  need_app_identity() { :; }
+  make_jwt() { JWT=jwt-stand-in; }
+  jwt_call() {
+    local n p
+    n=$(($(cat "$T_TMP/minted") + 1))
+    echo "$n" >"$T_TMP/minted"
+    cp "$3" "$T_TMP/request-$n.json"
+    p="$(jq -c '.permissions // empty' "$3")"
+    [[ -n "$p" ]] || p="$WANT_PERMS"
+    LAST_HTTP=201
+    LAST_OUT="$(jq -n -c --arg t "$(printf 'gh%s_tok%s' s "$n")$(printf 'Q%.0s' $(seq 1 30))" --argjson p "$p" --arg r "$REPO" \
+      '{token: $t, expires_at: "2026-11-11T19:00:00Z", repository_selection: "selected", permissions: $p, repositories: [{full_name: $r, id: 1}]}')"
+    if [[ -f "$T_TMP/extra-$n" ]]; then LAST_OUT="$(jq -c "$(cat "$T_TMP/extra-$n")" <<<"$LAST_OUT")"; fi
+  }
+  probe_answer() { # <logged call>
+    local pat rc text
+    while IFS='|' read -r pat rc text; do
+      [[ -n "$pat" ]] || continue
+      if [[ "$1" == *$pat* ]]; then
+        [[ -n "$text" ]] && printf '%b\n' "$text"
+        return "$rc"
+      fi
+    done <"$T_TMP/answers"
+    return 0
+  }
+  app_gh() {
+    local tag="${TOKEN:4:4}"
+    echo "app_gh $tag $*" >>"$T_TMP/calls"
+    if [[ " $REVOKED_TOKENS " == *" $TOKEN "* && ! -f "$T_TMP/revoked-still-works" ]]; then
+      echo "gh: Bad credentials (HTTP 401)" >&2
+      return 1
+    fi
+    if [[ -f "$T_TMP/refs-change" && "$*" == *"repos/$REPO2/git/refs"* ]]; then echo "refs/heads/frg26-probe-r1 $(printf 'c%.0s' $(seq 1 40))" >>"$T_TMP/refs"; fi
+    case "$*" in
+      "api -X DELETE installation/token") return 0 ;;
+      "api installation/repositories"*) cat "$T_TMP/reach-$tag" 2>/dev/null || echo "$REPO"; return 0 ;;
+      "api rate_limit") rate_fixture 0; return 0 ;;
+    esac
+    probe_answer "app_gh $tag $*"
+  }
+  owner_gh() {
+    echo "owner_gh $*" >>"$T_TMP/calls"
+    case "$*" in
+      *"repos/$REPO2/git/matching-refs/heads"*) grep heads "$T_TMP/refs"; return 0 ;;
+      *"repos/$REPO2/git/matching-refs/tags"*) grep tags "$T_TMP/refs"; return 0 ;;
+    esac
+    probe_answer "owner_gh $*"
+  }
+  date() { if [[ "${1:-}" == -u && "${2:-}" == +%Y%m%dT%H%M%SZ ]]; then echo r1; else command date "$@"; fi; }
+  cat >"$T_TMP/answers" <<EOF
+owner_gh api repos/$REPO2/branches/main --jq .commit.sha|0|$(printf 'b%.0s' $(seq 1 40))
+owner_gh api repos/$REPO/branches/dev --jq .commit.sha|0|$(printf 'd%.0s' $(seq 1 40))
+owner_gh api repos/$REPO2/compare/main...frg26-a2 --jq .ahead_by|0|1
+owner_gh api repos/$REPO2/issues|0|kept-object
+app_gh tok2 api -i -X PUT repos/$REPO2/contents/|1|HTTP/2.0 403 Forbidden\nX-Accepted-Github-Permissions: contents=write\n\n{"message":"Resource not accessible by integration"}\ngh: Resource not accessible by integration (HTTP 403)
+app_gh tok2 api -i -X POST repos/$REPO2/git/refs|1|HTTP/2.0 403 Forbidden\n\n{"message":"Resource not accessible by integration"}\ngh: Resource not accessible by integration (HTTP 403)
+app_gh tok2 api -X POST repos/$REPO/git/refs|0|{}
+app_gh tok2 api -X PUT repos/$REPO/contents/|0|{}
+app_gh tok2 api -i -X POST repos/$REPO2/issues/1/comments|0|HTTP/2.0 201 Created\n\n{"id":901}
+app_gh tok2 api -i -X POST repos/$REPO2/pulls|0|HTTP/2.0 201 Created\n\n{"number":3}
+app_gh tok3 api -i -X POST repos/$REPO2/issues|1|HTTP/2.0 403 Forbidden\nX-Accepted-Github-Permissions: issues=write\n\n{"message":"Resource not accessible by integration"}\ngh: Resource not accessible by integration (HTTP 403)
+app_gh tok4 api -i -X POST repos/$REPO2/issues|0|HTTP/2.0 201 Created\n\n{"number":4}
+EOF
+}
+
+probe_answer_first() { # <line> — put an answer ahead of the defaults (the first match wins)
+  printf '%s\n' "$1" | cat - "$T_TMP/answers" >"$T_TMP/answers.new"
+  mv "$T_TMP/answers.new" "$T_TMP/answers"
+}
+
+test_a2_probe_runs_each_attempt_with_its_own_token_and_keeps_what_got_through() {
+  probe_stubs
+  local out rc=0 calls
+  out="$(cmd_a2_probe 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "a probe whose code changes were refused"
+  calls="$(cat "$T_TMP/calls")"
+  # Four tokens, each asked for exactly what its attempts need, each limited to the throwaway.
+  assert_eq "$(jq -S -c . "$T_TMP/request-1.json")" '{}' "the whole-installation token"
+  assert_eq "$(jq -S -c . "$T_TMP/request-2.json")" "{\"permissions\":$WANT_PERMS,\"repositories\":[\"$REPO_NAME\"]}" "the full token"
+  assert_eq "$(jq -S -c . "$T_TMP/request-3.json")" "{\"permissions\":{\"contents\":\"write\",\"metadata\":\"read\"},\"repositories\":[\"$REPO_NAME\"]}" "P1's token: no Issues"
+  assert_eq "$(jq -S -c . "$T_TMP/request-4.json")" "{\"permissions\":{\"metadata\":\"read\"},\"repositories\":[\"$REPO_NAME\"]}" "P2's token: metadata only"
+  assert_contains "$out" "TOKEN P1 issued: {\"expires_at\":\"2026-11-11T19:00:00Z\",\"permissions\":{\"contents\":\"write\",\"metadata\":\"read\"},\"repositories\":[\"$REPO\"],\"repository_selection\":\"selected\"}"
+  assert_contains "$out" "TOKEN P2 reaches (GET /installation/repositories): $REPO"
+  # Each token is revoked, and a read with it afterwards gets HTTP 401.
+  assert_eq "$(printf '%s\n' "$out" | grep -c 'revoked: a read with it now gets HTTP 401')" 4 "revocations confirmed"
+  assert_not_contains "$out" "gh$(printf s)_tok" "a token printed"
+  # 9a refused, with its controls on the throwaway; then the readings, GitHub's answers kept.
+  assert_contains "$out" "RESULT P5 code changes refused"
+  assert_contains "$calls" "app_gh tok2 api -X POST repos/$REPO/git/refs -f ref=refs/heads/frg26/probe/P5-r1"
+  assert_contains "$out" "X-Accepted-Github-Permissions: issues=write"
+  assert_contains "$out" "READING P1 an issue, with a token without Issues (contents write, metadata read): refused (HTTP 403)"
+  assert_contains "$out" "READING P2 an issue, with a token with metadata read only: allowed"
+  assert_contains "$out" "READING P3 a comment on issue #1: allowed"
+  assert_contains "$out" "READING P4 a PR from $A2_BRANCH into main: allowed"
+  # Every object an attempt made is read back by its number, and nothing is closed or deleted.
+  assert_contains "$out" "KEPT comment 901: kept-object"
+  assert_contains "$out" "KEPT pr 3: kept-object"
+  assert_contains "$out" "KEPT issue 4: kept-object"
+  assert_contains "$calls" "owner_gh api repos/$REPO2/issues/comments/901"
+  assert_eq "$(printf '%s\n' "$calls" | grep '^owner_gh' | grep -c -e ' -X ' -e ' close ' || true)" 0 "an owner write"
+  assert_eq "$(printf '%s\n' "$calls" | grep 'DELETE' | grep -vc 'api -X DELETE installation/token$' || true)" 0 "a delete other than a token's"
+  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "A2 PROBE: DONE: code changes refused"
+  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "readings P3=allowed P4=allowed P1=refused P2=allowed;"
+}
+
+test_a2_probe_stops_when_a_code_change_is_not_refused() {
+  local name line out rc calls
+  load
+  for name in "a file got through|app_gh tok2 api -i -X PUT repos/$REPO2/contents/|0|HTTP/2.0 201 Created\n\n{}|GOT THROUGH" \
+    "a branch got through|app_gh tok2 api -i -X POST repos/$REPO2/git/refs|0|HTTP/2.0 201 Created\n\n{}|GOT THROUGH" \
+    "a refusal for another reason|app_gh tok2 api -i -X PUT repos/$REPO2/contents/|1|gh: Invalid request (HTTP 422)|proves nothing"; do
+    IFS='|' read -r name line <<<"$name"
+    probe_stubs
+    probe_answer_first "${line%|*}"
+    rc=0; out="$(cmd_a2_probe 2>&1)" || rc=$?
+    assert_exit 1 "$rc" "$name"
+    assert_contains "$out" "PROBE STOP: P5" "$name"
+    assert_contains "$out" "${line##*|}" "$name"
+    calls="$(cat "$T_TMP/calls")"
+    assert_not_contains "$calls" "issues/1/comments" "a public attempt after $name"
+    assert_not_contains "$calls" "app_gh tok3" "another token after $name"
+    assert_contains "$out" "TOKEN full revoked: a read with it now gets HTTP 401" "$name"
+    assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "A2 PROBE: STOPPED" "$name"
+  done
+}
+
+test_a2_probe_needs_its_code_change_controls() {
+  probe_stubs
+  probe_answer_first "app_gh tok2 api -X POST repos/$REPO/git/refs|1|gh: Server Error (HTTP 502)"
+  local out rc=0
+  out="$(cmd_a2_probe 2>&1)" || rc=$?
+  assert_exit 1 "$rc" "a failed control"
+  assert_contains "$out" "PROBE STOP: control"
+  assert_not_contains "$(cat "$T_TMP/calls")" "issues/1/comments" "a public attempt after a failed control"
+}
+
+test_a2_probe_stops_when_the_second_throwaways_branches_change() {
+  probe_stubs
+  : >"$T_TMP/refs-change"
+  local out rc=0
+  out="$(cmd_a2_probe 2>&1)" || rc=$?
+  assert_exit 1 "$rc" "a branch appeared after refused attempts"
+  assert_contains "$out" "PROBE STOP: $REPO2's branches or tags changed"
+  assert_contains "$out" "refs/heads/frg26-probe-r1"
+  assert_not_contains "$(cat "$T_TMP/calls")" "issues/1/comments" "a public attempt after a change"
+}
+
+test_a2_probe_checks_each_tokens_scope_before_using_it() {
+  probe_stubs
+  printf '%s\nThebigtuna88/forge\n' "$REPO" >"$T_TMP/reach-tok3"
+  local out rc=0 calls
+  out="$(cmd_a2_probe 2>&1)" || rc=$?
+  assert_exit 1 "$rc" "a token that reaches another repo"
+  assert_contains "$out" "PROBE STOP: token P1 reaches more than $REPO"
+  assert_contains "$out" "TOKEN P1 revoked: a read with it now gets HTTP 401"
+  calls="$(cat "$T_TMP/calls")"
+  assert_not_contains "$calls" "app_gh tok3 api -i" "an attempt with that token"
+  assert_contains "$out" "KEPT comment 901" "objects made before the stop are read back"
+  # A token GitHub issued with more permissions than asked is revoked, never used.
+  probe_stubs
+  echo '.permissions.issues = "write"' >"$T_TMP/extra-3"
+  rc=0; out="$(cmd_a2_probe 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "P1's token with Issues"
+  assert_contains "$out" "carries more than was asked"
+  calls="$(cat "$T_TMP/calls")"
+  assert_contains "$calls" "app_gh tok3 api -X DELETE installation/token"
+  assert_not_contains "$calls" "app_gh tok3 api -i" "an attempt with that token"
+}
+
+test_a2_probe_reports_a_token_that_still_works_after_revocation() {
+  probe_stubs
+  : >"$T_TMP/revoked-still-works"
+  printf '%s\n' "app_gh tok1 api repos/$REPO --jq .full_name|0|$REPO" "app_gh tok2 api repos/$REPO --jq .full_name|0|$REPO" \
+    "app_gh tok3 api repos/$REPO --jq .full_name|0|$REPO" "app_gh tok4 api repos/$REPO --jq .full_name|0|$REPO" >>"$T_TMP/answers"
+  local out rc=0
+  out="$(cmd_a2_probe 2>&1)" || rc=$?
+  assert_exit 1 "$rc" "revoked tokens that still work"
+  assert_contains "$out" "TOKEN whole revoked, but a read with it did not get HTTP 401"
+  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "A2 PROBE: DONE WITH"
+}
+
+test_mint_checks_the_permissions_it_was_asked_for() {
+  app_stubs
+  INSTALLATION_ID=77
+  token_fixture | jq -c '.permissions = {"metadata":"read"}' >"$T_TMP/token.json"
+  mint '{"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}' narrowed '{"metadata":"read"}' >/dev/null 2>&1 \
+    || _t_fail "a token for exactly the permissions asked for was refused"
+  local rc=0
+  (mint '{"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}' narrowed '{"contents":"write","metadata":"read"}') >/dev/null 2>&1 || rc=$?
+  assert_exit 2 "$rc" "permissions other than asked"
+  assert_eq "$MINT_ANSWER" "{\"expires_at\":\"2026-11-01T12:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repositories\":[\"$REPO\"],\"repository_selection\":\"selected\"}" "GitHub's answer without the token"
+}
+
 run_tests

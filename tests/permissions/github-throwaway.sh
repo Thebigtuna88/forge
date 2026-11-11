@@ -10,7 +10,8 @@
 #   github.com/Thebigtuna88/forge-frg26-throwaway     the tests: both parties write here
 #   github.com/Thebigtuna88/forge-frg26-throwaway-2   test A2: the owner creates it once (one
 #       branch, one file; create-second); after that only the app tries a push, an issue and a PR,
-#       which must be refused (the app is not installed there); the owner only reads it
+#       which must be refused (the app is not installed there); the owner only reads it. A2 failed
+#       on 2026-11-11 (the issue got through); a2-probe then tries more there, as the app
 #
 #   github-throwaway.sh create            owner: create the throwaway repo (public; main dev side)
 #   github-throwaway.sh check-app         the app, its installation and its token carry exactly the
@@ -28,6 +29,9 @@
 #   github-throwaway.sh create-second     owner: the second public throwaway, app not installed (A2)
 #   github-throwaway.sh ptests            the permission tests (kind P, each with a control):
 #                                         S1 A6 A8 A5 A3 A2, and the readings A11 A12
+#   github-throwaway.sh a2-probe          after A2 failed (owner-approved 2026-11-11): the app's
+#                                         tokens on the second throwaway; code changes must be
+#                                         refused, public activity is only recorded, nothing closed
 #   github-throwaway.sh env-setup         owner: the Environment frg26-test, a dummy value (S2)
 #   github-throwaway.sh env-tests         S2b S2d S2a S2c, in the open phase (then reset)
 #   github-throwaway.sh hold-token <name> keep a token for a later check: age keyold suspend
@@ -332,9 +336,12 @@ need_app_identity() {
 }
 
 # Asks GitHub for an installation token and keeps it only if GitHub issued exactly what was asked:
-# the four permissions, selected repositories, and (narrowed) only the throwaway. Anything more is
-# revoked at once (plan 4.2 step 3).
-mint() { # <request json> <narrowed|whole>
+# the permissions (the four unless a probe asks for fewer), selected repositories, and (narrowed)
+# only the throwaway. Anything more is revoked at once (plan 4.2 step 3). MINT_ANSWER keeps what
+# GitHub said it issued, without the token.
+mint() { # <request json> <narrowed|whole> [permissions json, sorted]
+  local want="${3:-$WANT_PERMS}"
+  MINT_ANSWER=""
   printf '%s\n' "$1" >"$WORK/token-request.json" || die "writing the token request failed"
   jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" \
     || die "GitHub refused the token request (HTTP ${LAST_HTTP:-none}): $(evidence)"
@@ -358,12 +365,14 @@ mint() { # <request json> <narrowed|whole>
   perms="$(jq -S -c .permissions <<<"$ans" 2>/dev/null)" || perms=error
   sel="$(jq -r .repository_selection <<<"$ans" 2>/dev/null)" || sel=error
   repos="$(jq -c '[.repositories[]?.full_name]' <<<"$ans" 2>/dev/null)" || repos=error
-  if [[ "$perms" != "$WANT_PERMS" || "$sel" != selected ]] || [[ "$2" == narrowed && "$repos" != "[\"$REPO\"]" ]]; then
+  if [[ "$perms" != "$want" || "$sel" != selected ]] || [[ "$2" == narrowed && "$repos" != "[\"$REPO\"]" ]]; then
     if revoke_token; then
       die "the token GitHub issued carries more than was asked (permissions $perms, repositories $sel $repos): it was revoked"
     fi
     die "the token GitHub issued carries more than was asked (permissions $perms, repositories $sel $repos), and revoking it failed: it may work until it expires, within an hour; the exit clean-up tries once more"
   fi
+  # Named fields only, so nothing else GitHub may add to its answer is ever printed.
+  MINT_ANSWER="$(jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' <<<"$ans" 2>/dev/null)" || MINT_ANSWER=unreadable
 }
 
 mint_token() { mint "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}" narrowed; }
@@ -1663,6 +1672,245 @@ cmd_ptests() {
   exit 0
 }
 
+# --- A2 investigation (owner-approved 2026-11-11; plan section 6, "A2, 2026-11-11") --------------
+# A2 failed: the app opened an issue on the second throwaway, where it is not installed. This finds
+# out what else its tokens can do there, all against that repository. Code changes (claim 9a) must
+# be refused, each with a control on the throwaway; the first that isn't refused stops the run, and
+# so does any change to the second throwaway's branches or tags. Public activity (claim 9b) is a
+# reading, never a pass or a fail. Whatever an attempt creates stays there as evidence: nothing is
+# closed or deleted, and each object is read back by the number GitHub returned. Each token's
+# permissions and repositories are printed from GitHub's answer (without the token) and read back
+# with GET /installation/repositories; each is revoked as soon as its attempts end, and a read with
+# it must then get HTTP 401.
+
+readonly PROBE_PERMS_P1='{"contents":"write","metadata":"read"}'
+readonly PROBE_PERMS_P2='{"metadata":"read"}'
+PROBE_FAILS=0
+PROBE_LABEL=""
+PROBE_MADE=""     # kind:number of each object an attempt created
+PROBE_READINGS=""
+OBS_KEPT=""
+PROBE_REVOKED=0
+PROBE_ISSUED=0
+REFS_BEFORE=""
+
+probe_stop() { # <why> — revoke the current token, read back what was made, and stop
+  PROBE_FAILS=$((PROBE_FAILS + 1))
+  say "PROBE STOP: $1"
+  if [[ -n "$TOKEN" ]]; then revoke_confirmed "$PROBE_LABEL"; fi
+  if [[ -n "$REFS_BEFORE" ]]; then probe_refs_same || true; fi
+  probe_read_back
+  say "A2 PROBE: STOPPED: $1"
+  exit 1
+}
+
+probe_token() { # <label> <request json> <narrowed|whole> <permissions json> — a token, its scope read back
+  PROBE_LABEL="$1"
+  mint "$2" "$3" "$4"
+  PROBE_ISSUED=$((PROBE_ISSUED + 1))
+  say "TOKEN $1 issued: $MINT_ANSWER"
+  local got
+  got="$(app_gh api installation/repositories --paginate --jq '.repositories[].full_name' 2>&1)" || got="unreadable: $got"
+  say "TOKEN $1 reaches (GET /installation/repositories): $(printf '%s' "$got" | tr '\n' ' ')"
+  [[ "$got" == "$REPO" ]] || probe_stop "token $1 reaches more than $REPO, or what it reaches could not be read"
+}
+
+revoke_confirmed() { # <label> — revoke the current token; a read with it afterwards must get HTTP 401
+  local t="$TOKEN"
+  if ! revoke_token; then
+    PROBE_FAILS=$((PROBE_FAILS + 1))
+    say "TOKEN $1 revocation FAILED: GitHub expires it within an hour of its issue; the exit clean-up tries again"
+    return 0
+  fi
+  TOKEN="$t"
+  capture app_gh api "repos/$REPO" --jq .full_name || true
+  TOKEN=""
+  if [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 401|Bad credentials'; then
+    PROBE_REVOKED=$((PROBE_REVOKED + 1))
+    say "TOKEN $1 revoked: a read with it now gets HTTP 401"
+  else
+    PROBE_FAILS=$((PROBE_FAILS + 1))
+    OUTSTANDING="$OUTSTANDING $t"
+    say "TOKEN $1 revoked, but a read with it did not get HTTP 401 ($(evidence)): the exit clean-up tries again"
+  fi
+}
+
+# An attempt as the app, with GitHub's whole answer kept, headers too (X-Accepted-GitHub-Permissions
+# names the permission GitHub wanted). Sets OBS.
+probe_attempt() { # <label> <gh api args…>
+  local label="$1"
+  shift
+  local status
+  capture app_gh api -i "$@" || true
+  OBS="$(classify_api)"
+  if [[ $LAST_RC -eq 0 ]]; then status="$(printf '%s\n' "$LAST_OUT" | head -n 1 | tr -d '\r')"; else status="$(http_of)"; fi
+  say "ATTEMPT $label (token $PROBE_LABEL): $OBS ($status); GitHub's answer:"
+  printf '%s\n' "$LAST_OUT" | tr -d '\r' | sed 's/^/    /'
+}
+
+probe_keep() { # <kind> <jq path> — after an allowed attempt, note the object by the number GitHub returned
+  [[ "$OBS" == allowed ]] || return 0
+  local n
+  n="$(printf '%s\n' "$LAST_OUT" | tr -d '\r' | awk 'body { print } /^$/ { body = 1 }' | jq -r "$2 // empty" 2>/dev/null)" || n=""
+  if [[ "$n" =~ ^[0-9]+$ ]]; then
+    PROBE_MADE="$PROBE_MADE $1:$n"
+    OBS_KEPT=" (kept: $1 $n)"
+  else
+    PROBE_FAILS=$((PROBE_FAILS + 1))
+    OBS_KEPT=" (GitHub's answer holds no number: look on $REPO2 for it)"
+  fi
+}
+
+probe_reading() { # <id> <what was tried>
+  local how
+  if [[ "$OBS" == allowed ]]; then how="allowed$OBS_KEPT"; else how="$OBS ($(http_of))"; fi
+  PROBE_READINGS="$PROBE_READINGS $1=$OBS"
+  say "READING $1 $2: $how"
+}
+
+probe_refs() { # the second throwaway's branches and tags with their commits, as the owner reads them
+  local h t
+  h="$(owner_gh api --paginate "repos/$REPO2/git/matching-refs/heads" --jq '.[] | "\(.ref) \(.object.sha)"' 2>/dev/null)" || { echo error; return; }
+  t="$(owner_gh api --paginate "repos/$REPO2/git/matching-refs/tags" --jq '.[] | "\(.ref) \(.object.sha)"' 2>/dev/null)" || { echo error; return; }
+  printf '%s\n%s\n' "$h" "$t"
+}
+
+probe_refs_same() { # 1 (and both lists shown) if they changed since the run began
+  local now
+  now="$(probe_refs)"
+  if [[ "$now" == "$REFS_BEFORE" ]]; then
+    say "REFS $REPO2 unchanged: $(printf '%s' "$now" | tr '\n' ';')"
+    return 0
+  fi
+  say "REFS $REPO2 CHANGED. Before: $(printf '%s' "$REFS_BEFORE" | tr '\n' ';') Now: $(printf '%s' "$now" | tr '\n' ';')"
+  return 1
+}
+
+probe_read_back() { # each object an attempt created, as the owner reads it by its number
+  local m kind n
+  for m in $PROBE_MADE; do
+    kind="${m%%:*}" n="${m#*:}"
+    if [[ "$kind" == comment ]]; then
+      capture owner_gh api "repos/$REPO2/issues/comments/$n" --jq '[.id, .user.login, .user.type, .author_association, (.performed_via_github_app | tostring), .issue_url] | map(tostring) | join(" ")' || true
+    else
+      capture owner_gh api "repos/$REPO2/issues/$n" --jq '[.number, .state, .user.login, .user.type, .author_association, (.performed_via_github_app | tostring), (.pull_request != null | tostring), .title] | map(tostring) | join(" ")' || true
+    fi
+    if [[ $LAST_RC -eq 0 ]]; then
+      say "KEPT $kind $n: $LAST_OUT"
+    else
+      PROBE_FAILS=$((PROBE_FAILS + 1))
+      say "KEPT $kind $n: could not be read back ($(evidence)); look on $REPO2 for it"
+    fi
+  done
+  PROBE_MADE=""
+}
+
+# P5 (claim 9a), with the full token: a file and a branch on the second throwaway must be refused.
+# Controls: the same two writes on the throwaway, on a new branch (never dev, main or side).
+probe_code() {
+  local main2 dev b content
+  main2="$(owner_gh api "repos/$REPO2/branches/main" --jq .commit.sha 2>/dev/null)" || main2=""
+  [[ "$main2" =~ ^[0-9a-f]{40}$ ]] || probe_stop "can't read $REPO2's main"
+  dev="$(owner_gh api "repos/$REPO/branches/dev" --jq .commit.sha 2>/dev/null)" || dev=""
+  [[ "$dev" =~ ^[0-9a-f]{40}$ ]] || probe_stop "can't read $REPO's dev"
+  content="$(printf 'FRG-26 A2 probe P5\n' | base64 | tr -d '\n')"
+  probe_attempt "P5 file" -X PUT "repos/$REPO2/contents/frg26-probe-$(stamp).txt" -f message="FRG-26 A2 probe P5 ($(stamp))" \
+    -f content="$content" -f branch="$A2_BRANCH"
+  probe_code_judge "P5 file"
+  probe_attempt "P5 branch" -X POST "repos/$REPO2/git/refs" -f ref="refs/heads/frg26-probe-$(stamp)" -f sha="$main2"
+  probe_code_judge "P5 branch"
+  b="frg26/probe/P5-$(stamp)"
+  capture app_gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$b" -f sha="$dev" \
+    || probe_stop "control: the app could not create the branch $b on $REPO ($(evidence)), so the refusals prove nothing"
+  capture app_gh api -X PUT "repos/$REPO/contents/tests/frg26-probe-$(stamp).txt" -f message="FRG-26 A2 probe P5 control ($(stamp))" \
+    -f content="$content" -f branch="$b" \
+    || probe_stop "control: the app could not add a file to $b on $REPO ($(evidence)), so the refusals prove nothing"
+  say "CONTROL P5: the app created the branch $b and a file on it, on $REPO"
+  probe_refs_same || probe_stop "$REPO2's branches or tags changed"
+  say "RESULT P5 code changes refused: a file and a branch on $REPO2; controls ok; its branches and tags unchanged"
+}
+
+probe_code_judge() { # <label>
+  case "$OBS" in
+    refused) ;;
+    allowed) probe_stop "$1 on $REPO2 GOT THROUGH: a code change on a repository the app is not installed on" ;;
+    *) probe_stop "$1 on $REPO2 was neither allowed nor refused for a permission reason: it proves nothing" ;;
+  esac
+}
+
+probe_issue() { # <id> <what the token is> — an issue on the second throwaway, with the current token
+  OBS_KEPT=""
+  probe_attempt "$1" -X POST "repos/$REPO2/issues" -f title="FRG-26 A2 probe $1 ($(stamp))" \
+    -f body="FRG-26 throwaway: an issue by the app, investigating test A2. Kept as evidence; safe to delete with the repository."
+  probe_keep issue .number
+  probe_reading "$1" "an issue, with a token $2"
+}
+
+# P3, P4 (claim 9b), with the full token: a comment on A2's issue #1, and a PR. Readings.
+probe_public() {
+  local ahead
+  OBS_KEPT=""
+  probe_attempt P3 -X POST "repos/$REPO2/issues/1/comments" \
+    -f body="FRG-26 throwaway: a comment by the app, investigating test A2 ($(stamp)). Kept as evidence."
+  probe_keep comment .id
+  probe_reading P3 "a comment on issue #1"
+  OBS_KEPT=""
+  ahead="$(owner_gh api "repos/$REPO2/compare/main...$A2_BRANCH" --jq .ahead_by 2>/dev/null)" || ahead=""
+  if [[ ! "$ahead" =~ ^[1-9][0-9]*$ ]]; then
+    PROBE_FAILS=$((PROBE_FAILS + 1))
+    OBS=not-tried
+    say "READING P4 not tried: $REPO2's $A2_BRANCH is not ahead of main (ahead by '${ahead:-unreadable}')"
+    PROBE_READINGS="$PROBE_READINGS P4=not-tried"
+    return 0
+  fi
+  probe_attempt P4 -X POST "repos/$REPO2/pulls" -f title="FRG-26 A2 probe P4 ($(stamp))" -f head="$A2_BRANCH" -f base=main \
+    -f body="FRG-26 throwaway: a PR by the app, investigating test A2. Kept as evidence; never merge."
+  probe_keep pr .number
+  probe_reading P4 "a PR from $A2_BRANCH into main"
+}
+
+cmd_a2_probe() {
+  need_owner
+  assert_throwaway
+  assert_second
+  load_app
+  need_app_identity
+  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  say "== FRG-26 A2 investigation, app $APP_BOT (id $APP_ID, installation $INSTALLATION_ID), run $RUN_ID =="
+  REFS_BEFORE="$(probe_refs)"
+  if [[ "$REFS_BEFORE" == error || "$REFS_BEFORE" != *"refs/heads/$A2_BRANCH "* ]]; then
+    REFS_BEFORE=""
+    probe_stop "can't read $REPO2's branches and tags"
+  fi
+  say "REFS $REPO2 before: $(printf '%s' "$REFS_BEFORE" | tr '\n' ';')"
+  # C1: what a token for the whole installation reaches, then each narrowed token in turn.
+  probe_token whole '{}' whole "$WANT_PERMS"
+  revoke_confirmed whole
+  probe_token full "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}" narrowed "$WANT_PERMS"
+  if ! app_rate || [[ "$RATE_REST" -lt $MIN_REST ]]; then
+    probe_stop "the app's allowance is too low or can't be read: ${RATE_LINE:-$(evidence)}"
+  fi
+  say "app allowance: $RATE_LINE"
+  probe_code
+  probe_public
+  revoke_confirmed full
+  probe_token P1 "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$PROBE_PERMS_P1}" narrowed "$PROBE_PERMS_P1"
+  probe_issue P1 "without Issues (contents write, metadata read)"
+  revoke_confirmed P1
+  probe_token P2 "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$PROBE_PERMS_P2}" narrowed "$PROBE_PERMS_P2"
+  probe_issue P2 "with metadata read only"
+  revoke_confirmed P2
+  probe_refs_same || probe_stop "$REPO2's branches or tags changed"
+  probe_read_back
+  say "TOKENS $PROBE_ISSUED issued, $PROBE_REVOKED revoked and confirmed by HTTP 401"
+  if [[ $PROBE_FAILS -eq 0 ]]; then
+    say "A2 PROBE: DONE: code changes refused (P5, controls ok, branches and tags unchanged); readings$PROBE_READINGS; $PROBE_REVOKED of $PROBE_ISSUED tokens revoked (confirmed)"
+    exit 0
+  fi
+  say "A2 PROBE: DONE WITH $PROBE_FAILS PROBLEM(S), see above; readings$PROBE_READINGS; $PROBE_REVOKED of $PROBE_ISSUED tokens revoked (confirmed)"
+  exit 1
+}
+
 # --- S2: an Environment keeps its secret from the app (plan 4.4, revised 2026-11-01) ------------
 # On the throwaway only, in the open phase (no protection, so the app may push main). The value is
 # a dummy, never a real secret; the workflow prints only its length.
@@ -2404,6 +2652,7 @@ main() {
     ruleset) cmd_ruleset ;;
     tests) cmd_tests "$@" ;;
     ptests) cmd_ptests ;;
+    a2-probe) cmd_a2_probe ;;
     env-setup) cmd_env_setup ;;
     env-tests) cmd_env_tests ;;
     hold-token) cmd_hold_token "$@" ;;
@@ -2415,7 +2664,7 @@ main() {
     delete-check) cmd_delete_check ;;
     actions-setting) cmd_actions_setting ;;
     status) cmd_status ;;
-    *) die "usage: github-throwaway.sh create|create-second|check-app|rate|allowance|reset|protect|unprotect|ruleset|tests <phase>|ptests|env-setup|env-tests|hold-token <name>|token-age-check|key-check|suspend-check|unsuspend-check|uninstall-check|delete-check|actions-setting|status" ;;
+    *) die "usage: github-throwaway.sh create|create-second|check-app|rate|allowance|reset|protect|unprotect|ruleset|tests <phase>|ptests|a2-probe|env-setup|env-tests|hold-token <name>|token-age-check|key-check|suspend-check|unsuspend-check|uninstall-check|delete-check|actions-setting|status" ;;
   esac
 }
 
