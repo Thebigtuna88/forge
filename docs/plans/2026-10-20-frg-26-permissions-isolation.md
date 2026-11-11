@@ -6,9 +6,11 @@
   Done so far (2026-11-06, from the owner's handoff): the throwaway app `frg26-throwaway-test-atl`
   was created and installed on the first throwaway only, its App ID and key were stored in
   `work/owner-secrets/frg26/` (mode 600), and the second throwaway `forge-frg26-throwaway-2` was
-  created; an earlier app from 2026-11-02 (no key, never installed) is to be deleted in the next
-  handoff. No feasibility test has run yet (the app check failed on GitHub's new token format,
-  since fixed), and nothing on the Mac or in FORGE's settings has changed.
+  created; the earlier app from 2026-11-02 (no key, never installed) was deleted (2026-11-07, app
+  check passed). **Stage 1 part 0 ran on 2026-11-11 and stopped: test A2 failed, a failed
+  protection** (section 6, "A2, 2026-11-11"). Item 9 is unresolved until the owner approves a
+  revised protection claim; the later stage 1 handoffs wait. Nothing on the Mac or in FORGE's
+  settings has changed.
 - **Ticket:** FRG-26 (#26). Branch `feature/FRG-26-permissions-isolation`, draft PR #37.
 - **Follow-up:** FRG-27 (#27), review isolation, starts immediately after this one.
 - **Why revised:** the owner asked (2026-11-01) whether FRG-26 needs a separate GitHub account.
@@ -88,7 +90,9 @@ are readable by anyone on the internet, logged in or not, so the app (or I) may 
 public repositories it isn't installed on; that isn't a protection we claim. The protection we
 need is:
 - **no writes** (pushes, PRs, issues, comments, merges) to any repository the app isn't installed
-  on, and none beyond its four permissions where it is installed;
+  on, and none beyond its four permissions where it is installed. **Failed for issues** (test A2,
+  2026-11-11: the app opened an issue on the second throwaway; section 6). Unresolved until the
+  owner approves a revised claim;
 - **no access to private resources**: private repositories it isn't installed on, and private
   data in installed ones that needs a permission it doesn't have (settings, protection, secrets'
   names, collaborators, webhooks, deploy keys).
@@ -319,7 +323,7 @@ reason from GitHub (BLOCKED, GH006/GH013, 403/404/401); anything else is inconcl
 | 5b | See secret values; approve its own deployment | No repo-level secrets; Environments need you, self-review prevented, `main` only | Confirmed (docs) | S1 (read-only), S2a-c (stage 1, P with controls) |
 | 6 | Change workflow files | No Workflows permission | Confirmed | A3 (P) |
 | 7 | Widen my access (permissions, repos, keys) | Only you change the app, in your browser | Confirmed | A1, A6 (P); A10 docs only (no API makes keys) |
-| 9 | Write to, or read private resources of, repos it isn't installed on | Selected repositories + narrowed tokens | Confirmed | A2 (P) |
+| 9 | Write to, or read private resources of, repos it isn't installed on | Selected repositories + narrowed tokens | Confirmed (docs); **failed in A2 for issues, 2026-11-11; unresolved** | A2 (P) |
 | 15 | Keep using an old, revoked or suspended token; mint with a deleted key | 1-hour expiry; revoke; suspend; uninstall; app deletion; key deletion | Partly Confirmed | A4, A5, A9, A9b, E1, E2, E3 (P) |
 | 16 | Read the app's private key or change the broker | Broker user owns key; root owns program and settings | Goal | K1-K4 (stage 3, P) |
 | 8, 10, 11, 13, 14 | Mac items | Unchanged | — | Unchanged (stage 3) |
@@ -335,7 +339,7 @@ New tests (throwaway app, throwaway repo, run only from your handoffs):
 | # | Tries… | Must happen | Control |
 |---|---|---|---|
 | A1 | Mint a token; read what GitHub says it carries | Exactly the four permissions, only the throwaway repo | — (a reading) |
-| A2 | Push, open a PR, open an issue on a second public throwaway repo the app isn't installed on | Refused | Same three on the installed repo succeed. The PR's branch there must be ahead of main (checked first), or no one could open it (review round 15) |
+| A2 | Push, open a PR, open an issue on a second public throwaway repo the app isn't installed on | Refused. **2026-11-11: FAILED** (the issue was allowed; below the table) | Same three on the installed repo succeed. The PR's branch there must be ahead of main (checked first), or no one could open it (review round 15) |
 | A3 | Push a commit adding `.github/workflows/x.yml` to a feature branch | Refused | The same commit with an ordinary file succeeds |
 | A4 | Use a token over 1 hour old | 401 | A fresh token, same request, succeeds |
 | A5 | Revoke a token, then use it | 401 | The same token makes the same request successfully just before it is revoked (review round 36) |
@@ -351,6 +355,28 @@ New tests (throwaway app, throwaway repo, run only from your handoffs):
 | E2 | Uninstall at the end of stage 1; use a token issued before | Recorded | — (the app is deleted next) |
 | S1 | (Read-only) repository secrets count; default workflow token permission | 0; read-only | — |
 | K1-K4 | (Stage 3) as `forge-agent`: read the key; list the broker's folder; change the broker's settings; read the token file | Refused, refused, refused, works | You (admin) can read the key: the check is valid |
+
+**A2, 2026-11-11: failed, a failed protection, unresolved.** Stage 1 part 0 (handoff
+`2026-11-06-frg26-stage1-open`, run 2026-11-11T06:51:10Z, verify failed) stopped after A2:
+- The push to `forge-frg26-throwaway-2` (the app not installed there) was refused: "Permission to
+  … denied to frg26-throwaway-test-atl[bot]", 403.
+- Opening an issue there **was allowed**: issue #1, "FRG-26 A2 (20261111T065801Z-3110)", created
+  06:58:16Z, author `frg26-throwaway-test-atl[bot]` (type Bot, author association NONE). The token
+  was narrowed when minted to the first throwaway and the four permissions.
+- Opening a PR there was not tried (the first attempt not refused ends the test), nor were the
+  controls.
+- The exit check that lists the second throwaway's open "FRG-26 " issues, seconds later, did not
+  report issue #1, although GitHub lists it now. So that check can't be relied on to catch a write
+  there. Why it missed it is Unconfirmed.
+- GitHub's documentation, as far as one search found, doesn't describe this.
+
+Item 9 therefore stays **failed and unresolved** until the owner approves a revised protection
+claim. A2 is not run again and is not marked passed. The kind-P tests run before it in that same
+run (S1, A6, A8, A5, A3) gave their expected results; they are recorded, not accepted, since the
+run did not finish. Evidence, kept unchanged: the handoff's folder in `work/owner/`, and read-only
+byte-for-byte copies in `work/FRG-26-permissions-isolation/evidence/` 36-39 (the paste, the log,
+issue #1 and its timeline as GitHub returned them). Issue #1 stays open: this script never writes
+to the second throwaway.
 
 ## 7. Your home folder (D8)
 
@@ -383,7 +409,10 @@ run myself.
 Clean-up the stop rule allows after a failed test (review rounds 13-28): closing this run's test PRs
 and issues, and cancelling S2 runs still unfinished (a waiting run, like an open PR with auto-merge
 armed, could otherwise go ahead later). Nothing else is written: the disposable dummy secret, a
-changed setting or description, or a ruleset stays for you to see.
+changed setting or description, or a ruleset stays for you to see. After A2's failure the owner
+asked (2026-11-11) for one more step, by its own reviewed handoff: putting back the throwaway's
+`dev` and `main` protection exactly as `protect` applies it (part 0 had removed it), with nothing
+else written and no evidence removed.
 
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.
