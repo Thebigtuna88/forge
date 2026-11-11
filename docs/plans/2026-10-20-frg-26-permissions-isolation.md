@@ -140,7 +140,8 @@ settings are owned by `root`, so `forge-agent` can't change what it does (K4).
 
 *What this does not stop.* **Automatic renewal means ongoing access:** as long as the broker runs
 and the app is installed, I always have a valid token, so the one-hour expiry does not limit what
-I can do over time; the four permissions and the selected repositories do. **Expiry limits only a
+I can do over time; the four permissions and the selected repositories do (not fully: A2 showed
+the app can open an issue on a public repo it isn't installed on; section 6). **Expiry limits only a
 copied token:** a token copied elsewhere stops working within an hour of being issued, and
 cancelling it (4.3) is documented to stop it sooner (for GitHub's stateless tokens Unconfirmed
 until A5 runs; until then, count on the hour). Stopping ongoing access means stopping renewal or the app

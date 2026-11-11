@@ -67,6 +67,12 @@ official docs on 2026-11-01, follows.
 | 7 widen own access | Token can't make tokens; but it is the owner's account | Only the owner changes permissions and approves them | Classic token; the owner holds the account |
 | 9 only FORGE repos | Enforced (selected repositories) | Enforced (selected repositories) | Classic `public_repo` reaches every public repo the helper can write to (only invited ones) |
 
+**2026-11-11: row 9 is not enforced for B as written.** Test A2 failed: the throwaway app, with a
+token narrowed to the first throwaway, opened an issue on the second throwaway, a public repo it
+isn't installed on (its push there was refused). Item 9 is failed and unresolved until the owner
+approves a revised protection claim; see the plan, section 6, "A2, 2026-11-11". The table above is
+kept as it was decided on 2026-11-01.
+
 ## Authorship and the owner's approval
 
 - A: PRs, pushes, comments and merges all show as the owner. GitHub can't tell agent from owner.
