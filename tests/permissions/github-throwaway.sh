@@ -728,33 +728,40 @@ protection_json() { # <enforce_admins true|false>
 EOF
 }
 
-# Each branch must be unprotected, or already carry exactly this protection, which is left as it
-# is: a run that protected dev and then failed on main can be run again (review round 41, C1).
-# Anything else stops before any write.
-cmd_protect() {
-  need_owner
-  assert_throwaway
-  [[ "$(ruleset_count)" == 0 ]] || die "protect only runs while there is no ruleset"
-  local b s ea todo=""
+# Which of dev and main protect or unprotect must change, in PROTECTION_TODO. Each branch must be
+# unprotected or carry exactly protect's protection; one already in the wanted state is left as it
+# is, so a run that changed dev and then failed on main can be run again (review rounds 41 and 43,
+# C1). Anything else, an unreadable branch or a ruleset, stops before any write.
+protection_todo() { # <protected|unprotected>: the state wanted
+  local b s ea
+  PROTECTION_TODO=""
+  [[ "$(ruleset_count)" == 0 ]] || die "protect and unprotect only run while there is no ruleset"
   for b in dev main; do
     ea=false
     [[ "$b" == dev ]] && ea=true
     s="$(branch_state "$b")"
     case "$s" in
-      unprotected) todo="$todo $b" ;;
-      protected)
-        [[ "$(protection_full "$b")" == "$(want_protection "$ea")" ]] \
-          || die "$b is protected, but not exactly as protect applies it, so nothing was changed"
-        ;;
+      unprotected | protected) ;;
       *) die "$b reads $s, so nothing was changed" ;;
     esac
+    if [[ "$s" == protected && "$(protection_full "$b")" != "$(want_protection "$ea")" ]]; then
+      die "$b is protected, but not exactly as protect applies it, so nothing was changed"
+    fi
+    [[ "$s" == "$1" ]] || PROTECTION_TODO="$PROTECTION_TODO $b"
   done
+}
+
+cmd_protect() {
+  need_owner
+  assert_throwaway
+  protection_todo protected
+  local b
   # dev: nobody merges without the owner's code-owner approval, admins included (D5).
   protection_json true >"$WORK/dev.json"
   # main: the same review rule; admins (only the owner) may bypass it, so the owner can merge
   # dev into main (M6). Who may update main at all is the ruleset's job (D6).
   protection_json false >"$WORK/main.json"
-  for b in $todo; do
+  for b in $PROTECTION_TODO; do
     owner_gh api -X PUT "repos/$REPO/branches/$b/protection" --input "$WORK/$b.json" >/dev/null || die "protecting $b failed"
   done
   verify_phase protected
@@ -762,14 +769,16 @@ cmd_protect() {
   say "main protection: $(protection_of main)"
 }
 
-# The reverse of protect, only from exactly the state protect leaves (no ruleset), so a phase
-# open can run again (owner, 2026-10-31: a fresh open phase on the reviewed commit).
+# The reverse of protect, from the state protect leaves (or part of it, after a failed run), so a
+# phase open can run again (owner, 2026-10-31: a fresh open phase on the reviewed commit).
 cmd_unprotect() {
   need_owner
   assert_throwaway
-  verify_phase protected
-  owner_gh api -X DELETE "repos/$REPO/branches/dev/protection" >/dev/null || die "unprotecting dev failed"
-  owner_gh api -X DELETE "repos/$REPO/branches/main/protection" >/dev/null || die "unprotecting main failed"
+  protection_todo unprotected
+  local b
+  for b in $PROTECTION_TODO; do
+    owner_gh api -X DELETE "repos/$REPO/branches/$b/protection" >/dev/null || die "unprotecting $b failed"
+  done
   verify_phase open
   say "dev and main unprotected; no ruleset"
 }

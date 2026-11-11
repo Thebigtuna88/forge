@@ -852,40 +852,51 @@ test_allowance_check_fails_closed() {
   assert_contains "$out" "app allowance: graphql limit=5000 used=1000 remaining=4000"
 }
 
-test_unprotect_lifts_exactly_what_protect_applies() {
-  # The fresh open phase (owner, 2026-10-31) starts from the protected state the throwaway is in:
-  # unprotect only runs from exactly that state, removes both protections, and checks the result.
+protect_stubs() { # <dev state> <main state>: a stand-in repository protect and unprotect change
+  # Each branch's state is a file, so it survives the subshell a failing command runs in. A PUT
+  # protects a branch, a DELETE unprotects it; the write named in $T_TMP/fail fails once. A
+  # protected branch reads protect's own settings.
   owner_cmd_stubs
-  verify_phase() { echo "verify $1" >>"$T_TMP/owner"; }
-  local rc=0
-  cmd_unprotect >/dev/null 2>&1 || rc=$?
-  assert_exit 0 "$rc"
-  assert_eq "$(cat "$T_TMP/owner")" "verify protected
-api -X DELETE repos/$REPO/branches/dev/protection
-api -X DELETE repos/$REPO/branches/main/protection
-verify open"
-  : >"$T_TMP/owner"
-  verify_phase() { die "phase $1 needs dev and main protected"; }
-  rc=0
-  (cmd_unprotect) >/dev/null 2>&1 || rc=$?
-  assert_exit 2 "$rc" "not in the protected state"
-  assert_eq "$(cat "$T_TMP/owner")" "" "owner calls outside the protected state"
-}
-
-protect_stubs() { # <dev state> <main state>: each branch reads that state; a protected one reads protect's own settings
-  owner_cmd_stubs
-  P_DEV="$1" P_MAIN="$2"
-  branch_state() { if [[ "$1" == dev ]]; then echo "$P_DEV"; else echo "$P_MAIN"; fi; }
+  echo "$1" >"$T_TMP/state-dev"
+  echo "$2" >"$T_TMP/state-main"
+  : >"$T_TMP/fail"
+  branch_state() { cat "$T_TMP/state-$1"; }
   ruleset_count() { echo 0; }
   protection_full() { if [[ "$1" == dev ]]; then want_protection true; else want_protection false; fi; }
   protection_of() { echo stub; }
-  verify_phase() { # open: the real rule, on the stubbed reads; protected: logged
-    if [[ "$1" == open ]]; then
-      [[ "$P_DEV" == unprotected && "$P_MAIN" == unprotected && "$(ruleset_count)" == 0 ]] || die "phase open needs dev and main unprotected and no ruleset"
-    else
-      echo "verify $1" >>"$T_TMP/owner"
-    fi
+  owner_gh() {
+    echo "$*" >>"$T_TMP/owner"
+    local w="${2:-} ${3:-} ${4:-}" st b
+    case "$w" in
+      "-X PUT repos/$REPO/branches/"*"/protection") st=protected ;;
+      "-X DELETE repos/$REPO/branches/"*"/protection") st=unprotected ;;
+      *) return 0 ;;
+    esac
+    if [[ "$w" == "$(cat "$T_TMP/fail")" ]]; then : >"$T_TMP/fail"; return 1; fi
+    b="${4#repos/"$REPO"/branches/}"
+    echo "$st" >"$T_TMP/state-${b%/protection}"
   }
+  verify_phase() { # the real rule on the stand-in's state, logged
+    echo "verify $1" >>"$T_TMP/owner"
+    local d m
+    d="$(cat "$T_TMP/state-dev")" m="$(cat "$T_TMP/state-main")"
+    case "$1" in
+      open) [[ "$d" == unprotected && "$m" == unprotected ]] || die "phase open needs dev and main unprotected (dev $d, main $m)" ;;
+      protected) [[ "$d" == protected && "$m" == protected ]] || die "phase protected needs dev and main protected (dev $d, main $m)" ;;
+    esac
+  }
+}
+
+test_unprotect_lifts_exactly_what_protect_applies() {
+  # The fresh open phase (owner, 2026-10-31) starts from the protected state the throwaway is in:
+  # unprotect removes both protections and checks the result.
+  protect_stubs protected protected
+  local rc=0
+  cmd_unprotect >/dev/null 2>&1 || rc=$?
+  assert_exit 0 "$rc"
+  assert_eq "$(cat "$T_TMP/owner")" "api -X DELETE repos/$REPO/branches/dev/protection
+api -X DELETE repos/$REPO/branches/main/protection
+verify open"
 }
 
 test_protect_applies_both_protections_from_the_open_state() {
@@ -899,47 +910,69 @@ verify protected"
   assert_eq "$(jq -c .enforce_admins "$WORK/dev.json") $(jq -c .enforce_admins "$WORK/main.json")" "true false" "dev enforces admins, main doesn't"
 }
 
-test_protect_resumes_after_only_dev_was_protected() {
-  # Round 41 C1: a run that protected dev and then failed on main can be run again; dev, already
-  # protected exactly as protect applies it, is left as it is.
-  protect_stubs protected unprotected
-  local rc=0
-  cmd_protect >/dev/null 2>&1 || rc=$?
-  assert_exit 0 "$rc"
+test_protect_and_unprotect_resume_after_their_second_write_failed() {
+  # Rounds 41 and 43, C1: a run that changed dev and then failed on main can be run again; dev,
+  # already in the wanted state, is left as it is.
+  local rc out
+  protect_stubs unprotected unprotected
+  echo "-X PUT repos/$REPO/branches/main/protection" >"$T_TMP/fail"
+  rc=0; out="$( (cmd_protect) 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "protect, main's write failing"
+  assert_contains "$out" "protecting main failed"
+  assert_eq "$(cat "$T_TMP/state-dev") $(cat "$T_TMP/state-main")" "protected unprotected" "after protect's failed run"
+  : >"$T_TMP/owner"
+  rc=0; out="$( (cmd_protect) 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "protect run again"
   assert_eq "$(cat "$T_TMP/owner")" "api -X PUT repos/$REPO/branches/main/protection --input $WORK/main.json
-verify protected"
+verify protected" "protect run again"
+
+  protect_stubs protected protected
+  echo "-X DELETE repos/$REPO/branches/main/protection" >"$T_TMP/fail"
+  rc=0; out="$( (cmd_unprotect) 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "unprotect, main's write failing"
+  assert_contains "$out" "unprotecting main failed"
+  assert_eq "$(cat "$T_TMP/state-dev") $(cat "$T_TMP/state-main")" "unprotected protected" "after unprotect's failed run"
+  : >"$T_TMP/owner"
+  rc=0; out="$( (cmd_unprotect) 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "unprotect run again"
+  assert_eq "$(cat "$T_TMP/owner")" "api -X DELETE repos/$REPO/branches/main/protection
+verify open" "unprotect run again"
 }
 
-test_protect_changes_nothing_unless_each_branch_is_unprotected_or_exactly_protected() {
-  local rc out
-  # dev protected with anything more than protect applies: nothing is written, dev or main.
-  protect_stubs protected unprotected
-  protection_full() { echo '{"owner-extra":true}'; }
-  rc=0; out="$(cmd_protect 2>&1)" || rc=$?
-  assert_exit 2 "$rc" "dev protected differently"
-  assert_contains "$out" "dev is protected, but not exactly as protect applies it"
-  assert_eq "$(cat "$T_TMP/owner")" "" "writes with dev protected differently"
-  # main protected differently, dev unprotected: dev isn't protected either.
-  protect_stubs unprotected protected
-  protection_full() { if [[ "$1" == main ]]; then echo error; else want_protection true; fi; }
-  rc=0; out="$(cmd_protect 2>&1)" || rc=$?
-  assert_exit 2 "$rc" "main's protection unreadable"
-  assert_contains "$out" "main is protected, but not exactly as protect applies it"
-  assert_eq "$(cat "$T_TMP/owner")" "" "writes with main's protection unreadable"
-  local s
-  for s in error missing; do
-    protect_stubs unprotected "$s"
-    rc=0; out="$(cmd_protect 2>&1)" || rc=$?
-    assert_exit 2 "$rc" "main reads $s"
-    assert_contains "$out" "main reads $s"
-    assert_eq "$(cat "$T_TMP/owner")" "" "writes while main reads $s"
+test_protect_and_unprotect_change_nothing_unless_each_branch_is_unprotected_or_exactly_protected() {
+  local rc out cmd s
+  for cmd in protect unprotect; do
+    # dev protected with anything more than protect applies: nothing is written, dev or main.
+    protect_stubs protected unprotected
+    protection_full() { echo '{"owner-extra":true}'; }
+    rc=0; out="$( ("cmd_$cmd") 2>&1)" || rc=$?
+    assert_exit 2 "$rc" "$cmd, dev protected differently"
+    assert_contains "$out" "dev is protected, but not exactly as protect applies it"
+    assert_eq "$(cat "$T_TMP/owner")" "" "$cmd's writes with dev protected differently"
+    # main's protection unreadable, dev in either state: dev isn't changed either.
+    protect_stubs unprotected protected
+    protection_full() { if [[ "$1" == main ]]; then echo error; else want_protection true; fi; }
+    rc=0; out="$( ("cmd_$cmd") 2>&1)" || rc=$?
+    assert_exit 2 "$rc" "$cmd, main's protection unreadable"
+    assert_contains "$out" "main is protected, but not exactly as protect applies it"
+    assert_eq "$(cat "$T_TMP/owner")" "" "$cmd's writes with main's protection unreadable"
+    for s in error missing; do
+      protect_stubs protected "$s"
+      rc=0; out="$( ("cmd_$cmd") 2>&1)" || rc=$?
+      assert_exit 2 "$rc" "$cmd, main reads $s"
+      assert_contains "$out" "main reads $s"
+      assert_eq "$(cat "$T_TMP/owner")" "" "$cmd's writes while main reads $s"
+    done
+    for s in 1 error; do
+      protect_stubs protected unprotected
+      RULESETS="$s"
+      ruleset_count() { echo "$RULESETS"; }
+      rc=0; out="$( ("cmd_$cmd") 2>&1)" || rc=$?
+      assert_exit 2 "$rc" "$cmd, rulesets $s"
+      assert_contains "$out" "only run while there is no ruleset"
+      assert_eq "$(cat "$T_TMP/owner")" "" "$cmd's writes with rulesets $s"
+    done
   done
-  protect_stubs unprotected unprotected
-  ruleset_count() { echo 1; }
-  rc=0; out="$(cmd_protect 2>&1)" || rc=$?
-  assert_exit 2 "$rc" "a ruleset"
-  assert_contains "$out" "protect only runs while there is no ruleset"
-  assert_eq "$(cat "$T_TMP/owner")" "" "writes with a ruleset"
 }
 
 test_ruleset_summary_includes_the_update_rules_parameter() {
