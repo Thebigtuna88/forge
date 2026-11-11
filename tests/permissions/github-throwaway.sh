@@ -1725,10 +1725,13 @@ probe_stop() { # <why> — revoke the current token, read back what was made, an
 # with it must get HTTP 401. Run on every way out of a2-probe (round 47, C1, SEC-1).
 probe_settle_tokens() {
   local t seen=" $PROBE_CONFIRMED "
-  revoke_outstanding
-  for t in $REVOKED_TOKENS $OUTSTANDING; do
+  for t in $TOKEN $REVOKED_TOKENS $OUTSTANDING; do
     [[ "$seen" != *" $t "* ]] || continue
     seen="$seen$t "
+    # Each one is revoked again here, even one whose earlier DELETE GitHub answered as done
+    # (round 50, C1).
+    TOKEN="$t"
+    revoke_token || true
     TOKEN="$t"
     capture app_gh api "repos/$REPO" --jq .full_name || true
     TOKEN=""
@@ -1738,7 +1741,9 @@ probe_settle_tokens() {
       say "TOKEN (one not yet checked, after $PROBE_LABEL was asked for) revoked: a read with it now gets HTTP 401"
     else
       PROBE_FAILS=$((PROBE_FAILS + 1))
-      say "TOKEN (one not yet checked, after $PROBE_LABEL was asked for) still answers a read after its revocation was tried ($(evidence)): GitHub expires it within an hour of its issue"
+      # Still working: the exit clean-up tries it once more.
+      [[ " $OUTSTANDING " == *" $t "* ]] || OUTSTANDING="$OUTSTANDING $t"
+      say "TOKEN (one not yet checked, after $PROBE_LABEL was asked for) still answers a read after its revocation was tried ($(evidence)): GitHub expires it within an hour of its issue; the exit clean-up tries once more"
     fi
   done
 }

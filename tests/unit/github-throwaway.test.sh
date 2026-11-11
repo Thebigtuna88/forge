@@ -3095,7 +3095,7 @@ probe_stubs() {
   WORK="$T_TMP/work"
   [[ -d "$WORK" ]] || mkdir -m 700 "$WORK"
   # A test may set up several runs: no stand-in state carries over from the one before.
-  rm -f "$T_TMP/revoked" "$T_TMP/revoked-still-works" "$T_TMP/refs-change" "$T_TMP"/delete-fails-* \
+  rm -f "$T_TMP/revoked" "$T_TMP/revoked-still-works" "$T_TMP/refs-change" "$T_TMP"/delete-fails-* "$T_TMP"/delete-lies-* \
     "$T_TMP"/extra-* "$T_TMP"/fail-* "$T_TMP"/reach-* "$T_TMP"/request-*.json
   : >"$T_TMP/calls"
   : >"$T_TMP/answers"
@@ -3150,7 +3150,8 @@ probe_stubs() {
           echo "gh: Server Error (HTTP 502)" >&2
           return 1
         fi
-        echo "$tag" >>"$T_TMP/revoked"
+        # $T_TMP/delete-lies-<tag>: GitHub answers the DELETE as done, but the token keeps working.
+        [[ -f "$T_TMP/delete-lies-$tag" ]] || echo "$tag" >>"$T_TMP/revoked"
         return 0
         ;;
       "api installation/repositories"*) cat "$T_TMP/reach-$tag" 2>/dev/null || echo "$REPO"; return 0 ;;
@@ -3354,6 +3355,21 @@ test_a2_probe_retries_and_checks_a_revocation_that_failed() {
   assert_exit 1 "$rc" "a token that could never be revoked"
   assert_contains "$out" "after P2 was asked for) still answers a read after its revocation was tried"
   assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "3 of 4 tokens revoked (confirmed)"
+}
+
+# Round 50 (C1): a token mint refused, whose DELETE GitHub answered as done but which still works,
+# is revoked again when the run settles, and is left for the exit clean-up to try once more.
+test_a2_probe_revokes_again_a_token_that_still_works_after_a_confirmed_delete() {
+  probe_stubs
+  echo '.permissions.issues = "write"' >"$T_TMP/extra-3"
+  : >"$T_TMP/delete-lies-tok3"
+  local out rc=0 calls
+  out="$(run_probe)" || rc=$?
+  assert_exit 2 "$rc" "P1's token with Issues"
+  calls="$(cat "$T_TMP/calls")"
+  assert_eq "$(printf '%s\n' "$calls" | grep -c '^app_gh tok3 api -X DELETE installation/token$')" 3 "mint's DELETE, the settling one, the exit clean-up's"
+  assert_contains "$out" "after P1 was asked for) still answers a read after its revocation was tried"
+  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "A2 PROBE: STOPPED by an error"
 }
 
 test_a2_probe_reports_a_token_that_still_works_after_revocation() {
