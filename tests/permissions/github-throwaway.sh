@@ -1805,6 +1805,11 @@ probe_reading() { # <id> <what was tried>
   if [[ "$OBS" == allowed ]]; then how="allowed$OBS_KEPT"; else how="$OBS ($(http_of))"; fi
   PROBE_READINGS="$PROBE_READINGS $1=$OBS"
   say "READING $1 $2: $how"
+  # Neither allowed nor refused for a permission reason (an error, a rate limit): no reading, and
+  # what GitHub did is unknown, so nothing more is tried (round 49, C1).
+  if [[ "$OBS" != allowed && "$OBS" != refused ]]; then
+    probe_stop "$1 got no clear answer from GitHub ($(http_of)): no reading; look on $REPO2 for anything it may have made"
+  fi
 }
 
 probe_refs() { # the second throwaway's branches and tags with their commits, as the owner reads them

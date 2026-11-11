@@ -3251,6 +3251,26 @@ test_a2_probe_stops_when_a_code_change_is_not_refused() {
   done
 }
 
+# Round 49 (C1): a reading GitHub gave no answer to (an error, a rate limit) is not a reading: the
+# run stops there, as the owner's, and never ends DONE.
+test_a2_probe_stops_at_a_reading_with_no_answer() {
+  local name line out rc calls
+  load
+  for name in "P3 gets a server error|app_gh tok2 api -i -X POST repos/$REPO2/issues/1/comments|1|gh: Server Error (HTTP 502)|PROBE STOP: P3|repos/$REPO2/pulls" \
+    "P1 is rate limited|app_gh tok3 api -i -X POST repos/$REPO2/issues|1|gh: API rate limit exceeded (HTTP 403)|PROBE STOP: P1|app_gh tok4"; do
+    IFS='|' read -r name line <<<"$name"
+    probe_stubs
+    probe_answer_first "$(printf '%s' "$line" | cut -d'|' -f1-3)"
+    rc=0; out="$(run_probe)" || rc=$?
+    assert_exit 1 "$rc" "$name"
+    assert_contains "$out" "$(printf '%s' "$line" | cut -d'|' -f4)" "$name"
+    calls="$(cat "$T_TMP/calls")"
+    assert_not_contains "$calls" "$(printf '%s' "$line" | cut -d'|' -f5)" "an attempt after $name"
+    assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "A2 PROBE: STOPPED" "$name"
+    assert_not_contains "$out" "A2 PROBE: DONE" "$name"
+  done
+}
+
 test_a2_probe_needs_its_code_change_controls() {
   probe_stubs
   probe_answer_first "app_gh tok2 api -X POST repos/$REPO/git/refs|1|gh: Server Error (HTTP 502)"

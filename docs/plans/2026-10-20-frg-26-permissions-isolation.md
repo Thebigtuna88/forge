@@ -396,7 +396,8 @@ against the second throwaway:
   the run for the owner.
 - Claim 9b, public activity, readings only: a comment on issue #1 (P3), a PR from `frg26-a2` (P4),
   an issue with P1's token and with P2's. GitHub's whole answer is kept, headers included
-  (`X-Accepted-GitHub-Permissions`).
+  (`X-Accepted-GitHub-Permissions`). An attempt GitHub gives no clear answer to (an error, a rate
+  limit) is no reading: it stops the run too, since what GitHub did is then unknown.
 - Nothing is closed or deleted: each object made is read back by the number GitHub returned (the
   fix for the exit check that missed issue #1). The second throwaway is deleted at the end of
   stage 1.
