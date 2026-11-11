@@ -18,8 +18,10 @@
 #   github-throwaway.sh rate              the app's API allowance: limit, used, reset (read-only)
 #   github-throwaway.sh allowance         fails unless the app has enough allowance for a phase
 #   github-throwaway.sh reset             owner: main dev side back to the baseline (unprotected only)
-#   github-throwaway.sh protect           owner: apply the dev and main branch protection
-#   github-throwaway.sh unprotect         owner: remove exactly that protection (protected state only)
+#   github-throwaway.sh protect           owner: apply the dev and main branch protection; a branch
+#                                         that already has exactly it is left (can be run again)
+#   github-throwaway.sh unprotect         owner: remove exactly that protection; a branch that is
+#                                         already unprotected is left (can be run again)
 #   github-throwaway.sh ruleset           owner: add the main ruleset (only the owner may bypass);
 #                                         first checks the app has enough allowance
 #   github-throwaway.sh tests <phase>     run the bypass tests (kind S); phase = open | protected | ruleset
