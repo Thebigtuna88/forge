@@ -422,15 +422,22 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
   # 520 characters, base64url parts joined by dots (changelog 2026-04-24). The length is checked on
   # its own: macOS regex allows at most 255 repeats. It is on the exit list before it is judged, so a
   # failed revocation is tried again on exit (round 32, C1).
+  # What GitHub said it issued (named fields only, no token) is kept too, so a token refused below
+  # is still described if its revocation isn't confirmed (round 54, SEC-1). The registration is
+  # whole or not begun when the clean-up sees it: a signal during it waits (round 58, C1, SEC-1),
+  # and the pending record goes only once the token is registered.
+  local meta label
+  meta="$(jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' <<<"$ans" 2>/dev/null || echo unreadable)"
+  label="${MINT_LABEL:-token$((MINTED + 1))}"
+  defer_signals
   TOKEN="$t"
   OUTSTANDING="$OUTSTANDING $t"
   MINTED=$((MINTED + 1))
-  PENDING_MINT=""
-  ISSUED="$ISSUED ${MINT_LABEL:-token$MINTED}=$t"
-  # What GitHub said it issued (named fields only, no token), kept before any check, so a token
-  # refused below is still described if its revocation isn't confirmed (round 54, SEC-1).
-  ISSUED_META="$ISSUED_META${MINT_LABEL:-token$MINTED} $(jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' <<<"$ans" 2>/dev/null || echo unreadable)
+  ISSUED="$ISSUED $label=$t"
+  ISSUED_META="$ISSUED_META$label $meta
 "
+  PENDING_MINT=""
+  resume_signals
   if [[ $ok -ne 0 ]]; then
     # What happened, never more (round 57, C3, SEC-2).
     if revoke_token; then
@@ -481,6 +488,22 @@ revoke_token() { # DELETE /installation/token, which GitHub documents as stoppin
   if [[ $rc -eq 0 ]]; then outstanding_drop "$TOKEN"; fi
   TOKEN=""
   return $rc
+}
+
+# A catchable signal waits while a token is being registered (round 58, C1, SEC-1): the clean-up
+# then finds the registration whole. resume_signals acts on a signal that came meanwhile.
+DEFERRED_SIG=""
+defer_signals() {
+  DEFERRED_SIG=""
+  trap 'DEFERRED_SIG=129' HUP
+  trap 'DEFERRED_SIG=130' INT
+  trap 'DEFERRED_SIG=143' TERM
+}
+resume_signals() {
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [[ -n "$DEFERRED_SIG" ]]; then exit "$DEFERRED_SIG"; fi
 }
 
 # Runs a command for at most <seconds> (none at 0); 124 if it was stopped. The whole process tree is
@@ -1672,7 +1695,8 @@ t_A5() {
   revoke_token
   TOKEN="$second"
   capture app_gh api "repos/$REPO" --jq .full_name || true
-  if [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 401|Bad credentials'; then OBS=refused
+  # HTTP 401 itself, never the words alone (round 58, C2's class).
+  if [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -q 'HTTP 401'; then OBS=refused
   elif [[ $LAST_RC -eq 0 ]]; then OBS=allowed
   fi
   EV="$EV after revoking: $(evidence)"
@@ -1869,12 +1893,13 @@ probe_label_of() { # <token> — its name in this run, never the token
   printf 'unnamed'
 }
 
-# Is the token now refused? A read with it, within call_secs; 0 only for HTTP 401.
+# Is the token now refused? A read with it, within call_secs; 0 only for HTTP 401 itself, never for
+# words alone (round 58, C2).
 probe_refused() { # <token>
   TOKEN="$1"
   capture with_timeout "$(call_secs)" app_gh api "repos/$REPO" --jq .full_name || true
   TOKEN=""
-  [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 401|Bad credentials'
+  [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -q 'HTTP 401'
 }
 
 # Every token GitHub issued to this run that no read has yet shown revoked, whatever happened to it

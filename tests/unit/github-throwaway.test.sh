@@ -3418,6 +3418,45 @@ test_mint_reports_a_token_request_with_no_complete_answer() {
   assert_not_contains "$out" "may have issued"
 }
 
+# Round 58 (C1, SEC-1): a signal while a received token is being registered waits until the
+# registration is whole, then ends the run through the clean-up.
+test_a_signal_during_token_registration_waits_until_it_is_whole() {
+  local sig want out rc
+  for sig in HUP:129 INT:130 TERM:143; do
+    want="${sig#*:}" sig="${sig%%:*}"
+    rc=0
+    out="$(/bin/bash -p -c 'sig="$2"; source "$1"; cleanup() { echo "cleanup with $REGISTERED"; }; REGISTERED=none; defer_signals; kill -s "$sig" $$; REGISTERED=half; REGISTERED=whole; resume_signals; echo after' _ "$GT" "$sig" 2>&1)" || rc=$?
+    assert_exit "$want" "$rc" "SIG$sig"
+    assert_contains "$out" "cleanup with whole" "SIG$sig"
+    assert_not_contains "$out" "after" "SIG$sig"
+  done
+  # Without a signal, nothing changes.
+  rc=0
+  out="$(/bin/bash -p -c 'source "$1"; cleanup() { :; }; defer_signals; resume_signals; echo after' _ "$GT" 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "no signal"
+  assert_contains "$out" "after"
+  # In mint, everything from the pending record to the token's registration is inside.
+  local body
+  body="$(declare -f mint 2>/dev/null || (source "$GT"; declare -f mint))"
+  body="$(printf '%s\n' "$body" | awk '/defer_signals/ { on = 1 } on { print } /resume_signals/ { exit }')"
+  # shellcheck disable=SC2016 # the literal source text is what's searched for
+  assert_contains "$body" 'ISSUED="$ISSUED' "ISSUED outside the deferred section"
+  # shellcheck disable=SC2016 # as above
+  assert_contains "$body" 'ISSUED_META="$ISSUED_META' "ISSUED_META outside the deferred section"
+  # shellcheck disable=SC2016 # as above
+  assert_contains "$body" 'OUTSTANDING="$OUTSTANDING' "OUTSTANDING outside the deferred section"
+  assert_contains "$body" 'PENDING_MINT=""' "the pending record cleared outside the deferred section"
+}
+
+# Round 58 (C2): only HTTP 401 confirms a revocation, not the words "Bad credentials".
+test_only_http_401_confirms_a_revocation() {
+  probe_stubs
+  app_gh() { echo "gh: Bad credentials (HTTP 502)" >&2; return 1; }
+  if probe_refused "$(printf 'gh%s_tokZ' s)"; then _t_fail "a 502 saying Bad credentials confirmed a revocation"; fi
+  app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  probe_refused "$(printf 'gh%s_tokZ' s)" || _t_fail "HTTP 401 did not confirm a revocation"
+}
+
 # Round 57 (C2, SEC-1): a 2xx answer without a readable token is no clear refusal either.
 test_mint_reports_a_2xx_answer_without_a_token_as_possibly_issued() {
   local out rc=0
