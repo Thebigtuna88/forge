@@ -327,7 +327,7 @@ make_jwt() {
 # A request as the app itself (with the JWT), for what only the app can ask: who it is, where it is
 # installed, a token. -q first: no ~/.curlrc. Sets LAST_OUT (the body) and LAST_HTTP; 1 unless 2xx.
 jwt_call() { # <method> <path> [json body file]
-  local args=(-q -sS --proto "=https" -X "$1" -H @"$WORK/jwt.hdr" -w '\nHTTP %{http_code}')
+  local args=(-q -sS --proto "=https" --max-time "$CALL_SECS" -X "$1" -H @"$WORK/jwt.hdr" -w '\nHTTP %{http_code}')
   if [[ -n "${3:-}" ]]; then args+=(-H "Content-Type: application/json" --data-binary @"$3"); fi
   capture curl "${args[@]}" "https://api.github.com/$2" || true
   LAST_HTTP="$(printf '%s\n' "$LAST_OUT" | tail -n 1 | sed -n 's/^HTTP \([0-9][0-9][0-9]\)$/\1/p')"
@@ -731,7 +731,7 @@ repo_settings() {
 # remaining); 1 if any of them can't be read.
 app_rate() {
   RATE_LINE="" RATE_LEFT="" RATE_REST=""
-  capture app_gh api rate_limit || return 1
+  capture with_timeout "$(call_secs)" app_gh api rate_limit || return 1
   RATE_LINE="$(printf '%s' "$LAST_OUT" | jq -r '.resources | "graphql limit=\(.graphql.limit) used=\(.graphql.used) remaining=\(.graphql.remaining) resets=\(.graphql.reset | todate) / rest limit=\(.core.limit) used=\(.core.used) remaining=\(.core.remaining)"' 2>/dev/null)" || return 1
   RATE_LEFT="$(printf '%s' "$LAST_OUT" | jq -r '.resources.graphql.remaining' 2>/dev/null)" || return 1
   RATE_REST="$(printf '%s' "$LAST_OUT" | jq -r '.resources.core.remaining' 2>/dev/null)" || return 1
@@ -1783,7 +1783,9 @@ cmd_ptests() {
 #   3. ends with one line naming the tokens confirmed revoked and those not, never a token itself.
 # Each revocation and each read is given at most CALL_SECS, and never more than is left of the
 # clean-up's CLEANUP_SECS; the deadline is checked before each step; a step the time cap leaves out
-# is named as not done. A timeout stops the request's whole process tree (gh included). Limits: a force-kill, a power loss, or a
+# is named as not done. A timeout stops the request's whole process tree (gh included). Every request
+# the run makes is bounded the same way (round 55), so a stop signal, which bash acts on only when
+# the request in progress returns, reaches the clean-up within CALL_SECS. Limits: a force-kill, a power loss, or a
 # revocation that fails or times out leaves a token unconfirmed. It may stay valid until its
 # expires_at, printed when it was issued. What it can do is what its TOKEN lines show for the first
 # throwaway, plus what this run's readings show on a public repository it isn't installed on (A2).
@@ -1801,11 +1803,11 @@ PROBE_END=""       # done, or "STOPPED: <why>"; empty after an error or a signal
 PROBE_EXPIRY_OK="" # labels of the tokens whose expiry was checked within the hour
 REFS_BEFORE=""
 
-probe_stop() { # <why> — stop: the exit clean-up settles the tokens and reads back what was made
+probe_stop() { # <why> — stop: the exit clean-up settles the tokens, compares the second throwaway's
+  # branches and tags, and reads back what was made, in that order (round 55, SEC-1)
   PROBE_FAILS=$((PROBE_FAILS + 1))
   say "PROBE STOP: $1"
   PROBE_END="STOPPED: $1"
-  if [[ -n "$REFS_BEFORE" ]]; then probe_refs_same || true; fi
   exit 1
 }
 
@@ -1875,7 +1877,7 @@ probe_token() { # <label> <request json> <narrowed|whole> <permissions json> —
   say "TOKEN $1 expires $exp, in $(((at - now) / 60)) minutes"
   PROBE_EXPIRY_OK="$PROBE_EXPIRY_OK $1"
   local got
-  got="$(app_gh api installation/repositories --paginate --jq '.repositories[].full_name' 2>&1)" || got="unreadable: $got"
+  got="$(with_timeout "$(call_secs)" app_gh api installation/repositories --paginate --jq '.repositories[].full_name' 2>&1)" || got="unreadable: $got"
   say "TOKEN $1 reaches (GET /installation/repositories): $(printf '%s' "$got" | tr '\n' ' ')"
   [[ "$got" == "$REPO" ]] || probe_stop "token $1 reaches more than $REPO, or what it reaches could not be read"
 }
@@ -1925,6 +1927,16 @@ probe_describe() { # <label> <token>
 probe_finish() {
   local rc="$1" e t yes="" no=""
   probe_settle_tokens
+  # After a stop, the second throwaway's branches and tags against the run's start (the normal end
+  # compared them already).
+  if [[ "$PROBE_END" != "done" && -n "$REFS_BEFORE" ]]; then
+    if in_time; then
+      probe_refs_same || true
+    else
+      PROBE_FAILS=$((PROBE_FAILS + 1))
+      say "REFS $REPO2 not compared: the clean-up's time cap (${CLEANUP_SECS}s) was reached"
+    fi
+  fi
   probe_read_back
   for e in $ISSUED; do
     t="${e#*=}"
@@ -1965,7 +1977,7 @@ probe_attempt() { # <label> <gh api args…>
   local label="$1"
   shift
   local status
-  capture app_gh api -i "$@" || true
+  capture with_timeout "$(call_secs)" app_gh api -i "$@" || true
   OBS="$(classify_api)"
   if [[ $LAST_RC -eq 0 ]]; then status="$(printf '%s\n' "$LAST_OUT" | head -n 1 | tr -d '\r')"; else status="$(http_of)"; fi
   say "ATTEMPT $label (token $PROBE_LABEL): $OBS ($status); GitHub's answer:"
@@ -1999,8 +2011,8 @@ probe_reading() { # <id> <what was tried>
 
 probe_refs() { # the second throwaway's branches and tags with their commits, as the owner reads them
   local h t
-  h="$(owner_gh api --paginate "repos/$REPO2/git/matching-refs/heads" --jq '.[] | "\(.ref) \(.object.sha)"' 2>/dev/null)" || { echo error; return; }
-  t="$(owner_gh api --paginate "repos/$REPO2/git/matching-refs/tags" --jq '.[] | "\(.ref) \(.object.sha)"' 2>/dev/null)" || { echo error; return; }
+  h="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO2/git/matching-refs/heads" --jq '.[] | "\(.ref) \(.object.sha)"' 2>/dev/null)" || { echo error; return; }
+  t="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO2/git/matching-refs/tags" --jq '.[] | "\(.ref) \(.object.sha)"' 2>/dev/null)" || { echo error; return; }
   printf '%s\n%s\n' "$h" "$t"
 }
 
@@ -2044,9 +2056,9 @@ probe_read_back() { # each object an attempt created, as the owner reads it by i
 # Controls: the same two writes on the throwaway, on a new branch (never dev, main or side).
 probe_code() {
   local main2 dev b content
-  main2="$(owner_gh api "repos/$REPO2/branches/main" --jq .commit.sha 2>/dev/null)" || main2=""
+  main2="$(with_timeout "$(call_secs)" owner_gh api "repos/$REPO2/branches/main" --jq .commit.sha 2>/dev/null)" || main2=""
   [[ "$main2" =~ ^[0-9a-f]{40}$ ]] || probe_stop "can't read $REPO2's main"
-  dev="$(owner_gh api "repos/$REPO/branches/dev" --jq .commit.sha 2>/dev/null)" || dev=""
+  dev="$(with_timeout "$(call_secs)" owner_gh api "repos/$REPO/branches/dev" --jq .commit.sha 2>/dev/null)" || dev=""
   [[ "$dev" =~ ^[0-9a-f]{40}$ ]] || probe_stop "can't read $REPO's dev"
   content="$(printf 'FRG-26 A2 probe P5\n' | base64 | tr -d '\n')"
   probe_attempt "P5 file" -X PUT "repos/$REPO2/contents/frg26-probe-$(stamp).txt" -f message="FRG-26 A2 probe P5 ($(stamp))" \
@@ -2055,9 +2067,9 @@ probe_code() {
   probe_attempt "P5 branch" -X POST "repos/$REPO2/git/refs" -f ref="refs/heads/frg26-probe-$(stamp)" -f sha="$main2"
   probe_code_judge "P5 branch"
   b="frg26/probe/P5-$(stamp)"
-  capture app_gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$b" -f sha="$dev" \
+  capture with_timeout "$(call_secs)" app_gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$b" -f sha="$dev" \
     || probe_stop "control: the app could not create the branch $b on $REPO ($(evidence)), so the refusals prove nothing"
-  capture app_gh api -X PUT "repos/$REPO/contents/tests/frg26-probe-$(stamp).txt" -f message="FRG-26 A2 probe P5 control ($(stamp))" \
+  capture with_timeout "$(call_secs)" app_gh api -X PUT "repos/$REPO/contents/tests/frg26-probe-$(stamp).txt" -f message="FRG-26 A2 probe P5 control ($(stamp))" \
     -f content="$content" -f branch="$b" \
     || probe_stop "control: the app could not add a file to $b on $REPO ($(evidence)), so the refusals prove nothing"
   say "CONTROL P5: the app created the branch $b and a file on it, on $REPO"
@@ -2090,7 +2102,7 @@ probe_public() {
   probe_keep comment .id
   probe_reading P3 "a comment on issue #1"
   OBS_KEPT=""
-  ahead="$(owner_gh api "repos/$REPO2/compare/main...$A2_BRANCH" --jq .ahead_by 2>/dev/null)" || ahead=""
+  ahead="$(with_timeout "$(call_secs)" owner_gh api "repos/$REPO2/compare/main...$A2_BRANCH" --jq .ahead_by 2>/dev/null)" || ahead=""
   if [[ ! "$ahead" =~ ^[1-9][0-9]*$ ]]; then
     PROBE_FAILS=$((PROBE_FAILS + 1))
     OBS=not-tried

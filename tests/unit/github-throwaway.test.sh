@@ -3510,6 +3510,45 @@ test_the_clean_up_names_what_its_time_cap_left_out() {
   assert_not_contains "$(cat "$T_TMP/calls")" "DELETE" "a revocation after the cap"
 }
 
+# Round 55 (C1, SEC-1): every request a2-probe makes is bounded, not only the clean-up's, so a hang
+# can't keep a stop signal (deferred by bash until the request returns) from reaching the clean-up.
+test_every_request_of_a2_probe_is_bounded() {
+  local section bad
+  section="$(awk '/^# --- A2 investigation/ { on = 1 } on { print } on && /^cmd_a2_probe\(\)/ { c = 1 } c && /^}$/ { exit }' "$GT")"
+  [[ -n "$section" ]] || _t_fail "the a2-probe section was not found"
+  bad="$(printf '%s\n' "$section" | grep -E '(^|[^_a-z])(app_gh|owner_gh) ' | grep -vE '^[[:space:]]*#' | grep -v 'with_timeout' || true)"
+  assert_eq "$bad" "" "a request of a2-probe without a time limit"
+  # shellcheck disable=SC2016 # the literal source text is what's searched for
+  assert_contains "$(grep -A3 '^app_rate()' "$GT")" 'with_timeout "$(call_secs)" app_gh api rate_limit' "the allowance read"
+  # shellcheck disable=SC2016 # as above
+  assert_contains "$(grep -A3 '^jwt_call()' "$GT")" '--max-time "$CALL_SECS"' "the token request"
+}
+
+test_a_stop_signal_during_a_hung_request_reaches_the_clean_up_in_time() {
+  local out rc=0
+  out="$(/bin/bash -p -c 'source "$1"; WORK="$2"; cleanup() { echo "cleanup after $SECONDS s"; }; app_gh() { exec /bin/sleep 30; }; CLEANUP_DEADLINE=$(($(date +%s) + 3)); SECONDS=0; ( /bin/sleep 1; kill -TERM $$ ) & probe_attempt P3 -X POST repos/x/issues; echo continued' _ "$GT" "$T_TMP" 2>&1)" || rc=$?
+  assert_exit 143 "$rc"
+  assert_not_contains "$out" "continued"
+  local secs
+  secs="$(printf '%s\n' "$out" | sed -n 's/^cleanup after \([0-9]*\) s$/\1/p')"
+  [[ "$secs" =~ ^[0-9]+$ && $secs -le 5 ]] || _t_fail "the clean-up began after '${secs:-never}' s, not within the request's limit (3 s): $out"
+}
+
+# Round 55 (SEC-1): a stop revokes first; the stop's branch-and-tag comparison runs afterwards, in the
+# bounded clean-up.
+test_a_stop_revokes_before_it_reads_the_second_throwaways_branches() {
+  probe_stubs
+  probe_answer_first "app_gh tok2 api -i -X PUT repos/$REPO2/contents/|0|HTTP/2.0 201 Created\n\n{}"
+  local out rc=0 calls del refs
+  out="$(run_probe)" || rc=$?
+  assert_exit 1 "$rc" "a code change got through"
+  calls="$(cat "$T_TMP/calls")"
+  del="$(printf '%s\n' "$calls" | grep -n '^app_gh tok2 api -X DELETE installation/token$' | head -n 1 | cut -d: -f1)"
+  refs="$(printf '%s\n' "$calls" | grep -n 'matching-refs/heads' | tail -n 1 | cut -d: -f1)"
+  [[ -n "$del" && -n "$refs" && $del -lt $refs ]] || _t_fail "the stop read the branches (line ${refs:-none}) before revoking the token (line ${del:-none})"
+  assert_contains "$out" "REFS $REPO2 unchanged"
+}
+
 # Round 54 (C1): a read-back the time cap left out is a problem: the run can't end DONE.
 test_a_read_back_left_out_by_the_time_cap_is_a_problem() {
   probe_stubs

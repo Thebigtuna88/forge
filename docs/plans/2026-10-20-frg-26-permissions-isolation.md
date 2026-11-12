@@ -406,9 +406,12 @@ against the second throwaway:
 - The clean-up contract (owner-approved, 2026-11-12, after review round 52). However the run ends
   (its end, a stop, an error, Ctrl-C, closing the window, a kill), its clean-up runs to its end,
   ignoring further signals, for at most three minutes, each revocation and each check for at most
-  20 seconds. It revokes again every token issued to the run that no read has shown revoked, and
-  a read with it must get HTTP 401; it reads back each object made; it ends with one line naming
-  the tokens confirmed revoked and those not, never a token itself. Limits, accepted: a force-kill,
+  20 seconds. Every other request of the run has the same 20-second limit, so a stop reaches the
+  clean-up within 20 seconds. It revokes again every token issued to the run that no read has
+  shown revoked, and a read with it must get HTTP 401; after a stop it then compares the second
+  throwaway's branches and tags; it reads back each object made; it ends with one line naming the
+  tokens confirmed revoked and those not, describing each one not confirmed (GitHub's answer when
+  it was issued, whether its expiry was checked, what it reaches now), never a token itself. Limits, accepted: a force-kill,
   a power loss, or a revocation that fails or times out leaves a token unconfirmed. It may stay
   valid until its expiry and can do what the run shows the app's tokens can do (on the first
   throwaway, and on a public repository it isn't installed on, as in A2). A review finding that
