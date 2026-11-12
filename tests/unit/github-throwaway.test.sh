@@ -3136,10 +3136,10 @@ probe_stubs() {
     p="$(jq -c '.permissions // empty' "$3")"
     [[ -n "$p" ]] || p="$WANT_PERMS"
     LAST_HTTP=201
-    # GitHub issues each token for an hour: here it expires 59 minutes from now ($T_TMP/expires).
-    command date -u -v+59M +%Y-%m-%dT%H:%M:%SZ >"$T_TMP/expires"
+    # GitHub issues each token for an hour: here it expires 59 minutes from now ($T_TMP/expires-<n>).
+    command date -u -v+59M +%Y-%m-%dT%H:%M:%SZ >"$T_TMP/expires-$n"
     LAST_OUT="$(jq -n -c --arg t "$(printf 'gh%s_tok%s' s "$n")$(printf 'Q%.0s' $(seq 1 30))" --argjson p "$p" --arg r "$REPO" \
-      --arg e "$(cat "$T_TMP/expires")" \
+      --arg e "$(cat "$T_TMP/expires-$n")" \
       '{token: $t, expires_at: $e, repository_selection: "selected", permissions: $p, repositories: [{full_name: $r, id: 1}]}')"
     if [[ -f "$T_TMP/extra-$n" ]]; then LAST_OUT="$(jq -c "$(cat "$T_TMP/extra-$n")" <<<"$LAST_OUT")"; fi
   }
@@ -3230,8 +3230,8 @@ test_a2_probe_runs_each_attempt_with_its_own_token_and_keeps_what_got_through() 
   assert_eq "$(jq -S -c . "$T_TMP/request-2.json")" "{\"permissions\":$WANT_PERMS,\"repositories\":[\"$REPO_NAME\"]}" "the full token"
   assert_eq "$(jq -S -c . "$T_TMP/request-3.json")" "{\"permissions\":{\"contents\":\"write\",\"metadata\":\"read\"},\"repositories\":[\"$REPO_NAME\"]}" "P1's token: no Issues"
   assert_eq "$(jq -S -c . "$T_TMP/request-4.json")" "{\"permissions\":{\"metadata\":\"read\"},\"repositories\":[\"$REPO_NAME\"]}" "P2's token: metadata only"
-  assert_contains "$out" "TOKEN P1 issued: {\"expires_at\":\"$(cat "$T_TMP/expires")\",\"permissions\":{\"contents\":\"write\",\"metadata\":\"read\"},\"repositories\":[\"$REPO\"],\"repository_selection\":\"selected\"}"
-  assert_contains "$out" "TOKEN P1 expires $(cat "$T_TMP/expires"), in 5" "the expiry checked and shown"
+  assert_contains "$out" "TOKEN P1 issued: {\"expires_at\":\"$(cat "$T_TMP/expires-3")\",\"permissions\":{\"contents\":\"write\",\"metadata\":\"read\"},\"repositories\":[\"$REPO\"],\"repository_selection\":\"selected\"}"
+  assert_contains "$out" "TOKEN P1 expires $(cat "$T_TMP/expires-3"), in 5" "the expiry checked and shown"
   # Round 52 (owner): the tokens are named, confirmed or not, and never shown.
   assert_contains "$out" "TOKENS 4 issued; confirmed revoked: whole full P1 P2; NOT confirmed: none"
   assert_contains "$out" "TOKEN P2 reaches (GET /installation/repositories): $REPO"
@@ -3353,11 +3353,88 @@ test_a2_probe_reads_back_what_it_made_when_a_later_token_request_fails() {
   local out rc=0
   out="$(run_probe)" || rc=$?
   assert_exit 2 "$rc" "P1's token request refused"
-  assert_contains "$out" "GitHub refused the token request (HTTP 502)"
+  # Round 56 (C1, SEC-1): a 502 is no clear refusal: GitHub may have issued a token never received.
+  assert_contains "$out" "the token request got no complete answer (HTTP 502"
+  assert_contains "$out" "TOKEN P1 possibly issued, never received"
   assert_contains "$out" "KEPT comment 901"
   assert_contains "$out" "KEPT pr 3"
   assert_eq "$(printf '%s\n' "$out" | grep -c 'revoked: a read with it now gets HTTP 401')" 2 "the two tokens issued, both checked"
   assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "A2 PROBE: STOPPED by an error"
+  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "possibly issued, never received: P1"
+}
+
+# Round 56 (C1, SEC-1): how mint reads a token request that didn't end cleanly. The real jwt_call,
+# with a stand-in curl.
+mint_with_curl() { # <body> <curl's stderr> <http status> <curl's status>
+  load
+  APP_ID=123456
+  INSTALLATION_ID=77
+  WORK="$T_TMP/work"
+  mkdir -p "$WORK"
+  : >"$WORK/jwt.hdr"
+  : >"$T_TMP/app-gh.log"
+  CURL_BODY="$1" CURL_ERR="$2" CURL_HTTP="$3" CURL_RC="$4"
+  curl() { printf '%s' "$CURL_BODY"; [[ -z "$CURL_ERR" ]] || echo "$CURL_ERR" >&2; printf '\nHTTP %s' "$CURL_HTTP"; return "$CURL_RC"; }
+  app_gh() { echo "${TOKEN:0:8} $*" >>"$T_TMP/app-gh.log"; }
+}
+
+test_mint_takes_a_token_from_an_answer_whose_transfer_failed() {
+  local tok out rc=0
+  tok="$(new_token)"
+  mint_with_curl "{\"token\":\"$tok\",\"expires_at\":\"2026-11-12T12:00:00Z\",\"permissions\":{\"metadata\":\"read\"}}" "curl: (28) Operation timed out" 201 28
+  out="$(MINT_LABEL=P2; trap revoke_outstanding EXIT; mint '{"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}' narrowed '{"metadata":"read"}' 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a transfer that failed after the token arrived"
+  assert_contains "$out" "did not end cleanly"
+  assert_contains "$(cat "$T_TMP/app-gh.log")" "${tok:0:8} api -X DELETE installation/token" "the token that arrived was not revoked"
+  assert_not_contains "$out" "$tok" "the token printed"
+}
+
+test_mint_reports_a_token_request_with_no_complete_answer() {
+  local out rc=0
+  mint_with_curl "" "curl: (28) Operation timed out" 000 28
+  local before after
+  before="$(date +%s)"
+  out="$( (MINT_LABEL=P1; trap 'printf "unreceived=[%s]\n" "$UNRECEIVED"' EXIT; mint '{"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}' narrowed '{"metadata":"read"}') 2>&1)" || rc=$?
+  after="$(date +%s)"
+  assert_exit 2 "$rc" "no answer"
+  assert_contains "$out" "GitHub may have issued a token this run never received"
+  # Owner, round 56: the latest it can expire, conservatively: an hour after the request was sent,
+  # plus a minute.
+  local line deadline
+  line="$(printf '%s\n' "$out" | sed -n 's/^unreceived=\[P1 \([^ ]*\) .*/\1/p')"
+  deadline="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$line" +%s 2>/dev/null)" || deadline=""
+  [[ "$deadline" =~ ^[0-9]+$ && $deadline -ge $((before + 3660)) && $deadline -le $((after + 3660)) ]] \
+    || _t_fail "the recorded deadline '$line' is not the request time plus 61 minutes"
+  assert_contains "$out" "by $line at the latest" "the deadline in mint's message"
+  assert_contains "$out" 'unreceived=[P1 '"$line"' {"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}'
+  # Never asked again: one token request.
+  assert_eq "$(grep -c 'access_tokens' <<<"$(declare -f mint)")" 1 "mint asks for a token more than once"
+  # A clear refusal (4xx) issued nothing: not reported as possibly issued.
+  mint_with_curl '{"message":"Validation Failed"}' "" 422 0
+  rc=0
+  out="$(MINT_LABEL=P1; mint '{"permissions":{"metadata":"read"}}' narrowed '{"metadata":"read"}' 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a refusal"
+  assert_contains "$out" "GitHub refused the token request (HTTP 422)"
+  assert_not_contains "$out" "may have issued"
+}
+
+test_the_clean_up_reports_a_token_possibly_issued_and_never_received() {
+  probe_stubs
+  ISSUED=""
+  UNRECEIVED='P1 2026-11-12T13:01:00Z {"permissions":{"contents":"write","metadata":"read"},"repositories":["forge-frg26-throwaway"]}
+whole 2026-11-12T12:31:00Z {}
+'
+  PROBE_END=""
+  local out
+  out="$(probe_finish 2; echo "rc=$PROBE_RC"; echo "$PROBE_SUMMARY")"
+  assert_contains "$out" "TOKEN P1 possibly issued, never received"
+  assert_contains "$out" "it carries at most: repositories forge-frg26-throwaway; permissions {\"contents\":\"write\",\"metadata\":\"read\"}"
+  assert_contains "$out" "it expires by 2026-11-12T13:01:00Z at the latest"
+  assert_contains "$out" "TOKEN whole possibly issued, never received"
+  assert_contains "$out" "it carries at most: repositories every repository the installation is on; permissions the installation's $WANT_PERMS"
+  assert_contains "$out" "This run does not ask for it again"
+  assert_contains "$out" "possibly issued, never received: P1 whole"
+  assert_contains "$out" "rc=2"
 }
 
 # Round 47 (C1): a revocation GitHub didn't confirm is tried again on the way out, then checked.

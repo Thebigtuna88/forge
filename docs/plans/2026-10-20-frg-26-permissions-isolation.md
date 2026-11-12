@@ -416,6 +416,15 @@ against the second throwaway:
   valid until its expiry and can do what the run shows the app's tokens can do (on the first
   throwaway, and on a public repository it isn't installed on, as in A2). A review finding that
   fits these limits is recorded under them; any other is fixed.
+- A further limit, accepted by the owner (2026-11-12, review round 56) **for this throwaway
+  investigation only**: a token request that gets no complete answer (a timeout, a broken transfer,
+  a 5xx) may leave a token GitHub issued that the run never received. It can't be revoked or
+  checked from here. The run stops, never asks again, and names it as possibly issued and never
+  received, with the most it could carry (the requested repositories and permissions, or the
+  installation's for a request naming none) and the latest it can expire (an hour after the
+  request, plus a minute). A token that did arrive in an answer whose transfer then failed is
+  taken, revoked and checked like any other. This does **not** approve the same risk for the
+  production broker: it is assessed separately before stage 2.
 
 The proposed split of item 9 into 9a and 9b is not yet a claim: item 9 stays failed and unresolved,
 the remaining stage 1 handoffs stay paused, and the findings come to the owner with a

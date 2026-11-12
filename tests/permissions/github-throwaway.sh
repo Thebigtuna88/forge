@@ -98,6 +98,9 @@ PROBE_SUMMARY="" # a2-probe's last line, printed by the exit clean-up after ever
 PROBE_RC=""      # a2-probe's exit status, decided by the exit clean-up
 ISSUED=""        # label=token for every token GitHub issued to this run, kept or not
 ISSUED_META=""   # one line per token: label, then GitHub's answer when it was issued (no token)
+UNRECEIVED=""    # per token request with no complete answer: label, latest expiry, the request
+JWT_ERR=""
+JWT_RC=0
 MINT_LABEL=""    # the name mint gives the next token (a2-probe: whole full P1 P2)
 readonly CALL_SECS=20     # the longest a revocation or a check may take
 readonly CLEANUP_SECS=180 # the longest the whole clean-up may take
@@ -325,14 +328,21 @@ make_jwt() {
 }
 
 # A request as the app itself (with the JWT), for what only the app can ask: who it is, where it is
-# installed, a token. -q first: no ~/.curlrc. Sets LAST_OUT (the body) and LAST_HTTP; 1 unless 2xx.
+# installed, a token. -q first: no ~/.curlrc. Sets LAST_OUT (the body only), LAST_HTTP, JWT_ERR
+# (curl's own messages, kept apart so they can't spoil the body: round 56) and JWT_RC (curl's
+# status); 1 unless curl finished cleanly with a 2xx.
 jwt_call() { # <method> <path> [json body file]
   local args=(-q -sS --proto "=https" --max-time "$CALL_SECS" -X "$1" -H @"$WORK/jwt.hdr" -w '\nHTTP %{http_code}')
+  local out
   if [[ -n "${3:-}" ]]; then args+=(-H "Content-Type: application/json" --data-binary @"$3"); fi
-  capture curl "${args[@]}" "https://api.github.com/$2" || true
-  LAST_HTTP="$(printf '%s\n' "$LAST_OUT" | tail -n 1 | sed -n 's/^HTTP \([0-9][0-9][0-9]\)$/\1/p')"
-  LAST_OUT="$(printf '%s\n' "$LAST_OUT" | sed '$d')"
-  [[ "$LAST_HTTP" =~ ^2[0-9][0-9]$ ]]
+  JWT_RC=0
+  out="$(curl "${args[@]}" "https://api.github.com/$2" 2>"$WORK/jwt.err")" || JWT_RC=$?
+  LAST_HTTP="$(printf '%s\n' "$out" | tail -n 1 | sed -n 's/^HTTP \([0-9][0-9][0-9]\)$/\1/p')"
+  if [[ -n "$LAST_HTTP" ]]; then out="$(printf '%s\n' "$out" | sed '$d')"; fi
+  LAST_OUT="$(redact "$out")"
+  JWT_ERR="$(redact "$(tr '\n' ' ' <"$WORK/jwt.err" 2>/dev/null | cut -c1-200)")"
+  rm -f "$WORK/jwt.err"
+  [[ $JWT_RC -eq 0 && "$LAST_HTTP" =~ ^2[0-9][0-9]$ ]]
 }
 
 # The key must belong to the owner's app, which asks for exactly the four permissions, installed
@@ -374,12 +384,35 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
   local want="${3:-$WANT_PERMS}"
   MINT_ANSWER=""
   printf '%s\n' "$1" >"$WORK/token-request.json" || die "writing the token request failed"
-  jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" \
-    || die "GitHub refused the token request (HTTP ${LAST_HTTP:-none}): $(evidence)"
+  # Asked once, never again (owner, round 56): the time it was asked is the start of the latest
+  # deadline for a token that may have been issued.
+  local ok=0 asked
+  asked="$(date +%s)"
+  jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || ok=1
   local ans="$LAST_OUT" t perms sel repos
   LAST_OUT=""
+  # A token in the answer is taken whatever happened to the transfer (round 56, C1): GitHub may
+  # have issued it before the transfer failed. A whole quoted value only, never a cut one.
   t="$(jq -r '.token // empty' <<<"$ans" 2>/dev/null)" || t=""
-  [[ -n "$t" ]] || die "GitHub's answer holds no installation token"
+  if [[ -z "$t" ]]; then
+    t="$(printf '%s' "$ans" | grep -Eo '"token"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n 1 | sed -E 's/^"token"[[:space:]]*:[[:space:]]*"//; s/"$//')" || t=""
+  fi
+  if [[ -z "$t" ]]; then
+    # Only a clear refusal (4xx) says nothing was issued. Otherwise (a timeout, a broken transfer, a
+    # 5xx) GitHub may have issued a token this run never received (round 56, SEC-1): it is noted
+    # for the clean-up's report; it can't be revoked from here.
+    if [[ $ok -ne 0 && ! "$LAST_HTTP" =~ ^4[0-9][0-9]$ ]]; then
+      # GitHub issues a token for an hour; a token issued for this request expires an hour after the
+      # request at the latest (plus a minute for the clocks).
+      local by
+      by="$(date -u -r $((asked + 3660)) +%Y-%m-%dT%H:%M:%SZ)"
+      UNRECEIVED="$UNRECEIVED${MINT_LABEL:-token$((MINTED + 1))} $by $1
+"
+      die "the token request got no complete answer (HTTP ${LAST_HTTP:-none}${JWT_ERR:+, $JWT_ERR}): GitHub may have issued a token this run never received, which can't be revoked from here; if so it expires by $by at the latest. The run stops and does not ask again"
+    fi
+    [[ $ok -eq 0 ]] || die "GitHub refused the token request (HTTP ${LAST_HTTP:-none}): $(printf '%s' "$ans" | tail -n 3 | tr '\n\t' '  ' | cut -c1-240)"
+    die "GitHub's answer holds no installation token"
+  fi
   # Whatever GitHub issued is revoked if it isn't kept (round 31: the owner's run refused a real
   # token and left it working until it expired). GitHub's stateless format is ghs_APPID_JWT, about
   # 520 characters, base64url parts joined by dots (changelog 2026-04-24). The length is checked on
@@ -393,6 +426,10 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
   # refused below is still described if its revocation isn't confirmed (round 54, SEC-1).
   ISSUED_META="$ISSUED_META${MINT_LABEL:-token$MINTED} $(jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' <<<"$ans" 2>/dev/null || echo unreadable)
 "
+  if [[ $ok -ne 0 ]]; then
+    revoke_token || true
+    die "the token request did not end cleanly (HTTP ${LAST_HTTP:-none}${JWT_ERR:+, $JWT_ERR}), but its answer held a token: it was revoked, and the clean-up checks it"
+  fi
   if [[ ! "$t" =~ ^ghs_[A-Za-z0-9._-]+$ ]] || [[ ${#t} -lt 30 || ${#t} -gt 4096 ]]; then
     if revoke_token; then
       die "GitHub's answer holds a token in a form this script doesn't expect: it was revoked"
@@ -1781,12 +1818,17 @@ cmd_ptests() {
 #      revoked, and reads with it: only HTTP 401 confirms it;
 #   2. reads back by number each object an attempt made;
 #   3. ends with one line naming the tokens confirmed revoked and those not, never a token itself.
+# A token request with no complete answer (a timeout, a broken transfer, a 5xx) stops the run and is
+# reported as a token possibly issued and never received, with the most it could carry and the latest
+# it can expire; it can't be revoked from here, and the run never asks again (round 56: a limit the
+# owner accepted for this throwaway investigation only, not for the broker).
 # Each revocation and each read is given at most CALL_SECS, and never more than is left of the
 # clean-up's CLEANUP_SECS; the deadline is checked before each step; a step the time cap leaves out
 # is named as not done. A timeout stops the request's whole process tree (gh included). Every request
 # the run makes is bounded the same way (round 55), so a stop signal, which bash acts on only when
 # the request in progress returns, reaches the clean-up within CALL_SECS. Limits: a force-kill, a power loss, or a
-# revocation that fails or times out leaves a token unconfirmed. It may stay valid until its
+# revocation that fails or times out leaves a token unconfirmed, and a token request with no
+# complete answer may leave a token this run never received. It may stay valid until its
 # expires_at, printed when it was issued. What it can do is what its TOKEN lines show for the first
 # throwaway, plus what this run's readings show on a public repository it isn't installed on (A2).
 
@@ -1947,11 +1989,26 @@ probe_finish() {
       probe_describe "${e%%=*}" "$t"
     fi
   done
+  # A token GitHub may have issued but this run never received (round 56, SEC-1).
+  local line label by req repos perms unrec=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    label="${line%% *}" line="${line#* }"
+    by="${line%% *}" req="${line#* }"
+    unrec="$unrec $label"
+    # At most what was asked; a request that names none asks for the installation's.
+    repos="$(jq -r 'if .repositories then (.repositories | join(", ")) else empty end' <<<"$req" 2>/dev/null)" || repos=""
+    perms="$(jq -S -c '.permissions // empty' <<<"$req" 2>/dev/null)" || perms=""
+    # (Defaults set apart: bash 3.2 misreads an apostrophe inside a quoted ${x:-...}.)
+    [[ -n "$repos" ]] || repos="every repository the installation is on"
+    [[ -n "$perms" ]] || perms="the installation's $WANT_PERMS"
+    say "TOKEN $label possibly issued, never received: its request got no complete answer, so this run can't revoke or check it. If GitHub issued it, it carries at most: repositories $repos; permissions $perms; it expires by $by at the latest. This run does not ask for it again"
+  done <<<"$UNRECEIVED"
   say "TOKENS $MINTED issued; confirmed revoked:${yes:- none}; NOT confirmed:${no:- none}"
-  local tokens="$PROBE_REVOKED of $MINTED tokens revoked (confirmed)${no:+, NOT confirmed:$no}"
+  local tokens="$PROBE_REVOKED of $MINTED tokens revoked (confirmed)${no:+, NOT confirmed:$no}${unrec:+; possibly issued, never received:$unrec}"
   case "$PROBE_END" in
     done)
-      if [[ $PROBE_FAILS -eq 0 && -z "$no" ]]; then
+      if [[ $PROBE_FAILS -eq 0 && -z "$no" && -z "$unrec" ]]; then
         PROBE_SUMMARY="A2 PROBE: DONE: code changes refused (P5, controls ok, branches and tags unchanged); readings$PROBE_READINGS; $tokens"
         PROBE_RC=0
       else
