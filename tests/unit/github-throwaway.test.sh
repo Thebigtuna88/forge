@@ -3510,6 +3510,44 @@ test_the_clean_up_names_what_its_time_cap_left_out() {
   assert_not_contains "$(cat "$T_TMP/calls")" "DELETE" "a revocation after the cap"
 }
 
+# Round 54 (C1): a read-back the time cap left out is a problem: the run can't end DONE.
+test_a_read_back_left_out_by_the_time_cap_is_a_problem() {
+  probe_stubs
+  ISSUED=" whole=$(printf 'gh%s_tokA' s)"
+  PROBE_CONFIRMED=" $(printf 'gh%s_tokA' s)"
+  PROBE_REVOKED=1 MINTED=1
+  PROBE_MADE=" issue:42"
+  PROBE_END="done"
+  CLEANUP_DEADLINE=1
+  local out
+  out="$(probe_finish 0; echo "rc=$PROBE_RC"; echo "$PROBE_SUMMARY")"
+  assert_contains "$out" "KEPT issue 42: not read back"
+  assert_contains "$out" "rc=1"
+  assert_contains "$out" "A2 PROBE: DONE WITH 1 PROBLEM(S)"
+}
+
+# Round 54 (SEC-1): a token mint refused is still described when it isn't confirmed revoked:
+# GitHub's answer when it was issued (without the token), whether its expiry was checked, and what
+# it still reaches.
+test_an_unconfirmed_token_mint_refused_is_still_described() {
+  probe_stubs
+  echo '.permissions.issues = "write" | del(.expires_at)' >"$T_TMP/extra-3"
+  echo 99 >"$T_TMP/delete-fails-tok3"
+  local out rc=0
+  out="$(run_probe)" || rc=$?
+  assert_exit 2 "$rc" "P1's token refused by mint"
+  assert_contains "$out" "TOKEN P1 NOT confirmed revoked. When it was issued GitHub said: {\"expires_at\":null,\"permissions\":{\"contents\":\"write\",\"issues\":\"write\",\"metadata\":\"read\"}"
+  assert_contains "$out" "TOKEN P1 expiry checked within the hour: no"
+  assert_contains "$out" "TOKEN P1 still reaches (GET /installation/repositories): $REPO"
+  assert_not_contains "$out" "gh$(printf s)_tok" "a token printed"
+  # A confirmed one needs no description; one whose expiry was checked says so.
+  assert_not_contains "$out" "TOKEN whole NOT confirmed"
+  probe_stubs
+  echo 99 >"$T_TMP/delete-fails-tok2"
+  rc=0; out="$(run_probe)" || rc=$?
+  assert_contains "$out" "TOKEN full expiry checked within the hour: yes"
+}
+
 # The owner: each token's expiry is checked, not assumed.
 test_a2_probe_checks_each_tokens_expiry() {
   local name filter out rc

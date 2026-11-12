@@ -97,6 +97,7 @@ PROBE_ACTIVE="" # set while a2-probe runs: an error exit settles its tokens and 
 PROBE_SUMMARY="" # a2-probe's last line, printed by the exit clean-up after everything else
 PROBE_RC=""      # a2-probe's exit status, decided by the exit clean-up
 ISSUED=""        # label=token for every token GitHub issued to this run, kept or not
+ISSUED_META=""   # one line per token: label, then GitHub's answer when it was issued (no token)
 MINT_LABEL=""    # the name mint gives the next token (a2-probe: whole full P1 P2)
 readonly CALL_SECS=20     # the longest a revocation or a check may take
 readonly CLEANUP_SECS=180 # the longest the whole clean-up may take
@@ -388,6 +389,10 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
   OUTSTANDING="$OUTSTANDING $t"
   MINTED=$((MINTED + 1))
   ISSUED="$ISSUED ${MINT_LABEL:-token$MINTED}=$t"
+  # What GitHub said it issued (named fields only, no token), kept before any check, so a token
+  # refused below is still described if its revocation isn't confirmed (round 54, SEC-1).
+  ISSUED_META="$ISSUED_META${MINT_LABEL:-token$MINTED} $(jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' <<<"$ans" 2>/dev/null || echo unreadable)
+"
   if [[ ! "$t" =~ ^ghs_[A-Za-z0-9._-]+$ ]] || [[ ${#t} -lt 30 || ${#t} -gt 4096 ]]; then
     if revoke_token; then
       die "GitHub's answer holds a token in a form this script doesn't expect: it was revoked"
@@ -1793,6 +1798,7 @@ OBS_KEPT=""
 PROBE_REVOKED=0
 PROBE_CONFIRMED="" # tokens a read showed revoked (HTTP 401)
 PROBE_END=""       # done, or "STOPPED: <why>"; empty after an error or a signal
+PROBE_EXPIRY_OK="" # labels of the tokens whose expiry was checked within the hour
 REFS_BEFORE=""
 
 probe_stop() { # <why> — stop: the exit clean-up settles the tokens and reads back what was made
@@ -1867,6 +1873,7 @@ probe_token() { # <label> <request json> <narrowed|whole> <permissions json> —
     probe_stop "token $1's expiry '$exp' is not within the next hour, or could not be read"
   fi
   say "TOKEN $1 expires $exp, in $(((at - now) / 60)) minutes"
+  PROBE_EXPIRY_OK="$PROBE_EXPIRY_OK $1"
   local got
   got="$(app_gh api installation/repositories --paginate --jq '.repositories[].full_name' 2>&1)" || got="unreadable: $got"
   say "TOKEN $1 reaches (GET /installation/repositories): $(printf '%s' "$got" | tr '\n' ' ')"
@@ -1891,6 +1898,28 @@ revoke_confirmed() { # <label> — revoke the current token; a read with it afte
   fi
 }
 
+# A token not confirmed revoked, described for the owner without the token (round 54, SEC-1): what
+# GitHub said when it was issued, whether its expiry was checked within the hour, and what it
+# reaches now (a read with it, if the time cap allows).
+probe_describe() { # <label> <token>
+  local meta got
+  meta="$(printf '%s' "$ISSUED_META" | sed -n "s/^$1 //p" | head -n 1)"
+  say "TOKEN $1 NOT confirmed revoked. When it was issued GitHub said: ${meta:-nothing readable}"
+  if [[ " $PROBE_EXPIRY_OK " == *" $1 "* ]]; then
+    say "TOKEN $1 expiry checked within the hour: yes"
+  else
+    say "TOKEN $1 expiry checked within the hour: no (the run stopped before it was checked)"
+  fi
+  if ! in_time; then
+    say "TOKEN $1 reach not read: the clean-up's time cap (${CLEANUP_SECS}s) was reached"
+    return
+  fi
+  TOKEN="$2"
+  got="$(with_timeout "$(call_secs)" app_gh api installation/repositories --paginate --jq '.repositories[].full_name' 2>&1)" || got="unreadable: $got"
+  TOKEN=""
+  say "TOKEN $1 still reaches (GET /installation/repositories): $(printf '%s' "$got" | tr '\n' ' ')"
+}
+
 # The end of every a2-probe run, from the exit clean-up: settle the tokens, read back, and the
 # summary and status. <status> is the one the run stopped with.
 probe_finish() {
@@ -1899,7 +1928,12 @@ probe_finish() {
   probe_read_back
   for e in $ISSUED; do
     t="${e#*=}"
-    if [[ " $PROBE_CONFIRMED " == *" $t "* ]]; then yes="$yes ${e%%=*}"; else no="$no ${e%%=*}"; fi
+    if [[ " $PROBE_CONFIRMED " == *" $t "* ]]; then
+      yes="$yes ${e%%=*}"
+    else
+      no="$no ${e%%=*}"
+      probe_describe "${e%%=*}" "$t"
+    fi
   done
   say "TOKENS $MINTED issued; confirmed revoked:${yes:- none}; NOT confirmed:${no:- none}"
   local tokens="$PROBE_REVOKED of $MINTED tokens revoked (confirmed)${no:+, NOT confirmed:$no}"
@@ -1986,6 +2020,8 @@ probe_read_back() { # each object an attempt created, as the owner reads it by i
   for m in $PROBE_MADE; do
     kind="${m%%:*}" n="${m#*:}"
     if ! in_time; then
+      # Not verified, so the run can't pass (round 54, C1).
+      PROBE_FAILS=$((PROBE_FAILS + 1))
       say "KEPT $kind $n: not read back, the clean-up's time cap (${CLEANUP_SECS}s) was reached; look on $REPO2 for it"
       continue
     fi
