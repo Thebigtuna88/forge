@@ -380,67 +380,77 @@ need_app_identity() {
   [[ "$INSTALLATION_ID" =~ ^[0-9]+$ ]] || die "unexpected installation id"
 }
 
+# The one token request (round 60, C1: mint, key-check and suspend-check all use it), with every
+# safeguard the clean-up relies on. Asked once, never again (owner, round 56). GitHub issues a token
+# for an hour, so one issued for it expires an hour after it is sent at the latest (plus a minute
+# for the clocks): REQ_BY. It is recorded as pending before it is sent, so a signal while it is out
+# still reaches the clean-up's report (round 57, C1). Catchable signals are held from before it is
+# sent until a token its answer brings is registered (rounds 58, 59): a signal while it is out is
+# acted on once the answer is in hand (curl stops by CALL_SECS), so a token that arrived is always
+# registered (TOKEN, OUTSTANDING, MINTED, ISSUED, ISSUED_META) and then revoked and checked. A token
+# is taken from the answer whatever happened to the transfer (round 56, C1), a whole quoted value
+# only, never a cut one. An answer without one that isn't a clear refusal (4xx) - a timeout, a broken
+# transfer, a 5xx, a 2xx without a readable token (round 57, C2) - may mean a token this run never
+# received: it goes to UNRECEIVED for the clean-up's report (round 56, SEC-1). Never dies once the
+# request is sent. Sets REQ_OK (0 when curl finished cleanly with a 2xx), REQ_ANSWER (the body),
+# REQ_TOKEN (yes|no), REQ_UNRECEIVED (yes|no) and REQ_BY.
+request_token() { # <request json>
+  local t meta label
+  REQ_OK=0 REQ_TOKEN=no REQ_UNRECEIVED=no REQ_ANSWER=""
+  printf '%s\n' "$1" >"$WORK/token-request.json" || die "writing the token request failed"
+  REQ_BY="$(date -u -r $(($(date +%s) + 3660)) +%Y-%m-%dT%H:%M:%SZ)"
+  label="${MINT_LABEL:-token$((MINTED + 1))}"
+  defer_signals
+  PENDING_MINT="$label $REQ_BY $1"
+  jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || REQ_OK=1
+  REQ_ANSWER="$LAST_OUT"
+  LAST_OUT=""
+  t="$(jq -r '.token // empty' <<<"$REQ_ANSWER" 2>/dev/null)" || t=""
+  if [[ -z "$t" ]]; then
+    t="$(printf '%s' "$REQ_ANSWER" | grep -Eo '"token"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n 1 | sed -E 's/^"token"[[:space:]]*:[[:space:]]*"//; s/"$//')" || t=""
+  fi
+  if [[ -n "$t" ]]; then
+    # On the exit list before it is judged, so a failed revocation is tried again on exit (round 32,
+    # C1); what GitHub said it issued (named fields only, no token) kept too, so a token refused
+    # later is still described if its revocation isn't confirmed (round 54, SEC-1).
+    meta="$(jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' <<<"$REQ_ANSWER" 2>/dev/null || echo unreadable)"
+    TOKEN="$t"
+    OUTSTANDING="$OUTSTANDING $t"
+    MINTED=$((MINTED + 1))
+    ISSUED="$ISSUED $label=$t"
+    ISSUED_META="$ISSUED_META$label $meta
+"
+    REQ_TOKEN=yes
+  elif [[ ! "$LAST_HTTP" =~ ^4[0-9][0-9]$ ]]; then
+    UNRECEIVED="$UNRECEIVED$PENDING_MINT
+"
+    REQ_UNRECEIVED=yes
+  fi
+  # The pending record goes only once the token is registered or the answer settled.
+  PENDING_MINT=""
+  resume_signals
+}
+
 # Asks GitHub for an installation token and keeps it only if GitHub issued exactly what was asked:
 # the permissions (the four unless a probe asks for fewer), selected repositories, and (narrowed)
 # only the throwaway. Anything more is revoked at once (plan 4.2 step 3). MINT_ANSWER keeps what
 # GitHub said it issued, without the token.
 mint() { # <request json> <narrowed|whole> [permissions json, sorted]
-  local want="${3:-$WANT_PERMS}"
+  local want="${3:-$WANT_PERMS}" ans t perms sel repos ok
   MINT_ANSWER=""
-  printf '%s\n' "$1" >"$WORK/token-request.json" || die "writing the token request failed"
-  # Asked once, never again (owner, round 56). GitHub issues a token for an hour, so one issued for
-  # this request expires an hour after it is sent at the latest (plus a minute for the clocks). The
-  # request is recorded as pending before it is sent, so a signal while it is out still reaches the
-  # clean-up's report (round 57, C1); it is cleared once the answer is settled. Catchable signals
-  # are held from here until a token the answer brings is registered (round 59, C1, SEC-1): a signal
-  # while the request is out is acted on once its answer is in hand (curl stops by CALL_SECS), so a
-  # token that arrived is always revoked and checked, never taken for one never received.
-  local ok=0 by
-  by="$(date -u -r $(($(date +%s) + 3660)) +%Y-%m-%dT%H:%M:%SZ)"
-  defer_signals
-  PENDING_MINT="${MINT_LABEL:-token$((MINTED + 1))} $by $1"
-  jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || ok=1
-  local ans="$LAST_OUT" t perms sel repos
-  LAST_OUT=""
-  # A token in the answer is taken whatever happened to the transfer (round 56, C1): GitHub may
-  # have issued it before the transfer failed. A whole quoted value only, never a cut one.
-  t="$(jq -r '.token // empty' <<<"$ans" 2>/dev/null)" || t=""
-  if [[ -z "$t" ]]; then
-    t="$(printf '%s' "$ans" | grep -Eo '"token"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n 1 | sed -E 's/^"token"[[:space:]]*:[[:space:]]*"//; s/"$//')" || t=""
-  fi
-  if [[ -z "$t" ]]; then
-    # Only a clear refusal (4xx) says nothing was issued. Otherwise (a timeout, a broken transfer, a
-    # 5xx, or a 2xx without a readable token: round 57, C2) GitHub may have issued a token this run
-    # never received (round 56, SEC-1): it goes to the clean-up's report; it can't be revoked here.
-    if [[ ! "$LAST_HTTP" =~ ^4[0-9][0-9]$ ]]; then
-      UNRECEIVED="$UNRECEIVED$PENDING_MINT
-"
-      PENDING_MINT=""
-      die "the token request got no usable answer (HTTP ${LAST_HTTP:-none}${JWT_ERR:+, $JWT_ERR}): it holds no installation token, but GitHub may have issued one this run never received, which can't be revoked from here; if so it expires by $by at the latest. The run stops and does not ask again"
+  request_token "$1"
+  ans="$REQ_ANSWER" ok="$REQ_OK"
+  if [[ "$REQ_TOKEN" == no ]]; then
+    if [[ "$REQ_UNRECEIVED" == yes ]]; then
+      die "the token request got no usable answer (HTTP ${LAST_HTTP:-none}${JWT_ERR:+, $JWT_ERR}): it holds no installation token, but GitHub may have issued one this run never received, which can't be revoked from here; if so it expires by $REQ_BY at the latest. The run stops and does not ask again"
     fi
-    PENDING_MINT=""
     die "GitHub refused the token request (HTTP $LAST_HTTP): $(printf '%s' "$ans" | tail -n 3 | tr '\n\t' '  ' | cut -c1-240)"
   fi
   # Whatever GitHub issued is revoked if it isn't kept (round 31: the owner's run refused a real
   # token and left it working until it expired). GitHub's stateless format is ghs_APPID_JWT, about
   # 520 characters, base64url parts joined by dots (changelog 2026-04-24). The length is checked on
-  # its own: macOS regex allows at most 255 repeats. It is on the exit list before it is judged, so a
-  # failed revocation is tried again on exit (round 32, C1).
-  # What GitHub said it issued (named fields only, no token) is kept too, so a token refused below
-  # is still described if its revocation isn't confirmed (round 54, SEC-1). The registration is
-  # whole or not begun when the clean-up sees it: signals are still held (round 58, C1, SEC-1), and
-  # the pending record goes only once the token is registered.
-  local meta label
-  meta="$(jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' <<<"$ans" 2>/dev/null || echo unreadable)"
-  label="${MINT_LABEL:-token$((MINTED + 1))}"
-  TOKEN="$t"
-  OUTSTANDING="$OUTSTANDING $t"
-  MINTED=$((MINTED + 1))
-  ISSUED="$ISSUED $label=$t"
-  ISSUED_META="$ISSUED_META$label $meta
-"
-  PENDING_MINT=""
-  resume_signals
+  # its own: macOS regex allows at most 255 repeats.
+  t="$TOKEN"
   if [[ $ok -ne 0 ]]; then
     # What happened, never more (round 57, C3, SEC-2).
     if revoke_token; then
@@ -2071,16 +2081,22 @@ probe_finish() {
 }
 
 # An attempt as the app, with GitHub's whole answer kept, headers too (X-Accepted-GitHub-Permissions
-# names the permission GitHub wanted). Sets OBS.
-probe_attempt() { # <label> <gh api args…>
-  local label="$1"
-  shift
+# names the permission GitHub wanted). Sets OBS. <kind> <jq path> name the object an allowed attempt
+# makes (- - for none). Catchable signals are held from before the request until its answer is shown
+# and the object recorded (round 60, SEC-1), so a signal as it succeeds loses neither.
+probe_attempt() { # <label> <kind|-> <jq path|-> <gh api args…>
+  local label="$1" kind="$2" path="$3"
+  shift 3
   local status
+  defer_signals
   capture with_timeout "$(call_secs)" app_gh api -i "$@" || true
   OBS="$(classify_api)"
   if [[ $LAST_RC -eq 0 ]]; then status="$(printf '%s\n' "$LAST_OUT" | head -n 1 | tr -d '\r')"; else status="$(http_of)"; fi
   say "ATTEMPT $label (token $PROBE_LABEL): $OBS ($status); GitHub's answer:"
   printf '%s\n' "$LAST_OUT" | tr -d '\r' | sed 's/^/    /'
+  OBS_KEPT=""
+  if [[ "$kind" != - ]]; then probe_keep "$kind" "$path"; fi
+  resume_signals
 }
 
 probe_keep() { # <kind> <jq path> — after an allowed attempt, note the object by the number GitHub returned
@@ -2160,18 +2176,20 @@ probe_code() {
   dev="$(with_timeout "$(call_secs)" owner_gh api "repos/$REPO/branches/dev" --jq .commit.sha 2>/dev/null)" || dev=""
   [[ "$dev" =~ ^[0-9a-f]{40}$ ]] || probe_stop "can't read $REPO's dev"
   content="$(printf 'FRG-26 A2 probe P5\n' | base64 | tr -d '\n')"
-  probe_attempt "P5 file" -X PUT "repos/$REPO2/contents/frg26-probe-$(stamp).txt" -f message="FRG-26 A2 probe P5 ($(stamp))" \
+  probe_attempt "P5 file" - - -X PUT "repos/$REPO2/contents/frg26-probe-$(stamp).txt" -f message="FRG-26 A2 probe P5 ($(stamp))" \
     -f content="$content" -f branch="$A2_BRANCH"
   probe_code_judge "P5 file"
-  probe_attempt "P5 branch" -X POST "repos/$REPO2/git/refs" -f ref="refs/heads/frg26-probe-$(stamp)" -f sha="$main2"
+  probe_attempt "P5 branch" - - -X POST "repos/$REPO2/git/refs" -f ref="refs/heads/frg26-probe-$(stamp)" -f sha="$main2"
   probe_code_judge "P5 branch"
   b="frg26/probe/P5-$(stamp)"
+  defer_signals
   capture with_timeout "$(call_secs)" app_gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$b" -f sha="$dev" \
     || probe_stop "control: the app could not create the branch $b on $REPO ($(evidence)), so the refusals prove nothing"
   capture with_timeout "$(call_secs)" app_gh api -X PUT "repos/$REPO/contents/tests/frg26-probe-$(stamp).txt" -f message="FRG-26 A2 probe P5 control ($(stamp))" \
     -f content="$content" -f branch="$b" \
     || probe_stop "control: the app could not add a file to $b on $REPO ($(evidence)), so the refusals prove nothing"
   say "CONTROL P5: the app created the branch $b and a file on it, on $REPO"
+  resume_signals
   probe_refs_same || probe_stop "$REPO2's branches or tags changed"
   say "RESULT P5 code changes refused: a file and a branch on $REPO2; controls ok; its branches and tags unchanged"
 }
@@ -2185,20 +2203,16 @@ probe_code_judge() { # <label>
 }
 
 probe_issue() { # <id> <what the token is> — an issue on the second throwaway, with the current token
-  OBS_KEPT=""
-  probe_attempt "$1" -X POST "repos/$REPO2/issues" -f title="FRG-26 A2 probe $1 ($(stamp))" \
+  probe_attempt "$1" issue .number -X POST "repos/$REPO2/issues" -f title="FRG-26 A2 probe $1 ($(stamp))" \
     -f body="FRG-26 throwaway: an issue by the app, investigating test A2. Kept as evidence; safe to delete with the repository."
-  probe_keep issue .number
   probe_reading "$1" "an issue, with a token $2"
 }
 
 # P3, P4 (claim 9b), with the full token: a comment on A2's issue #1, and a PR. Readings.
 probe_public() {
   local ahead
-  OBS_KEPT=""
-  probe_attempt P3 -X POST "repos/$REPO2/issues/1/comments" \
+  probe_attempt P3 comment .id -X POST "repos/$REPO2/issues/1/comments" \
     -f body="FRG-26 throwaway: a comment by the app, investigating test A2 ($(stamp)). Kept as evidence."
-  probe_keep comment .id
   probe_reading P3 "a comment on issue #1"
   OBS_KEPT=""
   ahead="$(with_timeout "$(call_secs)" owner_gh api "repos/$REPO2/compare/main...$A2_BRANCH" --jq .ahead_by 2>/dev/null)" || ahead=""
@@ -2209,9 +2223,8 @@ probe_public() {
     PROBE_READINGS="$PROBE_READINGS P4=not-tried"
     return 0
   fi
-  probe_attempt P4 -X POST "repos/$REPO2/pulls" -f title="FRG-26 A2 probe P4 ($(stamp))" -f head="$A2_BRANCH" -f base=main \
+  probe_attempt P4 pr .number -X POST "repos/$REPO2/pulls" -f title="FRG-26 A2 probe P4 ($(stamp))" -f head="$A2_BRANCH" -f base=main \
     -f body="FRG-26 throwaway: a PR by the app, investigating test A2. Kept as evidence; never merge."
-  probe_keep pr .number
   probe_reading P4 "a PR from $A2_BRANCH into main"
 }
 
@@ -2782,20 +2795,21 @@ cmd_key_check() {
   # A9 (round 19, C2): a token request signed with the deleted key must be refused; the control is
   # the same request signed with the new key, whose token is then revoked.
   jwt_with "$old"
-  printf '%s\n' "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}" >"$WORK/token-request.json" \
-    || die "writing the token request failed"
-  jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || true
-  local obs=inconclusive old_http="$LAST_HTTP" t
+  # Through request_token, with its safeguards (round 60, C1).
+  request_token "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}"
+  local obs=inconclusive old_http="$LAST_HTTP"
   case "$old_http" in
-    2*)
-      obs=allowed
-      # Whatever GitHub issued, in any form, is revoked (round 33, C1).
-      t="$(jq -r '.token // empty' <<<"$LAST_OUT" 2>/dev/null)" || t=""
-      if [[ -n "$t" ]]; then TOKEN="$t"; OUTSTANDING="$OUTSTANDING $t"; revoke_token; fi
-      ;;
+    2*) obs=allowed ;;
     401) obs=refused ;;
   esac
-  LAST_OUT=""
+  # Whatever GitHub issued, in any form, is revoked (round 33, C1), whatever the answer's status.
+  if [[ "$REQ_TOKEN" == yes ]]; then
+    obs=allowed
+    revoke_token || true
+  fi
+  if [[ "$REQ_UNRECEIVED" == yes ]]; then
+    say "note: the request signed with the deleted key got no usable answer: GitHub may have issued a token this run never received; if so it expires by $REQ_BY at the latest"
+  fi
   make_jwt
   local ctl=failed
   if control_token mint_token; then ctl=ok; fi
@@ -2832,19 +2846,19 @@ cmd_suspend_check() {
   state_set E1 "pending HTTP-none" || die "can't write $STATE, where this step's observation is kept"
   state_set E1_HELD pending || die "can't write $STATE, where this step's observation is kept"
   state_set E1_AFTER none || die "can't write $STATE, where this step's observation is kept"
-  printf '%s\n' "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}" >"$WORK/token-request.json"
-  jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || true
+  # Through request_token, with its safeguards (round 60, C1): a token it brings is on the exit
+  # clean-up's list before it is revoked, so a failed revocation is tried again (round 27, SEC-1).
+  request_token "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}"
   local obs=inconclusive
-  if [[ "$LAST_HTTP" =~ ^2 ]]; then
-    obs=allowed
-    # On the exit clean-up's list before it is revoked, so a failed revocation is tried again
-    # (round 27, SEC-1; as key-check does).
-    local t
-    t="$(jq -r '.token // empty' <<<"$LAST_OUT" 2>/dev/null)" || t=""
-    LAST_OUT=""
+  if [[ "$REQ_TOKEN" == yes ]]; then
     # Whatever GitHub issued, in any form (round 33, C1).
-    if [[ -n "$t" ]]; then TOKEN="$t"; OUTSTANDING="$OUTSTANDING $t"; revoke_token; fi
-  elif [[ "$LAST_HTTP" =~ ^(401|403|404)$ ]] && ! grep -Eiq 'rate limit|abuse detection' <<<"$LAST_OUT"; then obs=refused
+    obs=allowed
+    revoke_token || true
+  elif [[ "$LAST_HTTP" =~ ^2 ]]; then obs=allowed
+  elif [[ "$LAST_HTTP" =~ ^(401|403|404)$ ]] && ! grep -Eiq 'rate limit|abuse detection' <<<"$REQ_ANSWER"; then obs=refused
+  fi
+  if [[ "$REQ_UNRECEIVED" == yes ]]; then
+    say "note: the token request got no usable answer: GitHub may have issued a token this run never received; if so it expires by $REQ_BY at the latest"
   fi
   state_set E1 "$obs HTTP-${LAST_HTTP:-none}" || die "can't store this step's observation in $STATE: run it again"
   use_held suspend

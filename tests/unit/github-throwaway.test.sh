@@ -3407,8 +3407,9 @@ test_mint_reports_a_token_request_with_no_complete_answer() {
     || _t_fail "the recorded deadline '$line' is not the request time plus 61 minutes"
   assert_contains "$out" "by $line at the latest" "the deadline in mint's message"
   assert_contains "$out" 'unreceived=[P1 '"$line"' {"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}'
-  # Never asked again: one token request.
-  assert_eq "$(grep -c 'access_tokens' <<<"$(declare -f mint)")" 1 "mint asks for a token more than once"
+  # Never asked again: one token request, in request_token, which mint calls once (round 60).
+  assert_eq "$(grep -c 'access_tokens' <<<"$(declare -f request_token)")" 1 "request_token asks for a token more than once"
+  assert_eq "$(grep -c 'request_token' <<<"$(declare -f mint)")" 1 "mint asks for a token more than once"
   # A clear refusal (4xx) issued nothing: not reported as possibly issued.
   mint_with_curl '{"message":"Validation Failed"}' "" 422 0
   rc=0
@@ -3435,10 +3436,10 @@ test_a_signal_during_token_registration_waits_until_it_is_whole() {
   out="$(/bin/bash -p -c 'source "$1"; cleanup() { :; }; defer_signals; resume_signals; echo after' _ "$GT" 2>&1)" || rc=$?
   assert_exit 0 "$rc" "no signal"
   assert_contains "$out" "after"
-  # In mint, everything from before the request is sent to the token's registration is inside
-  # (round 59: the answer is in hand from the moment curl returns).
+  # In request_token (the one token request, round 60), everything from before the request is sent
+  # to the token's registration is inside (round 59: the answer is in hand once curl returns).
   local body
-  body="$(declare -f mint 2>/dev/null || (source "$GT"; declare -f mint))"
+  body="$(source "$GT"; declare -f request_token)"
   body="$(printf '%s\n' "$body" | awk '/defer_signals/ { on = 1 } on { print } /resume_signals/ { exit }')"
   assert_contains "$body" "jwt_call POST" "the token request outside the deferred section"
   # shellcheck disable=SC2016 # the literal source text is what's searched for
@@ -3478,6 +3479,55 @@ test_a_signal_while_a_token_request_is_out_still_revokes_the_token_it_brings() {
   assert_contains "$out" "TOKEN P1 revoked: a read with it now gets HTTP 401"
   assert_not_contains "$out" "possibly issued"
   assert_not_contains "$out" "$(printf "gh%s_" s)QQQQ" "a token printed"
+}
+
+# Round 60 (C1): every command asks for a token through request_token, with all its safeguards
+# (key-check and suspend-check had their own request).
+test_every_token_request_goes_through_request_token() {
+  local n
+  n="$(grep -c 'access_tokens' "$GT")"
+  assert_eq "$n" 1 "token requests in the script"
+  assert_contains "$(source "$GT"; declare -f request_token)" "access_tokens" "the one request is not in request_token"
+  assert_contains "$(source "$GT"; declare -f cmd_key_check)" "request_token" "key-check"
+  assert_contains "$(source "$GT"; declare -f cmd_suspend_check)" "request_token" "suspend-check"
+  assert_contains "$(source "$GT"; declare -f mint)" "request_token" "mint"
+}
+
+# Round 60 (C1): suspend-check, given an answer whose transfer failed after a whole token, revokes it.
+test_suspend_check_revokes_a_token_from_a_broken_answer() {
+  held_stubs
+  local tok
+  tok="$(new_token)"
+  make_jwt() { JWT=x; }
+  jwt_call() {
+    case "$1 $2" in
+      "GET app/installations"*) LAST_HTTP=200; LAST_OUT='[{"id":77,"account":{"login":"Thebigtuna88"},"suspended_at":"2026-11-12T00:00:00Z"}]' ;;
+      "POST app/installations/77/access_tokens") LAST_HTTP=201; LAST_OUT="{\"token\":\"$tok\",\"expires_at\":"; JWT_ERR="curl: (28) Operation timed out"; return 1 ;;
+    esac
+  }
+  app_gh() { echo "${TOKEN:0:8} $*" >>"$T_TMP/app-gh.log"; echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  : >"$T_TMP/app-gh.log"
+  local out
+  out="$(cmd_suspend_check 2>&1)" || true
+  assert_contains "$(cat "$T_TMP/app-gh.log")" "${tok:0:8} api -X DELETE installation/token" "the token in the broken answer was not revoked"
+  assert_not_contains "$out" "$tok" "the token printed"
+}
+
+# Round 60 (SEC-1): a signal as an attempt succeeds waits until GitHub's answer is shown and the
+# object it made is recorded, so the clean-up still reads it back.
+test_a_signal_as_an_attempt_succeeds_keeps_the_object_it_made() {
+  local out rc=0
+  out="$(/bin/bash -p -c '
+    source "$1"; WORK="$2"
+    cleanup() { echo "EXIT: PROBE_MADE=[$PROBE_MADE]"; }
+    with_timeout() { shift; "$@"; }
+    app_gh() { kill -TERM $$; printf "HTTP/2.0 201 Created\n\n{\"number\":42}\n"; }
+    probe_issue P1 "without Issues"
+    echo continued' _ "$GT" "$T_TMP" 2>&1)" || rc=$?
+  assert_exit 143 "$rc"
+  assert_contains "$out" "EXIT: PROBE_MADE=[ issue:42]"
+  assert_contains "$out" '{"number":42}' "GitHub's answer not shown"
+  assert_not_contains "$out" "continued"
 }
 
 # Round 58 (C2): only HTTP 401 confirms a revocation, not the words "Bad credentials".
