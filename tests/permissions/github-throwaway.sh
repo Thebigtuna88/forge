@@ -95,6 +95,12 @@ OUTSTANDING=""
 MINTED=0 # tokens GitHub issued to this run, kept or not
 PROBE_ACTIVE="" # set while a2-probe runs: an error exit settles its tokens and reads back its objects
 PROBE_SUMMARY="" # a2-probe's last line, printed by the exit clean-up after everything else
+PROBE_RC=""      # a2-probe's exit status, decided by the exit clean-up
+ISSUED=""        # label=token for every token GitHub issued to this run, kept or not
+MINT_LABEL=""    # the name mint gives the next token (a2-probe: whole full P1 P2)
+readonly CALL_SECS=20     # the longest a revocation or a check may take
+readonly CLEANUP_SECS=180 # the longest the whole clean-up may take
+CLEANUP_DEADLINE=""
 LAST_HTTP=""
 WORK=""
 CLONE=""
@@ -129,6 +135,11 @@ CANCEL_ON_EXIT=""
 
 cleanup() {
   local rc=$?
+  # Once the clean-up starts it runs to its end: a second Ctrl-C, closing the window or a kill no
+  # longer stops it (round 52, owner-approved). It is bounded in time instead: each revocation and
+  # each check is given at most CALL_SECS, and the whole clean-up at most CLEANUP_SECS.
+  trap '' HUP INT TERM
+  CLEANUP_DEADLINE=$(($(date +%s) + CLEANUP_SECS))
   if [[ -n "$SWEEP_ON_EXIT" ]]; then
     SWEEP_ON_EXIT=""
     say "PHASE $PHASE: STOPPED by an error (status $rc); closing the open test PRs"
@@ -139,24 +150,24 @@ cleanup() {
     CANCEL_ON_EXIT=""
     cancel_waiting_runs || true
   fi
-  # a2-probe stopped by an error (die, or bash stopping): its tokens are settled and checked, and
-  # what it made is read back, as on its own ways out (round 47, C1, C2, SEC-1).
+  # Every way out of a2-probe ends here: its tokens are settled and checked, what it made is read
+  # back, and its result decides the exit status (rounds 47, 52).
   if [[ -n "$PROBE_ACTIVE" ]]; then
     PROBE_ACTIVE=""
-    probe_settle_tokens
-    probe_read_back
-    PROBE_SUMMARY="A2 PROBE: STOPPED by an error (status $rc), see above; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
+    probe_finish "$rc"
   fi
   revoke_outstanding
   if [[ -n "$HELD_LOCKED" ]]; then rmdir "$HELD.lock" 2>/dev/null || true; HELD_LOCKED=""; fi
   if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf "$WORK"; fi
   # a2-probe's summary is the last line, which the owner's handoff result shows (round 48).
   if [[ -n "$PROBE_SUMMARY" ]]; then say "$PROBE_SUMMARY"; fi
+  if [[ -n "$PROBE_RC" ]]; then exit "$PROBE_RC"; fi
 }
 trap cleanup EXIT
 # Closing the Terminal, Ctrl-C or a kill also end through cleanup, with the usual status (round 51,
 # SEC-1): an explicit exit, so it holds whatever the signal finds bash doing. A force-kill (KILL)
-# or a power loss can't be caught: a token not revoked then expires within an hour of its issue.
+# or a power loss can't be caught: a token not revoked then stays valid until it expires (GitHub
+# issues each for at most an hour).
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -376,6 +387,7 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
   TOKEN="$t"
   OUTSTANDING="$OUTSTANDING $t"
   MINTED=$((MINTED + 1))
+  ISSUED="$ISSUED ${MINT_LABEL:-token$MINTED}=$t"
   if [[ ! "$t" =~ ^ghs_[A-Za-z0-9._-]+$ ]] || [[ ${#t} -lt 30 || ${#t} -gt 4096 ]]; then
     if revoke_token; then
       die "GitHub's answer holds a token in a form this script doesn't expect: it was revoked"
@@ -411,13 +423,41 @@ revoke_token() { # DELETE /installation/token, which GitHub documents as stoppin
   # (for stateless tokens Unconfirmed until A5, plan 4.3); 1 if GitHub didn't confirm it
   [[ -n "$TOKEN" ]] || return 0
   local rc=0
-  app_gh api -X DELETE installation/token >/dev/null 2>&1 || rc=$?
-  if [[ $rc -ne 0 ]]; then say "note: revoking a token failed; GitHub expires it within an hour"; fi
+  # A network hang can't hold it: at most CALL_SECS (round 52, owner-approved).
+  with_timeout "$CALL_SECS" app_gh api -X DELETE installation/token >/dev/null 2>&1 || rc=$?
+  if [[ $rc -ne 0 ]]; then say "note: revoking a token failed or timed out; GitHub expires it within an hour"; fi
   REVOKED_TOKENS="$REVOKED_TOKENS $TOKEN"
   # Only a confirmed revocation leaves the list: a failed one is tried again on exit (round 26).
   if [[ $rc -eq 0 ]]; then outstanding_drop "$TOKEN"; fi
   TOKEN=""
   return $rc
+}
+
+# Runs a command for at most <seconds>; 124 if it was stopped. The watchdog writes nowhere, so a
+# command substitution around this never waits for it. KILL, not TERM: the clean-up ignores TERM,
+# and a command it starts inherits that.
+with_timeout() { # <seconds> <command…>
+  local secs="$1" pid w rc=0
+  shift
+  "$@" &
+  pid=$!
+  (
+    sleep "$secs"
+    kill -KILL "$pid" 2>/dev/null && echo stopped >"${WORK:-${TMPDIR:-/tmp}}/timeout-$pid"
+  ) </dev/null >/dev/null 2>&1 &
+  w=$!
+  wait "$pid" || rc=$?
+  kill -KILL "$w" 2>/dev/null
+  wait "$w" 2>/dev/null
+  if [[ -f "${WORK:-${TMPDIR:-/tmp}}/timeout-$pid" ]]; then
+    rm -f "${WORK:-${TMPDIR:-/tmp}}/timeout-$pid"
+    return 124
+  fi
+  return $rc
+}
+
+in_time() { # 1 once the clean-up's time cap has passed (no cap outside the clean-up)
+  [[ -z "$CLEANUP_DEADLINE" || $(date +%s) -lt $CLEANUP_DEADLINE ]]
 }
 
 outstanding_drop() { # <token> — revoked or held: no longer this run's to revoke on exit
@@ -429,6 +469,7 @@ revoke_outstanding() { # the current token, then every other token this run mint
   local t n=0
   revoke_token
   for t in $OUTSTANDING; do
+    in_time || break # the clean-up's time cap (round 52): what's left stays on the list, reported
     TOKEN="$t"
     revoke_token
   done
@@ -1699,9 +1740,21 @@ cmd_ptests() {
 # so does any change to the second throwaway's branches or tags. Public activity (claim 9b) is a
 # reading, never a pass or a fail. Whatever an attempt creates stays there as evidence: nothing is
 # closed or deleted, and each object is read back by the number GitHub returned. Each token's
-# permissions and repositories are printed from GitHub's answer (without the token) and read back
-# with GET /installation/repositories; each is revoked as soon as its attempts end, and a read with
-# it must then get HTTP 401.
+# permissions, repositories and expiry are printed from GitHub's answer (without the token), its
+# repositories read back with GET /installation/repositories, and its expiry checked to be within
+# an hour; each is revoked as soon as its attempts end, and a read with it must then get HTTP 401.
+#
+# The clean-up contract (owner-approved, round 52). Every way out (the end, a stop, an error, Ctrl-C,
+# closing the window, a kill) goes through cleanup, which then ignores further signals and:
+#   1. revokes again every token GitHub issued to the run (whole full P1 P2) that no read has shown
+#      revoked, and reads with it: only HTTP 401 confirms it;
+#   2. reads back by number each object an attempt made;
+#   3. ends with one line naming the tokens confirmed revoked and those not, never a token itself.
+# Each revocation and each read is given at most CALL_SECS, the whole clean-up at most CLEANUP_SECS;
+# a step the time cap leaves out is named as not done. Limits: a force-kill, a power loss, or a
+# revocation that fails or times out leaves a token unconfirmed. It may stay valid until its
+# expires_at, printed when it was issued. What it can do is what its TOKEN lines show for the first
+# throwaway, plus what this run's readings show on a public repository it isn't installed on (A2).
 
 readonly PROBE_PERMS_P1='{"contents":"write","metadata":"read"}'
 readonly PROBE_PERMS_P2='{"metadata":"read"}'
@@ -1712,52 +1765,76 @@ PROBE_READINGS=""
 OBS_KEPT=""
 PROBE_REVOKED=0
 PROBE_CONFIRMED="" # tokens a read showed revoked (HTTP 401)
+PROBE_END=""       # done, or "STOPPED: <why>"; empty after an error or a signal
 REFS_BEFORE=""
 
-probe_stop() { # <why> — revoke the current token, read back what was made, and stop
+probe_stop() { # <why> — stop: the exit clean-up settles the tokens and reads back what was made
   PROBE_FAILS=$((PROBE_FAILS + 1))
   say "PROBE STOP: $1"
-  if [[ -n "$TOKEN" ]]; then revoke_confirmed "$PROBE_LABEL"; fi
-  PROBE_ACTIVE=""
-  probe_settle_tokens
+  PROBE_END="STOPPED: $1"
   if [[ -n "$REFS_BEFORE" ]]; then probe_refs_same || true; fi
-  probe_read_back
-  PROBE_SUMMARY="A2 PROBE: STOPPED: $1; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
   exit 1
 }
 
+probe_label_of() { # <token> — its name in this run, never the token
+  local e
+  for e in $ISSUED; do
+    if [[ "${e#*=}" == "$1" ]]; then printf '%s' "${e%%=*}"; return; fi
+  done
+  printf 'unnamed'
+}
+
+# Is the token now refused? A read with it, within CALL_SECS; 0 only for HTTP 401.
+probe_refused() { # <token>
+  TOKEN="$1"
+  capture with_timeout "$CALL_SECS" app_gh api "repos/$REPO" --jq .full_name || true
+  TOKEN=""
+  [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 401|Bad credentials'
+}
+
 # Every token GitHub issued to this run that no read has yet shown revoked, whatever happened to it
-# (refused by mint, a revocation GitHub didn't confirm, an error exit): revoked (again), then a read
-# with it must get HTTP 401. Run on every way out of a2-probe (round 47, C1, SEC-1).
+# (refused by mint, a revocation GitHub didn't confirm or that timed out, an error exit): revoked
+# again, even one whose earlier DELETE GitHub answered as done (round 50), then a read with it must
+# get HTTP 401. One that still works stays on OUTSTANDING for the exit's last try (round 47, C1).
 probe_settle_tokens() {
-  local t seen=" $PROBE_CONFIRMED "
-  for t in $TOKEN $REVOKED_TOKENS $OUTSTANDING; do
-    [[ "$seen" != *" $t "* ]] || continue
-    seen="$seen$t "
-    # Each one is revoked again here, even one whose earlier DELETE GitHub answered as done
-    # (round 50, C1).
+  local e t label
+  for e in $ISSUED; do
+    t="${e#*=}" label="${e%%=*}"
+    [[ " $PROBE_CONFIRMED " != *" $t "* ]] || continue
+    if ! in_time; then
+      say "TOKEN $label not checked: the clean-up's time cap (${CLEANUP_SECS}s) was reached"
+      continue
+    fi
     TOKEN="$t"
     revoke_token || true
-    TOKEN="$t"
-    capture app_gh api "repos/$REPO" --jq .full_name || true
-    TOKEN=""
-    if [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 401|Bad credentials'; then
+    if probe_refused "$t"; then
       PROBE_REVOKED=$((PROBE_REVOKED + 1))
       PROBE_CONFIRMED="$PROBE_CONFIRMED $t"
-      say "TOKEN (one not yet checked, after $PROBE_LABEL was asked for) revoked: a read with it now gets HTTP 401"
+      say "TOKEN $label revoked: a read with it now gets HTTP 401"
     else
       PROBE_FAILS=$((PROBE_FAILS + 1))
-      # Still working: the exit clean-up tries it once more.
       [[ " $OUTSTANDING " == *" $t "* ]] || OUTSTANDING="$OUTSTANDING $t"
-      say "TOKEN (one not yet checked, after $PROBE_LABEL was asked for) still answers a read after its revocation was tried ($(evidence)): GitHub expires it within an hour of its issue; the exit clean-up tries once more"
+      say "TOKEN $label still answers a read after its revocation was tried ($(evidence)): it may stay valid until its expires_at; the exit clean-up tries once more"
     fi
   done
 }
 
 probe_token() { # <label> <request json> <narrowed|whole> <permissions json> — a token, its scope read back
   PROBE_LABEL="$1"
+  MINT_LABEL="$1"
   mint "$2" "$3" "$4"
+  MINT_LABEL=""
   say "TOKEN $1 issued: $MINT_ANSWER"
+  # Its expiry, from GitHub's answer: in the future, and at most an hour away (with a minute's
+  # leeway for the clocks).
+  local exp at now
+  exp="$(jq -r '.expires_at // empty' <<<"$MINT_ANSWER" 2>/dev/null)" || exp=""
+  at="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$exp" +%s 2>/dev/null)" || at=""
+  now="$(date +%s)"
+  if [[ ! "$at" =~ ^[0-9]+$ ]] || [[ $at -le $now || $at -gt $((now + 3660)) ]]; then
+    probe_stop "token $1's expiry '$exp' is not within the next hour, or could not be read"
+  fi
+  say "TOKEN $1 expires $exp, in $(((at - now) / 60)) minutes"
   local got
   got="$(app_gh api installation/repositories --paginate --jq '.repositories[].full_name' 2>&1)" || got="unreadable: $got"
   say "TOKEN $1 reaches (GET /installation/repositories): $(printf '%s' "$got" | tr '\n' ' ')"
@@ -1768,13 +1845,10 @@ revoke_confirmed() { # <label> — revoke the current token; a read with it afte
   local t="$TOKEN"
   if ! revoke_token; then
     PROBE_FAILS=$((PROBE_FAILS + 1))
-    say "TOKEN $1 revocation FAILED: GitHub expires it within an hour of its issue; the exit clean-up tries again"
+    say "TOKEN $1 revocation FAILED: the exit clean-up tries again"
     return 0
   fi
-  TOKEN="$t"
-  capture app_gh api "repos/$REPO" --jq .full_name || true
-  TOKEN=""
-  if [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 401|Bad credentials'; then
+  if probe_refused "$t"; then
     PROBE_REVOKED=$((PROBE_REVOKED + 1))
     PROBE_CONFIRMED="$PROBE_CONFIRMED $t"
     say "TOKEN $1 revoked: a read with it now gets HTTP 401"
@@ -1783,6 +1857,40 @@ revoke_confirmed() { # <label> — revoke the current token; a read with it afte
     OUTSTANDING="$OUTSTANDING $t"
     say "TOKEN $1 revoked, but a read with it did not get HTTP 401 ($(evidence)): the exit clean-up tries again"
   fi
+}
+
+# The end of every a2-probe run, from the exit clean-up: settle the tokens, read back, and the
+# summary and status. <status> is the one the run stopped with.
+probe_finish() {
+  local rc="$1" e t yes="" no=""
+  probe_settle_tokens
+  probe_read_back
+  for e in $ISSUED; do
+    t="${e#*=}"
+    if [[ " $PROBE_CONFIRMED " == *" $t "* ]]; then yes="$yes ${e%%=*}"; else no="$no ${e%%=*}"; fi
+  done
+  say "TOKENS $MINTED issued; confirmed revoked:${yes:- none}; NOT confirmed:${no:- none}"
+  local tokens="$PROBE_REVOKED of $MINTED tokens revoked (confirmed)${no:+, NOT confirmed:$no}"
+  case "$PROBE_END" in
+    done)
+      if [[ $PROBE_FAILS -eq 0 && -z "$no" ]]; then
+        PROBE_SUMMARY="A2 PROBE: DONE: code changes refused (P5, controls ok, branches and tags unchanged); readings$PROBE_READINGS; $tokens"
+        PROBE_RC=0
+      else
+        PROBE_SUMMARY="A2 PROBE: DONE WITH $PROBE_FAILS PROBLEM(S), see above; readings$PROBE_READINGS; $tokens"
+        PROBE_RC=1
+      fi
+      ;;
+    STOPPED:*)
+      PROBE_SUMMARY="A2 PROBE: $PROBE_END; $tokens"
+      PROBE_RC=1
+      ;;
+    *)
+      PROBE_SUMMARY="A2 PROBE: STOPPED by an error or a signal (status $rc), see above; $tokens"
+      PROBE_RC="$rc"
+      [[ "$PROBE_RC" != 0 ]] || PROBE_RC=1
+      ;;
+  esac
 }
 
 # An attempt as the app, with GitHub's whole answer kept, headers too (X-Accepted-GitHub-Permissions
@@ -1845,10 +1953,14 @@ probe_read_back() { # each object an attempt created, as the owner reads it by i
   local m kind n
   for m in $PROBE_MADE; do
     kind="${m%%:*}" n="${m#*:}"
+    if ! in_time; then
+      say "KEPT $kind $n: not read back, the clean-up's time cap (${CLEANUP_SECS}s) was reached; look on $REPO2 for it"
+      continue
+    fi
     if [[ "$kind" == comment ]]; then
-      capture owner_gh api "repos/$REPO2/issues/comments/$n" --jq '[.id, .user.login, .user.type, .author_association, (.performed_via_github_app | tostring), .issue_url] | map(tostring) | join(" ")' || true
+      capture with_timeout "$CALL_SECS" owner_gh api "repos/$REPO2/issues/comments/$n" --jq '[.id, .user.login, .user.type, .author_association, (.performed_via_github_app | tostring), .issue_url] | map(tostring) | join(" ")' || true
     else
-      capture owner_gh api "repos/$REPO2/issues/$n" --jq '[.number, .state, .user.login, .user.type, .author_association, (.performed_via_github_app | tostring), (.pull_request != null | tostring), .title] | map(tostring) | join(" ")' || true
+      capture with_timeout "$CALL_SECS" owner_gh api "repos/$REPO2/issues/$n" --jq '[.number, .state, .user.login, .user.type, .author_association, (.performed_via_github_app | tostring), (.pull_request != null | tostring), .title] | map(tostring) | join(" ")' || true
     fi
     if [[ $LAST_RC -eq 0 ]]; then
       say "KEPT $kind $n: $LAST_OUT"
@@ -1957,16 +2069,9 @@ cmd_a2_probe() {
   probe_issue P2 "with metadata read only"
   revoke_confirmed P2
   probe_refs_same || probe_stop "$REPO2's branches or tags changed"
-  PROBE_ACTIVE=""
-  probe_settle_tokens
-  probe_read_back
-  say "TOKENS $MINTED issued, $PROBE_REVOKED revoked and confirmed by HTTP 401"
-  if [[ $PROBE_FAILS -eq 0 && $PROBE_REVOKED -eq $MINTED ]]; then
-    PROBE_SUMMARY="A2 PROBE: DONE: code changes refused (P5, controls ok, branches and tags unchanged); readings$PROBE_READINGS; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
-    exit 0
-  fi
-  PROBE_SUMMARY="A2 PROBE: DONE WITH $PROBE_FAILS PROBLEM(S), see above; readings$PROBE_READINGS; $PROBE_REVOKED of $MINTED tokens revoked (confirmed)"
-  exit 1
+  # The exit clean-up settles the tokens, reads back, and decides the status (probe_finish).
+  PROBE_END="done"
+  exit 0
 }
 
 # --- S2: an Environment keeps its secret from the app (plan 4.4, revised 2026-11-01) ------------

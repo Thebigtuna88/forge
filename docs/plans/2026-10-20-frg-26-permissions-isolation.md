@@ -401,6 +401,18 @@ against the second throwaway:
 - Nothing is closed or deleted: each object made is read back by the number GitHub returned (the
   fix for the exit check that missed issue #1). The second throwaway is deleted at the end of
   stage 1.
+- Each token's expiry, from GitHub's answer, must be within the next hour, and its repositories
+  are read back, not assumed.
+- The clean-up contract (owner-approved, 2026-11-12, after review round 52). However the run ends
+  (its end, a stop, an error, Ctrl-C, closing the window, a kill), its clean-up runs to its end,
+  ignoring further signals, for at most three minutes, each revocation and each check for at most
+  20 seconds. It revokes again every token issued to the run that no read has shown revoked, and
+  a read with it must get HTTP 401; it reads back each object made; it ends with one line naming
+  the tokens confirmed revoked and those not, never a token itself. Limits, accepted: a force-kill,
+  a power loss, or a revocation that fails or times out leaves a token unconfirmed. It may stay
+  valid until its expiry and can do what the run shows the app's tokens can do (on the first
+  throwaway, and on a public repository it isn't installed on, as in A2). A review finding that
+  fits these limits is recorded under them; any other is fixed.
 
 The proposed split of item 9 into 9a and 9b is not yet a claim: item 9 stays failed and unresolved,
 the remaining stage 1 handoffs stay paused, and the findings come to the owner with a

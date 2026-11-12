@@ -3136,8 +3136,11 @@ probe_stubs() {
     p="$(jq -c '.permissions // empty' "$3")"
     [[ -n "$p" ]] || p="$WANT_PERMS"
     LAST_HTTP=201
+    # GitHub issues each token for an hour: here it expires 59 minutes from now ($T_TMP/expires).
+    command date -u -v+59M +%Y-%m-%dT%H:%M:%SZ >"$T_TMP/expires"
     LAST_OUT="$(jq -n -c --arg t "$(printf 'gh%s_tok%s' s "$n")$(printf 'Q%.0s' $(seq 1 30))" --argjson p "$p" --arg r "$REPO" \
-      '{token: $t, expires_at: "2026-11-11T19:00:00Z", repository_selection: "selected", permissions: $p, repositories: [{full_name: $r, id: 1}]}')"
+      --arg e "$(cat "$T_TMP/expires")" \
+      '{token: $t, expires_at: $e, repository_selection: "selected", permissions: $p, repositories: [{full_name: $r, id: 1}]}')"
     if [[ -f "$T_TMP/extra-$n" ]]; then LAST_OUT="$(jq -c "$(cat "$T_TMP/extra-$n")" <<<"$LAST_OUT")"; fi
   }
   probe_answer() { # <logged call>
@@ -3227,7 +3230,10 @@ test_a2_probe_runs_each_attempt_with_its_own_token_and_keeps_what_got_through() 
   assert_eq "$(jq -S -c . "$T_TMP/request-2.json")" "{\"permissions\":$WANT_PERMS,\"repositories\":[\"$REPO_NAME\"]}" "the full token"
   assert_eq "$(jq -S -c . "$T_TMP/request-3.json")" "{\"permissions\":{\"contents\":\"write\",\"metadata\":\"read\"},\"repositories\":[\"$REPO_NAME\"]}" "P1's token: no Issues"
   assert_eq "$(jq -S -c . "$T_TMP/request-4.json")" "{\"permissions\":{\"metadata\":\"read\"},\"repositories\":[\"$REPO_NAME\"]}" "P2's token: metadata only"
-  assert_contains "$out" "TOKEN P1 issued: {\"expires_at\":\"2026-11-11T19:00:00Z\",\"permissions\":{\"contents\":\"write\",\"metadata\":\"read\"},\"repositories\":[\"$REPO\"],\"repository_selection\":\"selected\"}"
+  assert_contains "$out" "TOKEN P1 issued: {\"expires_at\":\"$(cat "$T_TMP/expires")\",\"permissions\":{\"contents\":\"write\",\"metadata\":\"read\"},\"repositories\":[\"$REPO\"],\"repository_selection\":\"selected\"}"
+  assert_contains "$out" "TOKEN P1 expires $(cat "$T_TMP/expires"), in 5" "the expiry checked and shown"
+  # Round 52 (owner): the tokens are named, confirmed or not, and never shown.
+  assert_contains "$out" "TOKENS 4 issued; confirmed revoked: whole full P1 P2; NOT confirmed: none"
   assert_contains "$out" "TOKEN P2 reaches (GET /installation/repositories): $REPO"
   # Each token is revoked, and a read with it afterwards gets HTTP 401.
   assert_eq "$(printf '%s\n' "$out" | grep -c 'revoked: a read with it now gets HTTP 401')" 4 "revocations confirmed"
@@ -3335,7 +3341,7 @@ test_a2_probe_checks_each_tokens_scope_before_using_it() {
   assert_not_contains "$calls" "app_gh tok3 api -i" "an attempt with that token"
   # Round 47 (C1, SEC-1): that token's revocation is checked too, on the way out after the error.
   assert_contains "$calls" "app_gh tok3 api repos/$REPO --jq .full_name" "the rejected token's revocation was not checked"
-  assert_contains "$out" "TOKEN (one not yet checked, after P1 was asked for) revoked: a read with it now gets HTTP 401"
+  assert_contains "$out" "TOKEN P1 revoked: a read with it now gets HTTP 401"
   assert_contains "$out" "KEPT comment 901" "objects made before the error are read back"
   assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "A2 PROBE: STOPPED by an error"
 }
@@ -3366,15 +3372,15 @@ test_a2_probe_retries_and_checks_a_revocation_that_failed() {
   # Round 48 (C1): the retry revokes it (a second DELETE), and only then does a read get 401.
   assert_eq "$(printf '%s\n' "$calls" | grep -c '^app_gh tok2 api -X DELETE installation/token$')" 2 "the failed revocation was not retried"
   assert_eq "$(printf '%s\n' "$calls" | grep -A1 '^app_gh tok2 api -X DELETE installation/token$' | tail -n 1)" "app_gh tok2 api repos/$REPO --jq .full_name" "the read right after the retry"
-  assert_contains "$out" "TOKEN (one not yet checked, after P2 was asked for) revoked: a read with it now gets HTTP 401"
+  assert_contains "$out" "TOKEN full revoked: a read with it now gets HTTP 401"
   assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "4 of 4 tokens revoked (confirmed)"
   # A token whose every DELETE fails still works: reported, and the run does not pass.
   probe_stubs
   echo 99 >"$T_TMP/delete-fails-tok2"
   rc=0; out="$(run_probe)" || rc=$?
   assert_exit 1 "$rc" "a token that could never be revoked"
-  assert_contains "$out" "after P2 was asked for) still answers a read after its revocation was tried"
-  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "3 of 4 tokens revoked (confirmed)"
+  assert_contains "$out" "TOKEN full still answers a read after its revocation was tried"
+  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "3 of 4 tokens revoked (confirmed), NOT confirmed: full"
 }
 
 # Round 50 (C1): a token mint refused, whose DELETE GitHub answered as done but which still works,
@@ -3388,8 +3394,98 @@ test_a2_probe_revokes_again_a_token_that_still_works_after_a_confirmed_delete() 
   assert_exit 2 "$rc" "P1's token with Issues"
   calls="$(cat "$T_TMP/calls")"
   assert_eq "$(printf '%s\n' "$calls" | grep -c '^app_gh tok3 api -X DELETE installation/token$')" 3 "mint's DELETE, the settling one, the exit clean-up's"
-  assert_contains "$out" "after P1 was asked for) still answers a read after its revocation was tried"
+  assert_contains "$out" "TOKEN P1 still answers a read after its revocation was tried"
   assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "A2 PROBE: STOPPED by an error"
+  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "NOT confirmed: P1"
+}
+
+# --- The clean-up contract (round 52, owner-approved) ---
+
+# A second Ctrl-C, closing the window or a kill during the clean-up no longer cuts it short.
+test_the_clean_up_finishes_despite_a_signal_during_it() {
+  local sig out rc
+  for sig in HUP INT TERM; do
+    rc=0
+    out="$(/bin/bash -p -c 'sig="$2"; source "$1"; PROBE_ACTIVE=1; probe_finish() { echo finish-start; kill -s "$sig" $$; echo finish-end; PROBE_SUMMARY=summary-printed; PROBE_RC=1; }; kill -s "$sig" $$; sleep 2' _ "$GT" "$sig" 2>&1)" || rc=$?
+    assert_contains "$out" "finish-start" "SIG$sig"
+    assert_contains "$out" "finish-end" "a second SIG$sig cut the clean-up short"
+    assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "summary-printed" "SIG$sig"
+    assert_exit 1 "$rc" "SIG$sig: the probe's own status"
+  done
+}
+
+test_with_timeout_stops_a_command_that_hangs() {
+  load
+  WORK="$T_TMP/work"
+  mkdir -m 700 "$WORK"
+  local rc=0 start
+  start="$(date +%s)"
+  with_timeout 1 /bin/sleep 10 || rc=$?
+  assert_exit 124 "$rc" "a hang"
+  (($(date +%s) - start <= 4)) || _t_fail "with_timeout 1 took $(($(date +%s) - start))s"
+  rc=0
+  with_timeout 5 /bin/sh -c 'exit 3' || rc=$?
+  assert_exit 3 "$rc" "a command's own status"
+  # Inside a command substitution, as capture runs it: the watchdog doesn't hold it open.
+  start="$(date +%s)"
+  assert_eq "$(with_timeout 10 echo quick)" quick
+  (($(date +%s) - start <= 2)) || _t_fail "the watchdog held a command substitution open"
+  # The same while TERM is ignored, as it is during the clean-up (and in what it starts).
+  start="$(date +%s)"
+  rc=0
+  (trap '' HUP INT TERM; with_timeout 1 /bin/sleep 10) || rc=$?
+  assert_exit 124 "$rc" "a hang during the clean-up"
+  (($(date +%s) - start <= 4)) || _t_fail "with_timeout 1 took $(($(date +%s) - start))s with TERM ignored"
+  start="$(date +%s)"
+  assert_eq "$(trap '' HUP INT TERM; with_timeout 10 echo quick)" quick
+  (($(date +%s) - start <= 2)) || _t_fail "with TERM ignored, a quick command waited $(($(date +%s) - start))s for its watchdog"
+}
+
+test_every_revocation_and_check_is_given_call_secs() {
+  probe_stubs
+  with_timeout() { echo "with_timeout $1 ${*:2}" >>"$T_TMP/timeouts"; shift; "$@"; }
+  local out
+  out="$(run_probe)"
+  assert_contains "$(cat "$T_TMP/timeouts")" "with_timeout $CALL_SECS app_gh api -X DELETE installation/token"
+  assert_contains "$(cat "$T_TMP/timeouts")" "with_timeout $CALL_SECS app_gh api repos/$REPO --jq .full_name"
+  assert_contains "$(cat "$T_TMP/timeouts")" "with_timeout $CALL_SECS owner_gh api repos/$REPO2/issues/comments/901"
+  assert_eq "$(grep -c 'api -X DELETE installation/token' "$T_TMP/calls")" "$(grep -c 'api -X DELETE installation/token' "$T_TMP/timeouts")" "a revocation without a time limit"
+}
+
+# Past the cap, what's left is named as not done, and the summary says which tokens aren't confirmed.
+test_the_clean_up_names_what_its_time_cap_left_out() {
+  probe_stubs
+  ISSUED=" whole=$(printf 'gh%s_tokA' s) full=$(printf 'gh%s_tokB' s)"
+  PROBE_CONFIRMED=" $(printf 'gh%s_tokA' s)"
+  PROBE_MADE=" issue:7"
+  PROBE_END="done"
+  CLEANUP_DEADLINE=1
+  local out
+  out="$(probe_finish 0; echo "rc=$PROBE_RC"; echo "$PROBE_SUMMARY")"
+  assert_contains "$out" "TOKEN full not checked: the clean-up's time cap (${CLEANUP_SECS}s) was reached"
+  assert_contains "$out" "KEPT issue 7: not read back, the clean-up's time cap"
+  assert_contains "$out" "confirmed revoked: whole; NOT confirmed: full"
+  assert_contains "$out" "rc=1"
+  assert_contains "$out" "NOT confirmed: full"
+  assert_not_contains "$(cat "$T_TMP/calls")" "DELETE" "a revocation after the cap"
+}
+
+# The owner: each token's expiry is checked, not assumed.
+test_a2_probe_checks_each_tokens_expiry() {
+  local name filter out rc
+  load
+  for name in "three hours|.expires_at = \"$(date -u -v+3H +%Y-%m-%dT%H:%M:%SZ)\"" \
+    "already expired|.expires_at = \"$(date -u -v-1M +%Y-%m-%dT%H:%M:%SZ)\"" \
+    "no expiry|del(.expires_at)"; do
+    IFS='|' read -r name filter <<<"$name"
+    probe_stubs
+    echo "$filter" >"$T_TMP/extra-2"
+    rc=0; out="$(run_probe)" || rc=$?
+    assert_exit 1 "$rc" "$name"
+    assert_contains "$out" "PROBE STOP: token full's expiry" "$name"
+    assert_not_contains "$(cat "$T_TMP/calls")" "app_gh tok2 api -i" "an attempt with a token expiring $name"
+    assert_contains "$out" "TOKEN full revoked: a read with it now gets HTTP 401" "$name"
+  done
 }
 
 test_a2_probe_reports_a_token_that_still_works_after_revocation() {
