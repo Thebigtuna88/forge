@@ -99,6 +99,7 @@ PROBE_RC=""      # a2-probe's exit status, decided by the exit clean-up
 ISSUED=""        # label=token for every token GitHub issued to this run, kept or not
 ISSUED_META=""   # one line per token: label, then GitHub's answer when it was issued (no token)
 UNRECEIVED=""    # per token request with no complete answer: label, latest expiry, the request
+PENDING_MINT=""  # the token request in progress, in the same form, until its answer is settled
 JWT_ERR=""
 JWT_RC=0
 MINT_LABEL=""    # the name mint gives the next token (a2-probe: whole full P1 P2)
@@ -159,6 +160,9 @@ cleanup() {
   if [[ -n "$PROBE_ACTIVE" ]]; then
     PROBE_ACTIVE=""
     probe_finish "$rc"
+  fi
+  if [[ -n "$PENDING_MINT" ]]; then
+    say "note: a token request was in progress when the run stopped: GitHub may have issued a token this run never received; if so it expires by $(printf '%s' "$PENDING_MINT" | cut -d' ' -f2) at the latest"
   fi
   revoke_outstanding
   if [[ -n "$HELD_LOCKED" ]]; then rmdir "$HELD.lock" 2>/dev/null || true; HELD_LOCKED=""; fi
@@ -384,10 +388,13 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
   local want="${3:-$WANT_PERMS}"
   MINT_ANSWER=""
   printf '%s\n' "$1" >"$WORK/token-request.json" || die "writing the token request failed"
-  # Asked once, never again (owner, round 56): the time it was asked is the start of the latest
-  # deadline for a token that may have been issued.
-  local ok=0 asked
-  asked="$(date +%s)"
+  # Asked once, never again (owner, round 56). GitHub issues a token for an hour, so one issued for
+  # this request expires an hour after it is sent at the latest (plus a minute for the clocks). The
+  # request is recorded as pending before it is sent, so a signal while it is out still reaches the
+  # clean-up's report (round 57, C1); it is cleared once the answer is settled.
+  local ok=0 by
+  by="$(date -u -r $(($(date +%s) + 3660)) +%Y-%m-%dT%H:%M:%SZ)"
+  PENDING_MINT="${MINT_LABEL:-token$((MINTED + 1))} $by $1"
   jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || ok=1
   local ans="$LAST_OUT" t perms sel repos
   LAST_OUT=""
@@ -399,19 +406,16 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
   fi
   if [[ -z "$t" ]]; then
     # Only a clear refusal (4xx) says nothing was issued. Otherwise (a timeout, a broken transfer, a
-    # 5xx) GitHub may have issued a token this run never received (round 56, SEC-1): it is noted
-    # for the clean-up's report; it can't be revoked from here.
-    if [[ $ok -ne 0 && ! "$LAST_HTTP" =~ ^4[0-9][0-9]$ ]]; then
-      # GitHub issues a token for an hour; a token issued for this request expires an hour after the
-      # request at the latest (plus a minute for the clocks).
-      local by
-      by="$(date -u -r $((asked + 3660)) +%Y-%m-%dT%H:%M:%SZ)"
-      UNRECEIVED="$UNRECEIVED${MINT_LABEL:-token$((MINTED + 1))} $by $1
+    # 5xx, or a 2xx without a readable token: round 57, C2) GitHub may have issued a token this run
+    # never received (round 56, SEC-1): it goes to the clean-up's report; it can't be revoked here.
+    if [[ ! "$LAST_HTTP" =~ ^4[0-9][0-9]$ ]]; then
+      UNRECEIVED="$UNRECEIVED$PENDING_MINT
 "
-      die "the token request got no complete answer (HTTP ${LAST_HTTP:-none}${JWT_ERR:+, $JWT_ERR}): GitHub may have issued a token this run never received, which can't be revoked from here; if so it expires by $by at the latest. The run stops and does not ask again"
+      PENDING_MINT=""
+      die "the token request got no usable answer (HTTP ${LAST_HTTP:-none}${JWT_ERR:+, $JWT_ERR}): it holds no installation token, but GitHub may have issued one this run never received, which can't be revoked from here; if so it expires by $by at the latest. The run stops and does not ask again"
     fi
-    [[ $ok -eq 0 ]] || die "GitHub refused the token request (HTTP ${LAST_HTTP:-none}): $(printf '%s' "$ans" | tail -n 3 | tr '\n\t' '  ' | cut -c1-240)"
-    die "GitHub's answer holds no installation token"
+    PENDING_MINT=""
+    die "GitHub refused the token request (HTTP $LAST_HTTP): $(printf '%s' "$ans" | tail -n 3 | tr '\n\t' '  ' | cut -c1-240)"
   fi
   # Whatever GitHub issued is revoked if it isn't kept (round 31: the owner's run refused a real
   # token and left it working until it expired). GitHub's stateless format is ghs_APPID_JWT, about
@@ -421,14 +425,18 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
   TOKEN="$t"
   OUTSTANDING="$OUTSTANDING $t"
   MINTED=$((MINTED + 1))
+  PENDING_MINT=""
   ISSUED="$ISSUED ${MINT_LABEL:-token$MINTED}=$t"
   # What GitHub said it issued (named fields only, no token), kept before any check, so a token
   # refused below is still described if its revocation isn't confirmed (round 54, SEC-1).
   ISSUED_META="$ISSUED_META${MINT_LABEL:-token$MINTED} $(jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' <<<"$ans" 2>/dev/null || echo unreadable)
 "
   if [[ $ok -ne 0 ]]; then
-    revoke_token || true
-    die "the token request did not end cleanly (HTTP ${LAST_HTTP:-none}${JWT_ERR:+, $JWT_ERR}), but its answer held a token: it was revoked, and the clean-up checks it"
+    # What happened, never more (round 57, C3, SEC-2).
+    if revoke_token; then
+      die "the token request did not end cleanly (HTTP ${LAST_HTTP:-none}${JWT_ERR:+, $JWT_ERR}), but its answer held a token: it was revoked, and the clean-up checks it"
+    fi
+    die "the token request did not end cleanly (HTTP ${LAST_HTTP:-none}${JWT_ERR:+, $JWT_ERR}), but its answer held a token: revoking it failed; the exit clean-up tries again and checks it"
   fi
   if [[ ! "$t" =~ ^ghs_[A-Za-z0-9._-]+$ ]] || [[ ${#t} -lt 30 || ${#t} -gt 4096 ]]; then
     if revoke_token; then
@@ -1989,7 +1997,13 @@ probe_finish() {
       probe_describe "${e%%=*}" "$t"
     fi
   done
-  # A token GitHub may have issued but this run never received (round 56, SEC-1).
+  # A token GitHub may have issued but this run never received (round 56, SEC-1), a request still
+  # pending when the run stopped included (round 57, C1).
+  if [[ -n "$PENDING_MINT" ]]; then
+    UNRECEIVED="$UNRECEIVED$PENDING_MINT
+"
+    PENDING_MINT=""
+  fi
   local line label by req repos perms unrec=""
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue

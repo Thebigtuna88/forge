@@ -3354,7 +3354,7 @@ test_a2_probe_reads_back_what_it_made_when_a_later_token_request_fails() {
   out="$(run_probe)" || rc=$?
   assert_exit 2 "$rc" "P1's token request refused"
   # Round 56 (C1, SEC-1): a 502 is no clear refusal: GitHub may have issued a token never received.
-  assert_contains "$out" "the token request got no complete answer (HTTP 502"
+  assert_contains "$out" "the token request got no usable answer (HTTP 502"
   assert_contains "$out" "TOKEN P1 possibly issued, never received"
   assert_contains "$out" "KEPT comment 901"
   assert_contains "$out" "KEPT pr 3"
@@ -3397,7 +3397,7 @@ test_mint_reports_a_token_request_with_no_complete_answer() {
   out="$( (MINT_LABEL=P1; trap 'printf "unreceived=[%s]\n" "$UNRECEIVED"' EXIT; mint '{"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}' narrowed '{"metadata":"read"}') 2>&1)" || rc=$?
   after="$(date +%s)"
   assert_exit 2 "$rc" "no answer"
-  assert_contains "$out" "GitHub may have issued a token this run never received"
+  assert_contains "$out" "GitHub may have issued one this run never received"
   # Owner, round 56: the latest it can expire, conservatively: an hour after the request was sent,
   # plus a minute.
   local line deadline
@@ -3416,6 +3416,48 @@ test_mint_reports_a_token_request_with_no_complete_answer() {
   assert_exit 2 "$rc" "a refusal"
   assert_contains "$out" "GitHub refused the token request (HTTP 422)"
   assert_not_contains "$out" "may have issued"
+}
+
+# Round 57 (C2, SEC-1): a 2xx answer without a readable token is no clear refusal either.
+test_mint_reports_a_2xx_answer_without_a_token_as_possibly_issued() {
+  local out rc=0
+  mint_with_curl '{}' "" 201 0
+  out="$( (MINT_LABEL=P2; trap 'printf "unreceived=[%s]\n" "$UNRECEIVED"' EXIT; mint '{"permissions":{"metadata":"read"}}' narrowed '{"metadata":"read"}') 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a 2xx without a token"
+  assert_contains "$out" "holds no installation token"
+  assert_contains "$out" "GitHub may have issued"
+  assert_contains "$out" "unreceived=[P2 "
+}
+
+# Round 57 (C3, SEC-2): after a failed transfer, a failed revocation is not reported as done.
+test_mint_says_so_when_revoking_a_token_from_a_failed_transfer_fails() {
+  local tok out rc=0
+  tok="$(new_token)"
+  mint_with_curl "{\"token\":\"$tok\"}" "curl: (28) Operation timed out" 201 28
+  app_gh() { echo "${TOKEN:0:8} $*" >>"$T_TMP/app-gh.log"; return 1; }
+  out="$(MINT_LABEL=P2; mint '{"permissions":{"metadata":"read"}}' narrowed '{"metadata":"read"}' 2>&1)" || rc=$?
+  assert_exit 2 "$rc"
+  assert_not_contains "$out" "it was revoked"
+  assert_contains "$out" "revoking it failed"
+}
+
+# Round 57 (C1): the request is recorded before it is sent, so a signal while it is out still reaches
+# the clean-up's report as a token possibly issued.
+test_a_signal_during_a_token_request_is_reported_as_possibly_issued() {
+  local out rc=0
+  out="$(/bin/bash -p -c '
+    source "$1"
+    WORK="$2"; APP_ID=123456; INSTALLATION_ID=77; : >"$WORK/jwt.hdr"
+    curl() { /bin/sleep 2; printf "{}\nHTTP 201"; }
+    app_gh() { :; }
+    PROBE_ACTIVE=1 MINT_LABEL=P1
+    ( /bin/sleep 1; kill -TERM $$ ) &
+    mint "{\"repositories\":[\"forge-frg26-throwaway\"],\"permissions\":{\"metadata\":\"read\"}}" narrowed "{\"metadata\":\"read\"}"
+    echo continued' _ "$GT" "$T_TMP" 2>&1)" || rc=$?
+  assert_not_contains "$out" "continued"
+  assert_contains "$out" "TOKEN P1 possibly issued, never received"
+  assert_contains "$out" "repositories forge-frg26-throwaway; permissions {\"metadata\":\"read\"}"
+  assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "possibly issued, never received: P1"
 }
 
 test_the_clean_up_reports_a_token_possibly_issued_and_never_received() {
