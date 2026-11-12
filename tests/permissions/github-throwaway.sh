@@ -391,9 +391,13 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
   # Asked once, never again (owner, round 56). GitHub issues a token for an hour, so one issued for
   # this request expires an hour after it is sent at the latest (plus a minute for the clocks). The
   # request is recorded as pending before it is sent, so a signal while it is out still reaches the
-  # clean-up's report (round 57, C1); it is cleared once the answer is settled.
+  # clean-up's report (round 57, C1); it is cleared once the answer is settled. Catchable signals
+  # are held from here until a token the answer brings is registered (round 59, C1, SEC-1): a signal
+  # while the request is out is acted on once its answer is in hand (curl stops by CALL_SECS), so a
+  # token that arrived is always revoked and checked, never taken for one never received.
   local ok=0 by
   by="$(date -u -r $(($(date +%s) + 3660)) +%Y-%m-%dT%H:%M:%SZ)"
+  defer_signals
   PENDING_MINT="${MINT_LABEL:-token$((MINTED + 1))} $by $1"
   jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || ok=1
   local ans="$LAST_OUT" t perms sel repos
@@ -424,12 +428,11 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
   # failed revocation is tried again on exit (round 32, C1).
   # What GitHub said it issued (named fields only, no token) is kept too, so a token refused below
   # is still described if its revocation isn't confirmed (round 54, SEC-1). The registration is
-  # whole or not begun when the clean-up sees it: a signal during it waits (round 58, C1, SEC-1),
-  # and the pending record goes only once the token is registered.
+  # whole or not begun when the clean-up sees it: signals are still held (round 58, C1, SEC-1), and
+  # the pending record goes only once the token is registered.
   local meta label
   meta="$(jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' <<<"$ans" 2>/dev/null || echo unreadable)"
   label="${MINT_LABEL:-token$((MINTED + 1))}"
-  defer_signals
   TOKEN="$t"
   OUTSTANDING="$OUTSTANDING $t"
   MINTED=$((MINTED + 1))

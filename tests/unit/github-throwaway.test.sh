@@ -3435,10 +3435,14 @@ test_a_signal_during_token_registration_waits_until_it_is_whole() {
   out="$(/bin/bash -p -c 'source "$1"; cleanup() { :; }; defer_signals; resume_signals; echo after' _ "$GT" 2>&1)" || rc=$?
   assert_exit 0 "$rc" "no signal"
   assert_contains "$out" "after"
-  # In mint, everything from the pending record to the token's registration is inside.
+  # In mint, everything from before the request is sent to the token's registration is inside
+  # (round 59: the answer is in hand from the moment curl returns).
   local body
   body="$(declare -f mint 2>/dev/null || (source "$GT"; declare -f mint))"
   body="$(printf '%s\n' "$body" | awk '/defer_signals/ { on = 1 } on { print } /resume_signals/ { exit }')"
+  assert_contains "$body" "jwt_call POST" "the token request outside the deferred section"
+  # shellcheck disable=SC2016 # the literal source text is what's searched for
+  assert_contains "$body" 'meta="$(jq' "the answer's summary outside the deferred section"
   # shellcheck disable=SC2016 # the literal source text is what's searched for
   assert_contains "$body" 'ISSUED="$ISSUED' "ISSUED outside the deferred section"
   # shellcheck disable=SC2016 # as above
@@ -3446,6 +3450,34 @@ test_a_signal_during_token_registration_waits_until_it_is_whole() {
   # shellcheck disable=SC2016 # as above
   assert_contains "$body" 'OUTSTANDING="$OUTSTANDING' "OUTSTANDING outside the deferred section"
   assert_contains "$body" 'PENDING_MINT=""' "the pending record cleared outside the deferred section"
+}
+
+# Round 59 (C1, SEC-1): a signal while the request is out, whose answer then holds a token: the
+# token is registered, revoked and checked, not reported as never received.
+test_a_signal_while_a_token_request_is_out_still_revokes_the_token_it_brings() {
+  local out rc=0
+  out="$(/bin/bash -p -c '
+    source "$1"
+    D="$2"; WORK="$D/work"; mkdir -p "$WORK"; APP_ID=123456; INSTALLATION_ID=77; : >"$WORK/jwt.hdr"
+    tok="$(printf "gh%s_" s)$(printf "Q%.0s" $(seq 1 40))"
+    curl() { /bin/sleep 2; printf "{\"token\":\"%s\",\"expires_at\":\"2026-11-12T23:00:00Z\",\"repository_selection\":\"selected\",\"permissions\":{\"metadata\":\"read\"},\"repositories\":[{\"full_name\":\"Thebigtuna88/forge-frg26-throwaway\"}]}\nHTTP 201" "$tok"; }
+    app_gh() {
+      echo "app_gh $*" >>"$D/calls"
+      case "$*" in
+        "api -X DELETE installation/token") : >"$D/revoked"; return 0 ;;
+        *) if [ -f "$D/revoked" ]; then echo "gh: Bad credentials (HTTP 401)" >&2; return 1; fi ;;
+      esac
+    }
+    PROBE_ACTIVE=1 MINT_LABEL=P1
+    ( /bin/sleep 1; kill -TERM $$ ) &
+    mint "{\"repositories\":[\"forge-frg26-throwaway\"],\"permissions\":{\"metadata\":\"read\"}}" narrowed "{\"metadata\":\"read\"}"
+    echo continued' _ "$GT" "$T_TMP" 2>&1)" || rc=$?
+  assert_exit 143 "$rc"
+  assert_not_contains "$out" "continued"
+  assert_contains "$(cat "$T_TMP/calls")" "api -X DELETE installation/token" "the token brought was never revoked"
+  assert_contains "$out" "TOKEN P1 revoked: a read with it now gets HTTP 401"
+  assert_not_contains "$out" "possibly issued"
+  assert_not_contains "$out" "$(printf "gh%s_" s)QQQQ" "a token printed"
 }
 
 # Round 58 (C2): only HTTP 401 confirms a revocation, not the words "Bad credentials".
