@@ -423,8 +423,8 @@ revoke_token() { # DELETE /installation/token, which GitHub documents as stoppin
   # (for stateless tokens Unconfirmed until A5, plan 4.3); 1 if GitHub didn't confirm it
   [[ -n "$TOKEN" ]] || return 0
   local rc=0
-  # A network hang can't hold it: at most CALL_SECS (round 52, owner-approved).
-  with_timeout "$CALL_SECS" app_gh api -X DELETE installation/token >/dev/null 2>&1 || rc=$?
+  # A network hang can't hold it: at most CALL_SECS, less near the clean-up's cap (rounds 52, 53).
+  with_timeout "$(call_secs)" app_gh api -X DELETE installation/token >/dev/null 2>&1 || rc=$?
   if [[ $rc -ne 0 ]]; then say "note: revoking a token failed or timed out; GitHub expires it within an hour"; fi
   REVOKED_TOKENS="$REVOKED_TOKENS $TOKEN"
   # Only a confirmed revocation leaves the list: a failed one is tried again on exit (round 26).
@@ -433,27 +433,53 @@ revoke_token() { # DELETE /installation/token, which GitHub documents as stoppin
   return $rc
 }
 
-# Runs a command for at most <seconds>; 124 if it was stopped. The watchdog writes nowhere, so a
-# command substitution around this never waits for it. KILL, not TERM: the clean-up ignores TERM,
-# and a command it starts inherits that.
+# Runs a command for at most <seconds> (none at 0); 124 if it was stopped. The whole process tree is
+# stopped: app_gh and owner_gh are functions whose subshell execs gh, so killing the job's own
+# process alone would leave gh running and holding capture's output open (round 53, C1, SEC-1).
+# KILL, not TERM: the clean-up ignores TERM, and what it starts inherits that. The watchdog writes
+# nowhere, so a command substitution around this never waits for it.
 with_timeout() { # <seconds> <command…>
-  local secs="$1" pid w rc=0
+  local secs="$1" pid w rc=0 mark
   shift
+  [[ "$secs" =~ ^[0-9]+$ && $secs -gt 0 ]] || return 124
+  mark="${WORK:-${TMPDIR:-/tmp}}/timeout-$$-$RANDOM"
   "$@" &
   pid=$!
   (
     sleep "$secs"
-    kill -KILL "$pid" 2>/dev/null && echo stopped >"${WORK:-${TMPDIR:-/tmp}}/timeout-$pid"
+    echo stopped >"$mark"
+    kill_tree "$pid"
   ) </dev/null >/dev/null 2>&1 &
   w=$!
   wait "$pid" || rc=$?
-  kill -KILL "$w" 2>/dev/null
+  kill_tree "$w"
   wait "$w" 2>/dev/null
-  if [[ -f "${WORK:-${TMPDIR:-/tmp}}/timeout-$pid" ]]; then
-    rm -f "${WORK:-${TMPDIR:-/tmp}}/timeout-$pid"
+  if [[ -f "$mark" ]]; then
+    rm -f "$mark"
     return 124
   fi
   return $rc
+}
+
+kill_tree() { # <pid> — stop it, then KILL it and every process below it
+  local p
+  kill -STOP "$1" 2>/dev/null || return 0
+  for p in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$p"; done
+  kill -KILL "$1" 2>/dev/null
+}
+
+# CALL_SECS, or less inside the clean-up: what is left of its budget, 0 once it has passed (round
+# 53, C2, SEC-2), so no request runs past the cap.
+call_secs() {
+  local left
+  if [[ -z "$CLEANUP_DEADLINE" ]]; then
+    printf '%s' "$CALL_SECS"
+    return
+  fi
+  left=$((CLEANUP_DEADLINE - $(date +%s)))
+  if [[ $left -lt 0 ]]; then left=0; fi
+  if [[ $left -gt $CALL_SECS ]]; then left=$CALL_SECS; fi
+  printf '%s' "$left"
 }
 
 in_time() { # 1 once the clean-up's time cap has passed (no cap outside the clean-up)
@@ -1750,8 +1776,9 @@ cmd_ptests() {
 #      revoked, and reads with it: only HTTP 401 confirms it;
 #   2. reads back by number each object an attempt made;
 #   3. ends with one line naming the tokens confirmed revoked and those not, never a token itself.
-# Each revocation and each read is given at most CALL_SECS, the whole clean-up at most CLEANUP_SECS;
-# a step the time cap leaves out is named as not done. Limits: a force-kill, a power loss, or a
+# Each revocation and each read is given at most CALL_SECS, and never more than is left of the
+# clean-up's CLEANUP_SECS; the deadline is checked before each step; a step the time cap leaves out
+# is named as not done. A timeout stops the request's whole process tree (gh included). Limits: a force-kill, a power loss, or a
 # revocation that fails or times out leaves a token unconfirmed. It may stay valid until its
 # expires_at, printed when it was issued. What it can do is what its TOKEN lines show for the first
 # throwaway, plus what this run's readings show on a public repository it isn't installed on (A2).
@@ -1784,10 +1811,10 @@ probe_label_of() { # <token> — its name in this run, never the token
   printf 'unnamed'
 }
 
-# Is the token now refused? A read with it, within CALL_SECS; 0 only for HTTP 401.
+# Is the token now refused? A read with it, within call_secs; 0 only for HTTP 401.
 probe_refused() { # <token>
   TOKEN="$1"
-  capture with_timeout "$CALL_SECS" app_gh api "repos/$REPO" --jq .full_name || true
+  capture with_timeout "$(call_secs)" app_gh api "repos/$REPO" --jq .full_name || true
   TOKEN=""
   [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 401|Bad credentials'
 }
@@ -1807,6 +1834,11 @@ probe_settle_tokens() {
     fi
     TOKEN="$t"
     revoke_token || true
+    if ! in_time; then
+      say "TOKEN $label revocation tried, not checked: the clean-up's time cap (${CLEANUP_SECS}s) was reached"
+      [[ " $OUTSTANDING " == *" $t "* ]] || OUTSTANDING="$OUTSTANDING $t"
+      continue
+    fi
     if probe_refused "$t"; then
       PROBE_REVOKED=$((PROBE_REVOKED + 1))
       PROBE_CONFIRMED="$PROBE_CONFIRMED $t"
@@ -1958,9 +1990,9 @@ probe_read_back() { # each object an attempt created, as the owner reads it by i
       continue
     fi
     if [[ "$kind" == comment ]]; then
-      capture with_timeout "$CALL_SECS" owner_gh api "repos/$REPO2/issues/comments/$n" --jq '[.id, .user.login, .user.type, .author_association, (.performed_via_github_app | tostring), .issue_url] | map(tostring) | join(" ")' || true
+      capture with_timeout "$(call_secs)" owner_gh api "repos/$REPO2/issues/comments/$n" --jq '[.id, .user.login, .user.type, .author_association, (.performed_via_github_app | tostring), .issue_url] | map(tostring) | join(" ")' || true
     else
-      capture with_timeout "$CALL_SECS" owner_gh api "repos/$REPO2/issues/$n" --jq '[.number, .state, .user.login, .user.type, .author_association, (.performed_via_github_app | tostring), (.pull_request != null | tostring), .title] | map(tostring) | join(" ")' || true
+      capture with_timeout "$(call_secs)" owner_gh api "repos/$REPO2/issues/$n" --jq '[.number, .state, .user.login, .user.type, .author_association, (.performed_via_github_app | tostring), (.pull_request != null | tostring), .title] | map(tostring) | join(" ")' || true
     fi
     if [[ $LAST_RC -eq 0 ]]; then
       say "KEPT $kind $n: $LAST_OUT"

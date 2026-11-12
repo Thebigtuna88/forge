@@ -3441,6 +3441,46 @@ test_with_timeout_stops_a_command_that_hangs() {
   (($(date +%s) - start <= 2)) || _t_fail "with TERM ignored, a quick command waited $(($(date +%s) - start))s for its watchdog"
 }
 
+# Round 53 (C1, SEC-1): app_gh and owner_gh are functions whose subshell execs gh. The timeout must
+# stop gh itself, or it keeps the command substitution (capture) open until it ends.
+test_with_timeout_stops_the_real_command_under_a_function() {
+  load
+  WORK="$T_TMP/work"
+  mkdir -m 700 "$WORK"
+  gh_shaped() { (exec /bin/sleep 6); }
+  nested() { (/bin/sh -c '/bin/sleep 6; echo late') ; }
+  local f start out rc
+  for f in gh_shaped nested; do
+    start="$(date +%s)"
+    rc=0
+    out="$(trap '' HUP INT TERM; with_timeout 1 "$f"; echo "rc=$?")" || rc=$?
+    assert_contains "$out" "rc=124" "$f"
+    assert_not_contains "$out" "late" "$f"
+    (($(date +%s) - start <= 3)) || _t_fail "$f: capture returned after $(($(date +%s) - start))s, not about 1s"
+  done
+}
+
+# Round 53 (C2, SEC-2): each request gets at most what is left of the clean-up's budget, and the
+# deadline is checked again between a revocation and its check.
+test_the_clean_up_stays_within_its_deadline_when_calls_hang() {
+  probe_stubs
+  app_gh() { echo "app_gh ${TOKEN:4:4} $*" >>"$T_TMP/calls"; exec /bin/sleep 30; }
+  ISSUED=" whole=$(printf 'gh%s_tokA' s) full=$(printf 'gh%s_tokB' s)"
+  PROBE_END="done"
+  local start out
+  start="$(date +%s)"
+  CLEANUP_DEADLINE=$((start + 3))
+  out="$(probe_finish 0)"
+  (($(date +%s) - start <= 6)) || _t_fail "the clean-up ran $(($(date +%s) - start))s past a 3s budget"
+  assert_contains "$out" "NOT confirmed: whole full"
+  assert_eq "$(call_secs)" 0 "no time left after the deadline"
+  CLEANUP_DEADLINE=$(($(date +%s) + 5))
+  out="$(call_secs)"
+  [[ "$out" == 5 || "$out" == 4 ]] || _t_fail "the budget left, under CALL_SECS: got $out, want 4 or 5"
+  CLEANUP_DEADLINE=""
+  assert_eq "$(call_secs)" "$CALL_SECS" "outside the clean-up"
+}
+
 test_every_revocation_and_check_is_given_call_secs() {
   probe_stubs
   with_timeout() { echo "with_timeout $1 ${*:2}" >>"$T_TMP/timeouts"; shift; "$@"; }
