@@ -536,7 +536,14 @@ with_timeout() { # <seconds> <command…>
     kill_tree "$pid"
   ) </dev/null >/dev/null 2>&1 &
   w=$!
-  wait "$pid" || rc=$?
+  # A caught signal interrupts wait (status over 128) while the command may still run: wait again,
+  # under the same watchdog, until the command itself has ended (round 66, C1).
+  while :; do
+    rc=0
+    wait "$pid" || rc=$?
+    if [[ $rc -gt 128 ]] && kill -0 "$pid" 2>/dev/null; then continue; fi
+    break
+  done
   kill_tree "$w"
   wait "$w" 2>/dev/null
   if [[ -f "$mark" ]]; then

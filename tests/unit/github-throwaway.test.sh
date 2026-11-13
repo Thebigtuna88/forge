@@ -3817,6 +3817,27 @@ test_with_timeout_stops_a_command_that_hangs() {
   (($(date +%s) - start <= 2)) || _t_fail "with TERM ignored, a quick command waited $(($(date +%s) - start))s for its watchdog"
 }
 
+# Round 66 (C1): a caught signal interrupts bash's wait while the command still runs; with_timeout
+# keeps waiting under the same watchdog instead of taking that for the command's end.
+test_with_timeout_waits_on_through_a_caught_signal() {
+  local out
+  out="$(/bin/bash -p -c '
+    source "$1"; WORK="$2"; mkdir -p "$WORK"
+    trap "echo SIGNAL_HELD" TERM
+    ( /bin/sleep 1; kill -TERM $$ ) &
+    SECONDS=0; with_timeout 20 /bin/sleep 3; echo "ran rc=$? after=$SECONDS"
+    ( /bin/sleep 1; kill -TERM $$ ) &
+    SECONDS=0; with_timeout 2 /bin/sleep 9; echo "stopped rc=$? after=$SECONDS"
+    echo "jobs=[$(jobs -r)]"' _ "$GT" "$T_TMP/work" 2>&1)"
+  assert_contains "$out" "SIGNAL_HELD"
+  local secs
+  secs="$(printf '%s\n' "$out" | sed -n 's/^ran rc=0 after=\([0-9]*\)$/\1/p')"
+  [[ "$secs" =~ ^[0-9]+$ && $secs -ge 3 ]] || _t_fail "the command was left after the signal: $out"
+  secs="$(printf '%s\n' "$out" | sed -n 's/^stopped rc=124 after=\([0-9]*\)$/\1/p')"
+  [[ "$secs" =~ ^[0-9]+$ && $secs -ge 2 && $secs -le 4 ]] || _t_fail "the timeout did not hold through the signal: $out"
+  assert_contains "$out" "jobs=[]" "a command left running"
+}
+
 # Round 53 (C1, SEC-1): app_gh and owner_gh are functions whose subshell execs gh. The timeout must
 # stop gh itself, or it keeps the command substitution (capture) open until it ends.
 test_with_timeout_stops_the_real_command_under_a_function() {
