@@ -614,12 +614,18 @@ control_exit() {
 control_token() { # <command> — 0 if it got its token; reports a token left unrevoked
   local rc=0
   local rec
+  # Signals are held until a record the control hands over is registered here, so a signal while it
+  # comes in can't lose it (round 63, C1).
+  defer_signals
   rec="$( (trap control_exit EXIT; "$@") 3>&1 >/dev/null 2>&1)" || rc=$?
-  # A control's request that may have issued a token never received stops the run, reported whole
-  # (round 61, SEC-1); so does a record the control could not hand over (round 62).
   if [[ -n "$rec" ]]; then
     UNRECEIVED="$UNRECEIVED$rec
 "
+  fi
+  resume_signals
+  # A control's request that may have issued a token never received stops the run, reported whole
+  # (round 61, SEC-1); so does a record the control could not hand over (round 62).
+  if [[ -n "$rec" ]]; then
     report_unreceived
     die "a control's token request got no usable answer: GitHub may have issued a token this run never received; the run stops"
   fi

@@ -3581,6 +3581,23 @@ test_a_control_record_that_cannot_be_handed_over_still_stops_the_run() {
   assert_not_contains "$(declare -f control_exit control_token)" "control-unreceived" "a file for the record"
 }
 
+# Round 63 (C1): a signal while the caller receives a control's record waits until the record is
+# registered, so the clean-up still reports it whole.
+test_a_signal_while_a_controls_record_comes_in_keeps_it() {
+  local out rc=0
+  out="$(/bin/bash -p -c '
+    source "$1"; WORK="$2"; mkdir -p "$WORK"
+    app_gh() { :; }
+    cleanup() { echo "CLEANUP UNRECEIVED=<$UNRECEIVED>"; }
+    a_control() { UNRECEIVED="P9 2026-11-12T23:00:00Z {}
+"; kill -TERM $$; /bin/sleep 1; exit 2; }
+    control_token a_control
+    echo continued' _ "$GT" "$T_TMP/work" 2>&1)" || rc=$?
+  assert_exit 143 "$rc"
+  assert_contains "$out" "CLEANUP UNRECEIVED=<P9 2026-11-12T23:00:00Z {}"
+  assert_not_contains "$out" "continued"
+}
+
 # Round 60 (SEC-1): a signal as an attempt succeeds waits until GitHub's answer is shown and the
 # object it made is recorded, so the clean-up still reads it back.
 test_a_signal_as_an_attempt_succeeds_keeps_the_object_it_made() {
