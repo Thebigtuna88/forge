@@ -3613,6 +3613,24 @@ test_a_lost_control_record_is_reported_before_a_held_signal_acts() {
   assert_not_contains "$out" "continued"
 }
 
+# Round 65 (C1): a signal that reaches a control while its exit clean-up runs (closing the window
+# signals every process) doesn't cut it short: a token it couldn't revoke is still reported.
+test_a_signal_during_a_controls_clean_up_still_reports_its_token() {
+  local out rc=0
+  out="$(/bin/bash -p -c '
+    source "$1"; WORK="$2"; mkdir -p "$WORK"
+    a_control() {
+      OUTSTANDING=" dummy-token"
+      resume_signals
+      revoke_outstanding() { /bin/sh -c "kill -TERM \$PPID"; /bin/sleep 1; }
+      return 0
+    }
+    control_token a_control; echo "control_token status=$?"' _ "$GT" "$T_TMP/work" 2>&1)" || rc=$?
+  assert_contains "$out" "a control's token could not be revoked" "the unrevoked token went unreported"
+  # The control got its token (status 0), as control_token reports it, with the warning.
+  assert_contains "$out" "control_token status=0"
+}
+
 # Round 63 (C1): a signal while the caller receives a control's record waits until the record is
 # registered, so the clean-up still reports it whole.
 test_a_signal_while_a_controls_record_comes_in_keeps_it() {

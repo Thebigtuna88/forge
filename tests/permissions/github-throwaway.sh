@@ -595,6 +595,9 @@ revoke_outstanding() { # the current token, then every other token this run mint
 # here (round 35, C1/SEC-1): status 3 (the request worked) or 4 (it failed) from its exit trap.
 control_exit() {
   local rc=$?
+  # Like the clean-up, it runs to its end: a further signal (closing the window signals every
+  # process, this subshell too) can't cut it short and hide a token it couldn't revoke (round 65).
+  trap '' HUP INT TERM
   # Its requests that may have issued a token never received go to the caller (round 61, SEC-1),
   # through a pipe on fd 3 rather than a file that might not be written; if even that fails, status 5
   # tells the caller a record was lost (round 62, C1, SEC-1).
