@@ -3513,6 +3513,56 @@ test_suspend_check_revokes_a_token_from_a_broken_answer() {
   assert_not_contains "$out" "$tok" "the token printed"
 }
 
+# Round 61 (C1): key-check and suspend-check stop on an answer that may mean a token never received,
+# with the whole report (requested repositories, permissions, the latest expiry), and go no further.
+test_key_check_and_suspend_check_stop_on_a_token_possibly_issued() {
+  local cmd out rc
+  for cmd in cmd_suspend_check cmd_key_check; do
+    held_stubs
+    make_jwt() { JWT=jwt-stand-in-r61; }
+    jwt_with() { :; }
+    load_app() { :; }
+    need_app_identity() { INSTALLATION_ID=77; }
+    : >"$T_TMP/app-new.pem"
+    chmod 600 "$T_TMP/app-new.pem"
+    APP_KEY="$T_TMP/app.pem"
+    jwt_call() {
+      case "$1 $2" in
+        "GET app/installations"*) LAST_HTTP=200; LAST_OUT='[{"id":77,"account":{"login":"Thebigtuna88"},"suspended_at":"2026-11-12T00:00:00Z"}]' ;;
+        "POST app/installations/77/access_tokens") LAST_HTTP=201; LAST_OUT='{}' ;;
+      esac
+    }
+    control_token() { echo "control" >>"$T_TMP/calls"; }
+    use_held() { echo "use_held" >>"$T_TMP/calls"; }
+    rc=0
+    out="$("$cmd" 2>&1)" || rc=$?
+    assert_exit 2 "$rc" "$cmd"
+    assert_contains "$out" "possibly issued, never received" "$cmd"
+    assert_contains "$out" "repositories forge-frg26-throwaway; permissions $WANT_PERMS" "$cmd"
+    assert_contains "$out" "at the latest" "$cmd"
+    assert_eq "$(cat "$T_TMP/calls")" "" "$cmd went on after the answer"
+  done
+}
+
+# Round 61 (SEC-1): a control (run hidden) whose token request may have issued a token never
+# received is reported by the caller, which stops.
+test_a_controls_token_possibly_issued_is_reported_and_stops_the_run() {
+  load
+  WORK="$T_TMP/work"
+  mkdir -p "$WORK"
+  app_gh() { :; }
+  # shellcheck disable=SC2089 # the record is text (JSON), never run or split
+  a_control() { UNRECEIVED='P9 2026-11-12T23:00:00Z {"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}
+'; die "the token request got no usable answer"; }
+  local out rc=0
+  out="$(control_token a_control 2>&1; echo "went on")" || rc=$?
+  assert_exit 2 "$rc"
+  assert_contains "$out" "TOKEN P9 possibly issued, never received"
+  assert_contains "$out" "repositories forge-frg26-throwaway; permissions {\"metadata\":\"read\"}"
+  assert_contains "$out" "expires by 2026-11-12T23:00:00Z at the latest"
+  assert_not_contains "$out" "went on"
+}
+
 # Round 60 (SEC-1): a signal as an attempt succeeds waits until GitHub's answer is shown and the
 # object it made is recorded, so the clean-up still reads it back.
 test_a_signal_as_an_attempt_succeeds_keeps_the_object_it_made() {
@@ -3543,6 +3593,7 @@ test_only_http_401_confirms_a_revocation() {
 test_mint_reports_a_2xx_answer_without_a_token_as_possibly_issued() {
   local out rc=0
   mint_with_curl '{}' "" 201 0
+  # shellcheck disable=SC2090 # UNRECEIVED is text (JSON), only printed
   out="$( (MINT_LABEL=P2; trap 'printf "unreceived=[%s]\n" "$UNRECEIVED"' EXIT; mint '{"permissions":{"metadata":"read"}}' narrowed '{"metadata":"read"}') 2>&1)" || rc=$?
   assert_exit 2 "$rc" "a 2xx without a token"
   assert_contains "$out" "holds no installation token"

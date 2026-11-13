@@ -161,9 +161,8 @@ cleanup() {
     PROBE_ACTIVE=""
     probe_finish "$rc"
   fi
-  if [[ -n "$PENDING_MINT" ]]; then
-    say "note: a token request was in progress when the run stopped: GitHub may have issued a token this run never received; if so it expires by $(printf '%s' "$PENDING_MINT" | cut -d' ' -f2) at the latest"
-  fi
+  # Any other command's requests that may have issued a token never received (round 61, C1).
+  if [[ -n "$PENDING_MINT" || -n "$UNRECEIVED" ]]; then report_unreceived; fi
   revoke_outstanding
   if [[ -n "$HELD_LOCKED" ]]; then rmdir "$HELD.lock" 2>/dev/null || true; HELD_LOCKED=""; fi
   if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf "$WORK"; fi
@@ -596,6 +595,10 @@ revoke_outstanding() { # the current token, then every other token this run mint
 # here (round 35, C1/SEC-1): status 3 (the request worked) or 4 (it failed) from its exit trap.
 control_exit() {
   local rc=$?
+  # Its requests that may have issued a token never received go to the caller (round 61, SEC-1).
+  if [[ -n "$PENDING_MINT" ]]; then UNRECEIVED="$UNRECEIVED$PENDING_MINT
+"; fi
+  if [[ -n "$UNRECEIVED" ]]; then printf '%s' "$UNRECEIVED" >"$WORK/control-unreceived" 2>/dev/null; fi
   revoke_outstanding >/dev/null 2>&1
   if [[ -n "${OUTSTANDING// /}" ]]; then
     if [[ $rc -eq 0 ]]; then exit 3; fi
@@ -605,7 +608,17 @@ control_exit() {
 
 control_token() { # <command> — 0 if it got its token; reports a token left unrevoked
   local rc=0
+  rm -f "$WORK/control-unreceived"
   (trap control_exit EXIT; "$@") >/dev/null 2>&1 || rc=$?
+  # A control's request that may have issued a token never received stops the run, reported whole
+  # (round 61, SEC-1).
+  if [[ -s "$WORK/control-unreceived" ]]; then
+    UNRECEIVED="$UNRECEIVED$(cat "$WORK/control-unreceived")
+"
+    rm -f "$WORK/control-unreceived"
+    report_unreceived
+    die "a control's token request got no usable answer: GitHub may have issued a token this run never received; the run stops"
+  fi
   if [[ $rc -eq 3 || $rc -eq 4 ]]; then
     say "note: a control's token could not be revoked; GitHub expires it within an hour of its issue"
   fi
@@ -1988,6 +2001,34 @@ revoke_confirmed() { # <label> — revoke the current token; a read with it afte
   fi
 }
 
+# Every token GitHub may have issued that this run never received (round 56, SEC-1), a request still
+# pending included (round 57, C1), reported whole: the requested repositories and permissions and
+# the latest it can expire. Shared by every command (round 61, C1). Sets UNRECEIVED_LABELS; each
+# request is reported once.
+UNRECEIVED_LABELS=""
+report_unreceived() {
+  local line label by req repos perms
+  if [[ -n "$PENDING_MINT" ]]; then
+    UNRECEIVED="$UNRECEIVED$PENDING_MINT
+"
+    PENDING_MINT=""
+  fi
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    label="${line%% *}" line="${line#* }"
+    by="${line%% *}" req="${line#* }"
+    UNRECEIVED_LABELS="$UNRECEIVED_LABELS $label"
+    # At most what was asked; a request that names none asks for the installation's.
+    repos="$(jq -r 'if .repositories then (.repositories | join(", ")) else empty end' <<<"$req" 2>/dev/null)" || repos=""
+    perms="$(jq -S -c '.permissions // empty' <<<"$req" 2>/dev/null)" || perms=""
+    # (Defaults set apart: bash 3.2 misreads an apostrophe inside a quoted ${x:-...}.)
+    [[ -n "$repos" ]] || repos="every repository the installation is on"
+    [[ -n "$perms" ]] || perms="the installation's $WANT_PERMS"
+    say "TOKEN $label possibly issued, never received: its request got no complete answer, so this run can't revoke or check it. If GitHub issued it, it carries at most: repositories $repos; permissions $perms; it expires by $by at the latest. This run does not ask for it again"
+  done <<<"$UNRECEIVED"
+  UNRECEIVED=""
+}
+
 # A token not confirmed revoked, described for the owner without the token (round 54, SEC-1): what
 # GitHub said when it was issued, whether its expiry was checked within the hour, and what it
 # reaches now (a read with it, if the time cap allows).
@@ -2035,27 +2076,8 @@ probe_finish() {
       probe_describe "${e%%=*}" "$t"
     fi
   done
-  # A token GitHub may have issued but this run never received (round 56, SEC-1), a request still
-  # pending when the run stopped included (round 57, C1).
-  if [[ -n "$PENDING_MINT" ]]; then
-    UNRECEIVED="$UNRECEIVED$PENDING_MINT
-"
-    PENDING_MINT=""
-  fi
-  local line label by req repos perms unrec=""
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    label="${line%% *}" line="${line#* }"
-    by="${line%% *}" req="${line#* }"
-    unrec="$unrec $label"
-    # At most what was asked; a request that names none asks for the installation's.
-    repos="$(jq -r 'if .repositories then (.repositories | join(", ")) else empty end' <<<"$req" 2>/dev/null)" || repos=""
-    perms="$(jq -S -c '.permissions // empty' <<<"$req" 2>/dev/null)" || perms=""
-    # (Defaults set apart: bash 3.2 misreads an apostrophe inside a quoted ${x:-...}.)
-    [[ -n "$repos" ]] || repos="every repository the installation is on"
-    [[ -n "$perms" ]] || perms="the installation's $WANT_PERMS"
-    say "TOKEN $label possibly issued, never received: its request got no complete answer, so this run can't revoke or check it. If GitHub issued it, it carries at most: repositories $repos; permissions $perms; it expires by $by at the latest. This run does not ask for it again"
-  done <<<"$UNRECEIVED"
+  report_unreceived
+  local unrec="$UNRECEIVED_LABELS"
   say "TOKENS $MINTED issued; confirmed revoked:${yes:- none}; NOT confirmed:${no:- none}"
   local tokens="$PROBE_REVOKED of $MINTED tokens revoked (confirmed)${no:+, NOT confirmed:$no}${unrec:+; possibly issued, never received:$unrec}"
   case "$PROBE_END" in
@@ -2807,8 +2829,11 @@ cmd_key_check() {
     obs=allowed
     revoke_token || true
   fi
+  # An answer that may mean a token never received stops the step at once, before any other token
+  # is asked for, reported whole (round 61, C1).
   if [[ "$REQ_UNRECEIVED" == yes ]]; then
-    say "note: the request signed with the deleted key got no usable answer: GitHub may have issued a token this run never received; if so it expires by $REQ_BY at the latest"
+    report_unreceived
+    die "the request signed with the deleted key got no usable answer (HTTP ${LAST_HTTP:-none}): GitHub may have issued a token this run never received; the step stops"
   fi
   make_jwt
   local ctl=failed
@@ -2857,8 +2882,10 @@ cmd_suspend_check() {
   elif [[ "$LAST_HTTP" =~ ^2 ]]; then obs=allowed
   elif [[ "$LAST_HTTP" =~ ^(401|403|404)$ ]] && ! grep -Eiq 'rate limit|abuse detection' <<<"$REQ_ANSWER"; then obs=refused
   fi
+  # As in key-check (round 61, C1): reported whole, then the step stops at once.
   if [[ "$REQ_UNRECEIVED" == yes ]]; then
-    say "note: the token request got no usable answer: GitHub may have issued a token this run never received; if so it expires by $REQ_BY at the latest"
+    report_unreceived
+    die "the token request got no usable answer (HTTP ${LAST_HTTP:-none}): GitHub may have issued a token this run never received; the step stops"
   fi
   state_set E1 "$obs HTTP-${LAST_HTTP:-none}" || die "can't store this step's observation in $STATE: run it again"
   use_held suspend
