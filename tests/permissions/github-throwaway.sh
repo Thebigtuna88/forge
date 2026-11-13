@@ -622,6 +622,14 @@ control_token() { # <command> — 0 if it got its token; reports a token left un
     UNRECEIVED="$UNRECEIVED$rec
 "
   fi
+  # What the control reports is said before a held signal acts (round 64, C1, SEC-1): its token it
+  # couldn't revoke and a record it couldn't hand over live only in its subshell.
+  if [[ $rc -eq 3 || $rc -eq 4 ]]; then
+    say "note: a control's token could not be revoked; GitHub expires it within an hour of its issue"
+  fi
+  if [[ $rc -eq 5 ]]; then
+    say "a control's token request got no usable answer, and its record of it could not be handed over: GitHub may have issued a token this run never received (it expires within an hour of the request)"
+  fi
   resume_signals
   # A control's request that may have issued a token never received stops the run, reported whole
   # (round 61, SEC-1); so does a record the control could not hand over (round 62).
@@ -629,12 +637,7 @@ control_token() { # <command> — 0 if it got its token; reports a token left un
     report_unreceived
     die "a control's token request got no usable answer: GitHub may have issued a token this run never received; the run stops"
   fi
-  if [[ $rc -eq 5 ]]; then
-    die "a control's token request got no usable answer, and its record of it could not be handed over: GitHub may have issued a token this run never received (it expires within an hour of the request); the run stops"
-  fi
-  if [[ $rc -eq 3 || $rc -eq 4 ]]; then
-    say "note: a control's token could not be revoked; GitHub expires it within an hour of its issue"
-  fi
+  [[ $rc -ne 5 ]] || die "a control's record could not be handed over; the run stops"
   [[ $rc -eq 0 || $rc -eq 3 ]]
 }
 

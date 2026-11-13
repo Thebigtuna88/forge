@@ -3581,6 +3581,38 @@ test_a_control_record_that_cannot_be_handed_over_still_stops_the_run() {
   assert_not_contains "$(declare -f control_exit control_token)" "control-unreceived" "a file for the record"
 }
 
+# Round 64 (C1): a control's token it couldn't revoke is reported before a held signal acts.
+test_a_controls_unrevoked_token_is_reported_before_a_held_signal_acts() {
+  local out rc=0
+  out="$(/bin/bash -p -c '
+    source "$1"; WORK="$2"; mkdir -p "$WORK"
+    app_gh() { return 1; }
+    cleanup() { echo "parent cleanup"; }
+    a_control() { OUTSTANDING="$(printf "gh%s_" s)QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ"; kill -TERM $$; return 0; }
+    control_token a_control
+    echo continued' _ "$GT" "$T_TMP/work" 2>&1)" || rc=$?
+  assert_exit 143 "$rc"
+  assert_contains "$out" "a control's token could not be revoked"
+  assert_not_contains "$out" "continued"
+}
+
+# Round 64, the same class: a record the control could not hand over is reported before a held
+# signal acts too.
+test_a_lost_control_record_is_reported_before_a_held_signal_acts() {
+  local out rc=0
+  out="$(/bin/bash -p -c '
+    source "$1"; WORK="$2"; mkdir -p "$WORK"
+    app_gh() { :; }
+    cleanup() { echo "parent cleanup"; }
+    a_control() { exec 3>&-; UNRECEIVED="P9 2026-11-12T23:00:00Z {}
+"; kill -TERM $$; exit 2; }
+    control_token a_control
+    echo continued' _ "$GT" "$T_TMP/work" 2>&1)" || rc=$?
+  assert_exit 143 "$rc"
+  assert_contains "$out" "could not be handed over"
+  assert_not_contains "$out" "continued"
+}
+
 # Round 63 (C1): a signal while the caller receives a control's record waits until the record is
 # registered, so the clean-up still reports it whole.
 test_a_signal_while_a_controls_record_comes_in_keeps_it() {
