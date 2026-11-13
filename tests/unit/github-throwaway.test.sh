@@ -3665,6 +3665,32 @@ test_a_signal_as_an_attempt_succeeds_keeps_the_object_it_made() {
   assert_not_contains "$out" "continued"
 }
 
+# Round 68 (C1, SEC-1): a stop during P5's control branch request acts once the branch is reported,
+# before the control file request starts: a stop starts no new test action.
+test_a_stop_during_the_p5_control_branch_starts_no_file_write() {
+  local out rc=0
+  out="$(/bin/bash -p -c '
+    source "$1"; WORK="$2"; RUN_ID=t1
+    cleanup() { echo "EXIT"; }
+    with_timeout() { shift; "$@"; }
+    call_secs() { echo 20; }
+    probe_attempt() { OBS=refused; }
+    probe_refs_same() { return 0; }
+    owner_gh() { echo 0123456789abcdef0123456789abcdef01234567; }
+    app_gh() {
+      echo "app_gh $*" >>"$WORK/p5-calls"
+      case "$*" in *"-X POST repos/$REPO/git/refs"*) kill -TERM $$ ;; esac
+      echo "{}"
+    }
+    probe_code
+    echo continued' _ "$GT" "$T_TMP" 2>&1)" || rc=$?
+  assert_exit 143 "$rc"
+  assert_contains "$out" "CONTROL P5 branch: the app created the branch frg26/probe/P5-t1 on Thebigtuna88/forge-frg26-throwaway"
+  assert_contains "$(cat "$T_TMP/p5-calls")" "-X POST repos/Thebigtuna88/forge-frg26-throwaway/git/refs -f ref=refs/heads/frg26/probe/P5-t1"
+  assert_not_contains "$(cat "$T_TMP/p5-calls")" "-X PUT repos/Thebigtuna88/forge-frg26-throwaway/contents" "the file write started after the stop"
+  assert_not_contains "$out" "continued"
+}
+
 # Round 58 (C2): only HTTP 401 confirms a revocation, not the words "Bad credentials".
 test_only_http_401_confirms_a_revocation() {
   probe_stubs

@@ -2237,9 +2237,14 @@ probe_code() {
   probe_attempt "P5 branch" - - -X POST "repos/$REPO2/git/refs" -f ref="refs/heads/frg26-probe-$(stamp)" -f sha="$main2"
   probe_code_judge "P5 branch"
   b="frg26/probe/P5-$(stamp)"
+  # A stop held during the branch request acts once the branch is reported, before the file request
+  # starts: a stop starts no new test action (round 68, C1, SEC-1).
   defer_signals
   capture with_timeout "$(call_secs)" app_gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$b" -f sha="$dev" \
     || probe_stop "control: the app could not create the branch $b on $REPO ($(evidence)), so the refusals prove nothing"
+  say "CONTROL P5 branch: the app created the branch $b on $REPO"
+  resume_signals
+  defer_signals
   capture with_timeout "$(call_secs)" app_gh api -X PUT "repos/$REPO/contents/tests/frg26-probe-$(stamp).txt" -f message="FRG-26 A2 probe P5 control ($(stamp))" \
     -f content="$content" -f branch="$b" \
     || probe_stop "control: the app could not add a file to $b on $REPO ($(evidence)), so the refusals prove nothing"
