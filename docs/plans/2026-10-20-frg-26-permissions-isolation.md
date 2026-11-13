@@ -425,6 +425,17 @@ against the second throwaway:
   request, plus a minute). A token that did arrive in an answer whose transfer then failed is
   taken, revoked and checked like any other. This does **not** approve the same risk for the
   production broker: it is assessed separately before stage 2.
+- Interruption, accepted by the owner (2026-11-13, after review round 67) **for this throwaway
+  investigation only**. Ctrl-C and closing the window stay available: on one, the run starts no
+  new test action and attempts the bounded clean-up. A stop arriving at an unlucky moment may
+  leave the report incomplete or a revocation unconfirmed. Any token so affected is still within
+  the approved scope (what its TOKEN lines show, and what the run shows on a public repository it
+  isn't installed on) and expiry (within an hour of its issue). Uncertainty is reported when
+  possible, and a successful clean-up is never reported without confirmation (HTTP 401 for each
+  token). Not extended to the other stage 1 commands or the broker without separate approval.
+- Review criteria for this investigation (owner, 2026-11-13): a finding that fits one of these
+  accepted limits is recorded under it; any other is summarised for the owner before a fix is
+  proposed. Automatic review rounds are paused until the owner says otherwise.
 
 The proposed split of item 9 into 9a and 9b is not yet a claim: item 9 stays failed and unresolved,
 the remaining stage 1 handoffs stay paused, and the findings come to the owner with a

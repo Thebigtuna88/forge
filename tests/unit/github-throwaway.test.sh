@@ -3817,6 +3817,23 @@ test_with_timeout_stops_a_command_that_hangs() {
   (($(date +%s) - start <= 2)) || _t_fail "with TERM ignored, a quick command waited $(($(date +%s) - start))s for its watchdog"
 }
 
+# Round 67 (C1): a signal to the whole process group (as closing the window sends) doesn't kill
+# the watchdog, so a command that ignores it is still stopped in time. The case runs in its own
+# process group (a new session), so the signal reaches nothing else.
+test_with_timeout_survives_a_signal_to_the_process_group() {
+  local out
+  # shellcheck disable=SC2016 # the inner script is single-quoted on purpose: the inner bash expands it
+  out="$(/usr/bin/python3 -c 'import os, sys; os.setsid(); os.execv("/bin/bash", ["/bin/bash", "-p", "-c"] + sys.argv[1:])' '
+    source "$1"; WORK="$2"; mkdir -p "$WORK"
+    trap : TERM
+    slow() { trap "" TERM; /bin/sleep 6; }
+    ( /bin/sleep 1; kill -TERM -- -$$ ) &
+    SECONDS=0; with_timeout 2 slow; echo "rc=$? after=$SECONDS"' _ "$GT" "$T_TMP/work" 2>&1)"
+  local secs
+  secs="$(printf '%s\n' "$out" | sed -n 's/^rc=124 after=\([0-9]*\)$/\1/p')"
+  [[ "$secs" =~ ^[0-9]+$ && $secs -le 4 ]] || _t_fail "the watchdog died with the group signal: $out"
+}
+
 # Round 66 (C1): a caught signal interrupts bash's wait while the command still runs; with_timeout
 # keeps waiting under the same watchdog instead of taking that for the command's end.
 test_with_timeout_waits_on_through_a_caught_signal() {

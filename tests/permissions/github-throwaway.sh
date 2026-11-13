@@ -531,6 +531,9 @@ with_timeout() { # <seconds> <command…>
   "$@" &
   pid=$!
   (
+    # A signal to the whole process group (closing the window) must not end the watchdog: a subshell
+    # resets caught signals to their default, so it ignores them itself (round 67, C1).
+    trap '' HUP INT TERM
     sleep "$secs"
     echo stopped >"$mark"
     kill_tree "$pid"
@@ -1915,6 +1918,10 @@ cmd_ptests() {
 # complete answer may leave a token this run never received. It may stay valid until its
 # expires_at, printed when it was issued. What it can do is what its TOKEN lines show for the first
 # throwaway, plus what this run's readings show on a public repository it isn't installed on (A2).
+# Accepted by the owner for this investigation only (2026-11-13): a Ctrl-C or a closed window at an
+# unlucky moment may leave the report incomplete or a revocation unconfirmed; such a token stays
+# within the scope and expiry above. A clean-up is never reported successful without a 401 for each
+# token. Not extended to the other stage 1 commands or the broker without separate approval.
 
 readonly PROBE_PERMS_P1='{"contents":"write","metadata":"read"}'
 readonly PROBE_PERMS_P2='{"metadata":"read"}'
