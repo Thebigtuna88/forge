@@ -3563,6 +3563,24 @@ test_a_controls_token_possibly_issued_is_reported_and_stops_the_run() {
   assert_not_contains "$out" "went on"
 }
 
+# Round 62 (C1, SEC-1): if a control can't hand its record over, the caller still stops, saying so.
+test_a_control_record_that_cannot_be_handed_over_still_stops_the_run() {
+  load
+  WORK="$T_TMP/work"
+  mkdir -p "$WORK"
+  app_gh() { :; }
+  # shellcheck disable=SC2089 # the record is text (JSON), never run or split
+  lost_record() { exec 3>&-; UNRECEIVED='P9 2026-11-12T23:00:00Z {"permissions":{"metadata":"read"}}
+'; die "the token request got no usable answer"; }
+  local out rc=0
+  out="$(control_token lost_record 2>&1; echo "went on")" || rc=$?
+  assert_exit 2 "$rc"
+  assert_contains "$out" "its record of it could not be handed over"
+  assert_not_contains "$out" "went on"
+  # The record no longer goes through a file.
+  assert_not_contains "$(declare -f control_exit control_token)" "control-unreceived" "a file for the record"
+}
+
 # Round 60 (SEC-1): a signal as an attempt succeeds waits until GitHub's answer is shown and the
 # object it made is recorded, so the clean-up still reads it back.
 test_a_signal_as_an_attempt_succeeds_keeps_the_object_it_made() {

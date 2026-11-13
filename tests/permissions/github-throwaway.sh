@@ -595,10 +595,15 @@ revoke_outstanding() { # the current token, then every other token this run mint
 # here (round 35, C1/SEC-1): status 3 (the request worked) or 4 (it failed) from its exit trap.
 control_exit() {
   local rc=$?
-  # Its requests that may have issued a token never received go to the caller (round 61, SEC-1).
+  # Its requests that may have issued a token never received go to the caller (round 61, SEC-1),
+  # through a pipe on fd 3 rather than a file that might not be written; if even that fails, status 5
+  # tells the caller a record was lost (round 62, C1, SEC-1).
   if [[ -n "$PENDING_MINT" ]]; then UNRECEIVED="$UNRECEIVED$PENDING_MINT
 "; fi
-  if [[ -n "$UNRECEIVED" ]]; then printf '%s' "$UNRECEIVED" >"$WORK/control-unreceived" 2>/dev/null; fi
+  if [[ -n "$UNRECEIVED" ]] && ! printf '%s' "$UNRECEIVED" >&3 2>/dev/null; then
+    revoke_outstanding >/dev/null 2>&1
+    exit 5
+  fi
   revoke_outstanding >/dev/null 2>&1
   if [[ -n "${OUTSTANDING// /}" ]]; then
     if [[ $rc -eq 0 ]]; then exit 3; fi
@@ -608,16 +613,18 @@ control_exit() {
 
 control_token() { # <command> — 0 if it got its token; reports a token left unrevoked
   local rc=0
-  rm -f "$WORK/control-unreceived"
-  (trap control_exit EXIT; "$@") >/dev/null 2>&1 || rc=$?
+  local rec
+  rec="$( (trap control_exit EXIT; "$@") 3>&1 >/dev/null 2>&1)" || rc=$?
   # A control's request that may have issued a token never received stops the run, reported whole
-  # (round 61, SEC-1).
-  if [[ -s "$WORK/control-unreceived" ]]; then
-    UNRECEIVED="$UNRECEIVED$(cat "$WORK/control-unreceived")
+  # (round 61, SEC-1); so does a record the control could not hand over (round 62).
+  if [[ -n "$rec" ]]; then
+    UNRECEIVED="$UNRECEIVED$rec
 "
-    rm -f "$WORK/control-unreceived"
     report_unreceived
     die "a control's token request got no usable answer: GitHub may have issued a token this run never received; the run stops"
+  fi
+  if [[ $rc -eq 5 ]]; then
+    die "a control's token request got no usable answer, and its record of it could not be handed over: GitHub may have issued a token this run never received (it expires within an hour of the request); the run stops"
   fi
   if [[ $rc -eq 3 || $rc -eq 4 ]]; then
     say "note: a control's token could not be revoked; GitHub expires it within an hour of its issue"
