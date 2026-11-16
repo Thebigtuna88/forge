@@ -345,7 +345,7 @@ New tests (throwaway app, throwaway repo, run only from your handoffs):
 | # | Tries… | Must happen | Control |
 |---|---|---|---|
 | A1 | Mint a token; read what GitHub says it carries | Exactly the four permissions, only the throwaway repo | — (a reading) |
-| A2 | Push, open a PR, open an issue on a second public throwaway repo the app isn't installed on | Refused. **2026-11-11: FAILED** (the issue was allowed; below the table) | Same three on the installed repo succeed. The PR's branch there must be ahead of main (checked first), or no one could open it (review round 15) |
+| A2 | Since 2026-11-15 (owner), code changes only, on a second public throwaway repo the app isn't installed on: a push, a file and a branch through the API | Refused, and that repo's branches and tags unchanged. **2026-11-11: FAILED** as first written (an issue was allowed; below the table); an issue or PR there is no longer tried | Same three on the installed repo succeed. The file goes on the owner's branch there, which must exist (checked first) |
 | A3 | Push a commit adding `.github/workflows/x.yml` to a feature branch | Refused | The same commit with an ordinary file succeeds |
 | A4 | Use a token over 1 hour old | 401 | A fresh token, same request, succeeds |
 | A5 | Revoke a token, then use it | 401 | The same token makes the same request successfully just before it is revoked (review round 36) |
@@ -444,6 +444,20 @@ against the second throwaway:
 The proposed split of item 9 into 9a and 9b is not yet a claim: item 9 stays failed and unresolved,
 the remaining stage 1 handoffs stay paused, and the findings come to the owner with a
 recommendation before the broker is extended or any risk is accepted.
+
+**Investigation result (run 2026-11-14T00:33Z, verified):** code changes on the second throwaway
+were refused (a file and a branch, 403) and its branches and tags were unchanged; a comment and a
+PR there were refused; an issue was opened with a token without Issues and with one with metadata
+read only (issues #2, #3, kept open). All four tokens reached only the first throwaway, expired
+within the hour and were confirmed revoked (HTTP 401). Evidence: `evidence/70-a2-probe-log.txt` in
+`work/FRG-26-permissions-isolation/`. The owner's response: section 13 (a proposed broker design).
+
+**Stage 1 resumes (owner, 2026-11-15)** before the broker exists, with A2 changed to test code
+changes only (the table above): the paused handoffs test what GitHub itself enforces, which section
+13 doesn't change. The issue opening is recorded here as a known result, not tried again. Item 9
+stays failed and unresolved; A2 passing as changed shows claim 9a only. The issue check on the
+second throwaway now counts only this run's issues, so the kept evidence (#1-#3) stays open
+without failing every run. The regenerated handoffs are reviewed like the others.
 
 ## 7. Your home folder (D8)
 

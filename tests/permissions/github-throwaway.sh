@@ -9,9 +9,10 @@
 # It touches only two public throwaway repositories and refuses any other (review round 37):
 #   github.com/Thebigtuna88/forge-frg26-throwaway     the tests: both parties write here
 #   github.com/Thebigtuna88/forge-frg26-throwaway-2   test A2: the owner creates it once (one
-#       branch, one file; create-second); after that only the app tries a push, an issue and a PR,
-#       which must be refused (the app is not installed there); the owner only reads it. A2 failed
-#       on 2026-11-11 (the issue got through); a2-probe then tries more there, as the app
+#       branch, one file; create-second); after that only the app tries code changes (a push, a
+#       file and a branch), which must be refused (the app is not installed there); the owner only
+#       reads it. A2 failed on 2026-11-11 (an issue got through); a2-probe then tried more there,
+#       as the app; since 2026-11-15 A2 no longer tries an issue (owner)
 #
 #   github-throwaway.sh create            owner: create the throwaway repo (public; main dev side)
 #   github-throwaway.sh check-app         the app, its installation and its token carry exactly the
@@ -1771,26 +1772,42 @@ t_A3() {
   record_p A3 "$OBS" "$CTL" "$EV"
 }
 
-# A2 (plan 4.1, item 9): writes to a public repository the app is not installed on: a push, an
-# issue, a PR (from a branch the owner made there). Control: the same three on the throwaway.
+# A2 (plan 4.1, item 9, claim 9a): code changes on a public repository the app is not installed
+# on: a push, and a file and a branch through the API, each refused, with that repository's
+# branches and tags unchanged. Control: the same three on the throwaway. Opening an issue there is
+# not tried (owner, 2026-11-15): the A2 investigation showed it is allowed whatever the token
+# carries, and item 9 stays failed for it (plan sections 6 and 13).
 t_A2() {
-  local ahead
-  ahead="$(owner_gh api "repos/$REPO2/compare/main...$A2_BRANCH" --jq .ahead_by 2>/dev/null)" || ahead=""
-  [[ "$ahead" =~ ^[1-9][0-9]*$ ]] || { setup_fail_p A2 "$REPO2's $A2_BRANCH is not ahead of main (ahead by '${ahead:-unreadable}'): no PR could be opened from it"; return; }
+  local main2 dev before content b
+  main2="$(owner_gh api "repos/$REPO2/branches/main" --jq .commit.sha 2>/dev/null)" || main2=""
+  [[ "$main2" =~ ^[0-9a-f]{40}$ ]] || { setup_fail_p A2 "could not read $REPO2's main"; return; }
+  dev="$(owner_gh api "repos/$REPO/branches/dev" --jq .commit.sha 2>/dev/null)" || dev=""
+  [[ "$dev" =~ ^[0-9a-f]{40}$ ]] || { setup_fail_p A2 "could not read $REPO's dev"; return; }
+  # The file goes on the owner's branch there: with that branch missing, a 404 would prove nothing.
+  before="$(probe_refs)"
+  [[ "$before" != error && "$before" == *"refs/heads/$A2_BRANCH "* ]] || { setup_fail_p A2 "could not read $REPO2's branches and tags, or $A2_BRANCH is missing"; return; }
   fresh_from dev "a2-$(stamp)"
   add_commit "tests/permissions-A2-$(stamp).txt" "FRG-26 A2"
   # The push is judged by git's own words, the two API calls by GitHub's status.
   p_attempts push app_git -C "$CLONE" push "https://github.com/$REPO2.git" "HEAD:refs/heads/frg26-a2-$(stamp)"
   [[ "$OBS" == refused ]] || { record_p A2 "$OBS" "not run" "$EV"; return; }
   local ev="$EV"
-  p_attempts api app_gh api -X POST "repos/$REPO2/issues" -f title="FRG-26 A2 ($(stamp))" ";;" \
-    app_gh api -X POST "repos/$REPO2/pulls" -f title="FRG-26 A2 ($(stamp))" -f head="$A2_BRANCH" -f base=main
+  content="$(printf 'FRG-26 A2\n' | base64 | tr -d '\n')"
+  p_attempts api app_gh api -X PUT "repos/$REPO2/contents/frg26-a2-$(stamp).txt" -f message="FRG-26 A2 ($(stamp))" \
+    -f content="$content" -f branch="$A2_BRANCH" ";;" \
+    app_gh api -X POST "repos/$REPO2/git/refs" -f ref="refs/heads/frg26-a2-api-$(stamp)" -f sha="$main2"
   EV="$ev$EV"
   [[ "$OBS" == refused ]] || { record_p A2 "$OBS" "not run" "$EV"; return; }
-  p_controls app_git -C "$CLONE" push origin "HEAD:refs/heads/frg26/permissions/A2-$(stamp)" ";;" \
-    app_gh api -X POST "repos/$REPO/issues" -f title="FRG-26 A2 control ($(stamp))" ";;" \
-    app_gh api -X POST "repos/$REPO/pulls" -f title="FRG-26 A2 control ($(stamp))" -f head="frg26/permissions/A2-$(stamp)" -f base=dev
-  record_p A2 "$OBS" "$CTL" "$EV"
+  if [[ "$(probe_refs)" != "$before" ]]; then
+    record_p A2 allowed "not run" "$EV $REPO2's branches or tags changed (or could not be read again)"
+    return
+  fi
+  b="frg26/permissions/A2-$(stamp)"
+  p_controls app_git -C "$CLONE" push origin "HEAD:refs/heads/$b" ";;" \
+    app_gh api -X PUT "repos/$REPO/contents/tests/permissions-A2-api-$(stamp).txt" -f message="FRG-26 A2 control ($(stamp))" \
+    -f content="$content" -f branch="$b" ";;" \
+    app_gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/frg26/permissions/A2-api-$(stamp)" -f sha="$dev"
+  record_p A2 "$OBS" "$CTL" "$EV (opening an issue there is not tried: allowed whatever the token carries, A2 investigation 2026-11-14; item 9 stays failed)"
 }
 
 # A11: whether CI results on a public repo can be read with no Checks/Actions permission. A reading
@@ -1830,8 +1847,9 @@ setup_fail_p() { # <id> <what failed>
 }
 
 # This run's test issues ("FRG-26 " titles carrying RUN_ID) are closed in the throwaway. The second
-# throwaway is only read (round 13, SEC-4): an "FRG-26 " issue there means A2's attempt got through,
-# and is reported for the owner to close; this script never writes there as the owner.
+# throwaway is only read (round 13, SEC-4): an "FRG-26 " issue or PR there carrying RUN_ID means
+# this run wrote there, and is reported for the owner to close; this script never writes there as
+# the owner.
 sweep_issues() {
   local open n mine
   mine=".[] | select(.pull_request == null) | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number"
@@ -1844,8 +1862,9 @@ sweep_issues() {
       owner_gh issue close "$n" --repo "$REPO" >/dev/null 2>&1 || { FAILS=$((FAILS + 1)); say "CLEANUP FAIL issue #$n in $REPO may still be open"; }
     done
   fi
+  # Only this run's: issues #1-#3 there are the A2 evidence, kept open (owner, 2026-11-11).
   if ! open="$(owner_gh api --paginate "repos/$REPO2/issues?state=open&per_page=100" \
-    --jq '.[] | select(.title | startswith("FRG-26 ")) | .number' 2>/dev/null)"; then
+    --jq ".[] | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number" 2>/dev/null)"; then
     FAILS=$((FAILS + 1))
     say "CLEANUP FAIL could not list the open issues in $REPO2: check it on GitHub for \"FRG-26 \" issues"
   elif [[ -n "$open" ]]; then

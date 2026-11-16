@@ -1595,35 +1595,79 @@ p_stubs() { # app and owner calls are logged; answers come from $T_TMP/answers (
   sleep() { :; }
 }
 
-test_a2_tries_a_repo_the_app_is_not_installed_on() {
+a2_answers() { # the owner's reads A2 needs, then the given lines
+  local a b
+  # A2 reads the second throwaway's refs under with_timeout, whose watchdog needs the real sleep
+  # (p_stubs makes it instant, which would stop every read at once).
+  unset -f sleep
+  a="$(printf 'a%.0s' $(seq 1 40))" b="$(printf 'b%.0s' $(seq 1 40))"
+  {
+    echo "owner_gh api repos/$REPO2/branches/main --jq .commit.sha|0|$a"
+    echo "owner_gh api repos/$REPO/branches/dev --jq .commit.sha|0|$b"
+    echo "owner_gh api --paginate repos/$REPO2/git/matching-refs/heads|0|refs/heads/frg26-a2 $a"
+    printf '%s\n' "$@"
+  } >"$T_TMP/answers"
+}
+
+test_a2_tries_code_changes_on_a_repo_the_app_is_not_installed_on() {
   p_stubs
-  cat >"$T_TMP/answers" <<EOF
-owner_gh api repos/$REPO2/compare/main...frg26-a2 --jq .ahead_by|0|1
-app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot].
-app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)
-app_gh api -X POST repos/$REPO/issues|0|{"number":5}
-app_gh api -X POST repos/$REPO/pulls|0|{"number":6}
-EOF
-  local out
+  a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot]." \
+    "app_gh api -X PUT repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)" \
+    "app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)"
+  local out calls
   out="$(t_A2)"
   assert_contains "$out" "RESULT A2 permissions PASS attempt=refused control=ok"
-  local calls
   calls="$(cat "$T_TMP/calls")"
   assert_contains "$calls" "app_git -C $T_TMP/clone push https://github.com/$REPO2.git HEAD:refs/heads/frg26-a2-r1"
-  assert_contains "$calls" "app_gh api -X POST repos/$REPO2/issues"
-  assert_contains "$calls" "app_gh api -X POST repos/$REPO2/pulls"
+  assert_contains "$calls" "app_gh api -X PUT repos/$REPO2/contents/frg26-a2-r1.txt"
+  assert_contains "$calls" "branch=frg26-a2"
+  assert_contains "$calls" "app_gh api -X POST repos/$REPO2/git/refs -f ref=refs/heads/frg26-a2-api-r1"
   assert_contains "$calls" "app_git -C $T_TMP/clone push origin HEAD:refs/heads/frg26/permissions/A2-r1"
-  assert_contains "$calls" "app_gh api -X POST repos/$REPO/issues"
-  assert_contains "$calls" "app_gh api -X POST repos/$REPO/pulls"
+  assert_contains "$calls" "app_gh api -X PUT repos/$REPO/contents/tests/permissions-A2-api-r1.txt"
+  assert_contains "$calls" "app_gh api -X POST repos/$REPO/git/refs -f ref=refs/heads/frg26/permissions/A2-api-r1"
+  # Owner 2026-11-15: no issue or PR is tried there any more.
+  assert_not_contains "$calls" "repos/$REPO2/issues" "an issue on the second throwaway"
+  assert_not_contains "$calls" "repos/$REPO2/pulls" "a PR on the second throwaway"
+  assert_contains "$out" "opening an issue there is not tried"
   # A write that got through to the other repo fails the test, and nothing more is tried there.
-  cat >"$T_TMP/answers" <<EOF
-owner_gh api repos/$REPO2/compare/main...frg26-a2 --jq .ahead_by|0|1
-app_git -C $T_TMP/clone push https://github.com/$REPO2.git|0|
-EOF
+  a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|0|"
   : >"$T_TMP/calls"
   out="$(t_A2)"
   assert_contains "$out" "RESULT A2 permissions FAIL attempt=allowed"
-  assert_not_contains "$(cat "$T_TMP/calls")" "repos/$REPO2/issues" "attempts after one got through"
+  assert_not_contains "$(cat "$T_TMP/calls")" "-X PUT repos/$REPO2" "attempts after one got through"
+  # So does a file write that got through, before the branch is tried.
+  a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot]." \
+    "app_gh api -X PUT repos/$REPO2/|0|{}"
+  : >"$T_TMP/calls"
+  out="$(t_A2)"
+  assert_contains "$out" "RESULT A2 permissions FAIL attempt=allowed"
+  assert_not_contains "$(cat "$T_TMP/calls")" "-X POST repos/$REPO2/git/refs" "the branch after the file got through"
+}
+
+test_a2_fails_when_the_second_throwaways_branches_change() {
+  p_stubs
+  a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot]." \
+    "app_gh api -X PUT repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)" \
+    "app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)"
+  # Every refusal was clean, but a branch appeared there: the refs read differ the second time.
+  answer_refs() {
+    local n=0
+    [[ -f "$T_TMP/refs-reads" ]] && n="$(cat "$T_TMP/refs-reads")"
+    echo $((n + 1)) >"$T_TMP/refs-reads"
+    printf 'refs/heads/frg26-a2 %s\n' "$(printf 'a%.0s' $(seq 1 40))"
+    if [[ $n -ge 1 ]]; then echo "refs/heads/sneaked 0123456789abcdef0123456789abcdef01234567"; fi
+  }
+  owner_gh() {
+    case "$*" in
+      *"matching-refs/heads"*) echo "owner_gh $*" >>"$T_TMP/calls"; answer_refs ;;
+      *) answer owner_gh "$@" ;;
+    esac
+  }
+  local out
+  out="$(t_A2)"
+  assert_contains "$out" "RESULT A2 permissions FAIL attempt=allowed"
+  assert_contains "$out" "branches or tags changed"
+  assert_not_contains "$(cat "$T_TMP/calls")" "push origin" "a control after the change"
 }
 
 test_a3_pushes_a_workflow_file_and_a_plain_file() {
@@ -1775,7 +1819,8 @@ test_a11_and_a12_are_readings_not_results() {
 
 test_the_second_throwaways_branch_is_ahead_of_main() {
   # Round 15, SEC-1: a PR from a branch equal to main can't be opened by anyone, so a refusal would
-  # prove nothing. The branch is made first, the commit goes on it, and A2 checks it is ahead.
+  # prove nothing. The branch is made first, the commit goes on it. Since 2026-11-15 A2 writes a
+  # file on that branch instead, so it checks the branch is there.
   load
   : >"$T_TMP/owner"
   owner_gh() {
@@ -1796,10 +1841,13 @@ test_the_second_throwaways_branch_is_ahead_of_main() {
   [[ -n "$refs" && -n "$contents" && "$refs" -lt "$contents" ]] || _t_fail "the branch must be made before its commit"
   assert_contains "$(grep "contents/a2.txt" "$T_TMP/owner")" "branch=frg26-a2"
   p_stubs
-  printf 'owner_gh api repos/%s/compare/main...frg26-a2 --jq .ahead_by|0|0\n' "$REPO2" >"$T_TMP/answers"
+  a2_answers
+  sed -i '' '/matching-refs\/heads/d' "$T_TMP/answers"
+  echo "owner_gh api --paginate repos/$REPO2/git/matching-refs/heads|0|refs/heads/main $(printf 'a%.0s' $(seq 1 40))" >>"$T_TMP/answers"
   local out
   out="$(t_A2)"
-  assert_contains "$out" "RESULT A2 permissions FAIL attempt=setup-failed" "a branch not ahead of main"
+  assert_contains "$out" "RESULT A2 permissions FAIL attempt=setup-failed" "frg26-a2 missing"
+  assert_not_contains "$(cat "$T_TMP/calls")" "app_git" "an attempt without the branch"
 }
 
 test_assert_second_refuses_another_repo() {
@@ -1831,6 +1879,8 @@ test_a_permission_run_closes_its_test_issues() {
   assert_contains "$(grep "repos/$REPO/issues" "$T_TMP/owner")" "20261102T010203Z-77" "only this run's issues are closed"
   # Round 13, SEC-4: the second throwaway is only read; an issue there is reported, never closed.
   assert_contains "$(cat "$T_TMP/owner")" "repos/$REPO2/issues?state=open"
+  # Only this run's there: the A2 evidence (#1-#3) stays open and must not fail every run.
+  assert_contains "$(grep "repos/$REPO2/issues" "$T_TMP/owner")" "20261102T010203Z-77" "only this run's issues there count"
   assert_not_contains "$(cat "$T_TMP/owner")" "--repo $REPO2" "an owner write to the second throwaway"
   assert_contains "$out" "CLEANUP FAIL"
   assert_contains "$out" "fails=1"
@@ -3041,17 +3091,15 @@ test_controls_stop_at_their_first_failure() {
   out="$(t_S2c)"
   assert_contains "$out" "RESULT S2c permissions FAIL attempt=refused control=failed"
   assert_not_contains "$(cat "$T_TMP/calls")" "owner_gh api -X DELETE" "the disposable secret was deleted after a failed control"
-  # A2: a failed push control stops the issue and PR controls.
+  # A2: a failed push control stops the file and branch controls.
   p_stubs
-  cat >"$T_TMP/answers" <<EOF
-owner_gh api repos/$REPO2/compare/main...frg26-a2 --jq .ahead_by|0|1
-app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot].
-app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)
-app_git -C $T_TMP/clone push origin|1|fatal: unable to access: Could not resolve host
-EOF
+  a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot]." \
+    "app_gh api -X PUT repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)" \
+    "app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)" \
+    "app_git -C $T_TMP/clone push origin|1|fatal: unable to access: Could not resolve host"
   out="$(t_A2)"
   assert_contains "$out" "RESULT A2 permissions FAIL attempt=refused control=failed"
-  assert_not_contains "$(cat "$T_TMP/calls")" "app_gh api -X POST repos/$REPO/issues" "a control after the failed one"
+  assert_not_contains "$(cat "$T_TMP/calls")" "-X PUT repos/$REPO/contents" "a control after the failed one"
 }
 
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
