@@ -12,6 +12,7 @@
   revised protection claim; the later stage 1 handoffs wait. The owner approved an investigation
   on the throwaway repos (2026-11-11, section 6). Nothing on the Mac or in FORGE's settings has
   changed.
+- **Proposed revision, 2026-11-15:** section 13 records the request-forwarding broker design and required clarifications. Plan revision only; no implementation authorization, protection guarantee, risk acceptance or checkpoint change.
 - **Ticket:** FRG-26 (#26). Branch `feature/FRG-26-permissions-isolation`, draft PR #37.
 - **Follow-up:** FRG-27 (#27), review isolation, starts immediately after this one.
 - **Why revised:** the owner asked (2026-11-01) whether FRG-26 needs a separate GitHub account.
@@ -99,6 +100,9 @@ need is:
   names, collaborators, webhooks, deploy keys).
 
 ### 4.2 The token broker, in plain words (revision 1)
+
+*Proposed replacement (2026-11-15, not built): section 13, where the broker keeps every token and
+makes each request. This design stays the plan of record until that one is approved and tested.*
 
 *The problem.* The app has a **private key**, a file that proves to GitHub "this is the app". It
 never expires: whoever holds it can keep getting fresh access. So I must never be able to read it.
@@ -325,7 +329,7 @@ reason from GitHub (BLOCKED, GH006/GH013, 403/404/401); anything else is inconcl
 | 5b | See secret values; approve its own deployment | No repo-level secrets; Environments need you, self-review prevented, `main` only | Confirmed (docs) | S1 (read-only), S2a-c (stage 1, P with controls) |
 | 6 | Change workflow files | No Workflows permission | Confirmed | A3 (P) |
 | 7 | Widen my access (permissions, repos, keys) | Only you change the app, in your browser | Confirmed | A1, A6 (P); A10 docs only (no API makes keys) |
-| 9 | Write to, or read private resources of, repos it isn't installed on | Selected repositories + narrowed tokens | Confirmed (docs); **failed in A2 for issues, 2026-11-11; unresolved** | A2 (P) |
+| 9 | Write to, or read private resources of, repos it isn't installed on | Selected repositories + narrowed tokens | Confirmed (docs); **failed in A2 for issues, 2026-11-11; unresolved**; proposed replacement: section 13 (not built) | A2 (P) |
 | 15 | Keep using an old, revoked or suspended token; mint with a deleted key | 1-hour expiry; revoke; suspend; uninstall; app deletion; key deletion | Partly Confirmed | A4, A5, A9, A9b, E1, E2, E3 (P) |
 | 16 | Read the app's private key or change the broker | Broker user owns key; root owns program and settings | Goal | K1-K4 (stage 3, P) |
 | 8, 10, 11, 13, 14 | Mac items | Unchanged | — | Unchanged (stage 3) |
@@ -524,6 +528,387 @@ FRG-27 (review isolation, L12); Claude Code's sandbox; private repos / GitHub Pr
 - Kind S / kind P tests replace "every test fails first".
 - Stage-1 code on PR #37 changes again; the four frozen stage-1 handoffs and diagnose-7 are
   superseded and never given out. The helper's restriction no longer blocks stage 1.
+
+## 13. Proposed request-forwarding broker design (recorded 2026-11-15)
+
+Status: **a proposed design, not a proven guarantee.** Written as a proposal on 2026-11-14 and recorded in the plan at the owner’s request on 2026-11-15. Nothing here is built or proven. **Item 9 stays failed and unresolved** until the replacement is implemented, the expanded tests pass and the owner accepts the revised claim. Recording this proposal does not accept residual risks or authorize implementation. The checkpoint after stage 1 (stage 2 and every Mac
+change wait for it), the remaining stage 1 handoffs (paused), and the credential restrictions (no
+5:00 credentials, test-mode keys included, D1-D3) are unchanged.
+
+Labels as in the plan: **Confirmed (docs / this Mac / this run)**, **Unconfirmed**, **Goal** (a
+protection is a Goal until its test passes).
+
+### 13.1 Why the current broker design isn't enough
+
+The plan (4.2) has the broker write a fresh token into a file that `forge-agent` can read. The A2
+probe (2026-11-14, `a2-probe-findings.md`, evidence 70) showed what that token can do:
+
+- **Code changes stay on the installed repository** (claim 9a): a file and a branch on the second
+  throwaway were refused, 403, with the full token. Confirmed (this run).
+- **Opening issues does not.** A token with no Issues permission, and one with metadata read only,
+  each opened an issue on the second throwaway, where the app isn't installed. The token's
+  permissions and its repository limit didn't stop it. Confirmed (this run). Behavior on other people’s public repositories remains untested. P6 was the excluded private-repository test; it was not a test on someone else’s public repository.
+
+The investigation demonstrated issue creation on the second public throwaway outside the installation scope. Narrowing the token can't fix
+that, because GitHub doesn't apply the narrowing here. The proposed mitigation is to keep tokens inside the broker, subject to the restrictions and tests below.
+
+### 13.2 The change, in plain words
+
+Today's plan: the front desk (the broker) hands me a day pass (a token) and I use it myself.
+
+Proposed: the front desk **keeps every pass and makes each GitHub request for me**. I hand it a
+filled-in form ("open a PR from branch X into `dev`, with this title and this text"). It checks who
+I am, which repository, whether that kind of request is on your approved list, and what the form
+says. Only then does it make the request itself and give me GitHub's answer, with no token in it.
+Anything not on the list is refused on the Mac, before anything reaches GitHub.
+
+GitHub's own limits stay as a second wall: the installation's repositories and four permissions
+still bound what any token can do (9a). The broker's list adds what GitHub doesn't enforce.
+
+### 13.3 How one request travels
+
+1. I run a small client, `forge-github <action> <fields…>` (for example `forge-github pr-create`).
+2. The client connects to the broker through a **local socket**: a file-like connection point on
+   the Mac, `/var/run/forge-broker/broker.sock`. It is not a network port: nothing off the Mac can
+   reach it.
+3. The broker runs the four checks (13.4). The first failure ends the request with a refusal
+   and a log line. Nothing is sent to GitHub.
+4. The broker builds the request itself from a fixed template, adds the token in memory, sends it,
+   reads the answer, removes anything it doesn't pass back (13.7), and returns the answer to
+   the client.
+
+### 13.4 The four checks
+
+#### 13.4.1 Who is asking: the Mac user
+
+- The broker asks the macOS kernel which user is on the other end of the socket
+  (`getpeereid`). The macOS manual: "This mechanism is reliable; there is no way for either side to
+  influence the credentials returned to its peer except by calling the appropriate system call …
+  under different effective credentials." Confirmed (macOS manual page, read 2026-11-14).
+- Only `forge-agent`'s user number is accepted. Every other user is refused, your own account
+  included (you use your own GitHub login in the browser and `gh`, not the broker).
+- The socket's folder belongs to `_forgebroker`, group `forge-agent`, mode 750. Other users can't
+  even reach the socket (the kernel check is the real gate; the folder is a second one).
+- Nothing in the request can claim to be someone else: the form has no user field. Goal; tests R1,
+  R2.
+
+#### 13.4.2 The exact repository
+
+- The approved repositories are listed in the broker's settings file, owned by `root` (I can't
+  change it): each with its owner/name **and GitHub's permanent numeric id**.
+- The form names a repository by its listed short name only. Anything not listed is refused
+  (the A2 case: an issue on the second throwaway is refused on the Mac).
+- Before first use, and after each start, the broker reads each repository's id from GitHub and
+  stops if it doesn't match the settings (a renamed, deleted or recreated repository never quietly
+  becomes a different one).
+- Requests address the repository by id (`/repositories/<id>/…`) where GitHub accepts it.
+  Whether every needed endpoint accepts the id form: Unconfirmed, test R9b; where it doesn't, the
+  broker uses the name form and checks the repository id in GitHub's answer.
+
+#### 13.4.3 The allowed action
+
+- The settings file holds an **allowlist of actions**. Each action is a fixed HTTP method, a fixed
+  path template and a field schema. There is no "raw request" action, and no GraphQL (one GraphQL
+  query can name any repository; if A12 shows FORGE needs one, it becomes a fixed, reviewed query
+  with checked variables, by your approval).
+- First list, to be finalised from test A12 (every `gh` command FORGE uses), each with its own
+  limits:
+
+| Action | Limits checked by the broker |
+|---|---|
+| Read repository, issue, PR, PR checks, PR reviews | Approved repository only |
+| `issue-create`, `issue-comment` | Approved repository; title and body checked (13.4.4) |
+| `issue-close` | Only an issue on the approved repository |
+| `pr-create` | Base must be `dev`; head must be `feature/<KEY>-<n>-<slug>` |
+| `pr-edit` (title, body), `pr-comment`, `pr-ready` | PR on the approved repository, base `dev` |
+| `pr-merge` | Squash only; base `dev` (read from GitHub first); the head sha must be given and match; GitHub still requires your approval (item 3) |
+| `push-branch` | 13.5 |
+
+- Not on the list, so refused: anything to `main`, any settings, rulesets, collaborators, secrets,
+  workflows, releases, gists, deleting branches or repositories, and every other repository.
+- **Write quota** (proposed: 60 writes an hour, 300 a day, your call): bounds how much noise a
+  misbehaving agent can make even with approved actions on FORGE itself.
+
+#### 13.4.4 The request contents
+
+- The form is JSON, at most 1 MB (the push stream: 13.5). Unknown fields are refused, so a
+  smuggled `url`, `repo`, `method` or `path` field is refused, not ignored.
+- Each field has a type, a length limit and, for names, a strict pattern: branch names, labels,
+  and numbers (digits only). Characters that could change a path are refused, not encoded: `/` in a
+  single name, `..`, `%`, `?`, `#`, backslash, spaces, control characters, and look-alike Unicode.
+- Titles, bodies and comments are scanned with gitleaks and FORGE's rules (`.harness/gitleaks.toml`),
+  the same rule 10 applies to commits today. A hit refuses the request and names only the rule.
+- Cross-checks where an action depends on GitHub's state (a merge's base branch, an issue's
+  repository) read that state first, from the approved repository.
+
+### 13.5 Git pushes
+
+`git push` with a credential would put the token in my reach (git's credential helpers hand it to
+my process). So pushes go through the broker too, as a **bundle**: a single file containing a
+branch and its commits, made by git itself (`git bundle`).
+
+1. I run `forge-github push-branch <branch>`. The client makes a bundle of exactly that one branch
+   and streams it over the socket (cap 50 MB; FORGE is far smaller). No shared folder, so nothing
+   can be swapped in between the check and the push.
+2. The broker, in its own private clone of the approved repository:
+   - verifies the bundle (`git bundle verify`) and every object in it (`fsck`);
+   - requires **exactly one** branch, named `refs/heads/feature/<KEY>-<n>-<slug>` with a key from
+     the settings: no `dev`, no `main`, no tags, no deletions;
+   - refuses a change to `.github/workflows/` (GitHub refuses it too without the Workflows
+     permission, A3: two walls) and scans the new commits with gitleaks;
+   - pushes `<that commit>:refs/heads/<that branch>` to the fixed address
+     `https://github.com/<owner>/<name>.git`. **Never forced**: a branch that isn't a fast-forward
+     is refused by GitHub, and the broker never uses `+` or `--force`.
+3. The broker's git runs with system and user git settings ignored, hooks disabled, only `https`
+   allowed, `http.followRedirects=false`, no credential helper; the token is passed as a header
+   through git's environment-variable settings, never in the address or the command line.
+
+Fetching: FORGE's repositories are public, so I fetch with no credential at all, straight from
+GitHub. A private repository later would need a broker fetch action (not in this proposal).
+
+### 13.6 No redirects, no arbitrary addresses
+
+- **I never supply an address, host, path or method.** Only an action name and checked fields; the
+  broker fills its own fixed template on the fixed hosts `api.github.com` and `github.com`.
+- **Redirects are never followed.** The broker's HTTP client (`/usr/bin/curl`) runs with
+  `--proto =https --proto-redir =https --max-redirs 0` and without `-L`; a 3xx answer is a refusal,
+  its `Location` is never followed or stored in the metadata audit log. Git: `http.followRedirects=false`. So the token can't be
+  carried to another host or path, and GitHub's own 301/307 for a moved repository stops the broker
+  (the repository-id check then says why).
+- **No inherited settings:** the broker starts curl and git with an empty environment (no proxy
+  variables, `--noproxy '*'`), ignores `.curlrc` (`-q`), and pins the API version header.
+- **Pagination:** the broker counts pages itself; it doesn't follow `Link` addresses from GitHub.
+- Addresses in GitHub's answers (`html_url` and so on) come back to me as plain text. Without a
+  credential, following them can only read public pages.
+
+### 13.7 Credentials out of reach, out of answers, out of logs
+
+- **No token file any more.** The token (and the signed note, the JWT) live only in the broker's
+  memory. 4.2's step 4 is removed. The broker can mint a token when needed and revoke it after use,
+  instead of every 45 minutes.
+- **Never on a command line.** Any user can see other users' command lines with `ps` (Confirmed,
+  this Mac 2026-11-14: run as your user, not root, it lists root's processes with their arguments),
+  so the token reaches curl through its standard input (`-K -`) and git through environment settings.
+  Whether macOS hides another user's process environment from `forge-agent`: Unconfirmed, test R3.
+- **Answers:** I get GitHub's status, its JSON body, and a short list of headers (request id, rate
+  limit, `X-Accepted-GitHub-Permissions`). Before returning, the broker scans the answer for the
+  current and previous tokens and the token and JWT patterns; a hit withholds the answer, returns
+  an error and logs an incident (without the token). Error text from curl and git is scanned the
+  same way and never passed on raw.
+- **Logs:** one line per request: time, Mac user, action, repository id, object number, GitHub's
+  status and request id, sha256 of the form. No headers, no bodies. The log folder is written only
+  by the broker; you and `forge-agent` can read it.
+- **The broker process:** runs as `_forgebroker`; core dumps off; `forge-agent` isn't an
+  administrator, so it is intended to be refused debugger and memory access (Goal; test R4). A pass demonstrates only the tested methods, privileges and system version; it cannot prove tokens can never be extracted.
+
+### 13.8 What this still doesn't stop (stated, not accepted)
+
+- **Approved actions on FORGE itself:** I could still open too many issues, PRs or comments there.
+  Bounded by the write quota and visible in the log and on GitHub.
+- **A broker bug is a hole.** Mitigated by review, the tests in 13.10, root-owned code and
+  settings, and GitHub's own wall for code changes (9a). GitHub's wall does **not** cover public
+  issues, so for those the broker is the only wall.
+- **The internet outside GitHub:** the proposal controls authenticated operations through this broker; it does not establish a universal GitHub or internet data-loss boundary, including other identities or channels. Network limits are Claude Code's sandbox, already listed as not in this
+  ticket (11).
+- **You, as Mac administrator,** can read everything, the key included; unchanged.
+- **The limits you accepted for the throwaway investigation** (a token possibly issued but never
+  received; an interruption at an unlucky moment) are **not** carried over. With this design such
+  a token stays inside the broker, never with me. That is your decision before stage 2, asked
+  separately.
+
+### 13.9 Daily workflow
+
+**You:** unchanged. You approve PRs in your browser; PRs show the app's bot as author. Emergency
+steps (4.3) still need only your browser, plus stopping the broker on the Mac. New: you can read
+the broker's log to see every GitHub request I made.
+
+**Me:** `forge-github <action>` instead of `gh` for anything that writes, and
+`forge-github push-branch` instead of `git push`. Reads go through the broker too (one path to
+check), or anonymously with `gh` for public data. FORGE's command conventions in `CLAUDE.md` and
+the hooks change to match: owner-only paths, so by a PR you merge.
+
+**When FORGE needs a new action:** I propose the entry (method, path template, schema), it is
+reviewed like any change, and you install the new allowlist by a handoff (the root-owned settings
+need your Mac password). Nothing reaches the list otherwise.
+
+### 13.10 Tests
+
+Unit tests (stage 2, no GitHub): the broker runs against a local stand-in for GitHub. Its test
+settings live in a test folder; the production settings file is root-owned, so a test setting can
+never point the real broker elsewhere.
+
+Live tests (stage 3, on the Mac, as `forge-agent`, every one from an owner handoff, kind P with a
+control as in section 6 of the plan):
+
+| # | Tries, as `forge-agent` unless said | Must happen | Control |
+|---|---|---|---|
+| R1 | Connect to the broker as another Mac user (your account) | Refused by the user check | `forge-agent`, same read: works |
+| R2 | List or open the broker's folders, settings, key; find any token file | Refused; no token file exists | You (admin) can read the key: the check is valid |
+| R3 | Watch every process's command line and environment (`ps`) during 100 broker requests | No token or JWT pattern seen | A planted test value on `forge-agent`'s own process is seen (the watch works) |
+| R4 | Attach a debugger to, or read the memory of, the broker | Refused | Attaching to `forge-agent`'s own process works |
+| R5 | Each allowed action; scan everything returned | No token or JWT in any answer or error | A stand-in answer containing a fake token is withheld (unit) |
+| R6 | Look for a GitHub credential in `forge-agent`'s reach (`gh auth status`, keychain, git config, environment) | None | — |
+| R7 | Write to GitHub directly with no broker (an issue on the second throwaway) | 401: no credential | — |
+| R8 | An action not on the list (settings change, a raw path) | Refused on the Mac; nothing sent | The broker's outgoing log shows no request |
+| R9 | An approved action on another repository (the A2 case: an issue on the second throwaway) | Refused on the Mac; the second throwaway's issue count unchanged | The same action on the approved repository works |
+| R9b | Each action's path form, by repository id | Works, or the name form plus the id check | — (a finding) |
+| R10 | Names with `../`, `%2e`, `?`, `#`, encoded slashes, look-alike Unicode, overlong | Refused | A valid name works |
+| R11 | Extra fields (`url`, `repo`, `method`, `path`) | Refused | The same form without them works |
+| R12 | Redirects 301/302/307/308 from the stand-in (unit); a moved repository (live, if you approve renaming a throwaway) | Not followed; refused | — |
+| R13 | Push: a bundle with `dev`, `main`, a tag, two branches, a deletion, a non-fast-forward, a workflow file, a secret | Each refused (on the Mac; non-fast-forward and workflow also by GitHub) | One feature branch pushes |
+| R14 | A secret in a title, body or comment | Refused, rule named, nothing sent | The same text without it works |
+| R15 | Writes past the quota | Refused | Under the quota: works |
+| R16 | Broker stopped | Every request fails; no fallback | Broker started: works |
+| R17 | Merge: a push after your approval; a push while the merge request is out; no or a stale approval | Each refused (by GitHub's conditional merge and protection; the broker never retries on a new head) | Your approval of the current head: merges |
+| R18 | Push bundles carrying hostile git config, hooks, filters, helpers or submodules; malformed and oversized bundles | Refused or handled as data; no supplied program runs; no unexpected network or file access | A plain feature branch pushes |
+| R19 | Each limit in 13.15 exhausted (size, time, pages, quota); audit log or disk unwritable | The action is refused; nothing sent | Within limits: works |
+| R20 | The stand-in times out or drops the connection before and after a write commits; the broker dies mid-request | Reported `outcome unknown` with action id and target; reconciled by reads; never retried blindly | A normal answer: reported confirmed |
+
+K1-K4 change: K4 ("read the token file: works") becomes R2 ("no token file exists").
+
+**Item 9, proposed wording** (replaces 9 when the R tests pass): *I must be unable to make any
+GitHub write, or read a private resource, other than an approved action on an approved
+repository.* Enforced by: no GitHub credential in my reach (R1-R7, K1-K3); the broker's checks
+(R8-R20); GitHub's installation limits for code changes (9a, probe 2026-11-14). **Status: failed and
+unresolved** until R1-R20 pass live and you accept the revised claim.
+
+### 13.11 Added maintenance
+
+- **Allowlist updates:** a reviewed PR and your handoff each time FORGE needs a new action. Expect
+  several while A12's list settles, then rare.
+- **More code to review:** the broker grows from "mint and write a file" to a checked proxy with a
+  push path. Its reviews are larger, and it is an owner-only path (you merge).
+- **GitHub API version:** this run's answers say the version FORGE uses (2022-11-28) is deprecated
+  since 2026-03-10, with a sunset of 2028-03-10 (Confirmed, this run's `Deprecation` and `Sunset`
+  headers). The broker pins one version; moving it before the sunset is a reviewed change.
+- **After each macOS update:** a short self-test handoff (R1, R3, R9 and one push), since the
+  broker relies on the system's `curl`, `git` and Python.
+- **Repository changes:** a new or recreated repository needs its id in the settings, by handoff.
+- **Unchanged:** a new key every 90 days by handoff.
+
+### 13.12 What changes in the plan, if approved
+
+- 4.2: the broker forwards requests; no token file; the socket and the four checks (13.3-13.7).
+- 4.3 day to day: tokens live only in the broker; minted when needed and revoked after use.
+- 6: item 9 restated (13.10), still failed and unresolved; R1-R20 added; K4 replaced; A12
+  becomes the source of the first allowlist.
+- 8: stage 2 builds and unit-tests the broker proxy, the client and the push path; stage 3 runs
+  R1-R20 live. The stage 1 throwaway app and both throwaway repositories would then be kept until
+  stage 3's live tests instead of deleted at the end of stage 1 (R7, R9 need them): your decision.
+- 10: the day-to-day lines above.
+
+### 13.13 Cost
+
+$0: the broker uses what macOS and its command line tools already have (`curl` 8.7.1, `git`
+2.54.0, Python 3.9.6 standard library only, read on this Mac 2026-11-14). No new account, no
+subscription. If the Python that comes with the command line tools is ever removed, the broker
+stops and GitHub work stops (fails closed).
+
+### 13.14 Decisions
+
+Superseded by 13.17, which lists the remaining decisions.
+
+### 13.15 Required clarifications and acceptance evidence (2026-11-15)
+
+These requirements govern this proposal wherever earlier wording sounds stronger. The existing
+stage-1 checkpoint, paused handoffs, D1-D3 credential restrictions, D5-D8 and owner-only changes
+remain unchanged. Section 4.2’s token-file mechanism, its 45-minute renewal narrative, and K4’s
+successful token-file read are historical alternatives superseded by this proposal only if it is
+later implemented and accepted. No token file or agent credential is part of the proposed end state.
+
+- **Evidence, not guarantees.** R3/R4 show what the tested access methods were refused under the
+  tested account, privileges and macOS version. They cannot establish that no exploit, future
+  system change or untested method could extract a token. Item 9’s replacement is a bounded
+  protection goal for broker-controlled operations, not proof that all GitHub writes or all data
+  extraction are impossible. Item 9 remains failed and unresolved; A2 remains failed evidence.
+- **Secret scanning:** scan text, paths and transferred Git data before publication; unreadable,
+  incomplete or failed scans deny the action. Scanning reduces risk; it cannot guarantee that
+  private information, novel secrets or sensitive ordinary prose will never be published.
+- **Untrusted Git input:** never run agent-supplied hooks, configuration, helpers, filters,
+  external diff/text converters, submodule commands or supplied programs. Use broker-created
+  private storage, trusted executables, a clean environment and broker-controlled configuration;
+  never reuse the agent’s repository or execute its checkout. Disable hooks, config includes,
+  credential helpers and automatic maintenance; forbid external protocols and recursive
+  submodule operations. Validate refs and object closure, use fixed argument arrays (no shell
+  evaluation), bound decompressed objects and resource use, and scan the exact immutable objects
+  that will be pushed. Bundle verification/fsck alone does not establish these properties.
+  Add malicious config/hook/filter/helper/submodule fixtures and malformed/oversized bundles;
+  verify no supplied program runs and no unauthorized network or filesystem access occurs.
+- **Exact approval at merge:** bind the request to repository ID, PR number, base `dev` and full
+  head SHA. Check owner approval and required checks for that version; invalidate on a new push.
+  Submit a conditional merge naming the expected SHA and rely on server-enforced approval rules
+  at the merge itself. A local pre-check alone is insufficient. A head change between validation
+  and merge must refuse; never retry against a new head automatically. Changes to the base or
+  protection state require revalidation; inability to establish the required state denies merge.
+  Test both a push after approval and a push during the merge request, plus missing/stale approval.
+- **Failure behavior:** authentication, parsing, scanning, identity, policy, quota, audit recording
+  or upstream validation failures deny new actions with no direct-GitHub fallback. Bound input,
+  output, socket reads, connect/overall time, concurrency, subprocess time, memory, disk, objects,
+  pages and retries. The proposal’s 1 MB form and 50 MB stream are provisional; decompressed
+  limits and exact timeouts still need a reviewed specification. Reserve quota before dispatch;
+  concurrency and restarts must not reset or bypass it. Stop signals start no new write.
+- **Uncertain writes:** timeout, disconnect or process death after dispatch can mean GitHub
+  committed the write. Report `outcome unknown`, action ID, target, expected SHA and available
+  GitHub request ID; never claim refusal or success without evidence and never blindly retry.
+  Persist a pre-dispatch record, reconcile by bounded reads of authoritative remote state, and
+  hold conflicting/repeat actions pending resolution. Unknown token issuance/revocation must
+  likewise be reported with possible scope and expiry, without token values. The throwaway-only
+  exceptions are not accepted for production by this proposal. Test timeouts before/after commit,
+  crashes, disk/log failures, interrupted responses and exhausted limits.
+
+### 13.16 Exactly what the owner can inspect (proposed interfaces)
+
+| Surface | Visible information | Limits |
+|---|---|---|
+| Metadata-only audit log, readable by owner and agent | UTC time, unique action ID, kernel-derived user ID, action, repository ID, object/ref identifiers, expected head SHA, policy version, request digest, decision/reason code, dispatch state, HTTP status, safe GitHub request ID, confirmed/unknown outcome and reconciliation link | No title/body/comment text, patch, bundle, response body, auth header, token, JWT, private key or raw error/redirect text. Identifiers themselves may be sensitive. A digest links bytes; it does not reveal or reconstruct them. |
+| Review preview for a pending request | Exact validated destination/action and proposed title/body/comment; for pushes, ref, immutable SHA and complete publishable diff/commit/path scope; for merges, PR/base/head and matching approval/check evidence | Separate from the audit log. Preview must bind to the dispatched immutable request; editing invalidates it. This interface is proposed, not available now. It gives no credential access. |
+| GitHub after a confirmed write | Published issue/comment/PR content, commit objects/diffs, review/check state and merge result | Shows remote content, not necessarily the exact originally submitted bytes; content can later be edited/deleted. Missing content does not prove no write occurred. |
+| Owner’s administrator inspection | Broker source, installed binary/version, root-owned policy, permissions, service configuration and test evidence | Administrator access can reach credentials; the agent gets no additional access. Never print credentials into chat or audit exports. |
+
+The broker must process request contents transiently to validate and send them. **Metadata-only
+logging is not a retained copy of those contents.** Historical exact request inspection requires a
+separate, explicitly approved content archive with access, encryption, retention/deletion and
+redaction rules. No such archive is authorized here. Without it, previews plus published GitHub
+objects are inspectable, but past rejected requests or vanished content cannot be reconstructed.
+A safe export/viewer and exact digest canonicalization remain implementation specification work.
+
+### 13.17 Final proposed scope, decisions and FORGE schedule impact
+
+Scope to review before implementation: request broker and local client; kernel user authentication;
+root-owned repository/action policy; typed bounded schemas and scanning; safe Git bundle ingestion
+and non-forced feature pushes; conditional approved merges into dev; credentials kept inside the
+service; sanitized responses; metadata audit plus request preview; quotas; bounded failure,
+interruption and unknown-outcome reconciliation; install/undo owner handoffs; expanded unit and
+live tests. No main writes, extra permissions, arbitrary URLs, private-repository support, general
+network isolation or FRG-27 review isolation are added. No implementation starts from this revision.
+
+Remaining owner decisions, asked one at a time (recording this proposal is already authorized):
+1. Whether to keep the existing throwaway app and both repositories through stage 3 for live tests,
+   with revised reviewed cleanup/revocation handoffs. Recommendation: retain only for those tests;
+   do not silently skip the stage-1 revocation/app-deletion tests or widen installations.
+2. Write quota numbers (proposal: 60/hour and 300/day; retries and push counting must be specified).
+3. Production handling and acceptance, if any, of residual token-issuance, interruption and uncertain
+   write risks, after concrete recovery behavior and tests are reviewable.
+4. Whether remaining stage-1 handoffs resume before the broker exists; retain their existing scope
+   and reviewed-owner-handoff requirement.
+5. Whether historical request contents should be archived or only metadata retained. Recommendation:
+   metadata plus immutable preview, with the historical inspection limits explicitly accepted.
+
+Before coding, present a consolidated scope incorporating those answers, measurable limits,
+acceptance tests, residual risks and a refreshed effort estimate for owner review. That review
+cannot substitute for the existing checkpoint after stage 1 or authorize any Mac changes early.
+
+Timeline: this replaces a token-renewal helper with a substantial security component. It adds
+client/proxy work, Git parser containment, approval race tests, audit/preview handling, crash recovery
+and more review/live-test effort to FRG-26 stages 2–3. Stage 1 still needs its paused work and owner
+checkpoint; stages 4–5 and FRG-27 follow the tested broker. FRG-28/30/32/34 remain behind the
+existing checkpoint under the recorded schedule. Planning for 5:00 remains allowed; credential,
+payment (including test-mode keys) and deployment restrictions do not move. No dry-run deployment
+may bypass them. FRG-7–12 work may proceed only where existing gates allow; their current completion
+status and remaining work must be refreshed before quoting dates. The earlier 1–2 week estimate
+is historical, not a current commitment. A defensible new calendar estimate needs the decisions,
+a concrete task breakdown, review/CI/handoff allowances and current backlog status; no fixed delay
+or finish date is established by this plan change.
 
 ## Sources (read 2026-11-01)
 
