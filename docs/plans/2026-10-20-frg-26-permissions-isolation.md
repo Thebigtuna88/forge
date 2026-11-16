@@ -546,8 +546,9 @@ FRG-27 (review isolation, L12); Claude Code's sandbox; private repos / GitHub Pr
 ## 13. Proposed request-forwarding broker design (recorded 2026-11-15)
 
 Status: **a proposed design, not a proven guarantee.** Written as a proposal on 2026-11-14 and recorded in the plan at the owner’s request on 2026-11-15. Nothing here is built or proven. **Item 9 stays failed and unresolved** until the replacement is implemented, the expanded tests pass and the owner accepts the revised claim. Recording this proposal does not accept residual risks or authorize implementation. The checkpoint after stage 1 (stage 2 and every Mac
-change wait for it), the remaining stage 1 handoffs (paused), and the credential restrictions (no
-5:00 credentials, test-mode keys included, D1-D3) are unchanged.
+change wait for it) and the credential restrictions (no 5:00 credentials, test-mode keys included,
+D1-D3) are unchanged. The remaining stage 1 handoffs resume before the broker exists (owner,
+2026-11-15; section 6), each still given only after its review, as before.
 
 Labels as in the plan: **Confirmed (docs / this Mac / this run)**, **Unconfirmed**, **Goal** (a
 protection is a Goal until its test passes).
@@ -903,8 +904,9 @@ Remaining owner decisions, asked one at a time (recording this proposal is alrea
 2. Write quota numbers (proposal: 60/hour and 300/day; retries and push counting must be specified).
 3. Production handling and acceptance, if any, of residual token-issuance, interruption and uncertain
    write risks, after concrete recovery behavior and tests are reviewable.
-4. Whether remaining stage-1 handoffs resume before the broker exists; retain their existing scope
-   and reviewed-owner-handoff requirement.
+4. Decided (owner, 2026-11-15): the remaining stage-1 handoffs resume before the broker exists,
+   with A2 changed to code changes only (section 6); their scope and the reviewed-owner-handoff
+   requirement are unchanged.
 5. Whether historical request contents should be archived or only metadata retained. Recommendation:
    metadata plus immutable preview, with the historical inspection limits explicitly accepted.
 
@@ -914,7 +916,7 @@ cannot substitute for the existing checkpoint after stage 1 or authorize any Mac
 
 Timeline: this replaces a token-renewal helper with a substantial security component. It adds
 client/proxy work, Git parser containment, approval race tests, audit/preview handling, crash recovery
-and more review/live-test effort to FRG-26 stages 2–3. Stage 1 still needs its paused work and owner
+and more review/live-test effort to FRG-26 stages 2–3. Stage 1 still needs its remaining handoffs and owner
 checkpoint; stages 4–5 and FRG-27 follow the tested broker. FRG-28/30/32/34 remain behind the
 existing checkpoint under the recorded schedule. Planning for 5:00 remains allowed; credential,
 payment (including test-mode keys) and deployment restrictions do not move. No dry-run deployment

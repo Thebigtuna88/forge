@@ -1784,8 +1784,13 @@ t_A2() {
   dev="$(owner_gh api "repos/$REPO/branches/dev" --jq .commit.sha 2>/dev/null)" || dev=""
   [[ "$dev" =~ ^[0-9a-f]{40}$ ]] || { setup_fail_p A2 "could not read $REPO's dev"; return; }
   # The file goes on the owner's branch there: with that branch missing, a 404 would prove nothing.
+  # Only a whole line of the branch list counts, never a look-alike branch or tag (round 70, C1,
+  # SEC-1): branch lines are the only ones starting refs/heads/.
   before="$(probe_refs)"
-  [[ "$before" != error && "$before" == *"refs/heads/$A2_BRANCH "* ]] || { setup_fail_p A2 "could not read $REPO2's branches and tags, or $A2_BRANCH is missing"; return; }
+  if [[ "$before" == error ]] || ! printf '%s\n' "$before" | grep -Eqx "refs/heads/$A2_BRANCH [0-9a-f]{40}"; then
+    setup_fail_p A2 "could not read $REPO2's branches and tags, or $A2_BRANCH is missing"
+    return
+  fi
   fresh_from dev "a2-$(stamp)"
   add_commit "tests/permissions-A2-$(stamp).txt" "FRG-26 A2"
   # The push is judged by git's own words, the two API calls by GitHub's status.

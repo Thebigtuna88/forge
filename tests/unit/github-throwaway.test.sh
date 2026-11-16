@@ -1644,6 +1644,33 @@ test_a2_tries_code_changes_on_a_repo_the_app_is_not_installed_on() {
   assert_not_contains "$(cat "$T_TMP/calls")" "-X POST repos/$REPO2/git/refs" "the branch after the file got through"
 }
 
+# Round 70 (C1, SEC-1): only the exact branch counts; a look-alike branch or tag, with frg26-a2
+# missing, would let the file attempt's "Branch not found" (404) pass as a refusal.
+test_a2_needs_the_exact_branch_not_a_look_alike() {
+  local a case heads tags out
+  a="$(printf 'a%.0s' $(seq 1 40))"
+  for case in "a look-alike branch|refs/heads/main $a\\nrefs/heads/x/refs/heads/frg26-a2 $a|" \
+    "a look-alike tag|refs/heads/main $a|refs/tags/refs/heads/frg26-a2 $a"; do
+    IFS='|' read -r name heads tags <<<"$case"
+    p_stubs
+    a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot]." \
+      "app_gh api -X PUT repos/$REPO2/|1|gh: Branch not found (HTTP 404)" \
+      "app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)"
+    sed -i '' '/matching-refs\/heads/d' "$T_TMP/answers"
+    owner_gh() {
+      case "$*" in
+        *"matching-refs/heads"*) printf '%b\n' "$heads" ;;
+        *"matching-refs/tags"*) [[ -n "$tags" ]] && printf '%b\n' "$tags"; return 0 ;;
+        *) answer owner_gh "$@" ;;
+      esac
+    }
+    out="$(t_A2)"
+    assert_contains "$out" "RESULT A2 permissions FAIL attempt=setup-failed" "$name"
+    assert_not_contains "$out" "permissions PASS" "$name"
+    assert_not_contains "$(cat "$T_TMP/calls")" "app_git" "$name: an attempt without the branch"
+  done
+}
+
 test_a2_fails_when_the_second_throwaways_branches_change() {
   p_stubs
   a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot]." \
