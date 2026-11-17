@@ -514,8 +514,21 @@ then a read that must get HTTP 401, up to three tries within its own 90 seconds.
 leaves the control; the run is told only its name and state. A failed or timed-out check, or a
 control that ends without reporting, leaves its token NOT confirmed, and the clean-up INCOMPLETE;
 expiry is never counted as revocation. Every tidy-up failure, on a normal finish too, is named in
-the last line. The run's clean-up keeps its bound; a stop that arrives during a control acts once
-the control has ended, now up to 90 seconds later than before.
+the last line. (Until review round 74, a stop that arrived during a control acted only once the
+control had ended.)
+
+Bounded controls, and expiry (owner, 2026-11-17, review round 74). Every request a control makes
+has a time limit, and so does the control as a whole: it is told to stop once its work has had its
+share, which keeps 90 seconds for settling its own tokens, and is stopped outright at four
+minutes. A stop to the run acts at once, during a control too: the control is told to stop and
+settles its tokens while the run's clean-up runs, which collects its report within its own three
+minutes. A control that has to be stopped outright, or that can't report, leaves its tokens NOT
+confirmed and the clean-up INCOMPLETE. A revocation counts as confirmed only after GitHub answered
+it as done and a read with the token then got HTTP 401 at least a minute before the expiry GitHub
+gave the token when it issued it; otherwise the token is named "expired, revocation not
+confirmed", "expiry unknown, revocation not confirmed" or "revocation never answered as done", and
+the clean-up is INCOMPLETE. A revocation that took effect but whose answer was lost is therefore
+reported NOT confirmed. a2-probe is unchanged.
 
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.

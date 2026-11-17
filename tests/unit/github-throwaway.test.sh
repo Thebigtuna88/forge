@@ -1100,6 +1100,8 @@ test_redact_hides_the_token() {
   assert_contains "$out" "[REDACTED]"
   out="$( die "oops $TOKEN" 2>&1 )" || true
   assert_not_contains "$out" "$TOKEN" "die redacts too"
+  # A stand-in run's token: its end is no clean-up (round 74: nor a request to GitHub).
+  end_stand_in_run
 }
 
 test_app_gh_passes_the_token_only_in_the_environment() {
@@ -1112,6 +1114,8 @@ test_app_gh_passes_the_token_only_in_the_environment() {
   assert_eq "$(grep '^gh-github-token-set:' "$FAKE_LOG")" "gh-github-token-set:" "GITHUB_TOKEN reached the app's gh"
   assert_eq "$(grep '^gh-config-dir:' "$FAKE_LOG")" "gh-config-dir:$T_TMP/work/gh-app" "the owner's gh config"
   assert_not_contains "$(grep '^gh-args:' "$FAKE_LOG")" "$TOKEN" "token in gh's arguments"
+  # A stand-in run's token: its end is no clean-up (round 74: nor a request to GitHub).
+  end_stand_in_run
 }
 
 test_owner_gh_never_uses_a_token_variable() {
@@ -1137,6 +1141,8 @@ test_app_git_is_isolated_from_the_owners_git_config() {
   assert_contains "$log" "-c credential.helper= "
   assert_contains "$log" "-c core.hooksPath=/dev/null"
   assert_not_contains "$log" "$TOKEN" "token in git's arguments"
+  # A stand-in run's token: its end is no clean-up (round 74: nor a request to GitHub).
+  end_stand_in_run
 }
 
 test_capture_redacts_tool_output() {
@@ -1147,6 +1153,8 @@ test_capture_redacts_tool_output() {
   capture app_gh api -X DELETE repos/x/y || true
   assert_not_contains "$LAST_OUT" "$TOKEN"
   assert_contains "$LAST_OUT" "[REDACTED]"
+  # A stand-in run's token: its end is no clean-up (round 74: nor a request to GitHub).
+  end_stand_in_run
 }
 
 test_assert_throwaway_refuses_another_repo() {
@@ -1469,6 +1477,11 @@ test_a_termination_signal_still_runs_the_clean_up() {
 test_the_token_is_revoked_on_exit() {
   load
   TOKEN="$(fake_token)"
+  # Registered as request_token does: its expiry as GitHub gave it (round 74: without it, HTTP 401
+  # can't confirm the revocation).
+  ISSUED=" token1=$TOKEN"
+  ISSUED_META="token1 {\"expires_at\":\"$(date -u -v+50M +%Y-%m-%dT%H:%M:%SZ)\"}
+"
   WORK=""
   app_gh() {
     echo "$*" >>"$T_TMP/app-gh.log"
@@ -1480,7 +1493,7 @@ test_the_token_is_revoked_on_exit() {
   # Round 72: revoked, then confirmed by a read (HTTP 401).
   assert_eq "$(cat "$T_TMP/app-gh.log")" "api -X DELETE installation/token
 api repos/$REPO --jq .full_name"
-  assert_contains "$out" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): unnamed;"
+  assert_contains "$out" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1;"
   end_stand_in_run
 }
 
@@ -1750,6 +1763,8 @@ revoke ghs_second
 app_gh ghs_second api repos/$REPO --jq .full_name"
   t_A5 >/dev/null
   assert_eq "$TOKEN" "$session" "the session token after A5"
+  # A stand-in run's token: its end is no clean-up (round 74: nor a request to GitHub).
+  end_stand_in_run
 }
 
 test_a6_tries_settings_and_its_own_installation() {
@@ -2830,7 +2845,13 @@ test_only_one_step_uses_the_held_tokens_at_a_time() {
   # Round 19, C1: the held file's read-modify-write is serialized: a step that finds another one
   # holding the lock stops before touching any token, and the lock is released when a step ends.
   held_stubs
-  app_session() { TOKEN="ghs_session$(printf 'S%.0s' $(seq 1 30))"; }
+  # Registered as request_token does, with GitHub's expiry (round 74: the clean-up confirms the
+  # session token's revocation only with it).
+  app_session() {
+    TOKEN="ghs_session$(printf 'S%.0s' $(seq 1 30))" OUTSTANDING="$OUTSTANDING $TOKEN" ISSUED="$ISSUED token1=$TOKEN"
+    ISSUED_META="token1 {\"expires_at\":\"$(date -u -v+50M +%Y-%m-%dT%H:%M:%SZ)\"}
+"
+  }
   mint_token() { TOKEN="ghs_newheld$(printf 'N%.0s' $(seq 1 30))"; }
   # As GitHub: a read with a token revoked earlier gets HTTP 401 (the exit clean-up's check).
   app_gh() {
@@ -3095,8 +3116,13 @@ test_a_controls_token_that_cannot_be_revoked_is_reported() {
   load
   local tok rc out
   tok="ghs_control$(printf 'C%.0s' $(seq 1 30))"
-  mint_ok() { TOKEN="$tok"; OUTSTANDING="$OUTSTANDING $tok"; }
-  mint_bad() { TOKEN="$tok"; OUTSTANDING="$OUTSTANDING $tok"; die "refused"; }
+  # Registered as request_token does, with its expiry (round 74).
+  mint_ok() {
+    TOKEN="$tok" OUTSTANDING="$OUTSTANDING $tok" ISSUED="$ISSUED control-token=$tok"
+    ISSUED_META="control-token {\"expires_at\":\"$(date -u -v+50M +%Y-%m-%dT%H:%M:%SZ)\"}
+"
+  }
+  mint_bad() { mint_ok; die "refused"; }
   app_gh() { echo "${TOKEN:0:11} $*" >>"$T_TMP/app-gh.log"; return 1; }
   : >"$T_TMP/app-gh.log"
   rc=0; out="$(control_token mint_ok 2>&1)" || rc=$?
@@ -3712,17 +3738,19 @@ test_a_control_record_that_cannot_be_handed_over_still_stops_the_run() {
   assert_exit 2 "$rc"
   assert_contains "$out" "its record of it could not be handed over"
   assert_not_contains "$out" "went on"
-  # The record no longer goes through a file.
-  assert_not_contains "$(declare -f control_exit control_token)" "control-unreceived" "a file for the record"
+  # Round 74: the record comes through a file again (the control runs in the background), its write
+  # checked as above; no file is left behind.
+  assert_eq "$(find "$WORK" -name 'control.*')" "" "a control's record file left behind"
 }
 
-# Round 64 (C1): a control's token it couldn't revoke is reported before a held signal acts.
-test_a_controls_unrevoked_token_is_reported_before_a_held_signal_acts() {
+# Round 64 (C1): a control's token it couldn't revoke is reported when a stop comes during the
+# control. Round 74: the stop acts at once; the clean-up collects the control's record.
+test_a_controls_unrevoked_token_is_reported_when_a_stop_comes_during_it() {
   local out rc=0
   out="$(/bin/bash -p -c '
     source "$1"; WORK="$2"; mkdir -p "$WORK"
     app_gh() { return 1; }
-    cleanup() { echo "parent cleanup"; }
+    cleanup() { control_collect; echo "parent cleanup"; }
     a_control() { OUTSTANDING="$(printf "gh%s_" s)QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ"; kill -TERM $$; return 0; }
     control_token a_control
     echo continued' _ "$GT" "$T_TMP/work" 2>&1)" || rc=$?
@@ -3731,14 +3759,14 @@ test_a_controls_unrevoked_token_is_reported_before_a_held_signal_acts() {
   assert_not_contains "$out" "continued"
 }
 
-# Round 64, the same class: a record the control could not hand over is reported before a held
-# signal acts too.
-test_a_lost_control_record_is_reported_before_a_held_signal_acts() {
+# Round 64, the same class: a record the control could not hand over is reported when a stop comes
+# during the control too (round 74: by the clean-up).
+test_a_lost_control_record_is_reported_when_a_stop_comes_during_it() {
   local out rc=0
   out="$(/bin/bash -p -c '
     source "$1"; WORK="$2"; mkdir -p "$WORK"
     app_gh() { :; }
-    cleanup() { echo "parent cleanup"; }
+    cleanup() { control_collect; echo "parent cleanup"; }
     a_control() { exec 3>&-; UNRECEIVED="P9 2026-11-12T23:00:00Z {}
 "; kill -TERM $$; exit 2; }
     control_token a_control
@@ -3769,20 +3797,22 @@ test_a_signal_during_a_controls_clean_up_still_reports_its_token() {
   assert_contains "$out" "control_token status=0"
 }
 
-# Round 63 (C1): a signal while the caller receives a control's record waits until the record is
-# registered, so the clean-up still reports it whole.
+# Round 63 (C1): a signal while a control runs never loses the record it hands over: the clean-up
+# (round 74: which collects the control's record) still reports it whole.
 test_a_signal_while_a_controls_record_comes_in_keeps_it() {
   local out rc=0
   out="$(/bin/bash -p -c '
     source "$1"; WORK="$2"; mkdir -p "$WORK"
     app_gh() { :; }
-    cleanup() { echo "CLEANUP UNRECEIVED=<$UNRECEIVED>"; }
+    cleanup() { control_collect; echo "CLEANUP REPORTED=<$UNRECEIVED_LABELS>"; }
     a_control() { UNRECEIVED="P9 2026-11-12T23:00:00Z {}
 "; kill -TERM $$; /bin/sleep 1; exit 2; }
     control_token a_control
     echo continued' _ "$GT" "$T_TMP/work" 2>&1)" || rc=$?
   assert_exit 143 "$rc"
-  assert_contains "$out" "CLEANUP UNRECEIVED=<P9 2026-11-12T23:00:00Z {}"
+  assert_contains "$out" "TOKEN P9 possibly issued, never received"
+  assert_contains "$out" "expires by 2026-11-12T23:00:00Z at the latest"
+  assert_contains "$out" "CLEANUP REPORTED=< P9>"
   assert_not_contains "$out" "continued"
 }
 
@@ -4040,39 +4070,64 @@ test_with_timeout_stops_the_real_command_under_a_function() {
 }
 
 # Round 72 (SEC-1): every other command's clean-up, with budgets short enough to test: a copy of
-# the script with only its three budget lines changed (CALL_SECS 1, REVOKE_SECS 3, CLEANUP_SECS 6).
-# Three tokens of the run's own, none revoked yet: token1 in use, tokens 2 and 3 set aside.
-# $T_TMP/hang lists what never answers: "app <n>" (every call with token n), "app all", or
-# "owner <text>" (an owner call containing it). Other calls answer at once: nothing open, and a
-# read with a revoked token gets HTTP 401, unless $T_TMP/works lists that token's number. A token
-# request (a control's) is answered with token 4.
+# the script with only its budget lines changed (CALL_SECS 1, REVOKE_SECS 3, CLEANUP_SECS 6, and
+# from round 74 CONTROL_SECS 12). Three tokens of the run's own, none revoked yet: token1 in use,
+# tokens 2 and 3 set aside. $T_TMP/hang lists what never answers: "app <n>" (every call with token
+# n), "app all", "call <text>" (an app call containing it) or "owner <text>" (an owner call
+# containing it). Other calls answer at once: nothing open, and a read with a revoked token gets
+# HTTP 401, unless $T_TMP/works lists that token's number. $T_TMP/delete-fails lists tokens whose
+# revocation GitHub refuses, $T_TMP/expired tokens a read gets HTTP 401 with anyway (expired). A
+# token request (a control's) is answered with token 4. Each token's expiry, as GitHub gives it
+# when it issues it: $T_TMP/expiry-<n> (seconds from now, or "none"), else 50 minutes ahead.
 cleanup_stubs() {
   local short="$T_TMP/github-throwaway-short.sh"
   sed -e 's/^readonly CALL_SECS=20 /readonly CALL_SECS=1 /' -e 's/^readonly REVOKE_SECS=90 /readonly REVOKE_SECS=3 /' \
-    -e 's/^readonly CLEANUP_SECS=180 /readonly CLEANUP_SECS=6 /' "$GT" >"$short"
+    -e 's/^readonly CLEANUP_SECS=180 /readonly CLEANUP_SECS=6 /' -e 's/^readonly CONTROL_SECS=240 /readonly CONTROL_SECS=12 /' "$GT" >"$short"
   # shellcheck source=tests/permissions/github-throwaway.sh
   source "$short"
+  # The clean-up runs in each stopped run's own subshell; here, the exit trap sourcing installs
+  # would end a test that crashed with the clean-up's status, which can be 0 (a crash reported as
+  # a pass, round 74).
+  trap - EXIT
   assert_eq "$CALL_SECS ${REVOKE_SECS:-none} $CLEANUP_SECS" "1 3 6" "the short budgets"
   WORK="$T_TMP/work"
   [[ -d "$WORK" ]] || mkdir -m 700 "$WORK"
   : >"$T_TMP/calls"
+  : >"$T_TMP/timeline"
   : >"$T_TMP/revoked"
   : >"$T_TMP/hang"
   : >"$T_TMP/works"
+  : >"$T_TMP/delete-fails"
+  : >"$T_TMP/expired"
+  rm -f "$T_TMP"/expiry-*
   INSTALLATION_ID=77
   app_gh() {
-    local n="${TOKEN:11:1}"
+    local n="${TOKEN:11:1}" h
     echo "app_gh $n $*" >>"$T_TMP/calls"
+    echo "$(date +%s) app_gh $n $*" >>"$T_TMP/timeline"
     if grep -qx -e "app $n" -e "app all" "$T_TMP/hang"; then /bin/sleep 600; return 1; fi
+    while IFS= read -r h; do
+      if [[ "$h" == "call "* && "$*" == *"${h#call }"* ]]; then /bin/sleep 600; return 1; fi
+    done <"$T_TMP/hang"
     case "$*" in
-      "api -X DELETE installation/token") echo "$n" >>"$T_TMP/revoked" ;;
+      "api -X DELETE installation/token")
+        if grep -qx "$n" "$T_TMP/delete-fails"; then echo "gh: Server Error (HTTP 502)" >&2; return 1; fi
+        echo "$n" >>"$T_TMP/revoked" ;;
       "api repos/$REPO --jq .full_name")
-        if grep -qx "$n" "$T_TMP/revoked" && ! grep -qx "$n" "$T_TMP/works"; then echo "gh: Bad credentials (HTTP 401)" >&2; return 1; fi
+        if grep -qx "$n" "$T_TMP/expired" || { grep -qx "$n" "$T_TMP/revoked" && ! grep -qx "$n" "$T_TMP/works"; }; then
+          echo "gh: Bad credentials (HTTP 401)" >&2
+          return 1
+        fi
         echo "$REPO" ;;
+      "api installation/repositories"*) echo "$REPO" ;;
     esac
     return 0
   }
-  jwt_call() { LAST_HTTP=201; LAST_OUT="{\"token\":\"$(cleanup_token 4)\",\"expires_at\":\"2026-11-16T01:00:00Z\"}"; }
+  jwt_call() {
+    LAST_HTTP=201
+    LAST_OUT="$(stub_meta 4 | jq -c --arg t "$(cleanup_token 4)" --argjson p "$WANT_PERMS" --arg r "$REPO" \
+      '{token: $t, expires_at, repository_selection: "selected", permissions: $p, repositories: [{full_name: $r}]}')"
+  }
   owner_gh() {
     local h
     echo "owner_gh $*" >>"$T_TMP/calls"
@@ -4084,6 +4139,13 @@ cleanup_stubs() {
 }
 
 cleanup_token() { printf 'gh%s_cleanup%s%s' s "$1" "$(printf 'Q%.0s' $(seq 1 30))"; }
+
+stub_meta() { # <n> — what GitHub said when it issued token n, without the token: its expiry
+  local e=3000
+  [[ ! -f "$T_TMP/expiry-$1" ]] || e="$(cat "$T_TMP/expiry-$1")"
+  if [[ "$e" == none ]]; then printf '{"expires_at":null}'; return; fi
+  printf '{"expires_at":"%s"}' "$(date -u -r $(($(date +%s) + e)) +%Y-%m-%dT%H:%M:%SZ)"
+}
 
 # The clean-up of a run that stopped with status <rc>, after <set-up> (shell code) has run, and
 # then <after> (shell code, with the three tokens in place). One still running after 20s is killed
@@ -4098,6 +4160,10 @@ stopped_run_cleanup() { # <rc> <set-up> [after]
     TOKEN="$t1"
     OUTSTANDING=" $t1 $t2 $t3"
     ISSUED=" token1=$t1 token2=$t2 token3=$t3"
+    ISSUED_META="token1 $(stub_meta 1)
+token2 $(stub_meta 2)
+token3 $(stub_meta 3)
+"
     MINTED=3
     trap cleanup EXIT
     eval "${3:-}"
@@ -4222,6 +4288,113 @@ test_a_tidy_up_failure_on_a_normal_finish_is_in_the_last_line() {
     assert_exit 1 "$RC" "$name (137: still running after 20s)"
     assert_contains "$OUT" "CLEANUP FAIL" "$name"
     assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; not done:" "$name"
+    assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "$want" "$name"
+    assert_not_contains "$OUT" "CLEANUP DONE" "$name"
+  done
+}
+
+# Round 74 (C1, SEC-1): every request a control makes has a time limit (E1's control reads what the
+# whole installation reaches), and so does the control as a whole.
+test_every_request_a_control_makes_is_bounded() {
+  load
+  local f bad
+  for f in app_session load_app need_app_identity make_jwt need_installation_scope mint mint_token request_token \
+    revoke_token control_exit settle_tokens token_refused revocation_judged; do
+    bad="$(declare -f "$f" | grep -E '(^|[^_a-z])(app_gh|owner_gh|gh|curl) ' | grep -v 'with_timeout' || true)"
+    assert_eq "$bad" "" "$f: a request without a time limit"
+  done
+  # shellcheck disable=SC2016 # the literal source text is what's searched for
+  assert_contains "$(declare -f jwt_call)" '--max-time "$CALL_SECS"' "the app's own requests"
+  end_stand_in_run
+}
+
+# Round 74 (C1, SEC-1): a control that hangs can't hold the run: a hung request ends by its limit; a
+# control whose work outlasts its share is told to stop and still settles its token; one that
+# can't be stopped is stopped outright at CONTROL_SECS, its token NOT confirmed, the clean-up
+# INCOMPLETE. The run's own tokens are settled either way.
+test_a_hanging_control_is_bounded_and_its_token_settled() {
+  local case name hang cmd rc_want want note
+  scope_cmd() { need_installation_scope; }
+  loop_cmd() { request_token '{}'; while :; do with_timeout "$CALL_SECS" /bin/sleep 600; done; }
+  stuck_cmd() { request_token '{}'; /bin/sleep 600; }
+  for case in "its installation read hangs|call installation/repositories|scope_cmd|0|CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3 control1-token4; NOT confirmed: none; nothing left undone|" \
+    "its work outlasts its share||loop_cmd|0|CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3 control1-token4; NOT confirmed: none; nothing left undone|control1's work took longer than its share" \
+    "it can't be told to stop||stuck_cmd|1|CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: control1 (no result);|control1 did not end in time and was stopped outright"; do
+    IFS='|' read -r name hang cmd rc_want want note <<<"$case"
+    cleanup_stubs
+    assert_eq "${CONTROL_SECS:-none}" 12 "the short budget for a control"
+    printf '%s\n' "$hang" >"$T_TMP/hang"
+    stopped_run_cleanup 0 "" "control_token $cmd || true"
+    assert_exit "$rc_want" "$RC" "$name: the run's status (137: still running after 20s)"
+    ((SECS <= ${CONTROL_SECS:-0} + CLEANUP_SECS + 3)) || _t_fail "$name: took ${SECS}s, over the control's ${CONTROL_SECS:-unset}s and the clean-up's ${CLEANUP_SECS}s"
+    assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "$want" "$name"
+    [[ -z "$note" ]] || assert_contains "$OUT" "$note" "$name"
+    assert_not_contains "$OUT" "$(cleanup_token 4)" "$name: the control's token printed"
+  done
+}
+
+# Round 74 (C1, SEC-1): a stop during a control reaches the run's clean-up at once and starts no
+# new test action; the control is told to stop and settles its own token meanwhile, and the whole
+# ends within the clean-up's cap. A control that can't be told to stop is stopped outright by that
+# cap, its token NOT confirmed.
+test_a_stop_during_a_control_reaches_the_clean_up_at_once() {
+  local case name cmd rc_want want first
+  loop_cmd() { request_token '{}'; while :; do with_timeout "$CALL_SECS" /bin/sleep 600; done; }
+  stuck_cmd() { request_token '{}'; /bin/sleep 600; }
+  for case in "the control is told to stop|loop_cmd|143|CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3 control1-token4; NOT confirmed: none; nothing left undone" \
+    "the control can't be told to stop|stuck_cmd|143|CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: control1 (no result);"; do
+    IFS='|' read -r name cmd rc_want want <<<"$case"
+    cleanup_stubs
+    # shellcheck disable=SC2016 # run inside the stopped run: $PPID there is the run itself
+    stopped_run_cleanup 0 "" '/bin/sh -c "/bin/sleep 1; date +%s >$T_TMP/stop-at; kill -TERM \$PPID" & control_token '"$cmd"'; echo "NEXT TEST ACTION"'
+    assert_exit "$rc_want" "$RC" "$name: the run's status (137: still running after 20s)"
+    ((SECS <= 1 + CLEANUP_SECS + 3)) || _t_fail "$name: ${SECS}s, over the clean-up's ${CLEANUP_SECS}s after the stop"
+    assert_not_contains "$OUT" "NEXT TEST ACTION" "$name: a test action after the stop"
+    first="$(grep -m 1 'app_gh 1 api -X DELETE installation/token' "$T_TMP/timeline" | cut -d' ' -f1)"
+    if [[ -z "$first" ]] || (($(cat "$T_TMP/stop-at") + 2 < first)); then
+      _t_fail "$name: the clean-up's first revocation came at ${first:-never}, not within 2s of the stop at $(cat "$T_TMP/stop-at")"
+    fi
+    assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "$want" "$name"
+  done
+}
+
+# Round 74 (SEC-2): an expired token gets HTTP 401 too. A revocation is confirmed only once GitHub
+# answered it as done and a read then got HTTP 401 at least a minute before the token's recorded
+# expiry; otherwise the token is NOT confirmed, with why, and the clean-up INCOMPLETE.
+test_a_401_near_or_after_expiry_never_confirms_a_revocation() {
+  local case name setup rc_want line want
+  for case in "a failed revocation, then expiry|echo 2 >\$T_TMP/delete-fails; echo 2 >\$T_TMP/expired; echo -120 >\$T_TMP/expiry-2|1|TOKEN token2 NOT confirmed revoked: expired, revocation not confirmed|NOT confirmed: token2 (expired, revocation not confirmed);" \
+    "revoked, under a minute before expiry|echo 30 >\$T_TMP/expiry-2|1|TOKEN token2 NOT confirmed revoked: expired, revocation not confirmed|NOT confirmed: token2 (expired, revocation not confirmed);" \
+    "a failed revocation, a 401 before expiry|echo 2 >\$T_TMP/delete-fails; echo 2 >\$T_TMP/expired|1|TOKEN token2 NOT confirmed revoked: a read with it gets HTTP 401, but GitHub never answered a revocation of it as done|NOT confirmed: token2 (revocation never answered as done);" \
+    "a control's token: a failed revocation, then expiry|echo 4 >\$T_TMP/delete-fails; echo 4 >\$T_TMP/expired; echo -120 >\$T_TMP/expiry-4; AFTER=1|1|note: a control's token could not be revoked, or its revocation not confirmed: control1-token4 (expired, revocation not confirmed)|NOT confirmed: control1-token4 (expired, revocation not confirmed);" \
+    "control: revoked, 90s before expiry|echo 90 >\$T_TMP/expiry-2|0|TOKEN token2 revoked: a read with it now gets HTTP 401|CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none;"; do
+    IFS='|' read -r name setup rc_want line want <<<"$case"
+    cleanup_stubs
+    AFTER=""
+    eval "$setup"
+    control_cmd() { request_token '{}'; }
+    stopped_run_cleanup 0 "" "${AFTER:+control_token control_cmd || true}"
+    assert_exit "$rc_want" "$RC" "$name: the run's status (137: still running after 20s)"
+    assert_contains "$OUT" "$line" "$name"
+    assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "$want" "$name"
+    [[ $rc_want -eq 0 ]] || assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "CLEANUP INCOMPLETE" "$name"
+  done
+}
+
+# Round 74 (SEC-2): a token whose expiry isn't known is never confirmed revoked: HTTP 401 may be its
+# expiry.
+test_a_token_with_an_unknown_expiry_is_never_confirmed() {
+  local case name setup after want
+  for case in "no expiry in GitHub's answer%echo none >\$T_TMP/expiry-2%%token2 (expiry unknown, revocation not confirmed)" \
+    "a token with no record%:%TOKEN=\$(cleanup_token 5)%unnamed (expiry unknown, revocation not confirmed)" \
+    "a control's token with no expiry%echo none >\$T_TMP/expiry-4%control_token control_cmd || true%control1-token4 (expiry unknown, revocation not confirmed)"; do
+    IFS='%' read -r name setup after want <<<"$case"
+    cleanup_stubs
+    eval "$setup"
+    control_cmd() { request_token '{}'; }
+    stopped_run_cleanup 0 "" "$after"
+    assert_exit 1 "$RC" "$name: the run's status (137: still running after 20s)"
+    assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "CLEANUP INCOMPLETE" "$name"
     assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "$want" "$name"
     assert_not_contains "$OUT" "CLEANUP DONE" "$name"
   done

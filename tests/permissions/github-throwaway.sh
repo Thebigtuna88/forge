@@ -107,15 +107,26 @@ MINT_LABEL=""    # the name mint gives the next token (a2-probe: whole full P1 P
 readonly CALL_SECS=20     # the longest a revocation or a check may take
 readonly REVOKE_SECS=90   # the clean-up's first share, for the tokens alone (round 72, SEC-1)
 readonly CLEANUP_SECS=180 # the longest the whole clean-up may take
+readonly CONTROL_SECS=240 # the longest a control (A9, E1) may run, its own token clean-up included
 CLEANUP_DEADLINE=""
 HELD_KEPT=""        # tokens this run stored for a later check: never revoked by its clean-up
-CONFIRMED_TOKENS="" # tokens a read showed revoked (HTTP 401), outside a2-probe
+CONFIRMED_TOKENS="" # tokens confirmed revoked, outside a2-probe: see revocation_judged
+REVOKE_OK=""        # tokens whose revocation GitHub answered as done (round 74, SEC-2)
+UNCONFIRMABLE=""    # token:kind for each token a read refused but whose revocation can't be confirmed
 CLEANUP_UNDONE=""   # every tidy-up left undone, on any finish, for the clean-up's last line
 CONTROLS=0          # controls started (A9, E1), each named control<n> before it can ask for a token
 CONTROL_ID=""       # inside a control: its name, which its tokens' names start with
 CONTROL_PENDING=""  # controls that haven't said they are done: their tokens count as NOT confirmed
 CONTROL_CONFIRMED="" # names of control tokens their control confirmed revoked (HTTP 401)
 CONTROL_UNCONFIRMED="" # names of control tokens their control could not confirm
+CONTROL_PID=""      # the control running now, in the background (round 74, C1, SEC-1)
+CONTROL_NAME=""     # its name
+CONTROL_WATCH=""    # its watchdog
+CONTROL_REC=""      # the file its record comes through
+CONTROL_RC=""       # its exit status, once it has ended
+CONTROL_TOLD=""     # set once a stop has been passed on to it
+CONTROL_UNREC=""    # the requests it reports as possibly issued, never received
+CONTROL_END=""      # inside a control: when its own clean-up must have ended
 LAST_HTTP=""
 WORK=""
 CLONE=""
@@ -201,6 +212,9 @@ cleanup_tokens_first() { # <status> <start>
     CANCEL_ON_EXIT=""
     cancel_waiting_runs || true
   fi
+  # A control the stop found running settles its own tokens meanwhile, told to stop as the stop came;
+  # its record is collected here, by the clean-up's cap at the latest (round 74, C1, SEC-1).
+  if [[ -n "$CONTROL_PID" ]]; then control_collect; fi
   settle_tokens "the clean-up's time cap (${CLEANUP_SECS}s) was reached"
   cleanup_summary
 }
@@ -220,21 +234,22 @@ undone() { # <what> — a tidy-up left undone, named once in the clean-up's last
   [[ "$CLEANUP_UNDONE" == *" $1 (CLEANUP FAIL above);"* ]] || CLEANUP_UNDONE="$CLEANUP_UNDONE $1 (CLEANUP FAIL above);"
 }
 
-# label=token for each token of this run not yet confirmed revoked and not held, in issue order.
+# label=token for each token of this run not yet confirmed revoked and not held, in issue order;
+# one a read refused but whose revocation can't be confirmed is past trying (revocation_judged).
 settle_list() {
   local e t
   for e in $ISSUED; do
     t="${e#*=}"
-    [[ " $CONFIRMED_TOKENS $HELD_KEPT " == *" $t "* ]] || printf '%s\n' "$e"
+    [[ " $CONFIRMED_TOKENS $HELD_KEPT " == *" $t "* || " $UNCONFIRMABLE " == *" $t:"* ]] || printf '%s\n' "$e"
   done
   return 0
 }
 
 # Every token of the run's own not yet confirmed revoked: first a revocation for each one still
 # outstanding, before any check, those the clean-up hasn't tried yet ahead of retries, so a hung
-# call never keeps another token from its revocation; then a read with each, where only HTTP 401
-# confirms. One a read doesn't confirm goes back on OUTSTANDING, for the last try. A step the
-# deadline leaves out is named, with <why>.
+# call never keeps another token from its revocation; then a read with each, where HTTP 401 alone
+# never confirms (revocation_judged). One a read doesn't refuse goes back on OUTSTANDING, for the
+# last try. A step the deadline leaves out is named, with <why>.
 SETTLE_TRIED="" # tokens whose revocation the clean-up has tried
 settle_tokens() { # <why>
   local e t label pass why before="$SETTLE_TRIED"
@@ -259,9 +274,7 @@ settle_tokens() { # <why>
       continue
     fi
     if token_refused "$t"; then
-      CONFIRMED_TOKENS="$CONFIRMED_TOKENS $t"
-      outstanding_drop "$t"
-      say "TOKEN $label revoked: a read with it now gets HTTP 401"
+      revocation_judged "$label" "$t"
     else
       [[ " $OUTSTANDING " == *" $t "* ]] || OUTSTANDING="$OUTSTANDING $t"
       why="$(evidence)"
@@ -269,6 +282,57 @@ settle_tokens() { # <why>
       say "TOKEN $label NOT confirmed revoked: a read with it did not get HTTP 401 ($why)"
     fi
   done
+}
+
+# After a read with a token got HTTP 401 (round 74, SEC-2). An expired token gets HTTP 401 too, so
+# the revocation is confirmed only if GitHub answered a revocation of it as done and the read's
+# answer came at least a minute before the expiry GitHub gave when it issued the token (the minute
+# is taken off that expiry, never added). Otherwise no retry can confirm it: it is named NOT
+# confirmed, with why, and not tried again.
+revocation_judged() { # <label> <token>
+  local now exp="" kind=""
+  now=$(date +%s)
+  if ! exp="$(expiry_of "$1")"; then kind=unknown
+  elif [[ $((now + 60)) -gt $exp ]]; then kind=expired
+  elif [[ " $REVOKE_OK " != *" $2 "* ]]; then kind=unanswered
+  fi
+  outstanding_drop "$2"
+  if [[ -z "$kind" ]]; then
+    CONFIRMED_TOKENS="$CONFIRMED_TOKENS $2"
+    say "TOKEN $1 revoked: a read with it now gets HTTP 401, $((exp - now))s before its expiry, and GitHub answered its revocation as done"
+    return
+  fi
+  UNCONFIRMABLE="$UNCONFIRMABLE $2:$kind"
+  case "$kind" in
+    unknown) say "TOKEN $1 NOT confirmed revoked: a read with it gets HTTP 401, but its expiry is unknown, so that may be expiry (expiry unknown, revocation not confirmed)" ;;
+    expired) say "TOKEN $1 NOT confirmed revoked: expired, revocation not confirmed (a read with it got HTTP 401 at $(date -u -r "$now" +%H:%M:%SZ), less than a minute before its expiry $(date -u -r "$exp" +%H:%M:%SZ), or after it)" ;;
+    *) say "TOKEN $1 NOT confirmed revoked: a read with it gets HTTP 401, but GitHub never answered a revocation of it as done (revocation never answered as done)" ;;
+  esac
+}
+
+# The expiry GitHub gave when it issued that token (ISSUED_META), in seconds; 1 if unknown.
+expiry_of() { # <label>
+  local meta exp at
+  meta="$(printf '%s' "$ISSUED_META" | awk -v l="$1" '$1 == l { sub(/^[^ ]+ /, ""); print; exit }')"
+  exp="$(jq -r '.expires_at // empty' <<<"$meta" 2>/dev/null)" || return 1
+  at="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$exp" +%s 2>/dev/null)" || return 1
+  [[ "$at" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$at"
+}
+
+kind_of() { # <token> — why a read refused it but its revocation can't be confirmed, if so
+  local k
+  [[ " $UNCONFIRMABLE " == *" $1:"* ]] || return 0
+  k="${UNCONFIRMABLE##* "$1":}"
+  printf '%s' "${k%% *}"
+}
+
+unconfirmed_why() { # <kind> — how the last line names it
+  case "$1" in
+    expired) printf ' (expired, revocation not confirmed)' ;;
+    unknown) printf ' (expiry unknown, revocation not confirmed)' ;;
+    unanswered) printf ' (revocation never answered as done)' ;;
+  esac
 }
 
 # The clean-up's last line, without a token: each token confirmed revoked or not, held ones apart,
@@ -279,7 +343,7 @@ cleanup_summary() {
     t="${e#*=}"
     if [[ " $HELD_KEPT " == *" $t "* ]]; then held="$held ${e%%=*}"
     elif [[ " $CONFIRMED_TOKENS " == *" $t "* ]]; then yes="$yes ${e%%=*}"
-    else no="$no ${e%%=*}"
+    else no="$no ${e%%=*}$(unconfirmed_why "$(kind_of "$t")")"
     fi
   done
   # The controls' tokens, as their controls reported them; a control that never said it was done
@@ -300,10 +364,15 @@ trap cleanup EXIT
 # Closing the Terminal, Ctrl-C or a kill also end through cleanup, with the usual status (round 51,
 # SEC-1): an explicit exit, so it holds whatever the signal finds bash doing. A force-kill (KILL)
 # or a power loss can't be caught: a token not revoked then stays valid until it expires (GitHub
-# issues each for at most an hour).
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+# issues each for at most an hour). A stop ignores any further one first (round 74): a second
+# signal as the clean-up begins, before it ignores them itself, would otherwise end it there (seen
+# in a control's clean-up, which a stop can reach twice).
+stop_traps() {
+  trap 'trap "" HUP INT TERM; exit 129' HUP
+  trap 'trap "" HUP INT TERM; exit 130' INT
+  trap 'trap "" HUP INT TERM; exit 143' TERM
+}
+stop_traps
 
 # --- The two identities -------------------------------------------------------------------------
 
@@ -609,7 +678,8 @@ mint_token() { mint "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PE
 need_installation_scope() {
   mint '{}' whole
   local got
-  got="$(app_gh api installation/repositories --paginate --jq '.repositories[].full_name' 2>/dev/null)" || got=error
+  # Bounded like every other request (round 74, C1, SEC-1): it runs inside E1's control too.
+  got="$(with_timeout "$(call_secs)" app_gh api installation/repositories --paginate --jq '.repositories[].full_name' 2>/dev/null)" || got=error
   revoke_token
   [[ "$got" == "$REPO" ]] || die "the app must be installed on $REPO only (it reaches: $(printf '%s' "$got" | tr '\n' ' '))"
 }
@@ -623,7 +693,11 @@ revoke_token() { # DELETE /installation/token, which GitHub documents as stoppin
   if [[ $rc -ne 0 ]]; then say "note: revoking a token failed or timed out; GitHub expires it within an hour"; fi
   REVOKED_TOKENS="$REVOKED_TOKENS $TOKEN"
   # Only a confirmed revocation leaves the list: a failed one is tried again on exit (round 26).
-  if [[ $rc -eq 0 ]]; then outstanding_drop "$TOKEN"; fi
+  # GitHub's answer that it was done is kept: the clean-up's confirmation needs it (round 74, SEC-2).
+  if [[ $rc -eq 0 ]]; then
+    outstanding_drop "$TOKEN"
+    REVOKE_OK="$REVOKE_OK $TOKEN"
+  fi
   TOKEN=""
   return $rc
 }
@@ -638,10 +712,11 @@ defer_signals() {
   trap 'DEFERRED_SIG=143' TERM
 }
 resume_signals() {
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  if [[ -n "$DEFERRED_SIG" ]]; then exit "$DEFERRED_SIG"; fi
+  stop_traps
+  if [[ -n "$DEFERRED_SIG" ]]; then
+    trap '' HUP INT TERM
+    exit "$DEFERRED_SIG"
+  fi
 }
 
 # Runs a command for at most <seconds> (none at 0); 124 if it was stopped. The whole process tree is
@@ -653,9 +728,12 @@ with_timeout() { # <seconds> <command…>
   local secs="$1" pid w rc=0 mark
   shift
   [[ "$secs" =~ ^[0-9]+$ && $secs -gt 0 ]] || return 124
-  mark="${WORK:-${TMPDIR:-/tmp}}/timeout-$$-$RANDOM"
   "$@" &
   pid=$!
+  # Named by the command's own process (round 74): a control runs beside the run, and a background
+  # subshell of bash 3.2 repeats the run's $RANDOM, so a name from it could be shared.
+  mark="${WORK:-${TMPDIR:-/tmp}}/timeout-$$-$pid"
+  rm -f "$mark"
   (
     # A signal to the whole process group (closing the window) must not end the watchdog: a subshell
     # resets caught signals to their default, so it ignores them itself (round 67, C1).
@@ -746,16 +824,18 @@ control_exit() {
   # process, this subshell too) can't cut it short and hide a token it couldn't revoke (round 65).
   trap '' HUP INT TERM
   # Its requests that may have issued a token never received go to the caller (round 61, SEC-1),
-  # through a pipe on fd 3 rather than a file that might not be written; if even that fails, status 5
-  # tells the caller a record was lost (round 62, C1, SEC-1).
+  # on fd 3, a file only the caller reads (round 74: the control runs in the background). The write
+  # is checked: if it fails, status 5 tells the caller a record was lost (round 62, C1, SEC-1).
   if [[ -n "$PENDING_MINT" ]]; then UNRECEIVED="$UNRECEIVED$PENDING_MINT
 "; fi
   # Its own tokens are settled here and never leave it (round 73, C1, SEC-1): each revoked and its
-  # revocation confirmed by a read (HTTP 401), tried up to three times within REVOKE_SECS. The caller
-  # is told each one's name and state, then "done"; a control that never says "done" leaves its
-  # tokens NOT confirmed.
-  local n e t res="" bad=""
+  # revocation confirmed (revocation_judged), tried up to three times within REVOKE_SECS, and never
+  # past CONTROL_END, the end of the control's own time (round 74, C1). The caller is told each
+  # one's name and state, then "done"; a control that never says "done" leaves its tokens NOT
+  # confirmed.
+  local n e t res="" bad="" kind
   CLEANUP_DEADLINE=$(($(date +%s) + REVOKE_SECS))
+  if [[ -n "$CONTROL_END" && $CONTROL_END -lt $CLEANUP_DEADLINE ]]; then CLEANUP_DEADLINE=$CONTROL_END; fi
   settle_register
   for n in 1 2 3; do
     if [[ -z "$(settle_list)" ]] || ! in_time; then break; fi
@@ -769,7 +849,8 @@ control_exit() {
       res="${res}CONTROL $CONTROL_ID ${e%%=*} confirmed
 "
     else
-      res="${res}CONTROL $CONTROL_ID ${e%%=*} NOT-confirmed
+      kind="$(kind_of "$t")"
+      res="${res}CONTROL $CONTROL_ID ${e%%=*} NOT-confirmed${kind:+ $kind}
 "
       bad=1
     fi
@@ -784,18 +865,123 @@ control_exit() {
 control_begin() { # <name> — inside a control: only its own tokens, named after it
   CONTROL_ID="$1"
   TOKEN="" OUTSTANDING="" ISSUED="" ISSUED_META="" CONFIRMED_TOKENS="" SETTLE_TRIED="" UNRECEIVED="" PENDING_MINT=""
+  REVOKE_OK="" UNCONFIRMABLE="" CONTROL_PID=""
 }
 
+# A control runs in the background, bounded as a whole (round 74, C1, SEC-1). Its watchdog tells it
+# to stop (TERM) once its work has had its share, which leaves its own clean-up REVOKE_SECS (and
+# CALL_SECS for the request it may be in), and stops it outright (KILL) at CONTROL_SECS. A stop to
+# the run while a control works isn't held until the control ends any more: the control is told to
+# stop at once and settles its own tokens while the run's clean-up runs, which collects its record
+# (control_collect). A control stopped outright, or one that never reports, leaves its tokens NOT
+# confirmed and the clean-up INCOMPLETE.
 control_token() { # <command> — 0 if it got its token; its tokens are settled in it and reported here
-  local rc=0 rec line id unrec="" bad="" s
+  CONTROL_REC="$(umask 077 && mktemp "${WORK:-${TMPDIR:-/tmp}}/control.XXXXXX" 2>/dev/null)" \
+    || die "can't make the file a control's record comes through; no control ran"
   # Named, and counted as not done, before it can ask for a token (round 73, C1, SEC-1).
   CONTROLS=$((CONTROLS + 1))
-  id="control$CONTROLS"
-  CONTROL_PENDING="$CONTROL_PENDING $id"
-  # Signals are held until a record the control hands over is registered here, so a signal while it
-  # comes in can't lose it (round 63, C1).
+  CONTROL_NAME="control$CONTROLS"
+  CONTROL_PENDING="$CONTROL_PENDING $CONTROL_NAME"
+  # Signals are held while it starts and while its record is registered here, so a signal then can't
+  # lose it (round 63, C1); while it runs, a stop acts at once (control_wait).
   defer_signals
-  rec="$( (trap control_exit EXIT; control_begin "$id"; "$@") 3>&1 >/dev/null 2>&1)" || rc=$?
+  control_start "$@"
+  control_wait || resume_signals
+  control_end ""
+  resume_signals
+  # A control's request that may have issued a token never received stops the run, reported whole
+  # (round 61, SEC-1); so does a record the control could not hand over (round 62).
+  if [[ -n "$CONTROL_UNREC" ]]; then
+    report_unreceived
+    die "a control's token request got no usable answer: GitHub may have issued a token this run never received; the run stops"
+  fi
+  [[ $CONTROL_RC -ne 5 ]] || die "a control's record could not be handed over; the run stops"
+  [[ $CONTROL_RC -eq 0 || $CONTROL_RC -eq 3 ]]
+}
+
+control_start() { # <command…> — the control, and its watchdog
+  local stop_in=$((CONTROL_SECS - REVOKE_SECS - CALL_SECS - 5))
+  CONTROL_END=$(($(date +%s) + CONTROL_SECS - 5))
+  CONTROL_RC="" CONTROL_WATCH="" CONTROL_TOLD=""
+  (
+    control_begin "$CONTROL_NAME"
+    trap control_exit EXIT
+    resume_signals
+    "$@"
+  ) 3>"$CONTROL_REC" >/dev/null 2>&1 </dev/null &
+  CONTROL_PID=$!
+  (
+    trap '' HUP INT TERM
+    /bin/sleep "$stop_in"
+    kill -0 "$CONTROL_PID" 2>/dev/null || exit 0
+    echo stopped >"$CONTROL_REC.stopped"
+    kill -TERM "$CONTROL_PID" 2>/dev/null
+    /bin/sleep $((REVOKE_SECS + CALL_SECS + 5))
+    kill -0 "$CONTROL_PID" 2>/dev/null || exit 0
+    echo killed >"$CONTROL_REC.killed"
+    kill_tree "$CONTROL_PID"
+  ) </dev/null >/dev/null 2>&1 &
+  CONTROL_WATCH=$!
+}
+
+# 0 once the control has ended (CONTROL_RC); 1 as soon as a stop comes instead, or if one came while
+# it started. A stop is passed on to the control as it comes, so one that lands just before the
+# wait below still ends the control promptly. Signals are held again once it has ended.
+control_wait() {
+  local rc
+  trap 'control_stop 129' HUP
+  trap 'control_stop 130' INT
+  trap 'control_stop 143' TERM
+  [[ -z "$DEFERRED_SIG" ]] || control_stop "$DEFERRED_SIG"
+  while :; do
+    [[ -z "$DEFERRED_SIG" ]] || return 1
+    rc=0
+    wait "$CONTROL_PID" 2>/dev/null || rc=$?
+    if [[ $rc -gt 128 ]] && kill -0 "$CONTROL_PID" 2>/dev/null; then continue; fi
+    CONTROL_RC=$rc
+    trap 'DEFERRED_SIG=129' HUP
+    trap 'DEFERRED_SIG=130' INT
+    trap 'DEFERRED_SIG=143' TERM
+    return 0
+  done
+}
+
+control_stop() { # <status> — a stop while a control runs: kept, and passed on to the control once
+  DEFERRED_SIG="$1"
+  [[ -n "$CONTROL_TOLD" ]] || kill -TERM "$CONTROL_PID" 2>/dev/null
+  CONTROL_TOLD=1
+}
+
+# The control's end and its record: once it has ended, or (in the clean-up) by <cap> at the latest,
+# when it is stopped outright. Its tokens' names and states are registered, what it reports is said,
+# and a request it reports as possibly issued goes to UNRECEIVED (and CONTROL_UNREC).
+control_end() { # [cap, in seconds since 1970]
+  local w s rec line rest label state bad="" stopped="" killed="" id="$CONTROL_NAME"
+  if [[ -n "$1" ]]; then
+    s=$(($1 - $(date +%s)))
+    [[ $s -gt 0 ]] || s=0
+    (
+      trap '' HUP INT TERM
+      /bin/sleep "$s"
+      kill -0 "$CONTROL_PID" 2>/dev/null || exit 0
+      echo killed >"$CONTROL_REC.killed"
+      kill_tree "$CONTROL_PID"
+    ) </dev/null >/dev/null 2>&1 &
+    w=$!
+    CONTROL_RC=0
+    wait "$CONTROL_PID" 2>/dev/null || CONTROL_RC=$?
+    kill_tree "$w"
+    wait "$w" 2>/dev/null
+  fi
+  if [[ -n "$CONTROL_WATCH" ]]; then
+    kill_tree "$CONTROL_WATCH"
+    wait "$CONTROL_WATCH" 2>/dev/null
+  fi
+  rec="$(cat "$CONTROL_REC" 2>/dev/null)" || rec=""
+  [[ ! -f "$CONTROL_REC.stopped" ]] || stopped=1
+  [[ ! -f "$CONTROL_REC.killed" ]] || killed=1
+  rm -f "$CONTROL_REC" "$CONTROL_REC.stopped" "$CONTROL_REC.killed"
+  CONTROL_PID="" CONTROL_WATCH="" CONTROL_UNREC=""
   while IFS= read -r line; do
     case "$line" in
       "") ;;
@@ -803,40 +989,44 @@ control_token() { # <command> — 0 if it got its token; its tokens are settled 
         s=" $CONTROL_PENDING "
         CONTROL_PENDING="${s// $id / }"
         ;;
-      "CONTROL $id "*" NOT-confirmed")
-        line="${line#"CONTROL $id "}"
-        CONTROL_UNCONFIRMED="$CONTROL_UNCONFIRMED ${line% NOT-confirmed}"
-        bad="$bad ${line% NOT-confirmed}"
+      "CONTROL $id "*" "*)
+        rest="${line#"CONTROL $id "}"
+        label="${rest%% *}" state="${rest#* }"
+        case "$state" in
+          confirmed) CONTROL_CONFIRMED="$CONTROL_CONFIRMED $label" ;;
+          NOT-confirmed*)
+            label="$label$(unconfirmed_why "${state#NOT-confirmed }")"
+            CONTROL_UNCONFIRMED="$CONTROL_UNCONFIRMED $label"
+            bad="$bad $label"
+            ;;
+          *) CONTROL_UNREC="$CONTROL_UNREC$line
+" ;;
+        esac
         ;;
-      "CONTROL $id "*" confirmed")
-        line="${line#"CONTROL $id "}"
-        CONTROL_CONFIRMED="$CONTROL_CONFIRMED ${line% confirmed}"
-        ;;
-      *) unrec="$unrec$line
+      *) CONTROL_UNREC="$CONTROL_UNREC$line
 " ;;
     esac
   done <<<"$rec"
-  if [[ -n "$unrec" ]]; then UNRECEIVED="$UNRECEIVED$unrec"; fi
+  if [[ -n "$CONTROL_UNREC" ]]; then UNRECEIVED="$UNRECEIVED$CONTROL_UNREC"; fi
   # What the control reports is said before a held signal acts (round 64, C1, SEC-1): its tokens
   # and a record it couldn't hand over live only in its subshell.
   if [[ -n "$bad" ]]; then
-    say "note: a control's token could not be revoked, or its revocation not confirmed (HTTP 401):$bad; it may work until it expires, within an hour of its issue"
+    say "note: a control's token could not be revoked, or its revocation not confirmed:$bad; it may work until it expires, within an hour of its issue"
   fi
+  if [[ -n "$stopped" ]]; then say "note: $id's work took longer than its share of its ${CONTROL_SECS}s: it was told to stop"; fi
+  if [[ -n "$killed" ]]; then say "note: $id did not end in time and was stopped outright, before it could report"; fi
   if [[ " $CONTROL_PENDING " == *" $id "* ]]; then
-    say "note: $id ended without reporting on its tokens (status $rc): any it holds is NOT confirmed revoked"
+    say "note: $id ended without reporting on its tokens (status $CONTROL_RC): any it holds is NOT confirmed revoked"
   fi
-  if [[ $rc -eq 5 ]]; then
+  if [[ $CONTROL_RC -eq 5 ]]; then
     say "a control's token request got no usable answer, and its record of it could not be handed over: GitHub may have issued a token this run never received (it expires within an hour of the request)"
   fi
-  resume_signals
-  # A control's request that may have issued a token never received stops the run, reported whole
-  # (round 61, SEC-1); so does a record the control could not hand over (round 62).
-  if [[ -n "$unrec" ]]; then
-    report_unreceived
-    die "a control's token request got no usable answer: GitHub may have issued a token this run never received; the run stops"
-  fi
-  [[ $rc -ne 5 ]] || die "a control's record could not be handed over; the run stops"
-  [[ $rc -eq 0 || $rc -eq 3 ]]
+}
+
+# In the clean-up: a control the stop found running, collected by the clean-up's cap at the latest.
+control_collect() {
+  control_end "${CLEANUP_DEADLINE:-$((CONTROL_END + 5))}"
+  if [[ -n "$CONTROL_UNREC" ]]; then report_unreceived; fi
 }
 
 app_session() { # every command that acts as the app starts here
