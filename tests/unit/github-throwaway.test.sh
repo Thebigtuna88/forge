@@ -2413,6 +2413,9 @@ test_environment_cleanup_confirms_no_run_still_waits() {
   touch "$T_TMP/list-fails"
   rc=0; cancel_waiting_runs >/dev/null || rc=$?
   assert_exit 1 "$rc" "an unreadable list"
+  # Round 73 (C2): each failure is kept for the clean-up's last line.
+  assert_contains "$CLEANUP_UNDONE" "cancelling the waiting S2 runs"
+  end_stand_in_run
 }
 
 test_cleanup_waits_for_the_runs_this_run_started() {
@@ -3104,8 +3107,16 @@ test_a_controls_token_that_cannot_be_revoked_is_reported() {
   rc=0; out="$(control_token mint_bad 2>&1)" || rc=$?
   assert_exit 1 "$rc" "a control that failed, revocation failed"
   assert_contains "$out" "a control's token could not be revoked"
-  # Controls: revocation works, so nothing is reported either way.
-  app_gh() { echo "${TOKEN:0:11} $*" >>"$T_TMP/app-gh.log"; }
+  # Controls: revocation works, and a read with the token then gets HTTP 401 (round 73: only that
+  # confirms it), so nothing is reported either way.
+  app_gh() {
+    echo "${TOKEN:0:11} $*" >>"$T_TMP/app-gh.log"
+    if [[ "$*" == "api -X DELETE installation/token" ]]; then echo "$TOKEN" >>"$T_TMP/revoked-ctl"; fi
+    if [[ "$*" == "api repos/$REPO --jq .full_name" ]] && grep -qxF "$TOKEN" "$T_TMP/revoked-ctl" 2>/dev/null; then
+      echo "gh: Bad credentials (HTTP 401)" >&2
+      return 1
+    fi
+  }
   rc=0; out="$(control_token mint_ok 2>&1)" || rc=$?
   assert_exit 0 "$rc" "a control that minted"
   assert_eq "$out" "" "output from a control that settled"
@@ -3746,7 +3757,10 @@ test_a_signal_during_a_controls_clean_up_still_reports_its_token() {
     a_control() {
       OUTSTANDING=" dummy-token"
       resume_signals
-      revoke_outstanding() { /bin/sh -c "kill -TERM \$PPID"; /bin/sleep 1; }
+      # The signal arrives while the control settles its token (round 73: settle_tokens), which then
+      # does not confirm it.
+      settle_tokens() { /bin/sh -c "kill -TERM \$PPID"; /bin/sleep 1; }
+      sleep() { :; }
       return 0
     }
     control_token a_control; echo "control_token status=$?"' _ "$GT" "$T_TMP/work" 2>&1)" || rc=$?
@@ -4030,7 +4044,8 @@ test_with_timeout_stops_the_real_command_under_a_function() {
 # Three tokens of the run's own, none revoked yet: token1 in use, tokens 2 and 3 set aside.
 # $T_TMP/hang lists what never answers: "app <n>" (every call with token n), "app all", or
 # "owner <text>" (an owner call containing it). Other calls answer at once: nothing open, and a
-# read with a revoked token gets HTTP 401.
+# read with a revoked token gets HTTP 401, unless $T_TMP/works lists that token's number. A token
+# request (a control's) is answered with token 4.
 cleanup_stubs() {
   local short="$T_TMP/github-throwaway-short.sh"
   sed -e 's/^readonly CALL_SECS=20 /readonly CALL_SECS=1 /' -e 's/^readonly REVOKE_SECS=90 /readonly REVOKE_SECS=3 /' \
@@ -4043,6 +4058,8 @@ cleanup_stubs() {
   : >"$T_TMP/calls"
   : >"$T_TMP/revoked"
   : >"$T_TMP/hang"
+  : >"$T_TMP/works"
+  INSTALLATION_ID=77
   app_gh() {
     local n="${TOKEN:11:1}"
     echo "app_gh $n $*" >>"$T_TMP/calls"
@@ -4050,11 +4067,12 @@ cleanup_stubs() {
     case "$*" in
       "api -X DELETE installation/token") echo "$n" >>"$T_TMP/revoked" ;;
       "api repos/$REPO --jq .full_name")
-        if grep -qx "$n" "$T_TMP/revoked"; then echo "gh: Bad credentials (HTTP 401)" >&2; return 1; fi
+        if grep -qx "$n" "$T_TMP/revoked" && ! grep -qx "$n" "$T_TMP/works"; then echo "gh: Bad credentials (HTTP 401)" >&2; return 1; fi
         echo "$REPO" ;;
     esac
     return 0
   }
+  jwt_call() { LAST_HTTP=201; LAST_OUT="{\"token\":\"$(cleanup_token 4)\",\"expires_at\":\"2026-11-16T01:00:00Z\"}"; }
   owner_gh() {
     local h
     echo "owner_gh $*" >>"$T_TMP/calls"
@@ -4067,9 +4085,10 @@ cleanup_stubs() {
 
 cleanup_token() { printf 'gh%s_cleanup%s%s' s "$1" "$(printf 'Q%.0s' $(seq 1 30))"; }
 
-# The clean-up of a run that stopped with status <rc>, after <set-up> (shell code) has run. One still
-# running after 20s is killed (status 137). Sets OUT, RC and SECS.
-stopped_run_cleanup() { # <rc> <set-up>
+# The clean-up of a run that stopped with status <rc>, after <set-up> (shell code) has run, and
+# then <after> (shell code, with the three tokens in place). One still running after 20s is killed
+# (status 137). Sets OUT, RC and SECS.
+stopped_run_cleanup() { # <rc> <set-up> [after]
   local pid start t1 t2 t3
   t1="$(cleanup_token 1)" t2="$(cleanup_token 2)" t3="$(cleanup_token 3)"
   start="$(date +%s)"
@@ -4081,6 +4100,7 @@ stopped_run_cleanup() { # <rc> <set-up>
     ISSUED=" token1=$t1 token2=$t2 token3=$t3"
     MINTED=3
     trap cleanup EXIT
+    eval "${3:-}"
     exit "$1"
   ) >"$T_TMP/cleanup.out" 2>&1 &
   pid=$!
@@ -4148,6 +4168,63 @@ test_hung_revocations_end_by_the_cap_and_name_each_tokens_state() {
   out_tokens="$(printf '%s\n' "$OUT" | tail -n 1)"
   assert_contains "$out_tokens" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): none; NOT confirmed: token1 token2 token3; not done: closing the open test PRs" "everything hung"
   assert_not_contains "$OUT" "CLEANUP DONE" "everything hung"
+}
+
+# Round 73 (C1, SEC-1): a control's token stays in its control, which revokes it and confirms the
+# revocation with a read (HTTP 401), retrying within its own share; the run is told only its name
+# and its state, and names it in the clean-up's last line. A control that ends without telling
+# leaves it NOT confirmed. The control never touches the run's own tokens.
+test_a_controls_token_is_confirmed_in_its_control_and_named_in_the_last_line() {
+  local case name works hang after rc_want want n
+  for case in "confirmed||||0|CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3 control1-token4; NOT confirmed: none; nothing left undone" \
+    "still works after its revocation|4|||1|CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: control1-token4;" \
+    "its checks hang||app 4||1|CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: control1-token4;" \
+    "the control ends without telling|||vanish|1|CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: control1 (no result);"; do
+    IFS='|' read -r name works hang after rc_want want <<<"$case"
+    cleanup_stubs
+    printf '%s\n' "$works" >"$T_TMP/works"
+    printf '%s\n' "$hang" >"$T_TMP/hang"
+    control_cmd() { request_token '{}'; }
+    # Killed outright, so its exit trap never runs (bash 3.2 has no BASHPID: a child kills it).
+    vanish_cmd() { request_token '{}'; /bin/sh -c 'kill -KILL $PPID'; /bin/sleep 1; }
+    if [[ "$after" == vanish ]]; then after="control_token vanish_cmd || true"; else after="control_token control_cmd || true"; fi
+    stopped_run_cleanup 0 "" "$after"
+    assert_exit "$rc_want" "$RC" "$name: the run's status (137: still running after 20s)"
+    ((SECS <= REVOKE_SECS + CLEANUP_SECS + 3)) || _t_fail "$name: took ${SECS}s, over the control's ${REVOKE_SECS}s and the clean-up's ${CLEANUP_SECS}s"
+    assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "$want" "$name"
+    assert_not_contains "$OUT" "$(cleanup_token 4)" "$name: the control's token printed"
+    for n in 1 2 3; do
+      assert_eq "$(grep -c "^app_gh $n api -X DELETE installation/token" "$T_TMP/calls")" 1 "$name: the run's token$n revoked by the control too"
+    done
+    if [[ "$after" != *vanish* ]]; then
+      assert_contains "$(cat "$T_TMP/calls")" "app_gh 4 api repos/$REPO --jq .full_name" "$name: the control's token checked by a read"
+    fi
+  done
+  # Retried within the control's share: more than once, never past it.
+  cleanup_stubs
+  echo 4 >"$T_TMP/works"
+  stopped_run_cleanup 0 "" "control_token control_cmd || true"
+  n="$(grep -c '^app_gh 4 api -X DELETE installation/token' "$T_TMP/calls")"
+  ((n >= 2 && n <= 3)) || _t_fail "the control's revocation tried $n times, not 2 or 3"
+}
+
+# Round 73 (C2): a tidy-up that fails on a normal finish (cmd_tests, cmd_ptests, env-tests tidy up
+# themselves) is named in the last line too, which then never says DONE.
+test_a_tidy_up_failure_on_a_normal_finish_is_in_the_last_line() {
+  local case name setup hang want
+  for case in "test PRs%sweep_prs || true%owner pulls?state=open%closing the open test PRs" \
+    "test issues%RUN_ID=r1; sweep_issues%owner issues?state=open%closing the test issues" \
+    "S2 runs%sleep() { :; }; S2_SHAS=$(printf 'e%.0s' $(seq 1 40)); cancel_waiting_runs || true%owner actions/runs?per_page=100%cancelling the waiting S2 runs"; do
+    IFS='%' read -r name setup hang want <<<"$case"
+    cleanup_stubs
+    echo "$hang" >"$T_TMP/hang"
+    stopped_run_cleanup 1 "$setup"
+    assert_exit 1 "$RC" "$name (137: still running after 20s)"
+    assert_contains "$OUT" "CLEANUP FAIL" "$name"
+    assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; not done:" "$name"
+    assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "$want" "$name"
+    assert_not_contains "$OUT" "CLEANUP DONE" "$name"
+  done
 }
 
 # Round 53 (C2, SEC-2): each request gets at most what is left of the clean-up's budget, and the

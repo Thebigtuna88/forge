@@ -110,7 +110,12 @@ readonly CLEANUP_SECS=180 # the longest the whole clean-up may take
 CLEANUP_DEADLINE=""
 HELD_KEPT=""        # tokens this run stored for a later check: never revoked by its clean-up
 CONFIRMED_TOKENS="" # tokens a read showed revoked (HTTP 401), outside a2-probe
-CLEANUP_UNDONE=""   # what the clean-up's tidy-up left undone, for its last line
+CLEANUP_UNDONE=""   # every tidy-up left undone, on any finish, for the clean-up's last line
+CONTROLS=0          # controls started (A9, E1), each named control<n> before it can ask for a token
+CONTROL_ID=""       # inside a control: its name, which its tokens' names start with
+CONTROL_PENDING=""  # controls that haven't said they are done: their tokens count as NOT confirmed
+CONTROL_CONFIRMED="" # names of control tokens their control confirmed revoked (HTTP 401)
+CONTROL_UNCONFIRMED="" # names of control tokens their control could not confirm
 LAST_HTTP=""
 WORK=""
 CLONE=""
@@ -179,36 +184,40 @@ cleanup() {
 # confirmed revoked (a read with it got HTTP 401) or not, and what was left undone; 1 unless the
 # clean-up is shown complete.
 cleanup_tokens_first() { # <status> <start>
-  local fails t
   CLEANUP_DEADLINE=$(($2 + REVOKE_SECS))
-  # The token in use is always settled, as before, unless it is held for a later check; any token
-  # to settle that has no name yet is named "unnamed", so it is checked and reported like the rest.
-  if [[ -n "$TOKEN" && " $OUTSTANDING $HELD_KEPT " != *" $TOKEN "* ]]; then OUTSTANDING="$OUTSTANDING $TOKEN"; fi
-  for t in $OUTSTANDING; do
-    [[ " $ISSUED " == *"=$t "* ]] || ISSUED="$ISSUED unnamed=$t"
-  done
+  settle_register
   # Requests that may have issued a token never received (round 61, C1).
   if [[ -n "$PENDING_MINT" || -n "$UNRECEIVED" ]]; then report_unreceived; fi
   settle_tokens "the clean-up's share for tokens (${REVOKE_SECS}s) was used up; tried again after the tidy-up if time allows"
   CLEANUP_DEADLINE=$(($2 + CLEANUP_SECS))
+  # Each tidy-up records what it leaves undone itself, here as on a normal finish (round 73, C2).
   if [[ -n "$SWEEP_ON_EXIT" ]]; then
     SWEEP_ON_EXIT=""
     say "PHASE $PHASE: STOPPED by an error (status $1); closing the open test PRs"
-    fails=$FAILS
     sweep_prs || true
-    [[ $FAILS -eq $fails ]] || CLEANUP_UNDONE="$CLEANUP_UNDONE closing the open test PRs (CLEANUP FAIL above);"
-    if [[ "$PHASE" == permissions ]]; then
-      fails=$FAILS
-      sweep_issues
-      [[ $FAILS -eq $fails ]] || CLEANUP_UNDONE="$CLEANUP_UNDONE closing the test issues (CLEANUP FAIL above);"
-    fi
+    if [[ "$PHASE" == permissions ]]; then sweep_issues; fi
   fi
   if [[ -n "$CANCEL_ON_EXIT" ]]; then
     CANCEL_ON_EXIT=""
-    cancel_waiting_runs || CLEANUP_UNDONE="$CLEANUP_UNDONE cancelling the waiting S2 runs (CLEANUP FAIL above);"
+    cancel_waiting_runs || true
   fi
   settle_tokens "the clean-up's time cap (${CLEANUP_SECS}s) was reached"
   cleanup_summary
+}
+
+# The token in use is always settled, as before, unless it is held for a later check; any token to
+# settle that has no name yet is named "unnamed" (inside a control, after it), so it is checked and
+# reported like the rest.
+settle_register() {
+  local t
+  if [[ -n "$TOKEN" && " $OUTSTANDING $HELD_KEPT " != *" $TOKEN "* ]]; then OUTSTANDING="$OUTSTANDING $TOKEN"; fi
+  for t in $OUTSTANDING; do
+    [[ " $ISSUED " == *"=$t "* ]] || ISSUED="$ISSUED ${CONTROL_ID:+$CONTROL_ID-}unnamed=$t"
+  done
+}
+
+undone() { # <what> — a tidy-up left undone, named once in the clean-up's last line (round 73, C2)
+  [[ "$CLEANUP_UNDONE" == *" $1 (CLEANUP FAIL above);"* ]] || CLEANUP_UNDONE="$CLEANUP_UNDONE $1 (CLEANUP FAIL above);"
 }
 
 # label=token for each token of this run not yet confirmed revoked and not held, in issue order.
@@ -273,7 +282,11 @@ cleanup_summary() {
     else no="$no ${e%%=*}"
     fi
   done
-  [[ -n "$ISSUED$UNRECEIVED_LABELS$CLEANUP_UNDONE" ]] || return 0
+  # The controls' tokens, as their controls reported them; a control that never said it was done
+  # may hold one, NOT confirmed (round 73, C1, SEC-1).
+  yes="$yes$CONTROL_CONFIRMED" no="$no$CONTROL_UNCONFIRMED"
+  for t in $CONTROL_PENDING; do no="$no $t (no result)"; done
+  [[ -n "$ISSUED$UNRECEIVED_LABELS$CLEANUP_UNDONE$CONTROL_CONFIRMED$CONTROL_UNCONFIRMED$CONTROL_PENDING" ]] || return 0
   tokens="tokens confirmed revoked (HTTP 401):${yes:- none}; NOT confirmed:${no:- none}"
   tokens="$tokens${UNRECEIVED_LABELS:+; possibly issued, never received:$UNRECEIVED_LABELS}${held:+; held for a later check:$held}"
   if [[ -z "$no$UNRECEIVED_LABELS$CLEANUP_UNDONE" ]]; then
@@ -511,7 +524,7 @@ request_token() { # <request json>
   REQ_OK=0 REQ_TOKEN=no REQ_UNRECEIVED=no REQ_ANSWER=""
   printf '%s\n' "$1" >"$WORK/token-request.json" || die "writing the token request failed"
   REQ_BY="$(date -u -r $(($(date +%s) + 3660)) +%Y-%m-%dT%H:%M:%SZ)"
-  label="${MINT_LABEL:-token$((MINTED + 1))}"
+  label="${MINT_LABEL:-${CONTROL_ID:+$CONTROL_ID-}token$((MINTED + 1))}"
   defer_signals
   PENDING_MINT="$label $REQ_BY $1"
   jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || REQ_OK=1
@@ -737,32 +750,80 @@ control_exit() {
   # tells the caller a record was lost (round 62, C1, SEC-1).
   if [[ -n "$PENDING_MINT" ]]; then UNRECEIVED="$UNRECEIVED$PENDING_MINT
 "; fi
-  if [[ -n "$UNRECEIVED" ]] && ! printf '%s' "$UNRECEIVED" >&3 2>/dev/null; then
-    revoke_outstanding >/dev/null 2>&1
-    exit 5
-  fi
-  revoke_outstanding >/dev/null 2>&1
-  if [[ -n "${OUTSTANDING// /}" ]]; then
+  # Its own tokens are settled here and never leave it (round 73, C1, SEC-1): each revoked and its
+  # revocation confirmed by a read (HTTP 401), tried up to three times within REVOKE_SECS. The caller
+  # is told each one's name and state, then "done"; a control that never says "done" leaves its
+  # tokens NOT confirmed.
+  local n e t res="" bad=""
+  CLEANUP_DEADLINE=$(($(date +%s) + REVOKE_SECS))
+  settle_register
+  for n in 1 2 3; do
+    if [[ -z "$(settle_list)" ]] || ! in_time; then break; fi
+    settle_tokens "its control's share (${REVOKE_SECS}s) was used up" >/dev/null 2>&1
+    if [[ -n "$(settle_list)" && $n -lt 3 ]]; then pause 2; fi
+  done
+  for e in $ISSUED; do
+    t="${e#*=}"
+    [[ " $HELD_KEPT " != *" $t "* ]] || continue
+    if [[ " $CONFIRMED_TOKENS " == *" $t "* ]]; then
+      res="${res}CONTROL $CONTROL_ID ${e%%=*} confirmed
+"
+    else
+      res="${res}CONTROL $CONTROL_ID ${e%%=*} NOT-confirmed
+"
+      bad=1
+    fi
+  done
+  printf '%s%sCONTROL %s done\n' "$UNRECEIVED" "$res" "$CONTROL_ID" >&3 2>/dev/null || exit 5
+  if [[ -n "$bad" ]]; then
     if [[ $rc -eq 0 ]]; then exit 3; fi
     exit 4
   fi
 }
 
-control_token() { # <command> — 0 if it got its token; reports a token left unrevoked
-  local rc=0
-  local rec
+control_begin() { # <name> — inside a control: only its own tokens, named after it
+  CONTROL_ID="$1"
+  TOKEN="" OUTSTANDING="" ISSUED="" ISSUED_META="" CONFIRMED_TOKENS="" SETTLE_TRIED="" UNRECEIVED="" PENDING_MINT=""
+}
+
+control_token() { # <command> — 0 if it got its token; its tokens are settled in it and reported here
+  local rc=0 rec line id unrec="" bad="" s
+  # Named, and counted as not done, before it can ask for a token (round 73, C1, SEC-1).
+  CONTROLS=$((CONTROLS + 1))
+  id="control$CONTROLS"
+  CONTROL_PENDING="$CONTROL_PENDING $id"
   # Signals are held until a record the control hands over is registered here, so a signal while it
   # comes in can't lose it (round 63, C1).
   defer_signals
-  rec="$( (trap control_exit EXIT; "$@") 3>&1 >/dev/null 2>&1)" || rc=$?
-  if [[ -n "$rec" ]]; then
-    UNRECEIVED="$UNRECEIVED$rec
-"
+  rec="$( (trap control_exit EXIT; control_begin "$id"; "$@") 3>&1 >/dev/null 2>&1)" || rc=$?
+  while IFS= read -r line; do
+    case "$line" in
+      "") ;;
+      "CONTROL $id done")
+        s=" $CONTROL_PENDING "
+        CONTROL_PENDING="${s// $id / }"
+        ;;
+      "CONTROL $id "*" NOT-confirmed")
+        line="${line#"CONTROL $id "}"
+        CONTROL_UNCONFIRMED="$CONTROL_UNCONFIRMED ${line% NOT-confirmed}"
+        bad="$bad ${line% NOT-confirmed}"
+        ;;
+      "CONTROL $id "*" confirmed")
+        line="${line#"CONTROL $id "}"
+        CONTROL_CONFIRMED="$CONTROL_CONFIRMED ${line% confirmed}"
+        ;;
+      *) unrec="$unrec$line
+" ;;
+    esac
+  done <<<"$rec"
+  if [[ -n "$unrec" ]]; then UNRECEIVED="$UNRECEIVED$unrec"; fi
+  # What the control reports is said before a held signal acts (round 64, C1, SEC-1): its tokens
+  # and a record it couldn't hand over live only in its subshell.
+  if [[ -n "$bad" ]]; then
+    say "note: a control's token could not be revoked, or its revocation not confirmed (HTTP 401):$bad; it may work until it expires, within an hour of its issue"
   fi
-  # What the control reports is said before a held signal acts (round 64, C1, SEC-1): its token it
-  # couldn't revoke and a record it couldn't hand over live only in its subshell.
-  if [[ $rc -eq 3 || $rc -eq 4 ]]; then
-    say "note: a control's token could not be revoked; GitHub expires it within an hour of its issue"
+  if [[ " $CONTROL_PENDING " == *" $id "* ]]; then
+    say "note: $id ended without reporting on its tokens (status $rc): any it holds is NOT confirmed revoked"
   fi
   if [[ $rc -eq 5 ]]; then
     say "a control's token request got no usable answer, and its record of it could not be handed over: GitHub may have issued a token this run never received (it expires within an hour of the request)"
@@ -770,7 +831,7 @@ control_token() { # <command> — 0 if it got its token; reports a token left un
   resume_signals
   # A control's request that may have issued a token never received stops the run, reported whole
   # (round 61, SEC-1); so does a record the control could not hand over (round 62).
-  if [[ -n "$rec" ]]; then
+  if [[ -n "$unrec" ]]; then
     report_unreceived
     die "a control's token request got no usable answer: GitHub may have issued a token this run never received; the run stops"
   fi
@@ -1376,7 +1437,7 @@ close_if_open() { # <pr> — tidy up after a refused attempt
   fi
   if [[ "$st" == CLOSED || "$st" == MERGED ]]; then return 0; fi
   FAILS=$((FAILS + 1))
-  say "CLEANUP FAIL PR #$1 may still be open (state ${st:-unreadable}): close it on GitHub, in $REPO, before another phase"
+  undone "closing the open test PRs"; say "CLEANUP FAIL PR #$1 may still be open (state ${st:-unreadable}): close it on GitHub, in $REPO, before another phase"
   return 1
 }
 
@@ -1392,18 +1453,18 @@ sweep_prs() {
     --jq '.[] | select(.title | startswith("FRG-26 ")) | .number' 2>/dev/null)" || rc=$?
   if [[ $rc -ne 0 ]]; then
     FAILS=$((FAILS + 1))
-    say "CLEANUP FAIL could not list the open PRs in $REPO$(no_answer $rc): close any \"FRG-26 \" test PR on GitHub before another phase"
+    undone "closing the open test PRs"; say "CLEANUP FAIL could not list the open PRs in $REPO$(no_answer $rc): close any \"FRG-26 \" test PR on GitHub before another phase"
     return 1
   fi
   for pr in $open; do
     if [[ ! "$pr" =~ ^[0-9]+$ ]]; then
       FAILS=$((FAILS + 1))
-      say "CLEANUP FAIL unexpected PR list entry; close any \"FRG-26 \" test PR in $REPO on GitHub before another phase"
+      undone "closing the open test PRs"; say "CLEANUP FAIL unexpected PR list entry; close any \"FRG-26 \" test PR in $REPO on GitHub before another phase"
       return 1
     fi
     if ! in_time; then
       FAILS=$((FAILS + 1))
-      say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before PR #$pr was closed: close it, and any other \"FRG-26 \" test PR in $REPO, on GitHub before another phase"
+      undone "closing the open test PRs"; say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before PR #$pr was closed: close it, and any other \"FRG-26 \" test PR in $REPO, on GitHub before another phase"
       return 1
     fi
     if close_if_open "$pr"; then say "CLEANUP closed test PR #$pr, left open by a test"; fi
@@ -1992,21 +2053,21 @@ sweep_issues() {
   open="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO/issues?state=open&per_page=100" --jq "$mine" 2>/dev/null)" || rc=$?
   if [[ $rc -ne 0 ]]; then
     FAILS=$((FAILS + 1))
-    say "CLEANUP FAIL could not list the open issues in $REPO$(no_answer $rc): close any \"FRG-26 \" test issue on GitHub"
+    undone "closing the test issues"; say "CLEANUP FAIL could not list the open issues in $REPO$(no_answer $rc): close any \"FRG-26 \" test issue on GitHub"
   else
     for n in $open; do
       [[ "$n" =~ ^[0-9]+$ ]] || continue
       if ! in_time; then
         FAILS=$((FAILS + 1))
-        say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before issue #$n was closed: close it, and any other \"FRG-26 \" test issue in $REPO, on GitHub"
+        undone "closing the test issues"; say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before issue #$n was closed: close it, and any other \"FRG-26 \" test issue in $REPO, on GitHub"
         break
       fi
-      with_timeout "$(call_secs)" owner_gh issue close "$n" --repo "$REPO" >/dev/null 2>&1 || { FAILS=$((FAILS + 1)); say "CLEANUP FAIL issue #$n in $REPO may still be open"; }
+      with_timeout "$(call_secs)" owner_gh issue close "$n" --repo "$REPO" >/dev/null 2>&1 || { FAILS=$((FAILS + 1)); undone "closing the test issues"; say "CLEANUP FAIL issue #$n in $REPO may still be open"; }
     done
   fi
   if ! in_time; then
     FAILS=$((FAILS + 1))
-    say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before $REPO2 was checked: check it on GitHub for \"FRG-26 \" issues"
+    undone "checking $REPO2 for this run's issues"; say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before $REPO2 was checked: check it on GitHub for \"FRG-26 \" issues"
     return 0
   fi
   # Only this run's: issues #1-#3 there are the A2 evidence, kept open (owner, 2026-11-11).
@@ -2015,10 +2076,10 @@ sweep_issues() {
     --jq ".[] | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number" 2>/dev/null)" || rc=$?
   if [[ $rc -ne 0 ]]; then
     FAILS=$((FAILS + 1))
-    say "CLEANUP FAIL could not list the open issues in $REPO2$(no_answer $rc): check it on GitHub for \"FRG-26 \" issues"
+    undone "checking $REPO2 for this run's issues"; say "CLEANUP FAIL could not list the open issues in $REPO2$(no_answer $rc): check it on GitHub for \"FRG-26 \" issues"
   elif [[ -n "$open" ]]; then
     FAILS=$((FAILS + 1))
-    say "CLEANUP FAIL $REPO2 has open \"FRG-26 \" issues or PRs (#$(printf '%s' "$open" | tr '\n' ' ')): the app wrote there; close them on GitHub"
+    undone "closing this run's issues or PRs on $REPO2"; say "CLEANUP FAIL $REPO2 has open \"FRG-26 \" issues or PRs (#$(printf '%s' "$open" | tr '\n' ' ')): the app wrote there; close them on GitHub"
   fi
 }
 
@@ -2651,33 +2712,33 @@ cancel_waiting_runs() {
   done
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
     if ! in_time; then
-      say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before the S2 runs in $REPO were cancelled: cancel any unfinished S2 run on GitHub (Actions)"
+      undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before the S2 runs in $REPO were cancelled: cancel any unfinished S2 run on GitHub (Actions)"
       return 1
     fi
     rc=0
     ids="$(unfinished_runs)" || rc=$?
     if [[ $rc -ne 0 ]]; then
-      say "CLEANUP FAIL could not list the unfinished S2 runs in $REPO$(no_answer $rc): cancel any on GitHub (Actions)"
+      undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL could not list the unfinished S2 runs in $REPO$(no_answer $rc): cancel any on GitHub (Actions)"
       return 1
     fi
     if [[ -z "$ids" ]]; then ok=1; break; fi
     for id in $ids; do
-      if [[ ! "$id" =~ ^[0-9]+$ ]]; then say "CLEANUP FAIL unexpected run id in $REPO: cancel any unfinished S2 run on GitHub"; return 1; fi
+      if [[ ! "$id" =~ ^[0-9]+$ ]]; then undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL unexpected run id in $REPO: cancel any unfinished S2 run on GitHub"; return 1; fi
       in_time || break
       with_timeout "$(call_secs)" owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
     done
     pause 5
   done
   if [[ -z "$ok" ]]; then
-    say "CLEANUP FAIL S2 runs still unfinished in $REPO ($(printf '%s' "$ids" | tr '\n' ' ')): cancel them on GitHub (Actions)"
+    undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL S2 runs still unfinished in $REPO ($(printf '%s' "$ids" | tr '\n' ' ')): cancel them on GitHub (Actions)"
     return 1
   fi
   if [[ -n "$S2_UNKNOWN" ]]; then
-    say "CLEANUP FAIL the S2 workflow commit's outcome is unknown, so its run may appear later: check $REPO's Actions on GitHub and cancel any S2 run there"
+    undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL the S2 workflow commit's outcome is unknown, so its run may appear later: check $REPO's Actions on GitHub and cancel any S2 run there"
     return 1
   fi
   if [[ -n "$unseen" ]]; then
-    say "CLEANUP FAIL the S2 runs for commit(s)$unseen never appeared within a minute: check $REPO's Actions on GitHub and cancel any S2 run there"
+    undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL the S2 runs for commit(s)$unseen never appeared within a minute: check $REPO's Actions on GitHub and cancel any S2 run there"
     return 1
   fi
   return 0

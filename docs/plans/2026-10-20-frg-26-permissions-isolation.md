@@ -508,6 +508,15 @@ last line names each token confirmed revoked or not and what was left undone; a 
 shown complete makes the run's exit status a failure, never a success. This doesn't extend the
 investigation's accepted limits (above) to these commands or to the broker.
 
+Controls and every tidy-up (owner, 2026-11-16, review round 73). A control that needs its own
+token (A9, E1) is named before it can ask for one, and settles that token itself: a revocation,
+then a read that must get HTTP 401, up to three tries within its own 90 seconds. The token never
+leaves the control; the run is told only its name and state. A failed or timed-out check, or a
+control that ends without reporting, leaves its token NOT confirmed, and the clean-up INCOMPLETE;
+expiry is never counted as revocation. Every tidy-up failure, on a normal finish too, is named in
+the last line. The run's clean-up keeps its bound; a stop that arrives during a control acts once
+the control has ended, now up to 90 seconds later than before.
+
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.
 
