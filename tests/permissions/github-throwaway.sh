@@ -105,8 +105,12 @@ JWT_ERR=""
 JWT_RC=0
 MINT_LABEL=""    # the name mint gives the next token (a2-probe: whole full P1 P2)
 readonly CALL_SECS=20     # the longest a revocation or a check may take
+readonly REVOKE_SECS=90   # the clean-up's first share, for the tokens alone (round 72, SEC-1)
 readonly CLEANUP_SECS=180 # the longest the whole clean-up may take
 CLEANUP_DEADLINE=""
+HELD_KEPT=""        # tokens this run stored for a later check: never revoked by its clean-up
+CONFIRMED_TOKENS="" # tokens a read showed revoked (HTTP 401), outside a2-probe
+CLEANUP_UNDONE=""   # what the clean-up's tidy-up left undone, for its last line
 LAST_HTTP=""
 WORK=""
 CLONE=""
@@ -140,36 +144,144 @@ SWEEP_ON_EXIT=""
 CANCEL_ON_EXIT=""
 
 cleanup() {
-  local rc=$?
+  local rc=$? start incomplete=0
   # Once the clean-up starts it runs to its end: a second Ctrl-C, closing the window or a kill no
-  # longer stops it (round 52, owner-approved). It is bounded in time instead: each revocation and
-  # each check is given at most CALL_SECS, and the whole clean-up at most CLEANUP_SECS.
+  # longer stops it (round 52, owner-approved). It is bounded in time instead: every GitHub call in
+  # it is given at most CALL_SECS, never more than is left (the whole process tree is stopped at
+  # its limit), and every wait and loop checks the cap: the whole clean-up ends within CLEANUP_SECS
+  # plus a few seconds (the last call may end up to a second past it; the local work after it).
   trap '' HUP INT TERM
-  CLEANUP_DEADLINE=$(($(date +%s) + CLEANUP_SECS))
-  if [[ -n "$SWEEP_ON_EXIT" ]]; then
-    SWEEP_ON_EXIT=""
-    say "PHASE $PHASE: STOPPED by an error (status $rc); closing the open test PRs"
-    sweep_prs
-    if [[ "$PHASE" == permissions ]]; then sweep_issues; fi
-  fi
-  if [[ -n "$CANCEL_ON_EXIT" ]]; then
-    CANCEL_ON_EXIT=""
-    cancel_waiting_runs || true
-  fi
-  # Every way out of a2-probe ends here: its tokens are settled and checked, what it made is read
-  # back, and its result decides the exit status (rounds 47, 52).
+  start=$(date +%s)
   if [[ -n "$PROBE_ACTIVE" ]]; then
+    # Every way out of a2-probe ends here: its tokens are settled and checked, what it made is read
+    # back, and its result decides the exit status (rounds 47, 52).
+    CLEANUP_DEADLINE=$((start + CLEANUP_SECS))
     PROBE_ACTIVE=""
     probe_finish "$rc"
+    if [[ -n "$PENDING_MINT" || -n "$UNRECEIVED" ]]; then report_unreceived; fi
+    revoke_outstanding
+  else
+    cleanup_tokens_first "$rc" "$start" || incomplete=1
   fi
-  # Any other command's requests that may have issued a token never received (round 61, C1).
-  if [[ -n "$PENDING_MINT" || -n "$UNRECEIVED" ]]; then report_unreceived; fi
-  revoke_outstanding
   if [[ -n "$HELD_LOCKED" ]]; then rmdir "$HELD.lock" 2>/dev/null || true; HELD_LOCKED=""; fi
   if [[ -n "$WORK" && -d "$WORK" ]]; then rm -rf "$WORK"; fi
   # a2-probe's summary is the last line, which the owner's handoff result shows (round 48).
   if [[ -n "$PROBE_SUMMARY" ]]; then say "$PROBE_SUMMARY"; fi
   if [[ -n "$PROBE_RC" ]]; then exit "$PROBE_RC"; fi
+  # Any other command: a clean-up not shown complete is never a success (round 72, SEC-1).
+  if [[ $incomplete -ne 0 && $rc -eq 0 ]]; then exit 1; fi
+}
+
+# Every other command's clean-up (round 72, SEC-1). The tokens first, alone, within REVOKE_SECS of
+# its start, so no tidy-up can keep a token from its revocation; then the tidy-up (test PRs and
+# issues, waiting S2 runs) and a last try for any token not yet confirmed, within CLEANUP_SECS.
+# A step the deadline leaves out is named as not done. Ends with one line naming each token
+# confirmed revoked (a read with it got HTTP 401) or not, and what was left undone; 1 unless the
+# clean-up is shown complete.
+cleanup_tokens_first() { # <status> <start>
+  local fails t
+  CLEANUP_DEADLINE=$(($2 + REVOKE_SECS))
+  # The token in use is always settled, as before, unless it is held for a later check; any token
+  # to settle that has no name yet is named "unnamed", so it is checked and reported like the rest.
+  if [[ -n "$TOKEN" && " $OUTSTANDING $HELD_KEPT " != *" $TOKEN "* ]]; then OUTSTANDING="$OUTSTANDING $TOKEN"; fi
+  for t in $OUTSTANDING; do
+    [[ " $ISSUED " == *"=$t "* ]] || ISSUED="$ISSUED unnamed=$t"
+  done
+  # Requests that may have issued a token never received (round 61, C1).
+  if [[ -n "$PENDING_MINT" || -n "$UNRECEIVED" ]]; then report_unreceived; fi
+  settle_tokens "the clean-up's share for tokens (${REVOKE_SECS}s) was used up; tried again after the tidy-up if time allows"
+  CLEANUP_DEADLINE=$(($2 + CLEANUP_SECS))
+  if [[ -n "$SWEEP_ON_EXIT" ]]; then
+    SWEEP_ON_EXIT=""
+    say "PHASE $PHASE: STOPPED by an error (status $1); closing the open test PRs"
+    fails=$FAILS
+    sweep_prs || true
+    [[ $FAILS -eq $fails ]] || CLEANUP_UNDONE="$CLEANUP_UNDONE closing the open test PRs (CLEANUP FAIL above);"
+    if [[ "$PHASE" == permissions ]]; then
+      fails=$FAILS
+      sweep_issues
+      [[ $FAILS -eq $fails ]] || CLEANUP_UNDONE="$CLEANUP_UNDONE closing the test issues (CLEANUP FAIL above);"
+    fi
+  fi
+  if [[ -n "$CANCEL_ON_EXIT" ]]; then
+    CANCEL_ON_EXIT=""
+    cancel_waiting_runs || CLEANUP_UNDONE="$CLEANUP_UNDONE cancelling the waiting S2 runs (CLEANUP FAIL above);"
+  fi
+  settle_tokens "the clean-up's time cap (${CLEANUP_SECS}s) was reached"
+  cleanup_summary
+}
+
+# label=token for each token of this run not yet confirmed revoked and not held, in issue order.
+settle_list() {
+  local e t
+  for e in $ISSUED; do
+    t="${e#*=}"
+    [[ " $CONFIRMED_TOKENS $HELD_KEPT " == *" $t "* ]] || printf '%s\n' "$e"
+  done
+  return 0
+}
+
+# Every token of the run's own not yet confirmed revoked: first a revocation for each one still
+# outstanding, before any check, those the clean-up hasn't tried yet ahead of retries, so a hung
+# call never keeps another token from its revocation; then a read with each, where only HTTP 401
+# confirms. One a read doesn't confirm goes back on OUTSTANDING, for the last try. A step the
+# deadline leaves out is named, with <why>.
+SETTLE_TRIED="" # tokens whose revocation the clean-up has tried
+settle_tokens() { # <why>
+  local e t label pass why before="$SETTLE_TRIED"
+  for pass in new again; do
+    for e in $(settle_list); do
+      t="${e#*=}" label="${e%%=*}"
+      [[ " $OUTSTANDING " == *" $t "* ]] || continue
+      if [[ " $before " == *" $t "* ]]; then [[ $pass == again ]] || continue; else [[ $pass == new ]] || continue; fi
+      if ! in_time; then
+        if [[ $pass == new ]]; then say "TOKEN $label revocation not tried: $1"; else say "TOKEN $label revocation not tried again: $1"; fi
+        continue
+      fi
+      SETTLE_TRIED="$SETTLE_TRIED $t"
+      TOKEN="$t"
+      revoke_token || true
+    done
+  done
+  for e in $(settle_list); do
+    t="${e#*=}" label="${e%%=*}"
+    if ! in_time; then
+      say "TOKEN $label not checked yet: $1"
+      continue
+    fi
+    if token_refused "$t"; then
+      CONFIRMED_TOKENS="$CONFIRMED_TOKENS $t"
+      outstanding_drop "$t"
+      say "TOKEN $label revoked: a read with it now gets HTTP 401"
+    else
+      [[ " $OUTSTANDING " == *" $t "* ]] || OUTSTANDING="$OUTSTANDING $t"
+      why="$(evidence)"
+      [[ $LAST_RC -ne 124 ]] || why="no answer within its time limit"
+      say "TOKEN $label NOT confirmed revoked: a read with it did not get HTTP 401 ($why)"
+    fi
+  done
+}
+
+# The clean-up's last line, without a token: each token confirmed revoked or not, held ones apart,
+# and what was left undone. Nothing when the run had no token and no tidy-up. 1 unless complete.
+cleanup_summary() {
+  local e t yes="" no="" held="" tokens
+  for e in $ISSUED; do
+    t="${e#*=}"
+    if [[ " $HELD_KEPT " == *" $t "* ]]; then held="$held ${e%%=*}"
+    elif [[ " $CONFIRMED_TOKENS " == *" $t "* ]]; then yes="$yes ${e%%=*}"
+    else no="$no ${e%%=*}"
+    fi
+  done
+  [[ -n "$ISSUED$UNRECEIVED_LABELS$CLEANUP_UNDONE" ]] || return 0
+  tokens="tokens confirmed revoked (HTTP 401):${yes:- none}; NOT confirmed:${no:- none}"
+  tokens="$tokens${UNRECEIVED_LABELS:+; possibly issued, never received:$UNRECEIVED_LABELS}${held:+; held for a later check:$held}"
+  if [[ -z "$no$UNRECEIVED_LABELS$CLEANUP_UNDONE" ]]; then
+    say "CLEANUP DONE: $tokens; nothing left undone"
+    return 0
+  fi
+  say "CLEANUP INCOMPLETE: $tokens; not done:${CLEANUP_UNDONE:- nothing.} A token not confirmed may work until it expires, within an hour of its issue"
+  return 1
 }
 trap cleanup EXIT
 # Closing the Terminal, Ctrl-C or a kill also end through cleanup, with the usual status (round 51,
@@ -535,7 +647,7 @@ with_timeout() { # <seconds> <command…>
     # A signal to the whole process group (closing the window) must not end the watchdog: a subshell
     # resets caught signals to their default, so it ignores them itself (round 67, C1).
     trap '' HUP INT TERM
-    sleep "$secs"
+    /bin/sleep "$secs" # the clock itself, never a function of that name (round 72)
     echo stopped >"$mark"
     kill_tree "$pid"
   ) </dev/null >/dev/null 2>&1 &
@@ -580,6 +692,17 @@ call_secs() {
 
 in_time() { # 1 once the clean-up's time cap has passed (no cap outside the clean-up)
   [[ -z "$CLEANUP_DEADLINE" || $(date +%s) -lt $CLEANUP_DEADLINE ]]
+}
+
+pause() { # <seconds> — a wait between polls, never past the clean-up's cap (round 72, SEC-1)
+  local s
+  s="$(call_secs)"
+  [[ $s -lt $1 ]] || s=$1
+  [[ $s -le 0 ]] || sleep "$s"
+}
+
+no_answer() { # <status> — why a bounded call failed, for its CLEANUP FAIL line
+  [[ $1 -ne 124 ]] || printf ' (no answer within its time limit)'
 }
 
 outstanding_drop() { # <token> — revoked or held: no longer this run's to revoke on exit
@@ -1189,7 +1312,7 @@ feature_pr() { # <id> [base] — a fresh feature branch with one new file, and a
 }
 
 pr_view() { # <pr> <fields> <jq>
-  owner_gh pr view "$1" --repo "$REPO" --json "$2" --jq "$3" 2>/dev/null
+  with_timeout "$(call_secs)" owner_gh pr view "$1" --repo "$REPO" --json "$2" --jq "$3" 2>/dev/null
 }
 
 wait_settled() { # <pr> — GitHub computes mergeability in the background; 1 if it never settles
@@ -1247,8 +1370,8 @@ owner_approve() { # <pr>
 close_if_open() { # <pr> — tidy up after a refused attempt
   local st
   st="$(pr_view "$1" state .state)" || st=""
-  if [[ "$st" == OPEN ]]; then
-    owner_gh pr close "$1" --repo "$REPO" >/dev/null 2>&1 || true
+  if [[ "$st" == OPEN ]] && in_time; then
+    with_timeout "$(call_secs)" owner_gh pr close "$1" --repo "$REPO" >/dev/null 2>&1 || true
     st="$(pr_view "$1" state .state)" || st=""
   fi
   if [[ "$st" == CLOSED || "$st" == MERGED ]]; then return 0; fi
@@ -1262,18 +1385,25 @@ close_if_open() { # <pr> — tidy up after a refused attempt
 # number (dev_ahead, or a PR URL that couldn't be read). Any PR it can't confirm closed, or a
 # list it can't read, is a failure.
 sweep_prs() {
-  local open pr
-  # Every page, so no test PR is missed however many PRs are open (review round 9).
-  if ! open="$(owner_gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" \
-    --jq '.[] | select(.title | startswith("FRG-26 ")) | .number' 2>/dev/null)"; then
+  local open pr rc=0
+  # Every page, so no test PR is missed however many PRs are open (review round 9). Each call is
+  # bounded, and the clean-up's cap checked before each PR (round 72, SEC-1).
+  open="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" \
+    --jq '.[] | select(.title | startswith("FRG-26 ")) | .number' 2>/dev/null)" || rc=$?
+  if [[ $rc -ne 0 ]]; then
     FAILS=$((FAILS + 1))
-    say "CLEANUP FAIL could not list the open PRs in $REPO: close any \"FRG-26 \" test PR on GitHub before another phase"
+    say "CLEANUP FAIL could not list the open PRs in $REPO$(no_answer $rc): close any \"FRG-26 \" test PR on GitHub before another phase"
     return 1
   fi
   for pr in $open; do
     if [[ ! "$pr" =~ ^[0-9]+$ ]]; then
       FAILS=$((FAILS + 1))
       say "CLEANUP FAIL unexpected PR list entry; close any \"FRG-26 \" test PR in $REPO on GitHub before another phase"
+      return 1
+    fi
+    if ! in_time; then
+      FAILS=$((FAILS + 1))
+      say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before PR #$pr was closed: close it, and any other \"FRG-26 \" test PR in $REPO, on GitHub before another phase"
       return 1
     fi
     if close_if_open "$pr"; then say "CLEANUP closed test PR #$pr, left open by a test"; fi
@@ -1856,22 +1986,36 @@ setup_fail_p() { # <id> <what failed>
 # this run wrote there, and is reported for the owner to close; this script never writes there as
 # the owner.
 sweep_issues() {
-  local open n mine
+  local open n mine rc=0
+  # Each call bounded, the clean-up's cap checked before each step (round 72, SEC-1).
   mine=".[] | select(.pull_request == null) | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number"
-  if ! open="$(owner_gh api --paginate "repos/$REPO/issues?state=open&per_page=100" --jq "$mine" 2>/dev/null)"; then
+  open="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO/issues?state=open&per_page=100" --jq "$mine" 2>/dev/null)" || rc=$?
+  if [[ $rc -ne 0 ]]; then
     FAILS=$((FAILS + 1))
-    say "CLEANUP FAIL could not list the open issues in $REPO: close any \"FRG-26 \" test issue on GitHub"
+    say "CLEANUP FAIL could not list the open issues in $REPO$(no_answer $rc): close any \"FRG-26 \" test issue on GitHub"
   else
     for n in $open; do
       [[ "$n" =~ ^[0-9]+$ ]] || continue
-      owner_gh issue close "$n" --repo "$REPO" >/dev/null 2>&1 || { FAILS=$((FAILS + 1)); say "CLEANUP FAIL issue #$n in $REPO may still be open"; }
+      if ! in_time; then
+        FAILS=$((FAILS + 1))
+        say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before issue #$n was closed: close it, and any other \"FRG-26 \" test issue in $REPO, on GitHub"
+        break
+      fi
+      with_timeout "$(call_secs)" owner_gh issue close "$n" --repo "$REPO" >/dev/null 2>&1 || { FAILS=$((FAILS + 1)); say "CLEANUP FAIL issue #$n in $REPO may still be open"; }
     done
   fi
-  # Only this run's: issues #1-#3 there are the A2 evidence, kept open (owner, 2026-11-11).
-  if ! open="$(owner_gh api --paginate "repos/$REPO2/issues?state=open&per_page=100" \
-    --jq ".[] | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number" 2>/dev/null)"; then
+  if ! in_time; then
     FAILS=$((FAILS + 1))
-    say "CLEANUP FAIL could not list the open issues in $REPO2: check it on GitHub for \"FRG-26 \" issues"
+    say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before $REPO2 was checked: check it on GitHub for \"FRG-26 \" issues"
+    return 0
+  fi
+  # Only this run's: issues #1-#3 there are the A2 evidence, kept open (owner, 2026-11-11).
+  rc=0
+  open="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO2/issues?state=open&per_page=100" \
+    --jq ".[] | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number" 2>/dev/null)" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    FAILS=$((FAILS + 1))
+    say "CLEANUP FAIL could not list the open issues in $REPO2$(no_answer $rc): check it on GitHub for \"FRG-26 \" issues"
   elif [[ -n "$open" ]]; then
     FAILS=$((FAILS + 1))
     say "CLEANUP FAIL $REPO2 has open \"FRG-26 \" issues or PRs (#$(printf '%s' "$open" | tr '\n' ' ')): the app wrote there; close them on GitHub"
@@ -1978,7 +2122,7 @@ probe_label_of() { # <token> — its name in this run, never the token
 
 # Is the token now refused? A read with it, within call_secs; 0 only for HTTP 401 itself, never for
 # words alone (round 58, C2).
-probe_refused() { # <token>
+token_refused() { # <token>
   TOKEN="$1"
   capture with_timeout "$(call_secs)" app_gh api "repos/$REPO" --jq .full_name || true
   TOKEN=""
@@ -2005,7 +2149,7 @@ probe_settle_tokens() {
       [[ " $OUTSTANDING " == *" $t "* ]] || OUTSTANDING="$OUTSTANDING $t"
       continue
     fi
-    if probe_refused "$t"; then
+    if token_refused "$t"; then
       PROBE_REVOKED=$((PROBE_REVOKED + 1))
       PROBE_CONFIRMED="$PROBE_CONFIRMED $t"
       say "TOKEN $label revoked: a read with it now gets HTTP 401"
@@ -2047,7 +2191,7 @@ revoke_confirmed() { # <label> — revoke the current token; a read with it afte
     say "TOKEN $1 revocation FAILED: the exit clean-up tries again"
     return 0
   fi
-  if probe_refused "$t"; then
+  if token_refused "$t"; then
     PROBE_REVOKED=$((PROBE_REVOKED + 1))
     PROBE_CONFIRMED="$PROBE_CONFIRMED $t"
     say "TOKEN $1 revoked: a read with it now gets HTTP 401"
@@ -2423,7 +2567,7 @@ cmd_env_setup() {
 }
 
 runs_for() { # <sha> — "id status conclusion actor" for each run of the S2 workflow on that commit
-  owner_gh api "repos/$REPO/actions/runs?head_sha=$1&per_page=20" \
+  with_timeout "$(call_secs)" owner_gh api "repos/$REPO/actions/runs?head_sha=$1&per_page=20" \
     --jq '.workflow_runs[] | select(.name == "frg26-s2") | "\(.id) \(.status) \(.conclusion) \(.actor.login)"' 2>/dev/null
 }
 
@@ -2485,35 +2629,44 @@ policy_rejected() { # <check-run id>
 # The ids of S2 runs not yet completed (queued, in progress, waiting…), every page; fails if the
 # list can't be read. Not only waiting ones: a queued run reaches the approval gate later (round 22).
 unfinished_runs() {
-  owner_gh api --paginate "repos/$REPO/actions/runs?per_page=100" \
+  with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO/actions/runs?per_page=100" \
     --jq '.workflow_runs[] | select(.name == "frg26-s2" and .status != "completed") | .id' 2>/dev/null
 }
 
 # Every unfinished S2 run GitHub shows is cancelled, and confirmed finished (rounds 14, 22, 25); then
 # the clean-up fails if a run may still be missing: a commit env-tests made whose run never showed
 # within a minute (round 23), or a workflow commit whose sha is unknown (round 24). The visible runs
-# are always dealt with first, whatever else failed (round 25, SEC-1). 1 on any failure.
+# are always dealt with first, whatever else failed (round 25, SEC-1). Each call bounded, and no
+# wait or poll runs past the clean-up's cap (round 72, SEC-1). 1 on any failure.
 cancel_waiting_runs() {
-  local ids id _ sha seen unseen="" ok=""
+  local ids id _ sha seen unseen="" ok="" rc
   for sha in $S2_SHAS; do
     seen=""
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+      in_time || break
       if [[ -n "$(runs_for "$sha")" ]]; then seen=1; break; fi
-      sleep 5
+      pause 5
     done
     [[ -n "$seen" ]] || unseen="$unseen ${sha:0:7}"
   done
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    if ! ids="$(unfinished_runs)"; then
-      say "CLEANUP FAIL could not list the unfinished S2 runs in $REPO: cancel any on GitHub (Actions)"
+    if ! in_time; then
+      say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before the S2 runs in $REPO were cancelled: cancel any unfinished S2 run on GitHub (Actions)"
+      return 1
+    fi
+    rc=0
+    ids="$(unfinished_runs)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+      say "CLEANUP FAIL could not list the unfinished S2 runs in $REPO$(no_answer $rc): cancel any on GitHub (Actions)"
       return 1
     fi
     if [[ -z "$ids" ]]; then ok=1; break; fi
     for id in $ids; do
       if [[ ! "$id" =~ ^[0-9]+$ ]]; then say "CLEANUP FAIL unexpected run id in $REPO: cancel any unfinished S2 run on GitHub"; return 1; fi
-      owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
+      in_time || break
+      with_timeout "$(call_secs)" owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
     done
-    sleep 5
+    pause 5
   done
   if [[ -z "$ok" ]]; then
     say "CLEANUP FAIL S2 runs still unfinished in $REPO ($(printf '%s' "$ids" | tr '\n' ' ')): cancel them on GitHub (Actions)"
@@ -2794,6 +2947,7 @@ cmd_hold_token() {
     die "storing the held token failed, and revoking it failed too: GitHub expires it within an hour"
   fi
   outstanding_drop "$held"
+  HELD_KEPT="$HELD_KEPT $held"
   TOKEN="$session"
   say "held token '$name' stored (issued $(date -u +%Y-%m-%dT%H:%M:%SZ), used only by its check)"
 }

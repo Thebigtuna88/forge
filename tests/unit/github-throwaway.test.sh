@@ -22,6 +22,10 @@ load() { # source the script (main doesn't run when sourced)
   source "$GT"
 }
 
+# Sourcing installs the script's exit clean-up in the test's own subshell. A test that leaves a
+# stand-in run's tokens behind ends with this: they aren't a real run's, so its end is no clean-up.
+end_stand_in_run() { trap - EXIT; }
+
 fake_tools() { # gh and git that log their arguments and identity-related environment
   mkdir -p "$T_TMP/bin"
   cat >"$T_TMP/bin/gh" <<'EOF'
@@ -1346,6 +1350,7 @@ test_mint_asks_for_exactly_the_throwaway_and_four_permissions() {
   assert_eq "$TOKEN" "$(fake_token)"
   assert_eq "$(jq -S -c . "$T_TMP/last-body.json")" '{"permissions":{"contents":"write","issues":"write","metadata":"read","pull_requests":"write"},"repositories":["forge-frg26-throwaway"]}' "the token request"
   assert_eq "$(cat "$T_TMP/app-gh.log")" "" "a good token was revoked"
+  end_stand_in_run
 }
 
 # Round 31 (the owner's run, 2026-11-06): GitHub now issues stateless tokens; mint must take them.
@@ -1358,6 +1363,7 @@ test_mint_takes_githubs_stateless_token_format() {
   assert_eq "$TOKEN" "$(new_token)"
   assert_contains "$OUTSTANDING" "$(new_token)" "the token is revoked on exit"
   assert_eq "$(cat "$T_TMP/app-gh.log")" "" "a good token was revoked"
+  end_stand_in_run
 }
 
 # Round 31: a token GitHub issued but the script refuses is still revoked, and never shown.
@@ -1464,9 +1470,18 @@ test_the_token_is_revoked_on_exit() {
   load
   TOKEN="$(fake_token)"
   WORK=""
-  app_gh() { echo "$*" >>"$T_TMP/app-gh.log"; }
-  ( cleanup )
-  assert_eq "$(cat "$T_TMP/app-gh.log")" "api -X DELETE installation/token"
+  app_gh() {
+    echo "$*" >>"$T_TMP/app-gh.log"
+    [[ "$*" != "api repos/$REPO --jq .full_name" ]] || { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
+  }
+  local out rc=0
+  out="$(cleanup)" || rc=$?
+  assert_exit 0 "$rc" "a token revoked and confirmed"
+  # Round 72: revoked, then confirmed by a read (HTTP 401).
+  assert_eq "$(cat "$T_TMP/app-gh.log")" "api -X DELETE installation/token
+api repos/$REPO --jq .full_name"
+  assert_contains "$out" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): unnamed;"
+  end_stand_in_run
 }
 
 test_redact_hides_the_jwt_too() {
@@ -2343,6 +2358,7 @@ test_holding_a_name_again_settles_the_earlier_token_first() {
   (cmd_hold_token age) >/dev/null 2>&1 || rc=$?
   assert_exit 2 "$rc"
   assert_eq "$(grep '^HELD_AGE=' "$HELD")" "HELD_AGE=$(fake_token)" "the earlier token was replaced while still unsettled"
+  end_stand_in_run
 }
 
 test_an_unreliable_read_still_tries_to_revoke_the_held_token() {
@@ -2813,7 +2829,15 @@ test_only_one_step_uses_the_held_tokens_at_a_time() {
   held_stubs
   app_session() { TOKEN="ghs_session$(printf 'S%.0s' $(seq 1 30))"; }
   mint_token() { TOKEN="ghs_newheld$(printf 'N%.0s' $(seq 1 30))"; }
-  app_gh() { echo "app_gh $*" >>"$T_TMP/calls"; }
+  # As GitHub: a read with a token revoked earlier gets HTTP 401 (the exit clean-up's check).
+  app_gh() {
+    echo "app_gh $*" >>"$T_TMP/calls"
+    if [[ "$*" == "api -X DELETE installation/token" ]]; then echo "$TOKEN" >>"$T_TMP/revoked"; fi
+    if [[ "$*" == "api repos/$REPO --jq .full_name" ]] && grep -qxF "$TOKEN" "$T_TMP/revoked" 2>/dev/null; then
+      echo "gh: Bad credentials (HTTP 401)" >&2
+      return 1
+    fi
+  }
   HELD_LOCKED=""
   mkdir "$HELD.lock"
   local rc=0 out
@@ -2943,7 +2967,9 @@ test_a_failed_revocation_is_reported_and_retried_on_exit() {
     mint_token 2>&1)" || true
   assert_not_contains "$out" "it was revoked" "a failed revocation reported as done"
   assert_contains "$out" "until it expires"
-  assert_eq "$(grep -c 'app_gh ghs_secondQQ api -X DELETE installation/token' "$T_TMP/app-gh.log")" 2 "the exit clean-up did not retry it"
+  # Round 72: the exit clean-up tries again, then once more as its last try, and never claims it.
+  (($(grep -c 'app_gh ghs_secondQQ api -X DELETE installation/token' "$T_TMP/app-gh.log") >= 2)) || _t_fail "the exit clean-up did not retry it"
+  assert_contains "$out" "TOKEN token2 NOT confirmed revoked"
 }
 
 test_key_check_installs_the_new_key_at_the_configured_path() {
@@ -3793,9 +3819,9 @@ test_a_stop_during_the_p5_control_branch_starts_no_file_write() {
 test_only_http_401_confirms_a_revocation() {
   probe_stubs
   app_gh() { echo "gh: Bad credentials (HTTP 502)" >&2; return 1; }
-  if probe_refused "$(printf 'gh%s_tokZ' s)"; then _t_fail "a 502 saying Bad credentials confirmed a revocation"; fi
+  if token_refused "$(printf 'gh%s_tokZ' s)"; then _t_fail "a 502 saying Bad credentials confirmed a revocation"; fi
   app_gh() { echo "gh: Bad credentials (HTTP 401)" >&2; return 1; }
-  probe_refused "$(printf 'gh%s_tokZ' s)" || _t_fail "HTTP 401 did not confirm a revocation"
+  token_refused "$(printf 'gh%s_tokZ' s)" || _t_fail "HTTP 401 did not confirm a revocation"
 }
 
 # Round 57 (C2, SEC-1): a 2xx answer without a readable token is no clear refusal either.
@@ -3858,6 +3884,7 @@ whole 2026-11-12T12:31:00Z {}
   assert_contains "$out" "This run does not ask for it again"
   assert_contains "$out" "possibly issued, never received: P1 whole"
   assert_contains "$out" "rc=2"
+  end_stand_in_run
 }
 
 # Round 47 (C1): a revocation GitHub didn't confirm is tried again on the way out, then checked.
@@ -3998,6 +4025,131 @@ test_with_timeout_stops_the_real_command_under_a_function() {
   done
 }
 
+# Round 72 (SEC-1): every other command's clean-up, with budgets short enough to test: a copy of
+# the script with only its three budget lines changed (CALL_SECS 1, REVOKE_SECS 3, CLEANUP_SECS 6).
+# Three tokens of the run's own, none revoked yet: token1 in use, tokens 2 and 3 set aside.
+# $T_TMP/hang lists what never answers: "app <n>" (every call with token n), "app all", or
+# "owner <text>" (an owner call containing it). Other calls answer at once: nothing open, and a
+# read with a revoked token gets HTTP 401.
+cleanup_stubs() {
+  local short="$T_TMP/github-throwaway-short.sh"
+  sed -e 's/^readonly CALL_SECS=20 /readonly CALL_SECS=1 /' -e 's/^readonly REVOKE_SECS=90 /readonly REVOKE_SECS=3 /' \
+    -e 's/^readonly CLEANUP_SECS=180 /readonly CLEANUP_SECS=6 /' "$GT" >"$short"
+  # shellcheck source=tests/permissions/github-throwaway.sh
+  source "$short"
+  assert_eq "$CALL_SECS ${REVOKE_SECS:-none} $CLEANUP_SECS" "1 3 6" "the short budgets"
+  WORK="$T_TMP/work"
+  [[ -d "$WORK" ]] || mkdir -m 700 "$WORK"
+  : >"$T_TMP/calls"
+  : >"$T_TMP/revoked"
+  : >"$T_TMP/hang"
+  app_gh() {
+    local n="${TOKEN:11:1}"
+    echo "app_gh $n $*" >>"$T_TMP/calls"
+    if grep -qx -e "app $n" -e "app all" "$T_TMP/hang"; then /bin/sleep 600; return 1; fi
+    case "$*" in
+      "api -X DELETE installation/token") echo "$n" >>"$T_TMP/revoked" ;;
+      "api repos/$REPO --jq .full_name")
+        if grep -qx "$n" "$T_TMP/revoked"; then echo "gh: Bad credentials (HTTP 401)" >&2; return 1; fi
+        echo "$REPO" ;;
+    esac
+    return 0
+  }
+  owner_gh() {
+    local h
+    echo "owner_gh $*" >>"$T_TMP/calls"
+    while IFS= read -r h; do
+      if [[ "$h" == "owner "* && "$*" == *"${h#owner }"* ]]; then /bin/sleep 600; return 1; fi
+    done <"$T_TMP/hang"
+    return 0
+  }
+}
+
+cleanup_token() { printf 'gh%s_cleanup%s%s' s "$1" "$(printf 'Q%.0s' $(seq 1 30))"; }
+
+# The clean-up of a run that stopped with status <rc>, after <set-up> (shell code) has run. One still
+# running after 20s is killed (status 137). Sets OUT, RC and SECS.
+stopped_run_cleanup() { # <rc> <set-up>
+  local pid start t1 t2 t3
+  t1="$(cleanup_token 1)" t2="$(cleanup_token 2)" t3="$(cleanup_token 3)"
+  start="$(date +%s)"
+  # shellcheck disable=SC2030 # the stopped run's state belongs to its own subshell
+  (
+    eval "$2"
+    TOKEN="$t1"
+    OUTSTANDING=" $t1 $t2 $t3"
+    ISSUED=" token1=$t1 token2=$t2 token3=$t3"
+    MINTED=3
+    trap cleanup EXIT
+    exit "$1"
+  ) >"$T_TMP/cleanup.out" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && (($(date +%s) - start < 20)); do /bin/sleep 0.2; done
+  if kill -0 "$pid" 2>/dev/null; then kill_tree "$pid"; fi
+  RC=0
+  wait "$pid" 2>/dev/null || RC=$?
+  SECS=$(($(date +%s) - start))
+  OUT="$(cat "$T_TMP/cleanup.out")"
+}
+
+test_a_hung_tidy_up_call_never_keeps_the_tokens_from_their_revocation() {
+  local case name setup hang n first_owner last_app
+  for case in "a hung PR list|SWEEP_ON_EXIT=1 PHASE=open|owner pulls?state=open" \
+    "a hung issue list|SWEEP_ON_EXIT=1 PHASE=permissions|owner issues?state=open" \
+    "a hung S2 run list|CANCEL_ON_EXIT=1 S2_SHAS=$(printf 'e%.0s' $(seq 1 40))|owner actions/runs"; do
+    IFS='|' read -r name setup hang <<<"$case"
+    cleanup_stubs
+    echo "$hang" >"$T_TMP/hang"
+    stopped_run_cleanup 1 "$setup"
+    assert_exit 1 "$RC" "$name: the run's own status (137: still running after 20s)"
+    ((SECS <= CLEANUP_SECS + 3)) || _t_fail "$name: the clean-up took ${SECS}s, over its ${CLEANUP_SECS}s cap"
+    for n in 1 2 3; do
+      assert_contains "$(cat "$T_TMP/calls")" "app_gh $n api -X DELETE installation/token" "$name: token$n's revocation"
+      assert_contains "$OUT" "TOKEN token$n revoked: a read with it now gets HTTP 401" "$name"
+    done
+    # Every revocation and its check before the tidy-up's first call.
+    first_owner="$(grep -n '^owner_gh' "$T_TMP/calls" | head -n 1 | cut -d: -f1)"
+    last_app="$(grep -n '^app_gh' "$T_TMP/calls" | tail -n 1 | cut -d: -f1)"
+    [[ -n "$first_owner" && -n "$last_app" && $last_app -lt $first_owner ]] || _t_fail "$name: the tidy-up ran before the tokens were settled"
+    assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; not done:" "$name"
+    assert_not_contains "$OUT" "CLEANUP DONE" "$name"
+    assert_not_contains "$OUT" "$(cleanup_token 1)" "$name: a token printed"
+  done
+  # Control: nothing hangs, the run had passed.
+  cleanup_stubs
+  stopped_run_cleanup 0 "SWEEP_ON_EXIT=1 PHASE=open"
+  assert_exit 0 "$RC" "a clean-up with nothing left undone"
+  assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; nothing left undone"
+}
+
+test_hung_revocations_end_by_the_cap_and_name_each_tokens_state() {
+  local out_tokens
+  # One token's calls hang: the others are still revoked and confirmed, that one named as not.
+  cleanup_stubs
+  echo "app 2" >"$T_TMP/hang"
+  stopped_run_cleanup 0 ""
+  assert_exit 1 "$RC" "an unconfirmed token: no success claimed (137: still running after 20s)"
+  ((SECS <= CLEANUP_SECS + 3)) || _t_fail "one hung token: the clean-up took ${SECS}s, over its ${CLEANUP_SECS}s cap"
+  assert_contains "$(cat "$T_TMP/calls")" "app_gh 2 api -X DELETE installation/token" "token2's revocation"
+  assert_contains "$OUT" "TOKEN token1 revoked: a read with it now gets HTTP 401"
+  assert_contains "$OUT" "TOKEN token3 revoked: a read with it now gets HTTP 401"
+  assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token3; NOT confirmed: token2;"
+  # Everything hangs, the tidy-up too: each token's revocation is still tried, and the clean-up
+  # ends by its cap naming every token as not confirmed and the tidy-up as not done.
+  cleanup_stubs
+  printf 'app all\nowner pulls?state=open\n' >"$T_TMP/hang"
+  stopped_run_cleanup 1 "SWEEP_ON_EXIT=1 PHASE=open"
+  assert_exit 1 "$RC" "everything hung (137: still running after 20s)"
+  ((SECS <= CLEANUP_SECS + 3)) || _t_fail "everything hung: the clean-up took ${SECS}s, over its ${CLEANUP_SECS}s cap"
+  for n in 1 2 3; do
+    assert_contains "$(cat "$T_TMP/calls")" "app_gh $n api -X DELETE installation/token" "everything hung: token$n's revocation"
+  done
+  assert_not_contains "$OUT" "revoked: a read with it now gets HTTP 401" "everything hung"
+  out_tokens="$(printf '%s\n' "$OUT" | tail -n 1)"
+  assert_contains "$out_tokens" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): none; NOT confirmed: token1 token2 token3; not done: closing the open test PRs" "everything hung"
+  assert_not_contains "$OUT" "CLEANUP DONE" "everything hung"
+}
+
 # Round 53 (C2, SEC-2): each request gets at most what is left of the clean-up's budget, and the
 # deadline is checked again between a revocation and its check.
 test_the_clean_up_stays_within_its_deadline_when_calls_hang() {
@@ -4017,6 +4169,7 @@ test_the_clean_up_stays_within_its_deadline_when_calls_hang() {
   [[ "$out" == 5 || "$out" == 4 ]] || _t_fail "the budget left, under CALL_SECS: got $out, want 4 or 5"
   CLEANUP_DEADLINE=""
   assert_eq "$(call_secs)" "$CALL_SECS" "outside the clean-up"
+  end_stand_in_run
 }
 
 test_every_revocation_and_check_is_given_call_secs() {
@@ -4046,6 +4199,7 @@ test_the_clean_up_names_what_its_time_cap_left_out() {
   assert_contains "$out" "rc=1"
   assert_contains "$out" "NOT confirmed: full"
   assert_not_contains "$(cat "$T_TMP/calls")" "DELETE" "a revocation after the cap"
+  end_stand_in_run
 }
 
 # Round 55 (C1, SEC-1): every request a2-probe makes is bounded, not only the clean-up's, so a hang
@@ -4101,6 +4255,7 @@ test_a_read_back_left_out_by_the_time_cap_is_a_problem() {
   assert_contains "$out" "KEPT issue 42: not read back"
   assert_contains "$out" "rc=1"
   assert_contains "$out" "A2 PROBE: DONE WITH 1 PROBLEM(S)"
+  end_stand_in_run
 }
 
 # Round 54 (SEC-1): a token mint refused is still described when it isn't confirmed revoked:
@@ -4165,6 +4320,7 @@ test_mint_checks_the_permissions_it_was_asked_for() {
   (mint '{"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}' narrowed '{"contents":"write","metadata":"read"}') >/dev/null 2>&1 || rc=$?
   assert_exit 2 "$rc" "permissions other than asked"
   assert_eq "$MINT_ANSWER" "{\"expires_at\":\"2026-11-01T12:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repositories\":[\"$REPO\"],\"repository_selection\":\"selected\"}" "GitHub's answer without the token"
+  end_stand_in_run
 }
 
 run_tests

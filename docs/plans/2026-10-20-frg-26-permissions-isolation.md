@@ -9,9 +9,10 @@
   created; the earlier app from 2026-11-02 (no key, never installed) was deleted (2026-11-07, app
   check passed). **Stage 1 part 0 ran on 2026-11-11 and stopped: test A2 failed, a failed
   protection** (section 6, "A2, 2026-11-11"). Item 9 is unresolved until the owner approves a
-  revised protection claim; the later stage 1 handoffs wait. The owner approved an investigation
-  on the throwaway repos (2026-11-11, section 6). Nothing on the Mac or in FORGE's settings has
-  changed.
+  revised protection claim. The owner approved an investigation on the throwaway repos
+  (2026-11-11; run 2026-11-14, section 6), then resumed the later stage 1 handoffs (2026-11-15,
+  section 6), regenerated and reviewed before they are given. Nothing on the Mac or in FORGE's
+  settings has changed.
 - **Proposed revision, 2026-11-15:** section 13 records the request-forwarding broker design and required clarifications. Plan revision only; no implementation authorization, protection guarantee, risk acceptance or checkpoint change.
 - **Ticket:** FRG-26 (#26). Branch `feature/FRG-26-permissions-isolation`, draft PR #37.
 - **Follow-up:** FRG-27 (#27), review isolation, starts immediately after this one.
@@ -496,6 +497,16 @@ changed setting or description, or a ruleset stays for you to see. After A2's fa
 asked (2026-11-11) for one more step, by its own reviewed handoff: putting back the throwaway's
 `dev` and `main` protection exactly as `protect` applies it (part 0 had removed it), with nothing
 else written and no evidence removed.
+
+The exit clean-up of every stage 1 command other than a2-probe (owner, 2026-11-16, review round
+72): it settles the tokens first, alone, within its first 90 seconds (a revocation for each, before
+any check, then a read with each, where only HTTP 401 confirms); then the clean-up above; then a
+last try for any token not yet confirmed. Every GitHub call in it has a time limit (20 seconds,
+never more than is left), its waits and loops check the deadline, and the whole clean-up ends
+within three minutes plus a few seconds. What the deadline leaves out is named as not done. Its
+last line names each token confirmed revoked or not and what was left undone; a clean-up not
+shown complete makes the run's exit status a failure, never a success. This doesn't extend the
+investigation's accepted limits (above) to these commands or to the broker.
 
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.
