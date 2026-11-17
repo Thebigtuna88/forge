@@ -441,9 +441,11 @@ against the second throwaway:
   accepted limits is recorded under it; any other is summarised for the owner before a fix is
   proposed. Automatic review rounds are paused until the owner says otherwise.
 
-The proposed split of item 9 into 9a and 9b is not yet a claim: item 9 stays failed and unresolved,
-the remaining stage 1 handoffs stay paused, and the findings come to the owner with a
-recommendation before the broker is extended or any risk is accepted.
+**Status during the investigation (historical, 2026-11-13 to 2026-11-15; the remaining handoffs
+have since resumed, below):** the proposed split of item 9 into 9a and 9b was not yet a claim,
+item 9 stayed failed and unresolved, the remaining stage 1 handoffs were paused, and the findings
+went to the owner with a recommendation before the broker was extended or any risk accepted. Item 9
+is still failed and unresolved.
 
 **Investigation result (run 2026-11-14T00:33Z, verified):** code changes on the second throwaway
 were refused (a file and a branch, 403) and its branches and tags were unchanged; a comment and a
@@ -826,8 +828,8 @@ Superseded by 13.17, which lists the remaining decisions.
 ### 13.15 Required clarifications and acceptance evidence (2026-11-15)
 
 These requirements govern this proposal wherever earlier wording sounds stronger. The existing
-stage-1 checkpoint, paused handoffs, D1-D3 credential restrictions, D5-D8 and owner-only changes
-remain unchanged. Section 4.2’s token-file mechanism, its 45-minute renewal narrative, and K4’s
+stage-1 checkpoint, D1-D3 credential restrictions, D5-D8 and owner-only changes remain unchanged
+(the stage 1 handoffs, paused when this was written, have since resumed: section 6). Section 4.2’s token-file mechanism, its 45-minute renewal narrative, and K4’s
 successful token-file read are historical alternatives superseded by this proposal only if it is
 later implemented and accepted. No token file or agent credential is part of the proposed end state.
 

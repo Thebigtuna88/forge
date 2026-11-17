@@ -2321,10 +2321,13 @@ cmd_a2_probe() {
   RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   PROBE_ACTIVE=1
   say "== FRG-26 A2 investigation, app $APP_BOT (id $APP_ID, installation $INSTALLATION_ID), run $RUN_ID =="
+  # P5's file goes on the owner's branch: with that branch missing, a 404 would prove nothing. Only
+  # a whole line of the branch list counts, never a look-alike branch or tag (round 71, SEC-1):
+  # branch lines are the only ones starting refs/heads/.
   REFS_BEFORE="$(probe_refs)"
-  if [[ "$REFS_BEFORE" == error || "$REFS_BEFORE" != *"refs/heads/$A2_BRANCH "* ]]; then
+  if [[ "$REFS_BEFORE" == error ]] || ! printf '%s\n' "$REFS_BEFORE" | grep -Eqx "refs/heads/$A2_BRANCH [0-9a-f]{40}"; then
     REFS_BEFORE=""
-    probe_stop "can't read $REPO2's branches and tags"
+    probe_stop "can't read $REPO2's branches and tags, or $A2_BRANCH is missing"
   fi
   say "REFS $REPO2 before: $(printf '%s' "$REFS_BEFORE" | tr '\n' ';')"
   # C1: what a token for the whole installation reaches, then each narrowed token in turn.

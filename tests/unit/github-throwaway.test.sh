@@ -3260,8 +3260,8 @@ probe_stubs() {
   owner_gh() {
     echo "owner_gh $*" >>"$T_TMP/calls"
     case "$*" in
-      *"repos/$REPO2/git/matching-refs/heads"*) grep heads "$T_TMP/refs"; return 0 ;;
-      *"repos/$REPO2/git/matching-refs/tags"*) grep tags "$T_TMP/refs"; return 0 ;;
+      *"repos/$REPO2/git/matching-refs/heads"*) grep '^refs/heads/' "$T_TMP/refs"; return 0 ;;
+      *"repos/$REPO2/git/matching-refs/tags"*) grep '^refs/tags/' "$T_TMP/refs"; return 0 ;;
     esac
     probe_answer "owner_gh $*"
   }
@@ -3392,6 +3392,29 @@ test_a2_probe_stops_when_the_second_throwaways_branches_change() {
   assert_contains "$out" "PROBE STOP: $REPO2's branches or tags changed"
   assert_contains "$out" "refs/heads/frg26-probe-r1"
   assert_not_contains "$(cat "$T_TMP/calls")" "issues/1/comments" "a public attempt after a change"
+}
+
+# Round 71 (SEC-1): P5's file goes on frg26-a2, so with that branch missing its "Branch not found"
+# (HTTP 404) would pass for a refusal. Only the branch itself counts, never a look-alike branch or
+# tag: the run stops before any token is asked for.
+test_a2_probe_needs_the_exact_branch_not_a_look_alike() {
+  local case name refs out rc a
+  load
+  a="$(printf 'a%.0s' $(seq 1 40))"
+  for case in "a look-alike branch|refs/heads/main $a\nrefs/heads/x/refs/heads/frg26-a2 $a" \
+    "a look-alike tag|refs/heads/main $a\nrefs/tags/refs/heads/frg26-a2 $a"; do
+    IFS='|' read -r name refs <<<"$case"
+    probe_stubs
+    printf '%b\n' "$refs" >"$T_TMP/refs"
+    probe_answer_first "app_gh tok2 api -i -X PUT repos/$REPO2/contents/|1|HTTP/2.0 404 Not Found\n\n{\"message\":\"Branch not found\"}\ngh: Branch not found (HTTP 404)"
+    rc=0; out="$(run_probe)" || rc=$?
+    assert_exit 1 "$rc" "$name"
+    assert_contains "$out" "PROBE STOP: can't read $REPO2's branches and tags, or $A2_BRANCH is missing" "$name"
+    assert_not_contains "$out" "RESULT P5" "$name"
+    assert_eq "$(cat "$T_TMP/minted")" 0 "tokens asked for with $name"
+    assert_not_contains "$(cat "$T_TMP/calls")" "app_gh" "an attempt with $name"
+    assert_contains "$(printf '%s\n' "$out" | tail -n 1)" "A2 PROBE: STOPPED" "$name"
+  done
 }
 
 test_a2_probe_checks_each_tokens_scope_before_using_it() {
