@@ -104,7 +104,9 @@ PENDING_MINT=""  # the token request in progress, in the same form, until its an
 JWT_ERR=""
 JWT_RC=0
 MINT_LABEL=""    # the name mint gives the next token (a2-probe: whole full P1 P2)
-readonly CALL_SECS=20     # the longest a revocation or a check may take
+readonly CALL_SECS=20     # the longest a GitHub API request (gh, curl) or a local git command may take
+readonly PUSH_SECS=60     # the longest a git push or fetch may take (round 75, C1)
+readonly CLONE_SECS=120   # the longest a git clone may take (round 75, C1)
 readonly REVOKE_SECS=90   # the clean-up's first share, for the tokens alone (round 72, SEC-1)
 readonly CLEANUP_SECS=180 # the longest the whole clean-up may take
 readonly CONTROL_SECS=240 # the longest a control (A9, E1) may run, its own token clean-up included
@@ -127,6 +129,12 @@ CONTROL_RC=""       # its exit status, once it has ended
 CONTROL_TOLD=""     # set once a stop has been passed on to it
 CONTROL_UNREC=""    # the requests it reports as possibly issued, never received
 CONTROL_END=""      # inside a control: when its own clean-up must have ended
+REQ_JOBS=""         # the requests (and waits) this shell has running, stopped whole by a stop
+# Set (local) while a tidy-up runs (sweep_prs, sweep_issues, cancel_waiting_runs): as in the
+# clean-up, its requests are bounded, and one with no answer in time is named as left undone by the
+# tidy-up itself (round 73, C2) rather than stopping the run (round 75).
+TIDY_UP=""
+STOP_WHY=""         # why the run stopped, said first by the clean-up (a request that timed out)
 LAST_HTTP=""
 WORK=""
 CLONE=""
@@ -168,6 +176,9 @@ cleanup() {
   # plus a few seconds (the last call may end up to a second past it; the local work after it).
   trap '' HUP INT TERM
   start=$(date +%s)
+  # A request a stop found running is stopped first, with everything it started (round 75, C1).
+  stop_requests
+  if [[ -n "$STOP_WHY" ]]; then say "$STOP_WHY"; fi
   if [[ -n "$PROBE_ACTIVE" ]]; then
     # Every way out of a2-probe ends here: its tokens are settled and checked, what it made is read
     # back, and its result decides the exit status (rounds 47, 52).
@@ -338,7 +349,7 @@ unconfirmed_why() { # <kind> — how the last line names it
 # The clean-up's last line, without a token: each token confirmed revoked or not, held ones apart,
 # and what was left undone. Nothing when the run had no token and no tidy-up. 1 unless complete.
 cleanup_summary() {
-  local e t yes="" no="" held="" tokens
+  local e t yes="" no="" held="" tokens unknown
   for e in $ISSUED; do
     t="${e#*=}"
     if [[ " $HELD_KEPT " == *" $t "* ]]; then held="$held ${e%%=*}"
@@ -350,15 +361,33 @@ cleanup_summary() {
   # may hold one, NOT confirmed (round 73, C1, SEC-1).
   yes="$yes$CONTROL_CONFIRMED" no="$no$CONTROL_UNCONFIRMED"
   for t in $CONTROL_PENDING; do no="$no $t (no result)"; done
-  [[ -n "$ISSUED$UNRECEIVED_LABELS$CLEANUP_UNDONE$CONTROL_CONFIRMED$CONTROL_UNCONFIRMED$CONTROL_PENDING" ]] || return 0
+  # A write that got no answer in time may have taken effect: named until someone reads it back
+  # (round 75, C1).
+  unknown="$(unknown_writes)"
+  unknown="${unknown%;}"
+  [[ -n "$ISSUED$UNRECEIVED_LABELS$CLEANUP_UNDONE$CONTROL_CONFIRMED$CONTROL_UNCONFIRMED$CONTROL_PENDING$unknown" ]] || return 0
   tokens="tokens confirmed revoked (HTTP 401):${yes:- none}; NOT confirmed:${no:- none}"
   tokens="$tokens${UNRECEIVED_LABELS:+; possibly issued, never received:$UNRECEIVED_LABELS}${held:+; held for a later check:$held}"
-  if [[ -z "$no$UNRECEIVED_LABELS$CLEANUP_UNDONE" ]]; then
+  tokens="$tokens${unknown:+; writes with outcome unknown (not retried, not reconciled: check them on GitHub):$unknown}"
+  if [[ -z "$no$UNRECEIVED_LABELS$CLEANUP_UNDONE$unknown" ]]; then
     say "CLEANUP DONE: $tokens; nothing left undone"
     return 0
   fi
   say "CLEANUP INCOMPLETE: $tokens; not done:${CLEANUP_UNDONE:- nothing.} A token not confirmed may work until it expires, within an hour of its issue"
   return 1
+}
+
+# Each write of this run's that got no answer in time, or that a stop cut short (its note is still
+# there: with_timeout), once, on one line.
+unknown_writes() {
+  local f
+  [[ -n "$WORK" && -d "$WORK" ]] || return 0
+  {
+    if [[ -f "$WORK/timed-out" ]]; then sed -n 's/^write //p' "$WORK/timed-out"; fi
+    for f in "$WORK"/out-write.*; do
+      if [[ -f "$f" ]]; then printf '%s (cut short by the stop)\n' "$(cat "$f")"; fi
+    done
+  } | sort -u | while IFS= read -r f; do printf ' %s;' "$f"; done
 }
 trap cleanup EXIT
 # Closing the Terminal, Ctrl-C or a kill also end through cleanup, with the usual status (round 51,
@@ -374,11 +403,41 @@ stop_traps() {
 }
 stop_traps
 
+
 # --- The two identities -------------------------------------------------------------------------
+
+# Every GitHub request goes through owner_gh, app_gh or app_git (or jwt_call's app_curl, the app's
+# own requests), each bounded where it starts (round 75, C1): an API call by CALL_SECS (20s), a git
+# push or fetch by PUSH_SECS (60s), a clone by CLONE_SECS (120s), a local git command by CALL_SECS;
+# each less near the clean-up's cap. A test checks that no gh, git or curl runs any other way, and
+# that none runs inside a command substitution or a pipeline, where bash would hold a stop until it
+# ended (a2-probe's own code aside, whose contract covers that): its output comes through into.
+owner_gh() { with_timeout "$(call_secs)" owner_gh_run "$@"; }
+app_gh() { with_timeout "$(call_secs)" app_gh_run "$@"; }
+app_git() { with_timeout "$(git_secs "$@")" app_git_run "$@"; }
+app_curl() { with_timeout $((CALL_SECS + 5)) curl "$@"; } # curl's own --max-time ends it first
+
+git_secs() { # <app git args…> — its time limit, by what it does
+  case "$(git_subcommand "$@")" in
+    clone) call_secs "$CLONE_SECS" ;;
+    push | fetch) call_secs "$PUSH_SECS" ;;
+    *) call_secs ;;
+  esac
+}
+
+git_subcommand() { # <git args…> — the command, after any -C <dir> and -c <setting>
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -C | -c) shift 2 ;;
+      -*) shift ;;
+      *) printf '%s' "$1"; return ;;
+    esac
+  done
+}
 
 # The owner's own gh login, as stored by gh. No token variable may override it.
 # shellcheck disable=SC2030,SC2031 # each identity's variables live only in its own subshell
-owner_gh() {
+owner_gh_run() {
   (
     unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_HOST GH_REPO GH_CONFIG_DIR
     export GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1
@@ -389,7 +448,7 @@ owner_gh() {
 # The app's installation token, for this one process only: an exported variable, never an argument
 # (so it isn't in the process list), and an empty gh config folder (none of the owner's settings).
 # shellcheck disable=SC2030,SC2031 # as above
-app_gh() {
+app_gh_run() {
   (
     unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO
     export GH_TOKEN="$TOKEN" GH_HOST=github.com GH_CONFIG_DIR="$WORK/gh-app" \
@@ -400,7 +459,7 @@ app_gh() {
 
 # git as the app: no GIT_* variable, no system or global config (so no credential helper or
 # URL rewrite of the owner's applies), no hooks, credentials only from our askpass script.
-app_git() {
+app_git_run() {
   (
     local v
     for v in $(compgen -e); do
@@ -417,10 +476,172 @@ app_git() {
 # Run a command; keep its redacted output in LAST_OUT and its status in LAST_RC.
 capture() {
   local out rc=0
-  out="$("$@" 2>&1)" || rc=$?
+  into -2 out "$@" || rc=$?
   LAST_OUT="$(redact "$out")"
   LAST_RC=$rc
   return $rc
+}
+
+# A command's output, as "$(command…)" would give it, without the command substitution (round 75,
+# C1): bash holds a stop until a command substitution returns, but acts on it at once while the
+# shell waits for a job. <var> gets the output, its trailing newlines removed; the status is the
+# command's. With -2 its error output is kept too, as 2>&1 inside would.
+into() { # [-2] <var> <command…>
+  local _i_both="" _i_var _i_f _i_pid _i_rc=0
+  if [[ "$1" == -2 ]]; then _i_both=1; shift; fi
+  _i_var="$1"
+  shift
+  _i_f="$(umask 077 && mktemp "${WORK:-${TMPDIR:-/tmp}}/out.XXXXXX" 2>/dev/null)" || die "can't make a file for a request's output"
+  if [[ -n "$_i_both" ]]; then "$@" >"$_i_f" 2>&1 & else "$@" >"$_i_f" & fi
+  _i_pid=$!
+  REQ_JOBS="$REQ_JOBS $_i_pid"
+  job_wait "$_i_pid" || _i_rc=$?
+  jobs_drop "$_i_pid"
+  printf -v "$_i_var" '%s' "$(cat "$_i_f")"
+  rm -f "$_i_f"
+  timeout_check
+  return $_i_rc
+}
+
+# Waits for a job to end; a caught signal interrupts wait while it may still run, so wait again
+# until it has (round 66, C1). A stop's trap ends the run from inside this wait.
+job_wait() { # <pid> — its status
+  local rc
+  while :; do
+    rc=0
+    wait "$1" || rc=$?
+    if [[ $rc -gt 128 ]] && kill -0 "$1" 2>/dev/null; then continue; fi
+    return $rc
+  done
+}
+
+jobs_drop() { # <pid…> — no longer running
+  local p s=" $REQ_JOBS "
+  for p in "$@"; do s="${s// $p / }"; done
+  REQ_JOBS="$s"
+}
+
+# The requests and waits this shell started that are still running, each stopped with every process
+# under it (a stop's trap left them there): the clean-up and a control's own clean-up begin here.
+stop_requests() {
+  local p
+  for p in $REQ_JOBS; do kill_tree "$p"; done
+  REQ_JOBS=""
+}
+
+# A wait between polls a stop ends at once (round 75, C1): bash would hold a stop until a sleep in
+# the foreground ended.
+nap() { # <seconds>
+  local pid
+  sleep "$1" &
+  pid=$!
+  REQ_JOBS="$REQ_JOBS $pid"
+  job_wait "$pid" || true
+  jobs_drop "$pid"
+}
+
+# Outside the clean-up (and a2-probe, whose own contract stands, round 52), a request with no answer
+# within its limit stops the run: it and its processes are stopped (with_timeout), it is recorded in
+# WORK (a write as outcome unknown: it may have taken effect, and is never tried again), and no new
+# request or test action starts; the run goes to its bounded clean-up, which says why first and
+# names each such write in its last line. A token's revocation is not named: the clean-up settles
+# and checks every token.
+request_timed_out() { # <seconds> <runner> <args…>
+  [[ -z "$CLEANUP_DEADLINE" && -z "$PROBE_ACTIVE" && -z "$TIDY_UP" && -n "$WORK" ]] || return 0
+  local secs="$1" what
+  shift
+  what="$(request_what "$@")"
+  if request_writes "$@" && [[ "$*" != *" installation/token"* ]]; then
+    printf 'write %s (no answer within %ss)\n' "$what" "$secs" >>"$WORK/timed-out"
+    printf 'stop %s got no answer within its %ss (a write: its outcome is unknown; it may have taken effect, and it is not tried again)\n' "$what" "$secs" >>"$WORK/timed-out"
+  else
+    printf 'stop %s got no answer within its %ss\n' "$what" "$secs" >>"$WORK/timed-out"
+  fi
+  timeout_check
+}
+
+# Once a request has timed out (in this shell or one it started), no new request starts: the run
+# stops here, for its clean-up (round 75, C1).
+timeout_check() {
+  [[ -z "$CLEANUP_DEADLINE" && -z "$PROBE_ACTIVE" && -z "$TIDY_UP" && -n "$WORK" && -s "$WORK/timed-out" ]] || return 0
+  STOP_WHY="STOPPED: $(sed -n 's/^stop //p' "$WORK/timed-out" | sort -u | tr '\n' ';' | sed 's/;$//'); the run starts no further test action"
+  exit 2
+}
+
+# Who asked what, in a few words: gh api's method and path, another gh command's first words, git's
+# command and what follows it, curl's method and address. Never a token: none is an argument.
+request_what() { # <runner> <args…>
+  local who m="" a s="" n=0
+  case "$1" in
+    owner_gh | owner_gh_run) who="owner gh" ;;
+    app_gh | app_gh_run) who="app gh" ;;
+    app_git | app_git_run) who="app git" ;;
+    *) who="app $1" ;;
+  esac
+  shift
+  case "$who" in
+    *git)
+      while [[ $# -gt 0 && "$1" == -* ]]; do
+        case "$1" in -C | -c) shift 2 ;; *) shift ;; esac
+      done
+      ;;
+    *curl)
+      while [[ $# -gt 0 ]]; do
+        case "$1" in -X) m="${2:-}"; shift ;; https://*) s="$1" ;; esac
+        shift
+      done
+      printf '%s %s %s' "$who" "${m:-GET}" "$s"
+      return
+      ;;
+    *)
+      if [[ "${1:-}" == api ]]; then
+        shift
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            -X | --method) m="${2:-}"; shift ;;
+            --jq | -q | --input | -f | -F | --field | --raw-field | -H | --header | -t | --template) shift ;;
+            -*) ;;
+            *) [[ -n "$s" ]] || s="$1" ;;
+          esac
+          shift
+        done
+        printf '%s api %s %s' "$who" "${m:-GET}" "$s"
+        return
+      fi
+      ;;
+  esac
+  for a in "$@"; do
+    n=$((n + 1))
+    [[ $n -le 4 ]] || break
+    s="$s ${a:0:80}"
+  done
+  printf '%s%s' "$who" "$s"
+}
+
+request_writes() { # <runner> <args…> — 0 if the request may change something on GitHub
+  local runner="$1" m="" fields=""
+  shift
+  case "$runner" in
+    app_git | app_git_run) [[ "$(git_subcommand "$@")" == push ]]; return ;;
+    curl) return 1 ;; # the app's own requests: a token request's answer is settled by request_token
+  esac
+  if [[ "${1:-}" != api ]]; then
+    case "${1:-} ${2:-}" in
+      "pr view" | "pr list" | "pr status" | "pr checks" | "pr diff" | "issue view" | "issue list" | "run view" | "run list" | "repo view") return 1 ;;
+    esac
+    return 0
+  fi
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -X | --method) m="${2:-}"; shift ;;
+      -X?*) m="${1#-X}" ;;
+      -f | -F | --field | --raw-field | --input) fields=1; shift ;;
+    esac
+    shift
+  done
+  [[ -n "$m" ]] || { [[ -n "$fields" ]] && m=POST; } || m=GET
+  [[ "$m" != GET && "$m" != get ]]
 }
 
 evidence() { # the last lines of LAST_OUT, on one line
@@ -480,13 +701,13 @@ need_tools() {
 
 need_owner() {
   local who
-  who="$(owner_gh api user --jq .login 2>/dev/null)" || die "gh is not signed in as the owner"
+  into who owner_gh api user --jq .login 2>/dev/null || die "gh is not signed in as the owner"
   [[ "$who" == "$OWNER" ]] || die "gh is signed in as '$who', not $OWNER"
 }
 
 owner_uid() {
   local id
-  id="$(owner_gh api user --jq .id 2>/dev/null)" || die "can't read the owner's user id"
+  into id owner_gh api user --jq .id 2>/dev/null || die "can't read the owner's user id"
   [[ "$id" =~ ^[0-9]+$ ]] || die "unexpected user id"
   printf '%s' "$id"
 }
@@ -534,7 +755,8 @@ jwt_call() { # <method> <path> [json body file]
   local out
   if [[ -n "${3:-}" ]]; then args+=(-H "Content-Type: application/json" --data-binary @"$3"); fi
   JWT_RC=0
-  out="$(curl "${args[@]}" "https://api.github.com/$2" 2>"$WORK/jwt.err")" || JWT_RC=$?
+  # curl's own messages go to a file (--stderr), not through into: -q must stay curl's first argument.
+  into out app_curl "${args[@]}" --stderr "$WORK/jwt.err" "https://api.github.com/$2" || JWT_RC=$?
   LAST_HTTP="$(printf '%s\n' "$out" | tail -n 1 | sed -n 's/^HTTP \([0-9][0-9][0-9]\)$/\1/p')"
   if [[ -n "$LAST_HTTP" ]]; then out="$(printf '%s\n' "$out" | sed '$d')"; fi
   LAST_OUT="$(redact "$out")"
@@ -679,7 +901,7 @@ need_installation_scope() {
   mint '{}' whole
   local got
   # Bounded like every other request (round 74, C1, SEC-1): it runs inside E1's control too.
-  got="$(with_timeout "$(call_secs)" app_gh api installation/repositories --paginate --jq '.repositories[].full_name' 2>/dev/null)" || got=error
+  into got with_timeout "$(call_secs)" app_gh api installation/repositories --paginate --jq '.repositories[].full_name' 2>/dev/null || got=error
   revoke_token
   [[ "$got" == "$REPO" ]] || die "the app must be installed on $REPO only (it reaches: $(printf '%s' "$got" | tr '\n' ' '))"
 }
@@ -723,11 +945,24 @@ resume_signals() {
 # stopped: app_gh and owner_gh are functions whose subshell execs gh, so killing the job's own
 # process alone would leave gh running and holding capture's output open (round 53, C1, SEC-1).
 # KILL, not TERM: the clean-up ignores TERM, and what it starts inherits that. The watchdog writes
-# nowhere, so a command substitution around this never waits for it.
+# nowhere, so a command substitution around this never waits for it. Both are on REQ_JOBS while they
+# run, so a stop's clean-up stops them at once (round 75, C1). A GitHub request (through an identity)
+# that times out stops the run (request_timed_out), and none starts once one has (timeout_check).
 with_timeout() { # <seconds> <command…>
-  local secs="$1" pid w rc=0 mark
+  local secs="$1" pid w rc=0 mark out=""
   shift
+  timeout_check
   [[ "$secs" =~ ^[0-9]+$ && $secs -gt 0 ]] || return 124
+  # A write is noted while it is out: one a stop cuts short is named by the clean-up, its outcome
+  # unknown, as is one that times out (round 75, C1).
+  case "$1" in
+    owner_gh_run | app_gh_run | app_git_run)
+      if [[ -z "$CLEANUP_DEADLINE" && -z "$PROBE_ACTIVE" && -n "$WORK" ]] && request_writes "$@" && [[ "$*" != *" installation/token"* ]]; then
+        out="$(umask 077 && mktemp "$WORK/out-write.XXXXXX" 2>/dev/null)" || die "can't note a write that is about to go out"
+        request_what "$@" >"$out"
+      fi
+      ;;
+  esac
   "$@" &
   pid=$!
   # Named by the command's own process (round 74): a control runs beside the run, and a background
@@ -743,18 +978,19 @@ with_timeout() { # <seconds> <command…>
     kill_tree "$pid"
   ) </dev/null >/dev/null 2>&1 &
   w=$!
-  # A caught signal interrupts wait (status over 128) while the command may still run: wait again,
-  # under the same watchdog, until the command itself has ended (round 66, C1).
-  while :; do
-    rc=0
-    wait "$pid" || rc=$?
-    if [[ $rc -gt 128 ]] && kill -0 "$pid" 2>/dev/null; then continue; fi
-    break
-  done
+  REQ_JOBS="$REQ_JOBS $pid $w"
+  # A caught signal interrupts wait while the command may still run: job_wait waits again, under the
+  # same watchdog, until the command itself has ended (round 66, C1).
+  job_wait "$pid" || rc=$?
   kill_tree "$w"
   wait "$w" 2>/dev/null
+  jobs_drop "$pid" "$w"
+  if [[ -n "$out" ]]; then rm -f "$out"; fi
   if [[ -f "$mark" ]]; then
     rm -f "$mark"
+    case "$1" in
+      owner_gh | app_gh | app_git | owner_gh_run | app_gh_run | app_git_run | curl) request_timed_out "$secs" "$@" ;;
+    esac
     return 124
   fi
   return $rc
@@ -767,17 +1003,17 @@ kill_tree() { # <pid> — stop it, then KILL it and every process below it
   kill -KILL "$1" 2>/dev/null
 }
 
-# CALL_SECS, or less inside the clean-up: what is left of its budget, 0 once it has passed (round
-# 53, C2, SEC-2), so no request runs past the cap.
-call_secs() {
-  local left
+# CALL_SECS (or <limit>), or less inside the clean-up: what is left of its budget, 0 once it has
+# passed (round 53, C2, SEC-2), so no request runs past the cap.
+call_secs() { # [limit]
+  local left max="${1:-$CALL_SECS}"
   if [[ -z "$CLEANUP_DEADLINE" ]]; then
-    printf '%s' "$CALL_SECS"
+    printf '%s' "$max"
     return
   fi
   left=$((CLEANUP_DEADLINE - $(date +%s)))
   if [[ $left -lt 0 ]]; then left=0; fi
-  if [[ $left -gt $CALL_SECS ]]; then left=$CALL_SECS; fi
+  if [[ $left -gt $max ]]; then left=$max; fi
   printf '%s' "$left"
 }
 
@@ -789,7 +1025,7 @@ pause() { # <seconds> — a wait between polls, never past the clean-up's cap (r
   local s
   s="$(call_secs)"
   [[ $s -lt $1 ]] || s=$1
-  [[ $s -le 0 ]] || sleep "$s"
+  [[ $s -le 0 ]] || nap "$s"
 }
 
 no_answer() { # <status> — why a bounded call failed, for its CLEANUP FAIL line
@@ -823,6 +1059,8 @@ control_exit() {
   # Like the clean-up, it runs to its end: a further signal (closing the window signals every
   # process, this subshell too) can't cut it short and hide a token it couldn't revoke (round 65).
   trap '' HUP INT TERM
+  # A request it was told to stop in is stopped first, whole (round 75, C1).
+  stop_requests
   # Its requests that may have issued a token never received go to the caller (round 61, SEC-1),
   # on fd 3, a file only the caller reads (round 74: the control runs in the background). The write
   # is checked: if it fails, status 5 tells the caller a record was lost (round 62, C1, SEC-1).
@@ -865,7 +1103,7 @@ control_exit() {
 control_begin() { # <name> — inside a control: only its own tokens, named after it
   CONTROL_ID="$1"
   TOKEN="" OUTSTANDING="" ISSUED="" ISSUED_META="" CONFIRMED_TOKENS="" SETTLE_TRIED="" UNRECEIVED="" PENDING_MINT=""
-  REVOKE_OK="" UNCONFIRMABLE="" CONTROL_PID=""
+  REVOKE_OK="" UNCONFIRMABLE="" CONTROL_PID="" REQ_JOBS=""
 }
 
 # A control runs in the background, bounded as a whole (round 74, C1, SEC-1). Its watchdog tells it
@@ -896,6 +1134,8 @@ control_token() { # <command> — 0 if it got its token; its tokens are settled 
     die "a control's token request got no usable answer: GitHub may have issued a token this run never received; the run stops"
   fi
   [[ $CONTROL_RC -ne 5 ]] || die "a control's record could not be handed over; the run stops"
+  # A request of the control's that timed out stops the run too (round 75, C1).
+  timeout_check
   [[ $CONTROL_RC -eq 0 || $CONTROL_RC -eq 3 ]]
 }
 
@@ -1039,7 +1279,7 @@ app_session() { # every command that acts as the app starts here
 # Every write is made only after this: the repo must be the throwaway one we created.
 assert_throwaway() {
   local info
-  info="$(owner_gh api "repos/$REPO" --jq '[.full_name, .owner.login, .description, (.private|tostring)] | @tsv' 2>/dev/null)" \
+  into info owner_gh api "repos/$REPO" --jq '[.full_name, .owner.login, .description, (.private|tostring)] | @tsv' 2>/dev/null \
     || die "can't read $REPO"
   [[ "$info" == "$REPO"$'\t'"$OWNER"$'\t'"$MARKER"$'\t'false ]] \
     || die "$REPO is not the public throwaway repo this script created (description must be: $MARKER)"
@@ -1047,7 +1287,7 @@ assert_throwaway() {
 
 assert_second() { # writes to the second throwaway are attempts only, and only there
   local info
-  info="$(owner_gh api "repos/$REPO2" --jq '[.full_name, .owner.login, .description, (.private|tostring)] | @tsv' 2>/dev/null)" \
+  into info owner_gh api "repos/$REPO2" --jq '[.full_name, .owner.login, .description, (.private|tostring)] | @tsv' 2>/dev/null \
     || die "can't read $REPO2"
   [[ "$info" == "$REPO2"$'\t'"$OWNER"$'\t'"$MARKER2"$'\t'false ]] \
     || die "$REPO2 is not the public second throwaway this script created (description must be: $MARKER2)"
@@ -1071,7 +1311,7 @@ EOF
 
 branch_state() { # <branch> — prints protected | unprotected | missing | error
   local out rc=0
-  out="$(owner_gh api "repos/$REPO/branches/$1" --jq .protected 2>&1)" || rc=$?
+  into -2 out owner_gh api "repos/$REPO/branches/$1" --jq .protected || rc=$?
   if [[ $rc -eq 0 && "$out" == true ]]; then echo protected
   elif [[ $rc -eq 0 && "$out" == false ]]; then echo unprotected
   elif printf '%s' "$out" | grep -q 'HTTP 404'; then echo missing
@@ -1092,8 +1332,9 @@ protection_of() { # <branch> — approvals codeowners last-push stale enforce-ad
 
 # A branch's whole protection as GitHub returns it, its url fields removed and keys sorted, or error.
 protection_full() { # <branch>
-  owner_gh api "repos/$REPO/branches/$1/protection" 2>/dev/null \
-    | jq -S -c 'walk(if type == "object" then del(.url) else . end)' 2>/dev/null || echo error
+  local j
+  into j owner_gh api "repos/$REPO/branches/$1/protection" 2>/dev/null || { echo error; return; }
+  jq -S -c 'walk(if type == "object" then del(.url) else . end)' <<<"$j" 2>/dev/null || echo error
 }
 
 # What protection_full reads after protection_json <enforce_admins> is applied (read from the
@@ -1104,21 +1345,23 @@ want_protection() { # <enforce_admins true|false>
 
 ruleset_summary() { # one line describing the only ruleset, or error
   local id
-  id="$(owner_gh api "repos/$REPO/rulesets" --jq '.[0].id' 2>/dev/null)" || { echo error; return; }
+  into id owner_gh api "repos/$REPO/rulesets" --jq '.[0].id' 2>/dev/null || { echo error; return; }
   [[ "$id" =~ ^[0-9]+$ ]] || { echo error; return; }
   owner_gh api "repos/$REPO/rulesets/$id" --jq '[.enforcement, .target, (.conditions.ref_name.include | join(",")), (.conditions.ref_name.exclude | length | tostring), ([.rules[] | if .type == "update" then "update:\(.parameters.update_allows_fetch_and_merge)" else .type end] | sort | join(",")), ([.bypass_actors[] | "\(.actor_type):\(.actor_id):\(.bypass_mode)"] | join(","))] | join(" ")' 2>/dev/null || echo error
 }
 
 want_ruleset() { # the two bypass choices this script may have installed
   local uid
-  uid="$(owner_uid)" || return 1 # owner_uid's die ends only this subshell (review round 10)
+  into uid owner_uid || return 1 # owner_uid's die ends only its own job (review round 10)
   printf 'active branch refs/heads/main 0 deletion,non_fast_forward,update:false User:%s:always\n' "$uid"
   printf 'active branch refs/heads/main 0 deletion,non_fast_forward,update:false RepositoryRole:5:always\n'
 }
 
 verify_phase() { # <phase> — the repository must be exactly in the state that phase needs
-  local d m r got
-  d="$(branch_state dev)" m="$(branch_state main)" r="$(ruleset_count)"
+  local d m r got want
+  into d branch_state dev
+  into m branch_state main
+  into r ruleset_count
   case "$1" in
     open)
       [[ "$d" == unprotected && "$m" == unprotected && "$r" == 0 ]] \
@@ -1126,22 +1369,22 @@ verify_phase() { # <phase> — the repository must be exactly in the state that 
       ;;
     protected | ruleset)
       [[ "$d" == protected && "$m" == protected ]] || die "phase $1 needs dev and main protected (dev $d, main $m)"
-      got="$(protection_of dev)"
+      into got protection_of dev
       [[ "$got" == "$WANT_DEV" ]] || die "dev protection is '$got', expected '$WANT_DEV'"
-      got="$(protection_of main)"
+      into got protection_of main
       [[ "$got" == "$WANT_MAIN" ]] || die "main protection is '$got', expected '$WANT_MAIN'"
       # All of it, not only those fields: an extra required check or restriction would make a
       # refusal pass for the wrong reason, and unprotect would delete what protect didn't apply.
-      got="$(protection_full dev)"
+      into got protection_full dev
       [[ "$got" == "$(want_protection true)" ]] || die "dev protection is not exactly what protect applies: $got"
-      got="$(protection_full main)"
+      into got protection_full main
       [[ "$got" == "$(want_protection false)" ]] || die "main protection is not exactly what protect applies: $got"
       if [[ "$1" == protected ]]; then
         [[ "$r" == 0 ]] || die "phase protected needs no ruleset (found $r)"
       else
         [[ "$r" == 1 ]] || die "phase ruleset needs exactly one ruleset (found $r)"
-        got="$(ruleset_summary)"
-        want_ruleset | grep -Fxq -- "$got" || die "the ruleset is '$got', not one this script installs"
+        into got ruleset_summary
+        { into want want_ruleset && grep -Fxq -- "$got" <<<"$want"; } || die "the ruleset is '$got', not one this script installs"
       fi
       ;;
     *) die "unknown phase $1" ;;
@@ -1175,7 +1418,7 @@ cmd_create() {
   owner_gh repo create "$REPO" --public --description "$MARKER" --add-readme >/dev/null || die "gh repo create failed"
   assert_throwaway
   local first
-  first="$(owner_gh api "repos/$REPO" --jq .default_branch)" || die "can't read the first branch's name"
+  into first owner_gh api "repos/$REPO" --jq .default_branch || die "can't read the first branch's name"
   if [[ "$first" != main ]]; then
     owner_gh api -X POST "repos/$REPO/branches/$first/rename" -f new_name=main >/dev/null \
       || die "renaming the first branch '$first' to main failed"
@@ -1184,7 +1427,7 @@ cmd_create() {
   put_file docs/README.md "Docs folder (CODEOWNERS may also live here; test B4b)."$'\n'
   put_file tests/README.md "Test files land here."$'\n'
   local sha
-  sha="$(owner_gh api "repos/$REPO/branches/main" --jq .commit.sha)" || die "can't read main"
+  into sha owner_gh api "repos/$REPO/branches/main" --jq .commit.sha || die "can't read main"
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "unexpected main sha"
   owner_gh api -X POST "repos/$REPO/git/refs" -f ref=refs/heads/dev -f sha="$sha" >/dev/null || die "creating dev failed"
   owner_gh api -X POST "repos/$REPO/git/refs" -f ref=refs/heads/side -f sha="$sha" >/dev/null || die "creating side failed"
@@ -1202,12 +1445,12 @@ cmd_create_second() {
   owner_gh repo create "$REPO2" --public --description "$MARKER2" --add-readme >/dev/null || die "gh repo create failed"
   assert_second
   local first sha
-  first="$(owner_gh api "repos/$REPO2" --jq .default_branch)" || die "can't read the first branch's name"
+  into first owner_gh api "repos/$REPO2" --jq .default_branch || die "can't read the first branch's name"
   if [[ "$first" != main ]]; then
     owner_gh api -X POST "repos/$REPO2/branches/$first/rename" -f new_name=main >/dev/null \
       || die "renaming the first branch '$first' to main failed"
   fi
-  sha="$(owner_gh api "repos/$REPO2/branches/main" --jq .commit.sha)" || die "can't read main"
+  into sha owner_gh api "repos/$REPO2/branches/main" --jq .commit.sha || die "can't read main"
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "unexpected main sha"
   # The branch first, then a commit on it: A2's PR attempt needs a branch ahead of main, or no one
   # could open it and its refusal would prove nothing (round 15, SEC-1).
@@ -1273,14 +1516,15 @@ cmd_reset() {
   assert_throwaway
   local b s
   for b in main dev side; do
-    s="$(branch_state "$b")"
+    into s branch_state "$b"
     [[ "$s" == unprotected || "$s" == missing ]] || die "reset only runs while nothing is protected ($b is $s)"
   done
-  [[ "$(ruleset_count)" == 0 ]] || die "reset only runs while there is no ruleset"
   local base open_prs n
-  base="$(owner_gh api "repos/$REPO/git/ref/tags/$BASELINE_TAG" --jq .object.sha)" || die "the baseline tag is missing"
+  into n ruleset_count
+  [[ "$n" == 0 ]] || die "reset only runs while there is no ruleset"
+  into base owner_gh api "repos/$REPO/git/ref/tags/$BASELINE_TAG" --jq .object.sha || die "the baseline tag is missing"
   [[ "$base" =~ ^[0-9a-f]{40}$ ]] || die "unexpected baseline sha"
-  open_prs="$(owner_gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" --jq '.[].number')" || die "can't list open PRs"
+  into open_prs owner_gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" --jq '.[].number' || die "can't list open PRs"
   for n in $open_prs; do
     [[ "$n" =~ ^[0-9]+$ ]] || die "unexpected PR number '$n'"
     owner_gh pr close "$n" --repo "$REPO" >/dev/null 2>&1 || die "closing PR #$n failed"
@@ -1288,7 +1532,7 @@ cmd_reset() {
   # Read again right before each rewrite, and rewrite only an unprotected branch (or recreate a
   # missing one): an unreadable or newly protected branch stops the reset (review round 11).
   for b in main dev side; do
-    s="$(branch_state "$b")"
+    into s branch_state "$b"
     case "$s" in
       missing)
         owner_gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$b" -f sha="$base" >/dev/null \
@@ -1332,15 +1576,16 @@ EOF
 # One branch, for protect and unprotect: sets BRANCH_PROTECTION to unprotected, or protected when
 # it carries exactly protect's protection; anything else stops.
 branch_protection() { # <branch>
-  local s ea=false
+  local s ea=false full
   [[ "$1" == dev ]] && ea=true
-  s="$(branch_state "$1")"
+  into s branch_state "$1"
   case "$s" in
     unprotected | protected) ;;
     *) die "$1 reads $s: stopped before changing it" ;;
   esac
-  if [[ "$s" == protected && "$(protection_full "$1")" != "$(want_protection "$ea")" ]]; then
-    die "$1 is protected, but not exactly as protect applies it: stopped before changing it"
+  if [[ "$s" == protected ]]; then
+    into full protection_full "$1"
+    [[ "$full" == "$(want_protection "$ea")" ]] || die "$1 is protected, but not exactly as protect applies it: stopped before changing it"
   fi
   BRANCH_PROTECTION="$s"
 }
@@ -1351,9 +1596,10 @@ branch_protection() { # <branch>
 # C1). Anything else, an unreadable branch or a ruleset, stops before any write. Each branch is
 # read again right before its own write (protection_write), as reset does (review round 44, C1).
 protection_todo() { # <protected|unprotected>: the state wanted
-  local b
+  local b n
   PROTECTION_TODO=""
-  [[ "$(ruleset_count)" == 0 ]] || die "protect and unprotect only run while there is no ruleset"
+  into n ruleset_count
+  [[ "$n" == 0 ]] || die "protect and unprotect only run while there is no ruleset"
   for b in dev main; do
     branch_protection "$b"
     [[ "$BRANCH_PROTECTION" == "$1" ]] || PROTECTION_TODO="$PROTECTION_TODO $b"
@@ -1384,8 +1630,11 @@ cmd_protect() {
     protection_write "$b" protected -X PUT "repos/$REPO/branches/$b/protection" --input "$WORK/$b.json" || die "protecting $b failed"
   done
   verify_phase protected
-  say "dev protection:  $(protection_of dev)   (approvals codeowners last-push stale enforce-admins force deletions)"
-  say "main protection: $(protection_of main)"
+  local p
+  into p protection_of dev
+  say "dev protection:  $p   (approvals codeowners last-push stale enforce-admins force deletions)"
+  into p protection_of main
+  say "main protection: $p"
 }
 
 # The reverse of protect, from the state protect leaves (or part of it, after a failed run), so a
@@ -1431,7 +1680,7 @@ cmd_ruleset() {
   app_session
   need_allowance
   local uid
-  uid="$(owner_uid)" || die "can't read the owner's user id, so no ruleset was requested"
+  into uid owner_uid || die "can't read the owner's user id, so no ruleset was requested"
   ruleset_json User "$uid" >"$WORK/ruleset-user.json"
   ruleset_json RepositoryRole 5 >"$WORK/ruleset-admin.json"
   if capture owner_gh api -X POST "repos/$REPO/rulesets" --input "$WORK/ruleset-user.json"; then
@@ -1441,7 +1690,7 @@ cmd_ruleset() {
     # there is still no ruleset. A lost answer after GitHub created it must not lead to a second.
     local ev n
     ev="$(evidence)"
-    n="$(ruleset_count)"
+    into n ruleset_count
     if ! printf '%s' "$LAST_OUT" | grep -q 'HTTP 422' || [[ "$n" != 0 ]]; then
       die "the ruleset request failed without a clear rejection, or a ruleset exists now (rulesets: $n): check $REPO's rulesets on GitHub before running this again: $ev"
     fi
@@ -1451,14 +1700,16 @@ cmd_ruleset() {
     say "ruleset created with bypass: Repository admin role (5)"
   fi
   verify_phase ruleset
-  say "ruleset: $(ruleset_summary)"
+  local sum
+  into sum ruleset_summary
+  say "ruleset: $sum"
 }
 
 cmd_actions_setting() {
   need_owner
   assert_throwaway
   local v
-  v="$(owner_gh api "repos/$REPO/actions/permissions/workflow" --jq .can_approve_pull_request_reviews)" \
+  into v owner_gh api "repos/$REPO/actions/permissions/workflow" --jq .can_approve_pull_request_reviews \
     || die "can't read the Actions workflow permissions"
   say "B15 can_approve_pull_request_reviews=$v (must be false)"
   [[ "$v" == false ]]
@@ -1471,21 +1722,21 @@ cmd_status() {
   assert_throwaway
   local b st prot n sum def bad=""
   for b in dev main; do
-    st="$(branch_state "$b")"
+    into st branch_state "$b"
     prot=none
-    if [[ "$st" == protected ]]; then prot="$(protection_of "$b")"; fi
+    if [[ "$st" == protected ]]; then into prot protection_of "$b"; fi
     if [[ "$st" == error || "$prot" == error ]]; then bad="$bad $b"; fi
     say "$b: $st [$prot]"
   done
-  n="$(ruleset_count)"
+  into n ruleset_count
   sum=none
   if [[ ! "$n" =~ ^[0-9]+$ ]]; then bad="$bad rulesets"
   elif [[ "$n" -gt 0 ]]; then
-    sum="$(ruleset_summary)"
+    into sum ruleset_summary
     if [[ "$sum" == error ]]; then bad="$bad ruleset"; fi
   fi
   say "rulesets: $n [$sum]"
-  def="$(owner_gh api "repos/$REPO" --jq .default_branch)" || def=""
+  into def owner_gh api "repos/$REPO" --jq .default_branch || def=""
   if [[ -z "$def" ]]; then bad="$bad default-branch"; fi
   say "default branch: ${def:-error}"
   if [[ -n "$bad" ]]; then die "could not read:$bad"; fi
@@ -1569,9 +1820,9 @@ pr_view() { # <pr> <fields> <jq>
 wait_settled() { # <pr> — GitHub computes mergeability in the background; 1 if it never settles
   local _ st
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    st="$(pr_view "$1" mergeable .mergeable)" || st=UNKNOWN
+    into st pr_view "$1" mergeable .mergeable || st=UNKNOWN
     [[ "$st" == MERGEABLE || "$st" == CONFLICTING ]] && return 0
-    sleep 3
+    nap 3
   done
   return 1
 }
@@ -1589,13 +1840,17 @@ app_merge() { # <id> <pr> <merge flags…>
   local id="$1" pr="$2" _ facts
   shift 2
   for _ in 1 2 3; do
-    if ! wait_settled "$pr"; then OBS=inconclusive; LAST_OUT="mergeability never settled [$(merge_facts "$pr")]"; return; fi
+    if ! wait_settled "$pr"; then
+      into facts merge_facts "$pr"
+      OBS=inconclusive LAST_OUT="mergeability never settled [$facts]"
+      return
+    fi
     capture app_gh pr merge "$pr" --repo "$REPO" "$@" || true
-    sleep 3
-    facts="$(merge_facts "$pr")"
+    nap 3
+    into facts merge_facts "$pr"
     if [[ "$facts" == MERGED* ]]; then OBS=allowed; LAST_OUT="$LAST_OUT [$facts]"; return; fi
     [[ "$(expect "$id" "$PHASE")" == allowed ]] || break
-    sleep 5
+    nap 5
   done
   # Refused needs both: the merge command itself was rejected for a protection reason, and GitHub
   # reports the PR open, free of conflicts and BLOCKED.
@@ -1613,17 +1868,17 @@ owner_approve() { # <pr>
   wait_settled "$1" || die "PR #$1 never became mergeable"
   owner_gh pr review "$1" --repo "$REPO" --approve --body "FRG-26 test approval by the owner" >/dev/null 2>&1 \
     || die "the owner could not approve PR #$1"
-  sleep 3
+  nap 3
 }
 
 # A test PR left open could still merge (B11 arms auto-merge), so a PR not confirmed closed or
 # merged afterwards is a failure: the phase stops, and the owner is told which PR to close.
 close_if_open() { # <pr> — tidy up after a refused attempt
   local st
-  st="$(pr_view "$1" state .state)" || st=""
+  into st pr_view "$1" state .state || st=""
   if [[ "$st" == OPEN ]] && in_time; then
     with_timeout "$(call_secs)" owner_gh pr close "$1" --repo "$REPO" >/dev/null 2>&1 || true
-    st="$(pr_view "$1" state .state)" || st=""
+    into st pr_view "$1" state .state || st=""
   fi
   if [[ "$st" == CLOSED || "$st" == MERGED ]]; then return 0; fi
   FAILS=$((FAILS + 1))
@@ -1636,11 +1891,11 @@ close_if_open() { # <pr> — tidy up after a refused attempt
 # number (dev_ahead, or a PR URL that couldn't be read). Any PR it can't confirm closed, or a
 # list it can't read, is a failure.
 sweep_prs() {
-  local open pr rc=0
+  local open pr rc=0 TIDY_UP=1
   # Every page, so no test PR is missed however many PRs are open (review round 9). Each call is
   # bounded, and the clean-up's cap checked before each PR (round 72, SEC-1).
-  open="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" \
-    --jq '.[] | select(.title | startswith("FRG-26 ")) | .number' 2>/dev/null)" || rc=$?
+  into open with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" \
+    --jq '.[] | select(.title | startswith("FRG-26 ")) | .number' 2>/dev/null || rc=$?
   if [[ $rc -ne 0 ]]; then
     FAILS=$((FAILS + 1))
     undone "closing the open test PRs"; say "CLEANUP FAIL could not list the open PRs in $REPO$(no_answer $rc): close any \"FRG-26 \" test PR on GitHub before another phase"
@@ -1748,7 +2003,7 @@ t_B7() {
   owner_approve "$pr"
   add_commit "tests/$PHASE-B7-after-approval-$(stamp).txt" "pushed after the owner's approval"
   push_branch "$BR"
-  sleep 3
+  nap 3
   app_merge B7 "$pr" --squash
   record B7 "$OBS" "$(evidence)"
   close_if_open "$pr"
@@ -1759,10 +2014,10 @@ t_B8() {
   local pr="$LAST_PR"
   owner_approve "$pr"
   local old_head dev_sha
-  old_head="$(pr_view "$pr" headRefOid .headRefOid)" || old_head=""
+  into old_head pr_view "$pr" headRefOid .headRefOid || old_head=""
   dev_ahead B8-advance
   [[ "$OBS" == allowed ]] || { setup_fail B8 "could not advance dev ($(evidence))"; close_if_open "$pr"; return; }
-  dev_sha="$(owner_gh api "repos/$REPO/branches/dev" --jq .commit.sha 2>/dev/null)" || dev_sha=""
+  into dev_sha owner_gh api "repos/$REPO/branches/dev" --jq .commit.sha 2>/dev/null || dev_sha=""
   if [[ ! "$old_head" =~ ^[0-9a-f]{40}$ || ! "$dev_sha" =~ ^[0-9a-f]{40}$ ]]; then
     setup_fail B8 "could not read the PR head or dev"
     close_if_open "$pr"
@@ -1787,12 +2042,12 @@ t_B8() {
 branch_updated() { # <pr> <old head> <dev sha> — 0 once the head moved and has dev as a parent
   local _ head parents
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    head="$(pr_view "$1" headRefOid .headRefOid)" || head=""
+    into head pr_view "$1" headRefOid .headRefOid || head=""
     if [[ "$head" =~ ^[0-9a-f]{40}$ && "$head" != "$2" ]]; then
-      parents="$(owner_gh api "repos/$REPO/commits/$head" --jq '[.parents[].sha] | join(" ")' 2>/dev/null)" || parents=""
+      into parents owner_gh api "repos/$REPO/commits/$head" --jq '[.parents[].sha] | join(" ")' 2>/dev/null || parents=""
       [[ " $parents " == *" $3 "* ]] && return 0
     fi
-    sleep 3
+    nap 3
   done
   return 1
 }
@@ -1809,9 +2064,9 @@ t_B9() {
     close_if_open "$pr"
     return
   fi
-  sleep 3
+  nap 3
   local base
-  base="$(pr_view "$pr" baseRefName .baseRefName)" || base=""
+  into base pr_view "$pr" baseRefName .baseRefName || base=""
   if [[ "$base" != dev ]]; then
     setup_fail B9 "re-aimed PR's base reads '${base:-unreadable}', not dev"
     close_if_open "$pr"
@@ -1842,9 +2097,9 @@ t_B11() {
   capture app_gh pr merge "$pr" --repo "$REPO" --squash --auto || true
   local first
   first="$(evidence)"
-  sleep 30
-  st="$(pr_view "$pr" state .state)" || st=unknown
-  armed="$(pr_view "$pr" autoMergeRequest '.autoMergeRequest != null')" || armed=unknown
+  nap 30
+  into st pr_view "$pr" state .state || st=unknown
+  into armed pr_view "$pr" autoMergeRequest '.autoMergeRequest != null' || armed=unknown
   if [[ "$PHASE" == open ]]; then
     if [[ "$st" == MERGED || ( "$st" == OPEN && "$armed" == true ) ]]; then
       record B11 allowed "$first [state $st, armed $armed]"
@@ -1866,9 +2121,9 @@ t_B11() {
   owner_approve "$pr"
   local _
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    st="$(pr_view "$pr" state .state)" || st=unknown
+    into st pr_view "$pr" state .state || st=unknown
     [[ "$st" == MERGED ]] && break
-    sleep 5
+    nap 5
   done
   if [[ "$st" == MERGED ]]; then
     record B11 refused "$first [held until the owner approved, then merged by itself]"
@@ -1902,7 +2157,7 @@ t_B12() {
 t_B13() {
   # The same payloads the owner's own ruleset step uses (one of them is proven valid there).
   local uid
-  uid="$(owner_uid)" || { setup_fail B13 "could not read the owner's user id"; return; }
+  into uid owner_uid || { setup_fail B13 "could not read the owner's user id"; return; }
   ruleset_json User "$uid" >"$WORK/app-ruleset-user.json"
   ruleset_json RepositoryRole 5 >"$WORK/app-ruleset-admin.json"
   admin_attempts B13 -X POST "repos/$REPO/rulesets" --input "$WORK/app-ruleset-user.json" ";;" \
@@ -1969,14 +2224,14 @@ t_M4() {
     return
   fi
   local id
-  id="$(owner_gh api "repos/$REPO/rulesets" --jq '.[0].id' 2>/dev/null)" || id=""
+  into id owner_gh api "repos/$REPO/rulesets" --jq '.[0].id' 2>/dev/null || id=""
   [[ "$id" =~ ^[0-9]+$ ]] || { setup_fail M4 "could not read the ruleset's id"; return; }
   # Changing the ruleset. Both payloads are built from GitHub's own copy of the installed ruleset
   # (so they are valid requests): one switches it off; the other adds the app to the bypass list as
   # an Integration actor (GitHub Apps may be bypass actors: Confirmed, docs), whichever form the
   # owner's bypass took.
   local rs
-  rs="$(owner_gh api "repos/$REPO/rulesets/$id" 2>/dev/null)" || { setup_fail M4 "could not read the ruleset"; return; }
+  into rs owner_gh api "repos/$REPO/rulesets/$id" 2>/dev/null || { setup_fail M4 "could not read the ruleset"; return; }
   printf '%s' "$rs" | jq '{name, target, enforcement: "disabled", conditions, rules, bypass_actors}' >"$WORK/ruleset-off.json" \
     || { setup_fail M4 "could not build the switch-off payload"; return; }
   [[ "$APP_ID" =~ ^[0-9]+$ ]] || { setup_fail M4 "no app id"; return; }
@@ -2003,8 +2258,8 @@ t_M6() { # the owner merges dev into main
   [[ "$pr" =~ ^[0-9]+$ ]] || { setup_fail M6 "unexpected PR URL: $(evidence)"; return; }
   wait_settled "$pr" || { setup_fail M6 "PR never became mergeable"; close_if_open "$pr"; return; }
   capture owner_gh pr merge "$pr" --repo "$REPO" --merge --admin || true
-  sleep 3
-  facts="$(merge_facts "$pr")"
+  nap 3
+  into facts merge_facts "$pr"
   if [[ "$facts" == MERGED* ]]; then OBS=allowed; else OBS=inconclusive; fi
   record M6 "$OBS" "$(evidence) [$facts]"
   close_if_open "$pr"
@@ -2078,9 +2333,9 @@ p_controls() { # <args…> separated by ";;"
 # Actions may not approve PRs.
 t_S1() {
   local n d a
-  n="$(owner_gh api "repos/$REPO/actions/secrets" --jq .total_count 2>/dev/null)" || n=error
-  d="$(owner_gh api "repos/$REPO/actions/permissions/workflow" --jq .default_workflow_permissions 2>/dev/null)" || d=error
-  a="$(owner_gh api "repos/$REPO/actions/permissions/workflow" --jq .can_approve_pull_request_reviews 2>/dev/null)" || a=error
+  into n owner_gh api "repos/$REPO/actions/secrets" --jq .total_count 2>/dev/null || n=error
+  into d owner_gh api "repos/$REPO/actions/permissions/workflow" --jq .default_workflow_permissions 2>/dev/null || d=error
+  into a owner_gh api "repos/$REPO/actions/permissions/workflow" --jq .can_approve_pull_request_reviews 2>/dev/null || a=error
   if [[ "$n" == 0 && "$d" == read && "$a" == false ]]; then
     say "RESULT S1 permissions PASS :: repository secrets $n, workflow token $d, Actions may approve PRs: $a"
   else
@@ -2093,7 +2348,7 @@ t_S1() {
 # installation (adding the repository it already has). Control: the owner's same no-op write.
 t_A6() {
   local rid
-  rid="$(owner_gh api "repos/$REPO" --jq .id 2>/dev/null)" || rid=""
+  into rid owner_gh api "repos/$REPO" --jq .id 2>/dev/null || rid=""
   [[ "$rid" =~ ^[0-9]+$ ]] || { setup_fail_p A6 "could not read the repository id"; return; }
   p_attempts api app_gh api -X PATCH "repos/$REPO" -f description="$MARKER" ";;" \
     app_gh api -X PUT "user/installations/$INSTALLATION_ID/repositories/$rid"
@@ -2159,15 +2414,15 @@ t_A3() {
 # not tried (owner, 2026-11-15): the A2 investigation showed it is allowed whatever the token
 # carries, and item 9 stays failed for it (plan sections 6 and 13).
 t_A2() {
-  local main2 dev before content b
-  main2="$(owner_gh api "repos/$REPO2/branches/main" --jq .commit.sha 2>/dev/null)" || main2=""
+  local main2 dev before after content b
+  into main2 owner_gh api "repos/$REPO2/branches/main" --jq .commit.sha 2>/dev/null || main2=""
   [[ "$main2" =~ ^[0-9a-f]{40}$ ]] || { setup_fail_p A2 "could not read $REPO2's main"; return; }
-  dev="$(owner_gh api "repos/$REPO/branches/dev" --jq .commit.sha 2>/dev/null)" || dev=""
+  into dev owner_gh api "repos/$REPO/branches/dev" --jq .commit.sha 2>/dev/null || dev=""
   [[ "$dev" =~ ^[0-9a-f]{40}$ ]] || { setup_fail_p A2 "could not read $REPO's dev"; return; }
   # The file goes on the owner's branch there: with that branch missing, a 404 would prove nothing.
   # Only a whole line of the branch list counts, never a look-alike branch or tag (round 70, C1,
   # SEC-1): branch lines are the only ones starting refs/heads/.
-  before="$(probe_refs)"
+  into before probe_refs || true
   if [[ "$before" == error ]] || ! printf '%s\n' "$before" | grep -Eqx "refs/heads/$A2_BRANCH [0-9a-f]{40}"; then
     setup_fail_p A2 "could not read $REPO2's branches and tags, or $A2_BRANCH is missing"
     return
@@ -2184,7 +2439,8 @@ t_A2() {
     app_gh api -X POST "repos/$REPO2/git/refs" -f ref="refs/heads/frg26-a2-api-$(stamp)" -f sha="$main2"
   EV="$ev$EV"
   [[ "$OBS" == refused ]] || { record_p A2 "$OBS" "not run" "$EV"; return; }
-  if [[ "$(probe_refs)" != "$before" ]]; then
+  into after probe_refs || true
+  if [[ "$after" != "$before" ]]; then
     record_p A2 allowed "not run" "$EV $REPO2's branches or tags changed (or could not be read again)"
     return
   fi
@@ -2237,10 +2493,10 @@ setup_fail_p() { # <id> <what failed>
 # this run wrote there, and is reported for the owner to close; this script never writes there as
 # the owner.
 sweep_issues() {
-  local open n mine rc=0
+  local open n mine rc=0 TIDY_UP=1
   # Each call bounded, the clean-up's cap checked before each step (round 72, SEC-1).
   mine=".[] | select(.pull_request == null) | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number"
-  open="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO/issues?state=open&per_page=100" --jq "$mine" 2>/dev/null)" || rc=$?
+  into open with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO/issues?state=open&per_page=100" --jq "$mine" 2>/dev/null || rc=$?
   if [[ $rc -ne 0 ]]; then
     FAILS=$((FAILS + 1))
     undone "closing the test issues"; say "CLEANUP FAIL could not list the open issues in $REPO$(no_answer $rc): close any \"FRG-26 \" test issue on GitHub"
@@ -2262,8 +2518,8 @@ sweep_issues() {
   fi
   # Only this run's: issues #1-#3 there are the A2 evidence, kept open (owner, 2026-11-11).
   rc=0
-  open="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO2/issues?state=open&per_page=100" \
-    --jq ".[] | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number" 2>/dev/null)" || rc=$?
+  into open with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO2/issues?state=open&per_page=100" \
+    --jq ".[] | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number" 2>/dev/null || rc=$?
   if [[ $rc -ne 0 ]]; then
     FAILS=$((FAILS + 1))
     undone "checking $REPO2 for this run's issues"; say "CLEANUP FAIL could not list the open issues in $REPO2$(no_answer $rc): check it on GitHub for \"FRG-26 \" issues"
@@ -2781,8 +3037,8 @@ EOF
 # prevented, only the branch main may deploy.
 env_summary() {
   local e p
-  e="$(owner_gh api "repos/$REPO/environments/$ENV_NAME" --jq '[([.protection_rules[] | select(.type == "required_reviewers") | .prevent_self_review | tostring] | join(",")), ([.protection_rules[] | select(.type == "required_reviewers") | .reviewers[] | "\(.type):\(.reviewer.login)"] | join(",")), (.deployment_branch_policy.protected_branches | tostring), (.deployment_branch_policy.custom_branch_policies | tostring)] | join(" ")' 2>/dev/null)" || { echo error; return; }
-  p="$(owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" --jq '[.branch_policies[] | "\(.type // "branch"):\(.name)"] | join(",")' 2>/dev/null)" || { echo error; return; }
+  into e owner_gh api "repos/$REPO/environments/$ENV_NAME" --jq '[([.protection_rules[] | select(.type == "required_reviewers") | .prevent_self_review | tostring] | join(",")), ([.protection_rules[] | select(.type == "required_reviewers") | .reviewers[] | "\(.type):\(.reviewer.login)"] | join(",")), (.deployment_branch_policy.protected_branches | tostring), (.deployment_branch_policy.custom_branch_policies | tostring)] | join(" ")' 2>/dev/null || { echo error; return; }
+  into p owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" --jq '[.branch_policies[] | "\(.type // "branch"):\(.name)"] | join(",")' 2>/dev/null || { echo error; return; }
   printf '%s %s\n' "$e" "$p"
 }
 
@@ -2797,12 +3053,12 @@ cmd_env_setup() {
   assert_throwaway
   verify_phase open
   local uid
-  uid="$(owner_uid)" || die "can't read the owner's user id, so no Environment was made"
+  into uid owner_uid || die "can't read the owner's user id, so no Environment was made"
   env_json "$uid" >"$WORK/env.json"
   owner_gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input "$WORK/env.json" >/dev/null || die "making the Environment failed"
   # Only a listing GitHub actually returned decides whether main is missing (round 31, C1).
   local names
-  names="$(owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" --jq '.branch_policies[].name' 2>/dev/null)" \
+  into names owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" --jq '.branch_policies[].name' 2>/dev/null \
     || die "can't read the Environment's branch policies, so nothing more was changed"
   if ! printf '%s\n' "$names" | grep -Fxq main; then
     owner_gh api -X POST "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" -f name=main -f type=branch >/dev/null \
@@ -2812,7 +3068,7 @@ cmd_env_setup() {
   owner_gh secret set "$DUMMY_NAME" --env "$ENV_NAME" --repo "$REPO" --body "$DUMMY_VALUE" >/dev/null \
     || die "storing the dummy value failed"
   local got
-  got="$(env_summary)"
+  into got env_summary
   [[ "$got" == "$(want_env)" ]] || die "the Environment is '$got', expected '$(want_env)'"
   say "Environment $ENV_NAME: reviewer $OWNER only, self-review prevented, only main deploys; dummy value stored"
 }
@@ -2827,12 +3083,13 @@ wait_run() { # <sha> <status…> — sets RUN to "id status conclusion actor" on
   shift
   RUN=""
   for _ in $(seq 1 60); do
-    line="$(runs_for "$sha" | head -n 1)" || line=""
+    into line runs_for "$sha" || line=""
+    line="${line%%$'\n'*}"
     st="$(printf '%s' "$line" | cut -d' ' -f2)"
     for want in "$@"; do
       if [[ -n "$line" && "$st" == "$want" ]]; then RUN="$line"; return 0; fi
     done
-    sleep 5
+    nap 5
   done
   RUN="$line"
   return 1
@@ -2848,7 +3105,7 @@ approve_run() { # <who owner_gh|app_gh> <run id> <env id>
 run_log_value() { # <run id> — yes (the job printed the dummy value's length), no, or error (the
   # log couldn't be read: that is not "no value", round 13)
   local log
-  log="$(owner_gh run view "$1" --repo "$REPO" --log 2>/dev/null)" || { echo error; return; }
+  into log owner_gh run view "$1" --repo "$REPO" --log 2>/dev/null || { echo error; return; }
   if grep -Fq "FRG26-S2 value length ${#DUMMY_VALUE}" <<<"$log"; then echo yes; else echo no; fi
 }
 
@@ -2867,14 +3124,16 @@ github_refused() { # after capture: GitHub itself answered with a 4xx that isn't
 # check-run id (round 16, C1).
 deploy_job() { # <run id> — "check-run-id steps-run conclusion" of the run's deploy job, or error
   local j
-  j="$(owner_gh api "repos/$REPO/actions/runs/$1/jobs" --jq '.jobs[] | select(.name == "deploy") | "\(.check_run_url | split("/") | last) \(.steps | length) \(.conclusion)"' 2>/dev/null | head -n 1)" || j=""
+  into j owner_gh api "repos/$REPO/actions/runs/$1/jobs" --jq '.jobs[] | select(.name == "deploy") | "\(.check_run_url | split("/") | last) \(.steps | length) \(.conclusion)"' 2>/dev/null || j=""
+  j="${j%%$'\n'*}"
   printf '%s\n' "${j:-error}"
 }
 
 # GitHub's annotation when an Environment's deployment branches leave a branch out. The wording is
 # Unconfirmed (the docs don't quote it): if it differs, S2a reads inconclusive and stops the run.
 policy_rejected() { # <check-run id>
-  owner_gh api "repos/$REPO/check-runs/$1/annotations" --jq '.[].message' 2>/dev/null | grep -Eiq 'not allowed to deploy'
+  local m
+  into m owner_gh api "repos/$REPO/check-runs/$1/annotations" --jq '.[].message' 2>/dev/null && grep -Eiq 'not allowed to deploy' <<<"$m"
 }
 
 # The ids of S2 runs not yet completed (queued, in progress, waiting…), every page; fails if the
@@ -2890,12 +3149,13 @@ unfinished_runs() {
 # are always dealt with first, whatever else failed (round 25, SEC-1). Each call bounded, and no
 # wait or poll runs past the clean-up's cap (round 72, SEC-1). 1 on any failure.
 cancel_waiting_runs() {
-  local ids id _ sha seen unseen="" ok="" rc
+  local ids id _ sha seen unseen="" ok="" rc runs TIDY_UP=1
   for sha in $S2_SHAS; do
     seen=""
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
       in_time || break
-      if [[ -n "$(runs_for "$sha")" ]]; then seen=1; break; fi
+      into runs runs_for "$sha" || true
+      if [[ -n "$runs" ]]; then seen=1; break; fi
       pause 5
     done
     [[ -n "$seen" ]] || unseen="$unseen ${sha:0:7}"
@@ -2906,7 +3166,7 @@ cancel_waiting_runs() {
       return 1
     fi
     rc=0
-    ids="$(unfinished_runs)" || rc=$?
+    into ids unfinished_runs || rc=$?
     if [[ $rc -ne 0 ]]; then
       undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL could not list the unfinished S2 runs in $REPO$(no_answer $rc): cancel any on GitHub (Actions)"
       return 1
@@ -2942,11 +3202,11 @@ t_S2b() {
   # Recorded before the push: GitHub may accept it, and start its run, even if the push reports a
   # failure (round 25, C2).
   local sha eid id
-  sha="$(app_git -C "$CLONE" rev-parse HEAD)" || sha=""
+  into sha app_git -C "$CLONE" rev-parse HEAD || sha=""
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { setup_fail_p S2b "could not read the local commit"; return; }
   S2_SHAS="$S2_SHAS $sha"
   capture app_git -C "$CLONE" push origin HEAD:refs/heads/main || { setup_fail_p S2b "the app could not push main in the open phase: $(evidence)"; return; }
-  eid="$(env_id)" || eid=""
+  into eid env_id || eid=""
   [[ "$sha" =~ ^[0-9a-f]{40}$ && "$eid" =~ ^[0-9]+$ ]] || { setup_fail_p S2b "could not read the commit or the Environment"; return; }
   wait_run "$sha" waiting || { setup_fail_p S2b "the app's run never waited for review ($RUN)"; return; }
   id="${RUN%% *}"
@@ -2955,9 +3215,9 @@ t_S2b() {
   EV="the app approving its own run: $(evidence) |"
   if [[ "$OBS" != refused ]]; then record_p S2b "$OBS" "not run" "$EV"; cancel_waiting_runs || true; return; fi
   CTL=failed
-  local can
-  can="$(can_approve "$id")"
-  if [[ "$can" == true ]] && approve_run owner_gh "$id" "$eid" && wait_run "$sha" completed && [[ "$(run_log_value "$id")" == yes ]]; then CTL=ok; fi
+  local can logv=""
+  into can can_approve "$id"
+  if [[ "$can" == true ]] && approve_run owner_gh "$id" "$eid" && wait_run "$sha" completed && into logv run_log_value "$id" && [[ "$logv" == yes ]]; then CTL=ok; fi
   EV="$EV GitHub says the owner can approve it: $can; owner approving: $(evidence), run $RUN"
   S2B_OWNER_APPROVAL="$CTL"
   record_p S2b "$OBS" "$CTL" "$EV"
@@ -2968,14 +3228,14 @@ t_S2b() {
 # same owner, on the app's run in S2b, was accepted.
 t_S2d() {
   local eid id
-  eid="$(env_id)" || eid=""
+  into eid env_id || eid=""
   [[ "$eid" =~ ^[0-9]+$ ]] || { setup_fail_p S2d "could not read the Environment"; return; }
   wait_run "$S2_OWNER_SHA" waiting || { setup_fail_p S2d "the owner's run never waited for review ($RUN)"; return; }
   id="${RUN%% *}"
   # Refused needs all three (round 13, C2/SEC-2): GitHub says the owner can't approve this run, GitHub
   # itself refused the approval (a 4xx, not a network error or a rate limit), and it still waits.
   local can
-  can="$(can_approve "$id")"
+  into can can_approve "$id"
   approve_run owner_gh "$id" "$eid" || true
   OBS=inconclusive
   if [[ $LAST_RC -eq 0 ]]; then OBS=allowed
@@ -2995,7 +3255,7 @@ t_S2a() {
   add_commit "tests/permissions-S2a-$(stamp).txt" "FRG-26 S2a"
   local sha id
   # Recorded before the push, as in S2b (round 25, C2).
-  sha="$(app_git -C "$CLONE" rev-parse HEAD)" || sha=""
+  into sha app_git -C "$CLONE" rev-parse HEAD || sha=""
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { setup_fail_p S2a "could not read the local commit"; return; }
   S2_SHAS="$S2_SHAS $sha"
   capture app_git -C "$CLONE" push origin "HEAD:refs/heads/$br" || { setup_fail_p S2a "pushing $br failed: $(evidence)"; return; }
@@ -3004,14 +3264,16 @@ t_S2a() {
   # Refused needs GitHub's own rejection (round 13, C3/SEC-1): the deploy job failed without running
   # a step, and its annotation says the branch may not deploy. A run that failed for another reason,
   # or that can't be read, proves nothing.
-  local job jid steps concl
+  local job jid steps concl logv
   OBS=inconclusive
   if [[ "$RUN" == *" waiting "* ]]; then OBS=allowed
   else
-    job="$(deploy_job "$id")"
+    into job deploy_job "$id"
     read -r jid steps concl <<<"$job"
     if [[ "$concl" == failure && "$steps" == 0 && "$jid" =~ ^[0-9]+$ ]] && policy_rejected "$jid"; then OBS=refused
-    elif [[ "$(run_log_value "$id")" == yes ]]; then OBS=allowed
+    else
+      into logv run_log_value "$id"
+      if [[ "$logv" == yes ]]; then OBS=allowed; fi
     fi
   fi
   record_p S2a "$OBS" ok "feature-branch run $RUN, deploy job ${job:-unread} (control: S2b's run on main got the value)"
@@ -3024,8 +3286,8 @@ t_S2a() {
 # public key, and deleting a disposable dummy secret made for this test. The Environment must read
 # unchanged afterwards.
 t_S2c() {
-  local uid
-  uid="$(owner_uid)" || { setup_fail_p S2c "could not read the owner's user id"; return; }
+  local uid got
+  into uid owner_uid || { setup_fail_p S2c "could not read the owner's user id"; return; }
   env_json "$uid" >"$WORK/env.json"
   if ! capture owner_gh secret set "$DISPOSABLE_NAME" --env "$ENV_NAME" --repo "$REPO" --body "$DUMMY_VALUE"; then
     setup_fail_p S2c "could not make the disposable dummy secret: $(evidence)"
@@ -3042,7 +3304,8 @@ t_S2c() {
   p_controls owner_gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input "$WORK/env.json" ";;" \
     owner_gh api "repos/$REPO/environments/$ENV_NAME/secrets/public-key" ";;" \
     owner_gh api -X DELETE "repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME"
-  [[ "$(env_summary)" == "$(want_env)" ]] || { CTL=failed; EV="$EV the Environment reads '$(env_summary)' afterwards |"; }
+  into got env_summary
+  [[ "$got" == "$(want_env)" ]] || { CTL=failed; EV="$EV the Environment reads '$got' afterwards |"; }
   record_p S2c "$OBS" "$CTL" "$EV"
 }
 
@@ -3058,7 +3321,9 @@ cmd_env_tests() {
   app_session
   verify_phase open
   need_allowance
-  [[ "$(env_summary)" == "$(want_env)" ]] || die "run env-setup first (the Environment reads '$(env_summary)')"
+  local got
+  into got env_summary
+  [[ "$got" == "$(want_env)" ]] || die "run env-setup first (the Environment reads '$got')"
   PHASE=permissions
   RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   CLONE="$WORK/clone"
@@ -3068,7 +3333,7 @@ cmd_env_tests() {
   # can't reconcile and reports (round 24, SEC-1).
   CANCEL_ON_EXIT=1
   S2_UNKNOWN=1
-  S2_OWNER_SHA="$(put_file_commit "$S2_WORKFLOW" "$(s2_workflow)" 2>/dev/null)" || S2_OWNER_SHA=""
+  into S2_OWNER_SHA put_file_commit "$S2_WORKFLOW" "$(s2_workflow)" 2>/dev/null || S2_OWNER_SHA=""
   [[ "$S2_OWNER_SHA" =~ ^[0-9a-f]{40}$ ]] || die "adding the S2 workflow failed, or its commit is unknown"
   S2_SHAS="$S2_SHAS $S2_OWNER_SHA"
   S2_UNKNOWN=""

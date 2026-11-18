@@ -530,6 +530,26 @@ confirmed", "expiry unknown, revocation not confirmed" or "revocation never answ
 the clean-up is INCOMPLETE. A revocation that took effect but whose answer was lost is therefore
 reported NOT confirmed. a2-probe is unchanged.
 
+Bounded requests (owner, 2026-11-17, review round 75). Every GitHub request goes through the
+owner's gh, the app's gh, the app's git or the app's own requests (curl), and each gets its time
+limit where it starts: 20 seconds for an API call (the app's own requests end at curl's 20, with 5
+more as a backstop), 60 seconds for a git push or fetch, 120 seconds for a clone, 20 seconds for a
+local git command; less near the clean-up's cap. A test reads the script and fails on any gh, git
+or curl run another way, and on any request inside a command substitution or a pipeline, or a
+sleep in the foreground, since bash holds a stop until those end (a2-probe's own code aside: its
+accepted limit covers that). A request with no answer in time is stopped with every process under
+it, and so is the run: no new request or test action starts, and the clean-up says why first. A
+tidy-up on a normal finish (closing test PRs or issues, cancelling S2 runs) instead names what a
+timeout left undone itself, as the clean-up does. A
+stop during any request stops the request the same way, at once. A write that timed out, or that a
+stop cut short, may have taken effect: it is never sent again, and the clean-up's last line names
+it, outcome unknown, until someone checks it on GitHub; the clean-up is then INCOMPLETE. A token
+request still holds a stop until its answer is in (rounds 58, 59), at most 25 seconds. What reaches
+a2-probe through the shared code: its requests are bounded at the wrappers too (the limits it
+already had); a stop during its revocations and its capture calls acts at once, while its reads in
+command substitutions still hold one up to 20 seconds, as before; a timeout doesn't stop it (its
+own handling stands), it notes no writes, and its own code and evidence are unchanged.
+
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.
 

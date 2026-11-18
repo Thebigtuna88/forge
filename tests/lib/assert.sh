@@ -30,11 +30,18 @@ assert_file_mode() { # <file> <octal mode>
   [[ "$mode" == "$2" ]] || _t_fail "mode of $1: expected $2 got $mode"
 }
 
+# A test passes only if it returned, every assertion held, and its subshell then ended with status
+# 0. Its result is written to a file only once it has returned: a test that crashed, or that ended
+# early through an exit or an exit trap (even with status 0, as a sourced script's clean-up can),
+# never writes it, and an exit trap that changes the status afterwards is caught too (FRG-26 round
+# 75). A test that runs a command expecting it to fail is unaffected: only the test's own end counts.
 run_tests() {
-  local file t rc failures=0 out
+  local file t rc failures=0 out res got
   file="$(basename "$0" .test.sh)"
   out="$(mktemp)" || return 1 # private (mode 600), unpredictable name
+  res="$(mktemp)" || return 1
   for t in $(declare -F | awk '{print $3}' | grep '^test_'); do
+    : >"$res"
     (
       _T_CUR_FAILED=0
       # A test never runs without its own temp folder (it would otherwise write to /h etc.).
@@ -45,17 +52,24 @@ run_tests() {
       "$t" || _t_fail "$t returned non-zero"
       rc=$_T_CUR_FAILED
       rm -rf "$T_TMP"
+      printf '%s\n' "$rc" >"$res"
       exit "$rc"
     ) >"$out" 2>&1
     rc=$?
-    if [[ $rc -eq 0 ]]; then
+    got="$(cat "$res" 2>/dev/null)"
+    if [[ $rc -eq 0 && "$got" == 0 ]]; then
       printf 'ok %s::%s\n' "$file" "$t"
     else
       printf 'not ok %s::%s\n' "$file" "$t"
-      grep '^  # ' "$out" || printf '  # crashed (status %s)\n' "$rc"
+      grep '^  # ' "$out"
+      if [[ -z "$got" ]]; then
+        printf '  # crashed or exited before it returned (status %s)\n' "$rc"
+      elif [[ "$got" != "$rc" ]]; then
+        printf '  # ended with status %s after it returned %s (an exit trap?)\n' "$rc" "$got"
+      fi
       failures=$((failures + 1))
     fi
   done
-  rm -f "$out"
+  rm -f "$out" "$res"
   [[ $failures -eq 0 ]]
 }

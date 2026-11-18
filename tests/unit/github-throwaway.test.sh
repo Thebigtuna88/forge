@@ -10,6 +10,7 @@
 source "$(dirname "$0")/../lib/assert.sh"
 
 GT="$(cd "$(dirname "$0")/.." && pwd)/permissions/github-throwaway.sh"
+SCAN="$(cd "$(dirname "$0")/../lib" && pwd)/request-scan.py"
 
 # A fake installation token, built at run time so no token-shaped text sits in the repository.
 # GitHub's stateless format (ghs_APPID_JWT, about 520 characters, changelog 2026-04-24): base64url
@@ -1150,6 +1151,7 @@ test_capture_redacts_tool_output() {
   fake_tools
   TOKEN="$(fake_token)"
   WORK="$T_TMP/work"
+  mkdir -m 700 "$WORK"
   capture app_gh api -X DELETE repos/x/y || true
   assert_not_contains "$LAST_OUT" "$TOKEN"
   assert_contains "$LAST_OUT" "[REDACTED]"
@@ -4080,16 +4082,7 @@ test_with_timeout_stops_the_real_command_under_a_function() {
 # token request (a control's) is answered with token 4. Each token's expiry, as GitHub gives it
 # when it issues it: $T_TMP/expiry-<n> (seconds from now, or "none"), else 50 minutes ahead.
 cleanup_stubs() {
-  local short="$T_TMP/github-throwaway-short.sh"
-  sed -e 's/^readonly CALL_SECS=20 /readonly CALL_SECS=1 /' -e 's/^readonly REVOKE_SECS=90 /readonly REVOKE_SECS=3 /' \
-    -e 's/^readonly CLEANUP_SECS=180 /readonly CLEANUP_SECS=6 /' -e 's/^readonly CONTROL_SECS=240 /readonly CONTROL_SECS=12 /' "$GT" >"$short"
-  # shellcheck source=tests/permissions/github-throwaway.sh
-  source "$short"
-  # The clean-up runs in each stopped run's own subshell; here, the exit trap sourcing installs
-  # would end a test that crashed with the clean-up's status, which can be 0 (a crash reported as
-  # a pass, round 74).
-  trap - EXIT
-  assert_eq "$CALL_SECS ${REVOKE_SECS:-none} $CLEANUP_SECS" "1 3 6" "the short budgets"
+  short_copy
   WORK="$T_TMP/work"
   [[ -d "$WORK" ]] || mkdir -m 700 "$WORK"
   : >"$T_TMP/calls"
@@ -4138,6 +4131,22 @@ cleanup_stubs() {
   }
 }
 
+# The script with only its budget lines changed, sourced: CALL_SECS 1, REVOKE_SECS 3, CLEANUP_SECS 6,
+# CONTROL_SECS 12 (round 74), PUSH_SECS 2 and CLONE_SECS 3 (round 75).
+short_copy() {
+  local short="$T_TMP/github-throwaway-short.sh"
+  sed -e 's/^readonly CALL_SECS=20 /readonly CALL_SECS=1 /' -e 's/^readonly REVOKE_SECS=90 /readonly REVOKE_SECS=3 /' \
+    -e 's/^readonly CLEANUP_SECS=180 /readonly CLEANUP_SECS=6 /' -e 's/^readonly CONTROL_SECS=240 /readonly CONTROL_SECS=12 /' \
+    -e 's/^readonly PUSH_SECS=60 /readonly PUSH_SECS=2 /' -e 's/^readonly CLONE_SECS=120 /readonly CLONE_SECS=3 /' "$GT" >"$short"
+  # shellcheck source=tests/permissions/github-throwaway.sh
+  source "$short"
+  # The clean-up runs in each stopped run's own subshell; here, the exit trap sourcing installs
+  # would end a test that crashed with the clean-up's status, which can be 0 (a crash reported as
+  # a pass, round 74).
+  trap - EXIT
+  assert_eq "$CALL_SECS ${REVOKE_SECS:-none} $CLEANUP_SECS" "1 3 6" "the short budgets"
+}
+
 cleanup_token() { printf 'gh%s_cleanup%s%s' s "$1" "$(printf 'Q%.0s' $(seq 1 30))"; }
 
 stub_meta() { # <n> — what GitHub said when it issued token n, without the token: its expiry
@@ -4156,6 +4165,10 @@ stopped_run_cleanup() { # <rc> <set-up> [after]
   start="$(date +%s)"
   # shellcheck disable=SC2030 # the stopped run's state belongs to its own subshell
   (
+    # The stop traps a real run has from the script's top level (round 75): a subshell starts with
+    # them reset, and bash's own handling of TERM then acts at once even inside a command
+    # substitution, which a real run never does.
+    if declare -F stop_traps >/dev/null; then stop_traps; fi
     eval "$2"
     TOKEN="$t1"
     OUTSTANDING=" $t1 $t2 $t3"
@@ -4317,7 +4330,9 @@ test_a_hanging_control_is_bounded_and_its_token_settled() {
   scope_cmd() { need_installation_scope; }
   loop_cmd() { request_token '{}'; while :; do with_timeout "$CALL_SECS" /bin/sleep 600; done; }
   stuck_cmd() { request_token '{}'; /bin/sleep 600; }
-  for case in "its installation read hangs|call installation/repositories|scope_cmd|0|CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3 control1-token4; NOT confirmed: none; nothing left undone|" \
+  # A request of the control's that hangs stops the run too, once the control has settled its token
+  # (round 75, C1).
+  for case in "its installation read hangs|call installation/repositories|scope_cmd|2|CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3 control1-token4; NOT confirmed: none; nothing left undone|STOPPED: app gh api GET installation/repositories got no answer within its 1s" \
     "its work outlasts its share||loop_cmd|0|CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3 control1-token4; NOT confirmed: none; nothing left undone|control1's work took longer than its share" \
     "it can't be told to stop||stuck_cmd|1|CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: control1 (no result);|control1 did not end in time and was stopped outright"; do
     IFS='|' read -r name hang cmd rc_want want note <<<"$case"
@@ -4571,6 +4586,159 @@ test_mint_checks_the_permissions_it_was_asked_for() {
   assert_exit 2 "$rc" "permissions other than asked"
   assert_eq "$MINT_ANSWER" "{\"expires_at\":\"2026-11-01T12:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repositories\":[\"$REPO\"],\"repository_selection\":\"selected\"}" "GitHub's answer without the token"
   end_stand_in_run
+}
+
+# Round 75 (C1): every GitHub request goes through owner_gh, app_gh, app_git or app_curl, each
+# bounded where it starts (an API call 20s, a push or fetch 60s, a clone 120s, a local git command
+# 20s), and none runs inside a command substitution or a pipeline or sleeps in the foreground (bash
+# holds a stop until those end), a2-probe's own code aside. tests/lib/request-scan.py reads the
+# script; a canary shows what it catches.
+test_no_request_bypasses_the_wrappers_or_holds_a_stop() {
+  local out want
+  out="$(python3 -I "$SCAN" "$GT")" || _t_fail "the scan did not run"
+  assert_eq "$(printf '%s\n' "$out" | grep -v '^functions:')" "" "a request outside the wrappers, or one that holds a stop"
+  assert_contains "$out" " verify_phase " "a function that makes requests through others"
+  # shellcheck disable=SC2016 # the canary is script text for the scan, never run
+  printf '%s\n' 'owner_gh() { :; }' 'reads() { owner_gh api x; }' 'a() { x="$(owner_gh api y)"; }' 'b() { reads | head -n 1; }' \
+    'c() { gh api z; }' 'd() { sleep 3; }' 'e() { y="$(reads)"; }' >"$T_TMP/canary.sh"
+  out="$(python3 -I "$SCAN" "$T_TMP/canary.sh")"
+  for want in "held 3:" "held 4:" "raw 5:" "sleep 6:" "held 7:"; do assert_contains "$out" "$want" "the canary"; done
+  load
+  assert_eq "$CALL_SECS ${PUSH_SECS:-none} ${CLONE_SECS:-none}" "20 60 120" "the stated limits"
+  if declare -F git_secs >/dev/null; then
+    assert_eq "$(git_secs -C d clone -q u d) $(git_secs -C d push origin HEAD) $(git_secs -C d fetch -q) $(git_secs -C d commit -q -m m)" "120 60 60 20" "app git's limit by what it does"
+  else
+    _t_fail "no git_secs: app git has no limit by what it does"
+  fi
+  # shellcheck disable=SC2016 # the literal source text is what's searched for
+  for want in 'owner_gh() { with_timeout "$(call_secs)" owner_gh_run "$@"; }' 'app_gh() { with_timeout "$(call_secs)" app_gh_run "$@"; }' \
+    'app_git() { with_timeout "$(git_secs "$@")" app_git_run "$@"; }' 'app_curl() { with_timeout $((CALL_SECS + 5)) curl "$@"; }'; do
+    grep -qxF -- "$want" <(sed 's/ *# .*$//' "$GT") || _t_fail "not bounded where it starts: $want"
+  done
+  end_stand_in_run
+}
+
+# Round 75 (C1): the real identities, with stand-in gh, git and curl on PATH. Each logs its call with
+# the time to $T_TMP/tools; one whose call contains the text in $T_TMP/hang-on never answers: it waits
+# on a child of its own, a sleep of <seconds>. Otherwise each answers at once: a revocation as done, a
+# read with a revoked token HTTP 401, mergeability MERGEABLE, anything else with nothing.
+request_tools() { # <seconds>
+  local t
+  mkdir -p "$T_TMP/bin" "$WORK/home" "$WORK/clone"
+  for t in gh git curl; do
+    cat >"$T_TMP/bin/$t" <<EOF
+#!/bin/bash
+printf '%s $t %s\n' "\$(date +%s)" "\$*" >>"\$T_TMP/tools"
+h="\$(cat "\$T_TMP/hang-on" 2>/dev/null)"
+if [[ -n "\$h" && "$t \$*" == *"\$h"* ]]; then /bin/sleep "\$(cat "\$T_TMP/child")" & wait; exit 1; fi
+EOF
+  done
+  cat >>"$T_TMP/bin/gh" <<'EOF'
+case "$*" in
+  "api -X DELETE installation/token") printf '%s\n' "$GH_TOKEN" >>"$T_TMP/revoked" ;;
+  "api repos/$FAKE_REPO --jq .full_name")
+    if grep -qxF -- "$GH_TOKEN" "$T_TMP/revoked" 2>/dev/null; then echo "gh: Bad credentials (HTTP 401)" >&2; exit 1; fi
+    echo "$FAKE_REPO" ;;
+  *"--jq .mergeable") echo MERGEABLE ;;
+esac
+EOF
+  chmod +x "$T_TMP/bin/gh" "$T_TMP/bin/git" "$T_TMP/bin/curl"
+  echo "$1" >"$T_TMP/child"
+  : >"$T_TMP/tools"
+  : >"$T_TMP/revoked"
+  : >"$T_TMP/hang-on"
+  export T_TMP FAKE_REPO="$REPO"
+  PATH="$T_TMP/bin:$PATH"
+}
+
+still_running() { pgrep -f "sleep $1\$" || true; } # <seconds> — a stand-in's child, by its sleep
+
+# Round 75 (C1): a request that never answers is stopped at its limit with every process under it;
+# the run starts no further test action and goes to its clean-up, which says why first. A write is
+# named there, its outcome unknown, and is never sent again (the merge, which a test expecting
+# "allowed" would otherwise try three times). One case for each kind of request.
+test_a_request_that_hangs_stops_at_its_limit_and_stops_the_run() {
+  local case name call hang limit kind child last
+  child=$(((RANDOM % 900 + 100) * 100)) # this run's own, so no other run's leftover is mistaken for it
+  for case in "an owner read, its output used|assert_throwaway|owner.login|CALL_SECS|read" \
+    "an app API write|capture app_gh api -X PATCH repos/\$REPO -f description=x|-X PATCH|CALL_SECS|write" \
+    "an app gh write|app_pr dev b1 B1|pr create|CALL_SECS|write" \
+    "a merge a test would retry|app_merge B16 5 --squash|pr merge|CALL_SECS|write" \
+    "an owner write in the run's own shell|owner_gh api -X PUT repos/\$REPO/contents/x -f message=m >/dev/null 2>&1|-X PUT|CALL_SECS|write" \
+    "a push|push_branch b1|push -q origin|PUSH_SECS|write" \
+    "a clone|app_git clone -q https://github.com/\$REPO.git \$WORK/c2| clone -q https:|CLONE_SECS|read" \
+    "a fetch|fresh_from dev b1|fetch -q --prune|PUSH_SECS|read" \
+    "a local git command|add_commit tests/x.txt hello|add -- tests/x.txt|CALL_SECS|read" \
+    "the app's own request|jwt_call GET app|api.github.com/app|CALL_SECS + 5|read"; do
+    IFS='|' read -r name call hang limit kind <<<"$case"
+    child=$((child + 1))
+    short_copy
+    WORK="$T_TMP/work"
+    request_tools "$child"
+    printf '%s\n' "$hang" >"$T_TMP/hang-on"
+    limit=$((limit))
+    stopped_run_cleanup 0 "PHASE=open CLONE=\$WORK/clone" "$call; echo NEXT TEST ACTION; owner_gh api next-action"
+    assert_exit 2 "$RC" "$name: the run's status (137: still running after 20s)"
+    ((SECS + 1 >= limit && SECS <= limit + 3)) || _t_fail "$name: ended after ${SECS}s, not at its ${limit}s limit"
+    assert_contains "$OUT" "got no answer within its ${limit}s" "$name"
+    assert_contains "$OUT" "the run starts no further test action" "$name"
+    assert_not_contains "$OUT" "NEXT TEST ACTION" "$name: a test action after the timeout"
+    assert_not_contains "$(cat "$T_TMP/tools")" "next-action" "$name: a request after the timeout"
+    assert_eq "$(grep -cF -- "$hang" "$T_TMP/tools")" 1 "$name: how often the request was sent"
+    assert_eq "$(still_running "$child")" "" "$name: a process the request started still runs"
+    last="$(printf '%s\n' "$OUT" | tail -n 1)"
+    if [[ "$kind" == write ]]; then
+      assert_contains "$OUT" "(a write: its outcome is unknown; it may have taken effect, and it is not tried again)" "$name"
+      assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; writes with outcome unknown (not retried, not reconciled: check them on GitHub):" "$name"
+      assert_contains "$last" "(no answer within ${limit}s);" "$name"
+    else
+      assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; nothing left undone" "$name"
+      assert_not_contains "$OUT" "outcome is unknown" "$name"
+    fi
+  done
+}
+
+# Round 75 (C1): a stop (TERM to the run alone) while any kind of request is out acts at once: the
+# request is stopped with every process under it, no further test action starts, and the clean-up's
+# first revocation comes within 2s; a write the stop cut short is named, its outcome unknown. With the
+# real limits (20s and more), so a stop held until the request ended would show.
+test_a_stop_during_any_request_reaches_the_clean_up_at_once() {
+  local case name call hang kind child first last
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  for case in "an owner read, its output used|assert_throwaway|owner.login|read" \
+    "a read in a function whose output is used|verify_phase open|branches/dev|read" \
+    "an app API write|capture app_gh api -X PATCH repos/\$REPO -f description=x|-X PATCH|write" \
+    "an owner write in the run's own shell|owner_gh api -X PUT repos/\$REPO/contents/x -f message=m >/dev/null 2>&1|-X PUT|write" \
+    "a push|push_branch b1|push -q origin|write" \
+    "a clone|app_git clone -q https://github.com/\$REPO.git \$WORK/c2| clone -q https:|read" \
+    "the app's own request|jwt_call GET app|api.github.com/app|read" \
+    "a wait between polls|nap \$child||read"; do
+    IFS='|' read -r name call hang kind <<<"$case"
+    child=$((child + 1))
+    load
+    end_stand_in_run
+    WORK="$T_TMP/work"
+    request_tools "$child"
+    printf '%s\n' "$hang" >"$T_TMP/hang-on"
+    # shellcheck disable=SC2016 # run inside the stopped run: $PPID there is the run itself
+    stopped_run_cleanup 0 "PHASE=open CLONE=\$WORK/clone" '/bin/sh -c "/bin/sleep 1; date +%s >$T_TMP/stop-at; kill -TERM \$PPID" & '"$call"'; echo "NEXT TEST ACTION"'
+    assert_exit 143 "$RC" "$name: the run's status (137: still running after 20s)"
+    ((SECS <= 4)) || _t_fail "$name: ended ${SECS}s after it began; the stop came at 1s"
+    assert_not_contains "$OUT" "NEXT TEST ACTION" "$name: a test action after the stop"
+    first="$(grep -m 1 'gh api -X DELETE installation/token' "$T_TMP/tools" | cut -d' ' -f1)"
+    if [[ -z "$first" ]] || (($(cat "$T_TMP/stop-at") + 2 < first)); then
+      _t_fail "$name: the clean-up's first revocation came at ${first:-never}, not within 2s of the stop at $(cat "$T_TMP/stop-at")"
+    fi
+    [[ -z "$hang" ]] || assert_eq "$(grep -cF -- "$hang" "$T_TMP/tools")" 1 "$name: how often the request was sent"
+    assert_eq "$(still_running "$child")" "" "$name: a process the request started still runs"
+    last="$(printf '%s\n' "$OUT" | tail -n 1)"
+    if [[ "$kind" == write ]]; then
+      assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; writes with outcome unknown (not retried, not reconciled: check them on GitHub):" "$name"
+      assert_contains "$last" "(cut short by the stop);" "$name"
+    else
+      assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; nothing left undone" "$name"
+    fi
+  done
 }
 
 run_tests
