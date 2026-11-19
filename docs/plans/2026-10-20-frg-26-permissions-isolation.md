@@ -544,11 +544,33 @@ timeout left undone itself, as the clean-up does. A
 stop during any request stops the request the same way, at once. A write that timed out, or that a
 stop cut short, may have taken effect: it is never sent again, and the clean-up's last line names
 it, outcome unknown, until someone checks it on GitHub; the clean-up is then INCOMPLETE. A token
-request still holds a stop until its answer is in (rounds 58, 59), at most 25 seconds. What reaches
+request still holds a stop until its answer is in (rounds 58, 59). What reaches
 a2-probe through the shared code: its requests are bounded at the wrappers too (the limits it
 already had); a stop during its revocations and its capture calls acts at once, while its reads in
 command substitutions still hold one up to 20 seconds, as before; a timeout doesn't stop it (its
 own handling stands), it notes no writes, and its own code and evidence are unchanged.
+
+**Token-request hold, accepted (owner, 2026-11-18, review round 76).** For the stage 1 commands
+only, **not the production broker**, a stop that comes while a token request is out is held until
+its answer is in: normally up to 20 seconds (curl's own limit), with a 25-second backstop if curl
+fails to stop. After the stop no new test action starts; the answer is handled, then the bounded
+clean-up runs. A token in the answer is registered, and its revocation is tried and checked. Not
+every issued token is received or revoked: a lost or incomplete answer is reported as a token
+possibly issued, never received, with the most it can carry (repository and permissions) and its
+latest expiry, and the clean-up is INCOMPLETE. A test shows each case. Two smaller points from the
+same round: the test runner runs each test with `set -e` off (a known limit, recorded in
+`tests/lib/assert.sh`; no test relies on it), and a test shows that an assertion's failure stands
+when a successful command follows it.
+
+**Tidy-up writes that time out (owner, 2026-11-18, round 77).** Closing a test issue or PR and
+cancelling an S2 run are bounded once, by the owner's request wrapper: the same 20 seconds, and less
+near the clean-up's cap. A timeout is named as a timeout ("no answer within" its limit), a stop as a
+stop ("cut short by the stop"), each with the repository and the issue, PR or run. It is never sent
+again. A read-back that shows the final state settles it, and the clean-up reports what it read (a
+PR closed or merged, a run no longer unfinished). Anything else stays outcome unknown in the
+clean-up's last line, which is then INCOMPLETE: an issue's close (not read back), a PR still open
+or unreadable, a run still unfinished or not listed again after its cancel. A test shows each case.
+a2-probe calls none of these tidy-ups, and its code and evidence are unchanged.
 
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.

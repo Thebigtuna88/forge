@@ -2,7 +2,8 @@
 # Tests for the test runner itself, tests/lib/assert.sh (FRG-26 round 75): a test that crashed, or
 # ended early or with another status through an exit or an exit trap, never counts as passing; a
 # test that expects a command to fail still passes. Each case is a small test file run with the
-# real runner.
+# real runner. Round 76 (C2): set -e is off inside a test (assert.sh), so an assertion's failure must
+# stand whatever succeeds after it.
 # shellcheck disable=SC2031 # each test sets and reads T_TMP inside its own subshell (assert.sh)
 # shellcheck source=tests/lib/assert.sh
 source "$(dirname "$0")/../lib/assert.sh"
@@ -24,7 +25,8 @@ test_a_crash_or_an_early_exit_never_counts_as_passing() {
     'crashed without a trap|set -u; echo "$NO_SUCH_VARIABLE_HERE"|crashed or exited before it returned (status 1)' \
     'an exit trap changed its status after it returned|trap "exit 5" EXIT; assert_eq 1 1|ended with status 5 after it returned 0 (an exit trap?)' \
     'returned non-zero|return 4|test_case returned non-zero' \
-    'an assertion failed|assert_eq 1 2 "one is not two"|one is not two: expected [2] got [1]'; do
+    'an assertion failed|assert_eq 1 2 "one is not two"|one is not two: expected [2] got [1]' \
+    'an assertion failed, then a command succeeded|assert_eq 1 2 "one is not two"; true|one is not two: expected [2] got [1]'; do
     IFS='|' read -r name body why <<<"$case"
     run_fixture "test_case() { $body; }"
     assert_contains "$OUT" "not ok fixture::test_case" "$name"

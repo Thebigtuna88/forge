@@ -35,6 +35,10 @@ assert_file_mode() { # <file> <octal mode>
 # early through an exit or an exit trap (even with status 0, as a sourced script's clean-up can),
 # never writes it, and an exit trap that changes the status afterwards is caught too (FRG-26 round
 # 75). A test that runs a command expecting it to fail is unaffected: only the test's own end counts.
+# Known limit (round 76, C2): the test runs on the left of ||, so set -e is off inside it and a
+# failing command that no assertion checks does not fail the test. A test fails through its
+# assertions (each failure is kept, whatever runs after it), a crash, an early exit or its status;
+# no test here relies on set -e.
 run_tests() {
   local file t rc failures=0 out res got
   file="$(basename "$0" .test.sh)"

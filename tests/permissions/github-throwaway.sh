@@ -132,8 +132,11 @@ CONTROL_END=""      # inside a control: when its own clean-up must have ended
 REQ_JOBS=""         # the requests (and waits) this shell has running, stopped whole by a stop
 # Set (local) while a tidy-up runs (sweep_prs, sweep_issues, cancel_waiting_runs): as in the
 # clean-up, its requests are bounded, and one with no answer in time is named as left undone by the
-# tidy-up itself (round 73, C2) rather than stopping the run (round 75).
+# tidy-up itself (round 73, C2) rather than stopping the run (round 75); a write among them is
+# named outcome unknown too unless a read-back settles it (round 77).
 TIDY_UP=""
+TIMED_OUT=""        # the limit (seconds) of the request with_timeout last stopped in this shell
+#                     for want of an answer; empty if it ended by itself or was never sent
 STOP_WHY=""         # why the run stopped, said first by the clean-up (a request that timed out)
 LAST_HTTP=""
 WORK=""
@@ -384,10 +387,20 @@ unknown_writes() {
   [[ -n "$WORK" && -d "$WORK" ]] || return 0
   {
     if [[ -f "$WORK/timed-out" ]]; then sed -n 's/^write //p' "$WORK/timed-out"; fi
+    if [[ -f "$WORK/unsettled" ]]; then cat "$WORK/unsettled"; fi
     for f in "$WORK"/out-write.*; do
       if [[ -f "$f" ]]; then printf '%s (cut short by the stop)\n' "$(cat "$f")"; fi
     done
   } | sort -u | while IFS= read -r f; do printf ' %s;' "$f"; done
+}
+
+# A tidy-up's write that got no answer in time and that no read-back settled (round 77): never sent
+# again blindly, and named in the clean-up's last line, its outcome unknown, so the clean-up is
+# INCOMPLETE. In the run's own shell or the clean-up, where a tidy-up's timeout doesn't stop the run.
+unsettled_write() { # <why> <runner> <args…> — the request, described by request_what
+  local why="$1"
+  shift
+  if [[ -n "$WORK" && -d "$WORK" ]]; then printf '%s (%s)\n' "$(request_what "$@")" "$why" >>"$WORK/unsettled"; fi
 }
 trap cleanup EXIT
 # Closing the Terminal, Ctrl-C or a kill also end through cleanup, with the usual status (round 51,
@@ -571,7 +584,7 @@ timeout_check() {
 # Who asked what, in a few words: gh api's method and path, another gh command's first words, git's
 # command and what follows it, curl's method and address. Never a token: none is an argument.
 request_what() { # <runner> <args…>
-  local who m="" a s="" n=0
+  local who m="" a s="" n=0 p="" r=""
   case "$1" in
     owner_gh | owner_gh_run) who="owner gh" ;;
     app_gh | app_gh_run) who="app gh" ;;
@@ -610,11 +623,15 @@ request_what() { # <runner> <args…>
       fi
       ;;
   esac
+  # The first four words, and the repository wherever it comes (round 77: "issue close 11 --repo"
+  # named no repository).
   for a in "$@"; do
     n=$((n + 1))
-    [[ $n -le 4 ]] || break
-    s="$s ${a:0:80}"
+    if [[ $n -le 4 ]]; then s="$s ${a:0:80}"; fi
+    if [[ "$p" == --repo ]]; then r="${a:0:80}"; fi
+    p="$a"
   done
+  if [[ -n "$r" && "$s" != *" --repo $r"* ]]; then s="${s% --repo} --repo $r"; fi
   printf '%s%s' "$who" "$s"
 }
 
@@ -802,8 +819,11 @@ need_app_identity() {
 # for the clocks): REQ_BY. It is recorded as pending before it is sent, so a signal while it is out
 # still reaches the clean-up's report (round 57, C1). Catchable signals are held from before it is
 # sent until a token its answer brings is registered (rounds 58, 59): a signal while it is out is
-# acted on once the answer is in hand (curl stops by CALL_SECS), so a token that arrived is always
-# registered (TOKEN, OUTSTANDING, MINTED, ISSUED, ISSUED_META) and then revoked and checked. A token
+# acted on once the answer is in hand, normally within curl's own CALL_SECS (20s), or CALL_SECS + 5
+# if curl fails to stop and app_curl's backstop ends it (an accepted limit for stage 1 commands only,
+# not the production broker: owner, 2026-11-18, round 76). A token in a whole answer is registered
+# (TOKEN, OUTSTANDING, MINTED, ISSUED, ISSUED_META) before the signal is acted on, so the clean-up
+# tries its revocation and checks it; one in a lost or cut answer can't be, and is reported. A token
 # is taken from the answer whatever happened to the transfer (round 56, C1), a whole quoted value
 # only, never a cut one. An answer without one that isn't a clear refusal (4xx) - a timeout, a broken
 # transfer, a 5xx, a 2xx without a readable token (round 57, C2) - may mean a token this run never
@@ -951,6 +971,7 @@ resume_signals() {
 with_timeout() { # <seconds> <command…>
   local secs="$1" pid w rc=0 mark out=""
   shift
+  TIMED_OUT=""
   timeout_check
   [[ "$secs" =~ ^[0-9]+$ && $secs -gt 0 ]] || return 124
   # A write is noted while it is out: one a stop cuts short is named by the clean-up, its outcome
@@ -988,6 +1009,7 @@ with_timeout() { # <seconds> <command…>
   if [[ -n "$out" ]]; then rm -f "$out"; fi
   if [[ -f "$mark" ]]; then
     rm -f "$mark"
+    TIMED_OUT="$secs"
     case "$1" in
       owner_gh | app_gh | app_git | owner_gh_run | app_gh_run | app_git_run | curl) request_timed_out "$secs" "$@" ;;
     esac
@@ -1873,14 +1895,22 @@ owner_approve() { # <pr>
 
 # A test PR left open could still merge (B11 arms auto-merge), so a PR not confirmed closed or
 # merged afterwards is a failure: the phase stops, and the owner is told which PR to close.
+# A close with no answer in time is settled only by that read-back (round 77): the state read is
+# reported; a PR not read closed or merged is named outcome unknown too. owner_gh bounds the close
+# itself, by the clean-up's cap too (call_secs): a second limit around it ended first and left the
+# close noted as cut short by a stop that never came.
 close_if_open() { # <pr> — tidy up after a refused attempt
-  local st
+  local st late=""
   into st pr_view "$1" state .state || st=""
   if [[ "$st" == OPEN ]] && in_time; then
-    with_timeout "$(call_secs)" owner_gh pr close "$1" --repo "$REPO" >/dev/null 2>&1 || true
+    owner_gh pr close "$1" --repo "$REPO" >/dev/null 2>&1 || late="$TIMED_OUT"
     into st pr_view "$1" state .state || st=""
   fi
-  if [[ "$st" == CLOSED || "$st" == MERGED ]]; then return 0; fi
+  if [[ "$st" == CLOSED || "$st" == MERGED ]]; then
+    [[ -z "$late" ]] || say "CLEANUP PR #$1 in $REPO: its close got no answer within ${late}s; read back: $st"
+    return 0
+  fi
+  [[ -z "$late" ]] || unsettled_write "no answer within ${late}s; read back: ${st:-unreadable}" owner_gh pr close "$1" --repo "$REPO"
   FAILS=$((FAILS + 1))
   undone "closing the open test PRs"; say "CLEANUP FAIL PR #$1 may still be open (state ${st:-unreadable}): close it on GitHub, in $REPO, before another phase"
   return 1
@@ -2508,7 +2538,17 @@ sweep_issues() {
         undone "closing the test issues"; say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before issue #$n was closed: close it, and any other \"FRG-26 \" test issue in $REPO, on GitHub"
         break
       fi
-      with_timeout "$(call_secs)" owner_gh issue close "$n" --repo "$REPO" >/dev/null 2>&1 || { FAILS=$((FAILS + 1)); undone "closing the test issues"; say "CLEANUP FAIL issue #$n in $REPO may still be open"; }
+      # Bounded by owner_gh alone, as in close_if_open (round 77). Not read back: a close with no
+      # answer in time is named outcome unknown, never sent again.
+      owner_gh issue close "$n" --repo "$REPO" >/dev/null 2>&1 && continue
+      FAILS=$((FAILS + 1))
+      undone "closing the test issues"
+      if [[ -n "$TIMED_OUT" ]]; then
+        unsettled_write "no answer within ${TIMED_OUT}s; not read back" owner_gh issue close "$n" --repo "$REPO"
+        say "CLEANUP FAIL issue #$n in $REPO: its close got no answer within ${TIMED_OUT}s, so its outcome is unknown (not tried again): check it on GitHub"
+      else
+        say "CLEANUP FAIL issue #$n in $REPO may still be open"
+      fi
     done
   fi
   if ! in_time; then
@@ -3143,13 +3183,43 @@ unfinished_runs() {
     --jq '.workflow_runs[] | select(.name == "frg26-s2" and .status != "completed") | .id' 2>/dev/null
 }
 
+# The S2 cancels that got no answer in time (round 77) are cancel_waiting_runs' LATE, each
+# id:seconds:read, settled only by a list of unfinished runs read after the cancel. runs_reread, with
+# each list read: a run no longer on it is reported so, and dropped; one still on it is marked read.
+runs_reread() { # <the list>
+  local e id keep=""
+  for e in $LATE; do
+    id="${e%%:*}"
+    if [[ " $(printf '%s' "$1" | tr '\n' ' ') " == *" $id "* ]]; then
+      keep="$keep ${e%:*}:read"
+    else
+      e="${e#*:}"
+      say "CLEANUP S2 run $id in $REPO: its cancel got no answer within ${e%:*}s; read back: no longer unfinished"
+    fi
+  done
+  LATE="$keep"
+}
+
+# runs_unsettled, when cancel_waiting_runs ends: each cancel still in LATE is named outcome unknown.
+runs_unsettled() {
+  local e id why
+  for e in $LATE; do
+    id="${e%%:*}"
+    why="not read back"
+    [[ "$e" != *:read ]] || why="read back: still unfinished"
+    e="${e#*:}"
+    unsettled_write "no answer within ${e%:*}s; $why" owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel"
+  done
+  LATE=""
+}
+
 # Every unfinished S2 run GitHub shows is cancelled, and confirmed finished (rounds 14, 22, 25); then
 # the clean-up fails if a run may still be missing: a commit env-tests made whose run never showed
 # within a minute (round 23), or a workflow commit whose sha is unknown (round 24). The visible runs
 # are always dealt with first, whatever else failed (round 25, SEC-1). Each call bounded, and no
 # wait or poll runs past the clean-up's cap (round 72, SEC-1). 1 on any failure.
 cancel_waiting_runs() {
-  local ids id _ sha seen unseen="" ok="" rc runs TIDY_UP=1
+  local ids id _ sha seen unseen="" ok="" rc runs TIDY_UP=1 LATE=""
   for sha in $S2_SHAS; do
     seen=""
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
@@ -3162,23 +3232,32 @@ cancel_waiting_runs() {
   done
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
     if ! in_time; then
+      runs_unsettled
       undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before the S2 runs in $REPO were cancelled: cancel any unfinished S2 run on GitHub (Actions)"
       return 1
     fi
     rc=0
     into ids unfinished_runs || rc=$?
     if [[ $rc -ne 0 ]]; then
+      runs_unsettled
       undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL could not list the unfinished S2 runs in $REPO$(no_answer $rc): cancel any on GitHub (Actions)"
       return 1
     fi
+    runs_reread "$ids"
     if [[ -z "$ids" ]]; then ok=1; break; fi
     for id in $ids; do
-      if [[ ! "$id" =~ ^[0-9]+$ ]]; then undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL unexpected run id in $REPO: cancel any unfinished S2 run on GitHub"; return 1; fi
+      if [[ ! "$id" =~ ^[0-9]+$ ]]; then runs_unsettled; undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL unexpected run id in $REPO: cancel any unfinished S2 run on GitHub"; return 1; fi
       in_time || break
-      with_timeout "$(call_secs)" owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
+      # Bounded by owner_gh alone, as in close_if_open (round 77). A cancel with no answer in time
+      # is never sent again: it waits in LATE for the lists that follow to settle it.
+      [[ " $LATE " != *" $id:"* ]] || continue
+      if ! owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 && [[ -n "$TIMED_OUT" ]]; then
+        LATE="$LATE $id:$TIMED_OUT:sent"
+      fi
     done
     pause 5
   done
+  runs_unsettled
   if [[ -z "$ok" ]]; then
     undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL S2 runs still unfinished in $REPO ($(printf '%s' "$ids" | tr '\n' ' ')): cancel them on GitHub (Actions)"
     return 1

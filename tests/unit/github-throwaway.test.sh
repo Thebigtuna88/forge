@@ -4640,6 +4640,16 @@ case "$*" in
     if grep -qxF -- "$GH_TOKEN" "$T_TMP/revoked" 2>/dev/null; then echo "gh: Bad credentials (HTTP 401)" >&2; exit 1; fi
     echo "$FAKE_REPO" ;;
   *"--jq .mergeable") echo MERGEABLE ;;
+  # A tidy-up's lists and read-backs (round 77), from files a test writes: the open issues and PRs,
+  # a PR's state (OPEN at the first read, then pr-state), the S2 runs of a commit, and the
+  # unfinished ones (runs-1 at the first list, then runs-2).
+  *"repos/$FAKE_REPO/issues?state=open"*) cat "$T_TMP/open-issues" 2>/dev/null ;;
+  *"repos/$FAKE_REPO/pulls?state=open"*) cat "$T_TMP/open-prs" 2>/dev/null ;;
+  "pr view "*"--json state --jq .state")
+    if [[ -f "$T_TMP/pr-viewed" ]]; then cat "$T_TMP/pr-state"; else : >"$T_TMP/pr-viewed"; echo OPEN; fi ;;
+  *"actions/runs?head_sha="*) [[ ! -f "$T_TMP/runs-1" ]] || echo 1 ;;
+  *"actions/runs?per_page=100"*)
+    if [[ -f "$T_TMP/runs-listed" ]]; then cat "$T_TMP/runs-2" 2>/dev/null; else : >"$T_TMP/runs-listed"; cat "$T_TMP/runs-1" 2>/dev/null; fi ;;
 esac
 EOF
   chmod +x "$T_TMP/bin/gh" "$T_TMP/bin/git" "$T_TMP/bin/curl"
@@ -4647,6 +4657,7 @@ EOF
   : >"$T_TMP/tools"
   : >"$T_TMP/revoked"
   : >"$T_TMP/hang-on"
+  rm -f "$T_TMP/open-issues" "$T_TMP/open-prs" "$T_TMP/pr-viewed" "$T_TMP/pr-state" "$T_TMP/runs-1" "$T_TMP/runs-2" "$T_TMP/runs-listed"
   export T_TMP FAKE_REPO="$REPO"
   PATH="$T_TMP/bin:$PATH"
 }
@@ -4712,7 +4723,8 @@ test_a_stop_during_any_request_reaches_the_clean_up_at_once() {
     "a push|push_branch b1|push -q origin|write" \
     "a clone|app_git clone -q https://github.com/\$REPO.git \$WORK/c2| clone -q https:|read" \
     "the app's own request|jwt_call GET app|api.github.com/app|read" \
-    "a wait between polls|nap \$child||read"; do
+    "a wait between polls|nap \$child||read" \
+    "a tidy-up's issue close (round 77)|echo 11 >\$T_TMP/open-issues; RUN_ID=r1; sweep_issues|issue close 11 |write"; do
     IFS='|' read -r name call hang kind <<<"$case"
     child=$((child + 1))
     load
@@ -4735,8 +4747,118 @@ test_a_stop_during_any_request_reaches_the_clean_up_at_once() {
     if [[ "$kind" == write ]]; then
       assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; writes with outcome unknown (not retried, not reconciled: check them on GitHub):" "$name"
       assert_contains "$last" "(cut short by the stop);" "$name"
+      assert_not_contains "$last" "(no answer within" "$name: a stop named as a timeout"
     else
       assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; nothing left undone" "$name"
+    fi
+    # Round 77: the write named with its repository and object.
+    [[ "$hang" != "issue close 11 " ]] || assert_contains "$last" " owner gh issue close 11 --repo $REPO (cut short by the stop);" "$name"
+  done
+}
+
+# Round 76 (C1, SEC-1), an accepted limit for stage 1 commands only, not the production broker
+# (owner, 2026-11-18): a stop while a token request is out waits for its answer, at most curl's own
+# CALL_SECS, or CALL_SECS + 5 if curl fails to stop (app_curl's backstop; the real limits, 20 and 25
+# seconds, are checked above). Then no test action starts and the clean-up runs. A token in the
+# answer is registered and its revocation tried and checked; an answer without one is reported as a
+# token possibly issued, with the most it can carry and its latest expiry, and the clean-up is
+# INCOMPLETE.
+test_a_stop_during_a_token_request_waits_only_for_its_answer() {
+  local case name mode rc_want max want child t4
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  for case in "curl ends at its own limit|limit|143|CALL_SECS|possibly issued, never received: token4" \
+    "curl fails to stop|hang|2|CALL_SECS + 5|possibly issued, never received: token4" \
+    "the answer brings a token|token|143|CALL_SECS|CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3 token4;"; do
+    IFS='|' read -r name mode rc_want max want <<<"$case"
+    child=$((child + 1))
+    short_copy
+    WORK="$T_TMP/work"
+    request_tools "$child"
+    max=$((max))
+    t4="$(cleanup_token 4)"
+    # The stand-in curl: honours --max-time (ends with curl's own timeout, status 28), never
+    # answers, or answers after a second with a token.
+    cat >"$T_TMP/bin/curl" <<EOF
+#!/bin/bash
+printf '%s curl %s\n' "\$(date +%s)" "\$*" >>"\$T_TMP/tools"
+case "$mode" in
+  limit) while [[ \$# -gt 0 && "\$1" != --max-time ]]; do shift; done; /bin/sleep "\$2"; exit 28 ;;
+  hang) /bin/sleep "$child" & wait; exit 1 ;;
+  token) /bin/sleep 1; printf '{"token":"%s","expires_at":"%s","repository_selection":"selected","permissions":%s,"repositories":[{"full_name":"%s"}]}\nHTTP 201' "$t4" "\$(date -u -v+50M +%Y-%m-%dT%H:%M:%SZ)" '$WANT_PERMS' "$REPO" ;;
+esac
+EOF
+    chmod +x "$T_TMP/bin/curl"
+    # shellcheck disable=SC2016 # run inside the stopped run: $PPID there is the run itself
+    stopped_run_cleanup 0 "INSTALLATION_ID=77; : >\$WORK/jwt.hdr" '/bin/sh -c "/bin/sleep 0.3; date +%s >$T_TMP/stop-at; kill -TERM \$PPID" & mint_token; echo "NEXT TEST ACTION"'
+    assert_exit "$rc_want" "$RC" "$name: the run's status (137: still running after 20s)"
+    ((SECS <= max + 3)) || _t_fail "$name: ${SECS}s, over the hold's ${max}s and the clean-up's few"
+    assert_not_contains "$OUT" "NEXT TEST ACTION" "$name: a test action after the stop"
+    assert_eq "$(grep -c 'curl ' "$T_TMP/tools")" 1 "$name: token requests sent"
+    assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "$want" "$name"
+    if [[ "$mode" != token ]]; then
+      assert_contains "$OUT" "TOKEN token4 possibly issued, never received" "$name"
+      assert_contains "$OUT" "it carries at most: repositories forge-frg26-throwaway; permissions $WANT_PERMS" "$name"
+      assert_contains "$OUT" "at the latest" "$name: its latest expiry"
+      assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "CLEANUP INCOMPLETE" "$name"
+    else
+      assert_contains "$OUT" "TOKEN token4 revoked: a read with it now gets HTTP 401" "$name"
+    fi
+    assert_eq "$(still_running "$child")" "" "$name: a process the request started still runs"
+  done
+}
+
+# Rounds 76 (C3) and 77: a tidy-up's write that gets no answer in time (closing a test issue or PR,
+# cancelling an S2 run) is stopped at its one limit with every process under it, never sent again,
+# and doesn't stop the run. A read-back that shows the final state settles it, and is reported; any
+# other is named in the last line with its repository and object, its outcome unknown, as a timeout
+# (not a stop), and the clean-up is INCOMPLETE. The last case runs in the clean-up itself, to its cap.
+test_a_tidy_up_write_that_times_out_is_settled_or_its_outcome_unknown() {
+  local case name prep setup call hang exit_rc rc_want child last unknown undo said sha
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  sha="$(printf 'e%.0s' $(seq 1 40))"
+  for case in "an issue close, not read back%echo 11 >\$T_TMP/open-issues; echo 12 >>\$T_TMP/open-issues%RUN_ID=r1%sweep_issues%issue close 11 %0%1" \
+    "a PR close, read back closed%echo 5 >\$T_TMP/open-prs; echo CLOSED >\$T_TMP/pr-state%%sweep_prs%pr close 5 %0%0" \
+    "a PR close, read back open%echo 5 >\$T_TMP/open-prs; echo OPEN >\$T_TMP/pr-state%%sweep_prs || true%pr close 5 %0%1" \
+    "an S2 cancel, read back finished%echo 9001 >\$T_TMP/runs-1; : >\$T_TMP/runs-2%S2_SHAS=$sha%cancel_waiting_runs%runs/9001/cancel%0%0" \
+    "an S2 cancel in the clean-up, still unfinished at its cap%echo 9001 >\$T_TMP/runs-1; echo 9001 >\$T_TMP/runs-2%CANCEL_ON_EXIT=1 S2_SHAS=$sha%%runs/9001/cancel%1%1"; do
+    IFS='%' read -r name prep setup call hang exit_rc rc_want <<<"$case"
+    child=$((child + 1))
+    short_copy
+    WORK="$T_TMP/work"
+    request_tools "$child"
+    eval "$prep"
+    printf '%s\n' "$hang" >"$T_TMP/hang-on"
+    stopped_run_cleanup "$exit_rc" "$setup" "${call:+$call; echo NEXT STEP}"
+    assert_exit "$rc_want" "$RC" "$name: the run's status (137: still running after 20s)"
+    ((SECS <= CLEANUP_SECS + 3)) || _t_fail "$name: ended after ${SECS}s; the write's limit is 1s, the clean-up's cap ${CLEANUP_SECS}s"
+    assert_eq "$(grep -cF -- "$hang" "$T_TMP/tools")" 1 "$name: how often the write was sent"
+    assert_eq "$(still_running "$child")" "" "$name: a process the write started still runs"
+    assert_not_contains "$OUT" "the run starts no further test action" "$name: a tidy-up's timeout stopped the run"
+    [[ -z "$call" ]] || assert_contains "$OUT" "NEXT STEP" "$name: a tidy-up's timeout stopped the run"
+    assert_not_contains "$OUT" "cut short by the stop" "$name: a timeout named as a stop"
+    unknown="" undo="" said=""
+    case "$name" in
+      "an issue close"*)
+        unknown="owner gh issue close 11 --repo $REPO (no answer within 1s; not read back)" undo="closing the test issues"
+        said="CLEANUP FAIL issue #11 in $REPO: its close got no answer within 1s, so its outcome is unknown (not tried again): check it on GitHub"
+        assert_eq "$(grep -c 'gh issue close 12 ' "$T_TMP/tools")" 1 "$name: the next issue's close"
+        assert_not_contains "$OUT" "issue #12 in" "$name: the next issue" ;;
+      *"read back closed") said="CLEANUP PR #5 in $REPO: its close got no answer within 1s; read back: CLOSED" ;;
+      *"read back open")
+        unknown="owner gh pr close 5 --repo $REPO (no answer within 1s; read back: OPEN)" undo="closing the open test PRs"
+        said="CLEANUP FAIL PR #5 may still be open (state OPEN)" ;;
+      *"read back finished") said="CLEANUP S2 run 9001 in $REPO: its cancel got no answer within 1s; read back: no longer unfinished" ;;
+      *)
+        unknown="owner gh api POST repos/$REPO/actions/runs/9001/cancel (no answer within 1s; read back: still unfinished)" undo="cancelling the waiting S2 runs"
+        said="CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before the S2 runs in $REPO were cancelled" ;;
+    esac
+    assert_contains "$OUT" "$said" "$name"
+    last="$(printf '%s\n' "$OUT" | tail -n 1)"
+    if [[ -n "$unknown" ]]; then
+      assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; writes with outcome unknown (not retried, not reconciled: check them on GitHub): $unknown; not done: $undo (CLEANUP FAIL above);" "$name"
+    else
+      assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; nothing left undone" "$name"
+      assert_not_contains "$OUT" "outcome is unknown" "$name"
     fi
   done
 }
