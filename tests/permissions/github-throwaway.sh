@@ -3274,8 +3274,12 @@ cancel_waiting_runs() {
 }
 
 # S2b: the app's push to main starts a run; the app tries to approve its own deployment. Control:
-# the owner approves the same run, and the job then reports the dummy value's length.
+# the owner approves the same run, and the job then reports the dummy value's length. GitHub's state
+# is also read around the owner's approval (S2d's criterion 6, owner 2026-11-20): it must show the
+# change an approval makes, so that S2d's "unchanged" means something. S2B_READINGS says whether it
+# did; S2b's own verdict doesn't depend on it.
 t_S2b() {
+  S2B_READINGS=""
   fresh_from main "s2b-$(stamp)"
   add_commit "tests/permissions-S2b-$(stamp).txt" "FRG-26 S2b"
   # Recorded before the push: GitHub may accept it, and start its run, even if the push reports a
@@ -3294,35 +3298,264 @@ t_S2b() {
   EV="the app approving its own run: $(evidence) |"
   if [[ "$OBS" != refused ]]; then record_p S2b "$OBS" "not run" "$EV"; cancel_waiting_runs || true; return; fi
   CTL=failed
-  local can logv=""
+  local can logv="" before dep
   into can can_approve "$id"
+  s2_reading "S2B before" "$id" "$sha"
+  s2_pending_check "$id" "$sha" "$APP_BOT" "$eid" true
+  before="$S2_WHY" dep="$S2R_DEP"
   if [[ "$can" == true ]] && approve_run owner_gh "$id" "$eid" && wait_run "$sha" completed && into logv run_log_value "$id" && [[ "$logv" == yes ]]; then CTL=ok; fi
   EV="$EV GitHub says the owner can approve it: $can; owner approving: $(evidence), run $RUN"
+  s2_reading "S2B after" "$id" "$sha" "$dep"
+  s2_approved_check "$id" "$sha" "$APP_BOT" "$eid" "$dep"
+  if [[ -z "$before" && -z "$S2_WHY" && -n "$dep" ]]; then
+    S2B_READINGS=ok
+  else
+    S2B_READINGS="before the owner's approval: ${before:-bound}; after it: ${S2_WHY:-the approval shows}"
+  fi
+  s2_say "S2B readings: $S2B_READINGS"
   S2B_OWNER_APPROVAL="$CTL"
   record_p S2b "$OBS" "$CTL" "$EV"
 }
 
-# S2d: the run the owner's own workflow commit started (env-tests' first step): the owner's own
-# approval is refused, because Prevent self-review is on. Control: the very same request, by the
-# same owner, on the app's run in S2b, was accepted.
+# S2's readings (rounds 78 and 79, owner 2026-11-20). On 2026-11-20 GitHub answered the owner's
+# approval of their own run with HTTP 422 "No pending deployment requests to approve or reject", which
+# fits both "pending, but not the owner's to review" and "nothing pending", and gh's error line named
+# no HTTP status. So GitHub's own state of a run is read around each owner approval, bound to the run,
+# its commit, the Environment and the one deployment GitHub made for them, and S2d's attempt keeps
+# GitHub's status line (gh api -i), not gh's wording. Each read is said in full, redacted.
+S2R_RUN=""       # "id status sha actor event branch workflow", or error
+S2R_PENDING=""   # "count environment-id environment-name can-approve reviewers", or error
+S2R_DEPS=""      # "count id sha environment" of the deployments for the commit and Environment, or error
+S2R_DEP=""       # the deployment whose statuses were read: the one wanted, or the first found
+S2R_STATES=""    # its status states, newest first, or error
+S2R_APPROVALS="" # "count state:login:environment-ids …", or error
+S2_J=""          # the JSON of the read s2_json made last
+S2_WHY=""        # what a check found that doesn't match, "; "-separated; empty when all of it does
+
+# Any text shaped like a GitHub token or a JWT hidden, not only this run's tokens: a GitHub answer is
+# said whole here, and its words can reach S2d's result.
+s2_redact() { # <text>
+  printf '%s' "$1" | sed -E 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_.-]+/[REDACTED]/g; s/eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/[REDACTED]/g'
+}
+
+s2_say() { say "$(s2_redact "$1")"; }
+
+s2_why() { S2_WHY="${S2_WHY:+$S2_WHY; }$1"; }
+
+s2_want() { # <what> <read> <wanted>
+  [[ "$2" == "$3" ]] || s2_why "$1 '$2', not '$3'"
+}
+
+s2_json() { # <label> <what> <path> — one read as the owner, its JSON said in full and kept in S2_J
+  local j
+  S2_J=""
+  into j owner_gh api "repos/$REPO/$3" 2>/dev/null || return 1
+  jq -e . >/dev/null 2>&1 <<<"$j" || return 1
+  S2_J="$j"
+  s2_say "$1 $2: $(jq -c . <<<"$j")"
+}
+
+# One reading of a run, its pending deployments, the deployments for its commit and the Environment
+# (and the statuses of the one wanted, or of the first found), and its approvals. Reads only.
+s2_reading() { # <label> <run id> <sha> [<deployment wanted>]
+  local r d
+  S2R_RUN=error S2R_PENDING=error S2R_DEPS=error S2R_DEP="" S2R_STATES="" S2R_APPROVALS=error
+  if into r owner_gh api "repos/$REPO/actions/runs/$2" --jq '"\(.id) \(.status) \(.head_sha) \(.actor.login) \(.event) \(.head_branch) \(.name)"' 2>/dev/null; then
+    S2R_RUN="$r"
+    s2_say "$1 run: $r"
+  fi
+  if s2_json "$1" pending_deployments "actions/runs/$2/pending_deployments"; then
+    S2R_PENDING="$(jq -r '"\(length) \(.[0].environment.id) \(.[0].environment.name) \(.[0].current_user_can_approve) \([.[0].reviewers[]? | "\(.type):\(.reviewer.login)"] | join(","))"' <<<"$S2_J")"
+  fi
+  if s2_json "$1" deployments "deployments?sha=$3&environment=$ENV_NAME&per_page=100"; then
+    S2R_DEPS="$(jq -r '"\(length) \(.[0].id) \(.[0].sha) \(.[0].environment)"' <<<"$S2_J")"
+    d="$(jq -r '.[0].id // empty' <<<"$S2_J")"
+    [[ "$d" =~ ^[0-9]+$ ]] || d=""
+    if [[ -n "$d" && ( -z "${4:-}" || "$d" == "$4" ) ]]; then
+      S2R_DEP="$d" S2R_STATES=error
+      if s2_json "$1" "deployment $d statuses" "deployments/$d/statuses?per_page=100"; then
+        S2R_STATES="$(jq -r '[.[].state] | join(",")' <<<"$S2_J")"
+      fi
+    fi
+  fi
+  if s2_json "$1" approvals "actions/runs/$2/approvals"; then
+    S2R_APPROVALS="$(jq -r 'if type == "array" then "\(length) \([.[] | "\(.state):\(.user.login):\([.environments[]?.id] | join(","))"] | join(" "))" else "not a list" end' <<<"$S2_J")"
+  fi
+}
+
+s2_read_ok() { # <what> <its reading> — false, and S2_WHY says so, when that read failed
+  [[ "$2" != error ]] || { s2_why "the $1 read failed"; return 1; }
+}
+
+# The run still waits, untouched: on <sha>, pushed by <actor> to main; exactly one deployment pending,
+# for this Environment, the owner its only reviewer, current_user_can_approve as given; exactly one
+# deployment for the commit and Environment (the one found before, when given), its statuses showing
+# it neither started nor ended; no approval recorded. Sets S2_WHY.
+s2_pending_check() { # <run id> <sha> <actor> <Environment id> <true|false> [<deployment>]
+  local re=',(in_progress|success|failure|error|inactive),'
+  S2_WHY=""
+  if s2_read_ok run "$S2R_RUN"; then s2_want run "$S2R_RUN" "$1 waiting $2 $3 push main frg26-s2"; fi
+  if s2_read_ok pending_deployments "$S2R_PENDING"; then s2_want "pending deployments" "$S2R_PENDING" "1 $4 $ENV_NAME $5 User:$OWNER"; fi
+  if s2_read_ok deployments "$S2R_DEPS"; then s2_want deployments "$S2R_DEPS" "1 ${6:-$S2R_DEP} $2 $ENV_NAME"; fi
+  if [[ -n "$S2R_DEP" ]] && s2_read_ok "deployment $S2R_DEP statuses" "$S2R_STATES"; then
+    [[ ! ",$S2R_STATES," =~ $re ]] || s2_why "deployment $S2R_DEP states $S2R_STATES: it started or ended"
+  fi
+  if s2_read_ok approvals "$S2R_APPROVALS"; then s2_want approvals "$S2R_APPROVALS" "0 "; fi
+}
+
+# After the owner's approval of <run id>: the same run, commit and deployment; nothing pending any
+# more; an approval by the owner recorded for this Environment; the deployment's statuses showing it
+# started. Sets S2_WHY.
+s2_approved_check() { # <run id> <sha> <actor> <Environment id> <deployment>
+  local parts
+  S2_WHY=""
+  if s2_read_ok run "$S2R_RUN"; then
+    read -r -a parts <<<"$S2R_RUN"
+    s2_want run "${parts[0]:-} ${parts[2]:-} ${parts[3]:-} ${parts[4]:-} ${parts[5]:-} ${parts[6]:-}" "$1 $2 $3 push main frg26-s2"
+  fi
+  if s2_read_ok pending_deployments "$S2R_PENDING"; then s2_want "pending deployments" "$S2R_PENDING" "0 null null null "; fi
+  if s2_read_ok deployments "$S2R_DEPS"; then s2_want deployments "$S2R_DEPS" "1 $5 $2 $ENV_NAME"; fi
+  if [[ -n "$5" && "$S2R_DEP" == "$5" ]] && s2_read_ok "deployment $5 statuses" "$S2R_STATES"; then
+    [[ ",$S2R_STATES," == *,in_progress,* || ",$S2R_STATES," == *,success,* ]] || s2_why "deployment $5 states '$S2R_STATES': no sign it started"
+  fi
+  if s2_read_ok approvals "$S2R_APPROVALS"; then
+    [[ " ${S2R_APPROVALS#* } " == *" approved:$OWNER:$4 "* ]] || s2_why "approvals '$S2R_APPROVALS': no approval by $OWNER for Environment $4"
+  fi
+}
+
+S2D_HTTP=""       # GitHub's status for S2d's attempt, or unknown
+S2D_RC=""         # gh's exit status for it
+S2D_REQUEST_ID="" # its x-github-request-id: correlation only (the HTTPS connection says who answered)
+S2D_REMAINING=""  # its x-ratelimit-remaining
+S2D_RETRY=""      # set when it carried a retry-after header (a rate-limit sign; the value isn't kept)
+S2D_BODY=""       # its body, compact JSON or the raw text
+S2D_ERRORS=""     # the body's errors, as text
+S2D_ERR=""        # gh's error output
+S2D_MISSING=""    # which of the criteria for a refusal didn't hold, "; "-separated
+
+s2d_post() { # <run id> <Environment id> — the attempt, its error output kept apart
+  owner_gh api -i -X POST "repos/$REPO/actions/runs/$1/pending_deployments" \
+    -F "environment_ids[]=$2" -f state=approved -f comment="FRG-26 S2d approval attempt" 2>"$WORK/s2d.err"
+}
+
+# The owner's approval of the run's deployment. Said: GitHub's status line, the headers
+# x-github-request-id, x-ratelimit-remaining and x-ratelimit-resource (no other header is kept; a
+# retry-after header is only noted), the whole body and gh's error output. An answer without a
+# status line, or cut before its body, is HTTP unknown.
+s2d_approve() { # <run id> <Environment id>
+  local out line name value kept="" body="" head=1 re='^HTTP/[0-9.]+ ([0-9]{3})( |$)'
+  S2D_RC=0 S2D_HTTP=unknown S2D_REQUEST_ID="" S2D_REMAINING="" S2D_RETRY="" S2D_ERRORS=""
+  : >"$WORK/s2d.err"
+  into out s2d_post "$1" "$2" || S2D_RC=$?
+  S2D_ERR="$(tr '\r\n' '  ' <"$WORK/s2d.err")"
+  line="${out%%$'\n'*}"
+  line="${line%$'\r'}"
+  if [[ "$line" =~ $re && "$out" == *$'\n'* ]]; then
+    S2D_HTTP="${BASH_REMATCH[1]}"
+    while IFS= read -r line; do
+      line="${line%$'\r'}"
+      if [[ -n "$head" ]]; then
+        if [[ -z "$line" ]]; then head=""; continue; fi
+        name="$(printf '%s' "${line%%:*}" | tr '[:upper:]' '[:lower:]')"
+        value="${line#*:}"
+        value="${value# }"
+        case "$name" in
+          x-github-request-id) S2D_REQUEST_ID="$value"; kept="$kept; $name: $value" ;;
+          x-ratelimit-remaining) S2D_REMAINING="$value"; kept="$kept; $name: $value" ;;
+          x-ratelimit-resource) kept="$kept; $name: $value" ;;
+          retry-after) S2D_RETRY=1 ;;
+        esac
+      else
+        body="$body$line"$'\n'
+      fi
+    done <<<"${out#*$'\n'}"
+    if [[ -n "$head" ]]; then S2D_HTTP=unknown S2D_REQUEST_ID="" S2D_REMAINING="" S2D_RETRY=""; fi
+  else
+    body="$out"
+  fi
+  if jq -e . >/dev/null 2>&1 <<<"$body"; then
+    S2D_BODY="$(jq -c . <<<"$body")"
+    S2D_ERRORS="$(jq -r 'if type == "object" then (.errors | if type == "string" then . elif type == "array" then map(if type == "string" then . else (.message // tostring) end) | join("; ") else "" end) else "" end' <<<"$body")"
+  else
+    S2D_BODY="$(printf '%s' "$body" | tr '\r\n' '  ')"
+  fi
+  s2_say "S2D approval: HTTP $S2D_HTTP (exit $S2D_RC); headers kept: ${kept#; }; body: $S2D_BODY; error output: $S2D_ERR${S2D_RETRY:+; a retry-after header (not kept)}"
+}
+
+s2d_miss() { S2D_MISSING="${S2D_MISSING:+$S2D_MISSING; }$1"; }
+
+# A rate limit is told apart from a refusal on its own signs, not by the quota alone (a secondary rate
+# limit can come with quota left): a 429, a 403, a retry-after header, a quota of 0, or GitHub's
+# rate-limit words in the answer.
+s2d_rate_limit() { # prints the signs found, nothing when there are none
+  local s=""
+  [[ "$S2D_HTTP" != 429 && "$S2D_HTTP" != 403 ]] || s="$s HTTP $S2D_HTTP;"
+  [[ -z "$S2D_RETRY" ]] || s="$s a retry-after header;"
+  [[ "$S2D_REMAINING" != 0 ]] || s="$s x-ratelimit-remaining 0;"
+  if printf '%s %s' "$S2D_BODY" "$S2D_ERR" | grep -Eiq 'rate limit|abuse detection|secondary rate'; then s="$s rate-limit words;"; fi
+  printf '%s' "${s# }"
+}
+
+# The criteria for a refusal (owner, 2026-11-20): the reading before bound (checked by t_S2d before
+# any attempt); HTTP 422 with an x-github-request-id; the errors exactly GitHub's words of 2026-11-20;
+# no rate-limit sign and quota left; the reading after bound to the same deployment; S2b's control and
+# S2b's readings (criterion 6). The words support the reading; they don't prove the refusal's cause.
+s2d_criteria() { # sets S2D_MISSING
+  local limit
+  S2D_MISSING=""
+  [[ "$S2D_HTTP" == 422 ]] || s2d_miss "HTTP $S2D_HTTP, not 422"
+  [[ -n "$S2D_REQUEST_ID" ]] || s2d_miss "no x-github-request-id"
+  [[ "$S2D_ERRORS" == "No pending deployment requests to approve or reject" ]] || s2d_miss "errors '$S2D_ERRORS', not GitHub's words of 2026-11-20"
+  limit="$(s2d_rate_limit)"
+  [[ -z "$limit" ]] || s2d_miss "rate-limit signs: $limit"
+  [[ "$S2D_REMAINING" =~ ^[0-9]+$ && "$S2D_REMAINING" -gt 0 ]] || s2d_miss "x-ratelimit-remaining '$S2D_REMAINING', not above 0"
+  [[ -z "$S2_WHY" ]] || s2d_miss "after it: $S2_WHY"
+  [[ "$S2B_OWNER_APPROVAL" == ok ]] || s2d_miss "S2b's control was not ok"
+  [[ "$S2B_READINGS" == ok ]] || s2d_miss "S2b's readings don't show an approval taking effect (${S2B_READINGS:-not read})"
+}
+
+# S2d: the run the owner's own workflow commit started (env-tests' first step): the owner tries to
+# approve it, which Prevent self-review should refuse. Control: the very same request, by the same
+# owner, on the app's run in S2b, was accepted. No approval is sent unless the reading before it is
+# bound in every part. Allowed when GitHub accepted the approval (exit 0 or a 2xx), recorded one, or
+# the deployment started. Refused only when every criterion holds (s2d_criteria), and then only
+# "refused in this tested configuration": no general guarantee. Anything else: inconclusive.
 t_S2d() {
-  local eid id
+  local eid id dep after
   into eid env_id || eid=""
   [[ "$eid" =~ ^[0-9]+$ ]] || { setup_fail_p S2d "could not read the Environment"; return; }
   wait_run "$S2_OWNER_SHA" waiting || { setup_fail_p S2d "the owner's run never waited for review ($RUN)"; return; }
   id="${RUN%% *}"
-  # Refused needs all three (round 13, C2/SEC-2): GitHub says the owner can't approve this run, GitHub
-  # itself refused the approval (a 4xx, not a network error or a rate limit), and it still waits.
-  local can
-  into can can_approve "$id"
-  approve_run owner_gh "$id" "$eid" || true
+  [[ "$id" =~ ^[0-9]+$ ]] || { setup_fail_p S2d "unexpected run id ($RUN)"; return; }
   OBS=inconclusive
-  if [[ $LAST_RC -eq 0 ]]; then OBS=allowed
-  elif [[ "$can" == false ]] && github_refused && wait_run "$S2_OWNER_SHA" waiting; then OBS=refused
+  s2_reading "S2D before" "$id" "$S2_OWNER_SHA"
+  s2_pending_check "$id" "$S2_OWNER_SHA" "$OWNER" "$eid" false
+  if [[ -n "$S2_WHY" ]]; then
+    s2_say "S2D before: NOT bound: $S2_WHY"
+    EV="inconclusive: no approval sent, GitHub's state before the attempt is not bound ($S2_WHY)"
+  else
+    dep="$S2R_DEP"
+    s2_say "S2D before: bound: run $id, commit $S2_OWNER_SHA, Environment $ENV_NAME ($eid), deployment $dep"
+    s2d_approve "$id" "$eid"
+    s2_reading "S2D after" "$id" "$S2_OWNER_SHA" "$dep"
+    s2_pending_check "$id" "$S2_OWNER_SHA" "$OWNER" "$eid" false "$dep"
+    after="bound: the same run, commit, Environment and deployment, still pending, no approval"
+    [[ -z "$S2_WHY" ]] || after="NOT bound: $S2_WHY"
+    s2_say "S2D after: $after"
+    s2d_criteria
+    if [[ $S2D_RC -eq 0 || "$S2D_HTTP" == 2?? || "${S2R_APPROVALS%% *}" =~ ^[1-9][0-9]*$ || ",$S2R_STATES," == *,in_progress,* || ",$S2R_STATES," == *,success,* ]]; then
+      OBS=allowed
+      EV="allowed: GitHub answered HTTP $S2D_HTTP (exit $S2D_RC); after it: $after"
+    elif [[ -z "$S2D_MISSING" ]]; then
+      OBS=refused
+      EV="self-approval refused in this tested configuration (Environment $ENV_NAME, Prevent self-review on, $OWNER its only reviewer): HTTP 422, errors \"$S2D_ERRORS\", request $S2D_REQUEST_ID; deployment $dep pending before and after, no approval recorded; S2b's control ok and its readings show an approval taking effect. GitHub's words support this; they don't prove the refusal's cause"
+    else
+      EV="inconclusive: $S2D_MISSING"
+    fi
   fi
-  EV="GitHub says the owner can approve it: $can; the owner approving the owner's own run: $(evidence)"
+  EV="$(s2_redact "$EV (S2D lines above; control: the owner's approval of the app's run in S2b)")"
   owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null 2>&1 || true
-  record_p S2d "$OBS" "${S2B_OWNER_APPROVAL:-failed}" "$EV (control: the owner's approval of the app's run in S2b)"
+  record_p S2d "$OBS" "${S2B_OWNER_APPROVAL:-failed}" "$EV"
 }
 
 # S2a: a feature branch's run may not deploy (only main may): it never waits for review and its
@@ -3393,6 +3626,7 @@ S2_OWNER_SHA=""
 S2_SHAS="" # every commit env-tests made that starts an S2 run (round 22, C2)
 S2_UNKNOWN="" # set while the owner's workflow commit may have happened but its sha isn't known
 S2B_OWNER_APPROVAL=""
+S2B_READINGS="" # ok when S2b's readings show its owner approval taking effect (S2d's criterion 6)
 
 cmd_env_tests() {
   need_owner

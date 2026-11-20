@@ -260,11 +260,10 @@ couldn't be revoked while suspended is read again after unsuspending, then revok
     its secrets' public key, and delete a disposable dummy secret made for this test: refused.
     Control: your token makes the very same three requests and they succeed; the Environment then
     reads unchanged (review round 15);
-  - S2d: a run you start yourself: your own approval is refused (shows Prevent self-review is
-    really on). Refused needs all of: GitHub says you can't approve it (`current_user_can_approve`
-    false), GitHub itself answered the approval with a 4xx (not a network error or a rate limit),
-    and the run still waits. Control: your same request on the app's run in S2b worked. The run is
-    then cancelled.
+  - S2d: a run you start yourself: your own approval should be refused, in this tested
+    configuration (Prevent self-review on, you the only reviewer). It passes only when every
+    criterion you approved holds (rounds 78-79, below). Control: your same request on the app's run
+    in S2b worked, and S2b's readings show that approval taking effect. The run is then cancelled.
   The workflow file and the Environment are added by your handoff (the app can't). Actions on a
   public repo: $0, "standard GitHub-hosted runners is free … In public repositories" (Confirmed,
   docs).
@@ -571,6 +570,40 @@ PR closed or merged, a run no longer unfinished). Anything else stays outcome un
 clean-up's last line, which is then INCOMPLETE: an issue's close (not read back), a PR still open
 or unreadable, a run still unfinished or not listed again after its cancel. A test shows each case.
 a2-probe calls none of these tidy-ups, and its code and evidence are unchanged.
+
+**S2d's evidence (owner, 2026-11-20, round 78).** Part 0's run on 2026-11-20 stopped at S2d,
+inconclusive: GitHub said you can't approve your own run, then answered the approval with HTTP 422
+"No pending deployment requests to approve or reject", whose gh error line names no HTTP status.
+That answer fits both "pending, but not yours to review" and "nothing pending", so it is never proof
+of a refusal on its own, and that run's result stays inconclusive. S2d now reads GitHub's own state
+before the attempt and again after it, each reading bound to the run (waiting, on your workflow
+commit, pushed by you to main), the Environment (exactly one pending deployment for it, you its only
+reviewer, GitHub saying you can't approve it), the one deployment GitHub made for that commit and
+Environment (its id the same after as before, its statuses showing it neither started nor ended),
+and no approval recorded. No approval is sent unless the reading before is bound in every part. The
+attempt keeps GitHub's own status line, the whole body, gh's error output and only the headers
+x-github-request-id, x-ratelimit-remaining and x-ratelimit-resource; every reading is recorded in
+full, with this run's tokens and anything shaped like a GitHub token or a JWT hidden. Allowed (a
+FAIL) when GitHub accepted the approval, recorded one, or the deployment started. Tests show a
+missing or changed pending state, unexpected answers and an incomplete read-back, none of them a
+pass. Whether a deployment waiting for review shows a deployment and its status before approval is
+Unconfirmed (the docs don't say); if not, the reading before is not bound, no approval is sent, and
+S2d stays inconclusive: the criteria are not weakened to fit.
+
+**S2d's criteria for a refusal (owner, 2026-11-20, round 79).** S2d passes, as "self-approval
+refused in this tested configuration" and never as a general guarantee, only when all of these hold:
+(1) the reading before is bound in every part; (2) GitHub's status line is 422, with an
+x-github-request-id (correlation only: the authenticated HTTPS connection is what says GitHub
+answered); (3) the body's errors are exactly "No pending deployment requests to approve or reject";
+(4) no sign of a rate limit, told apart on its own signs (a 429 or 403, a retry-after header, which
+is noted but not kept, a quota of 0, or GitHub's rate-limit words), and quota left above 0; (5) the
+reading after is bound to the same deployment, still pending, no approval recorded; (6) S2b's
+control is ok and S2b's readings around your approval of the app's run show it taking effect: the
+same run, commit and deployment, nothing pending afterwards, your approval recorded for the
+Environment, and the deployment started. The 422 and its words are supporting evidence, not proof of
+the refusal's cause. Anything short of all six is inconclusive, and names what was missing; S2b's
+own verdict doesn't depend on its readings. Tests show each criterion missing, and missing or
+ineffective S2b evidence, none of them a pass.
 
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.
