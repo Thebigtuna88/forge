@@ -3317,23 +3317,33 @@ t_S2b() {
   record_p S2b "$OBS" "$CTL" "$EV"
 }
 
-# S2's readings (rounds 78 and 79, owner 2026-11-20). On 2026-11-20 GitHub answered the owner's
-# approval of their own run with HTTP 422 "No pending deployment requests to approve or reject", which
-# fits both "pending, but not the owner's to review" and "nothing pending", and gh's error line named
-# no HTTP status. So GitHub's own state of a run is read around each owner approval, bound to the run,
-# its commit, the Environment and the one deployment GitHub made for them, and S2d's attempt keeps
-# GitHub's status line (gh api -i), not gh's wording. Each read is said in full, redacted.
+# S2's readings (rounds 78-80, owner 2026-11-20). On 2026-11-20 GitHub answered the owner's approval
+# of their own run with HTTP 422 "No pending deployment requests to approve or reject", which fits both
+# "pending, but not the owner's to review" and "nothing pending", and gh's error line named no HTTP
+# status. So GitHub's own state of a run is read around each owner approval, bound to the run, its
+# commit, the Environment and the one deployment GitHub made for them, and S2d's attempt keeps
+# GitHub's status line (gh api -i), not gh's wording. Only the fields the checks need are kept, each
+# as a value of a known form or a known word, else "[other]" (round 80, SEC-1): payloads,
+# descriptions, comments, messages and links can hold any text, a credential included.
 S2R_RUN=""       # "id status sha actor event branch workflow", or error
 S2R_PENDING=""   # "count environment-id environment-name can-approve reviewers", or error
 S2R_DEPS=""      # "count id sha environment" of the deployments for the commit and Environment, or error
 S2R_DEP=""       # the deployment whose statuses were read: the one wanted, or the first found
 S2R_STATES=""    # its status states, newest first, or error
 S2R_APPROVALS="" # "count state:login:environment-ids …", or error
-S2_J=""          # the JSON of the read s2_json made last
+S2_J=""          # the JSON of the read s2_json made last (never said)
 S2_WHY=""        # what a check found that doesn't match, "; "-separated; empty when all of it does
 
-# Any text shaped like a GitHub token or a JWT hidden, not only this run's tokens: a GitHub answer is
-# said whole here, and its words can reach S2d's result.
+# jq's helpers for the kept fields: num, sha, word (lowercase), login, and is(<the one word wanted>).
+# null stays "null"; anything else not of the form is "[other]".
+# shellcheck disable=SC2016 # jq's own $variables
+readonly S2_JQ='def form(re): if . == null then "null" else (tostring) as $v | if ($v | test(re)) then $v else "[other]" end end;
+def num: form("^[0-9]{1,20}$"); def sha: form("^[0-9a-f]{40}$"); def word: form("^[a-z_]{1,40}$");
+def login: form("^[A-Za-z0-9-]{1,39}(\\[bot\\])?$"); def bool: form("^(true|false)$");
+def is($w): if . == null then "null" elif . == $w then $w else "[other]" end;'
+
+# Any text shaped like a GitHub token or a JWT hidden, not only this run's tokens: a second guard,
+# behind keeping only fields of a known form.
 s2_redact() { # <text>
   printf '%s' "$1" | sed -E 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_.-]+/[REDACTED]/g; s/eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/[REDACTED]/g'
 }
@@ -3346,40 +3356,50 @@ s2_want() { # <what> <read> <wanted>
   [[ "$2" == "$3" ]] || s2_why "$1 '$2', not '$3'"
 }
 
-s2_json() { # <label> <what> <path> — one read as the owner, its JSON said in full and kept in S2_J
+s2_json() { # <path> — one read as the owner, its JSON kept in S2_J (not said)
   local j
   S2_J=""
-  into j owner_gh api "repos/$REPO/$3" 2>/dev/null || return 1
+  into j owner_gh api "repos/$REPO/$1" 2>/dev/null || return 1
   jq -e . >/dev/null 2>&1 <<<"$j" || return 1
   S2_J="$j"
-  s2_say "$1 $2: $(jq -c . <<<"$j")"
+}
+
+s2_fields() { # <jq filter> — the kept fields of S2_J
+  jq -r --arg env "$ENV_NAME" "$S2_JQ $1" <<<"$S2_J"
 }
 
 # One reading of a run, its pending deployments, the deployments for its commit and the Environment
-# (and the statuses of the one wanted, or of the first found), and its approvals. Reads only.
+# (and the statuses of the one wanted, or of the first found), and its approvals. Reads only; says
+# the kept fields of each.
 s2_reading() { # <label> <run id> <sha> [<deployment wanted>]
-  local r d
+  local d
   S2R_RUN=error S2R_PENDING=error S2R_DEPS=error S2R_DEP="" S2R_STATES="" S2R_APPROVALS=error
-  if into r owner_gh api "repos/$REPO/actions/runs/$2" --jq '"\(.id) \(.status) \(.head_sha) \(.actor.login) \(.event) \(.head_branch) \(.name)"' 2>/dev/null; then
-    S2R_RUN="$r"
-    s2_say "$1 run: $r"
+  if s2_json "actions/runs/$2"; then
+    S2R_RUN="$(s2_fields '"\(.id | num) \(.status | word) \(.head_sha | sha) \(.actor.login | login) \(.event | word) \(.head_branch | is("main")) \(.name | is("frg26-s2"))"')"
+    s2_say "$1 run: $S2R_RUN"
   fi
-  if s2_json "$1" pending_deployments "actions/runs/$2/pending_deployments"; then
-    S2R_PENDING="$(jq -r '"\(length) \(.[0].environment.id) \(.[0].environment.name) \(.[0].current_user_can_approve) \([.[0].reviewers[]? | "\(.type):\(.reviewer.login)"] | join(","))"' <<<"$S2_J")"
+  if s2_json "actions/runs/$2/pending_deployments"; then
+    # shellcheck disable=SC2016 # jq's own $env
+    S2R_PENDING="$(s2_fields '"\(length) \(.[0].environment.id | num) \(.[0].environment.name | is($env)) \(.[0].current_user_can_approve | bool) \([.[0].reviewers[]? | "\(.type | form("^[A-Za-z]{1,20}$")):\(.reviewer.login | login)"] | join(","))"')"
+    s2_say "$1 pending_deployments: $S2R_PENDING"
   fi
-  if s2_json "$1" deployments "deployments?sha=$3&environment=$ENV_NAME&per_page=100"; then
-    S2R_DEPS="$(jq -r '"\(length) \(.[0].id) \(.[0].sha) \(.[0].environment)"' <<<"$S2_J")"
-    d="$(jq -r '.[0].id // empty' <<<"$S2_J")"
+  if s2_json "deployments?sha=$3&environment=$ENV_NAME&per_page=100"; then
+    # shellcheck disable=SC2016 # jq's own $env
+    S2R_DEPS="$(s2_fields '"\(length) \(.[0].id | num) \(.[0].sha | sha) \(.[0].environment | is($env))"')"
+    s2_say "$1 deployments: $S2R_DEPS"
+    d="$(s2_fields '.[0].id | num')"
     [[ "$d" =~ ^[0-9]+$ ]] || d=""
     if [[ -n "$d" && ( -z "${4:-}" || "$d" == "$4" ) ]]; then
       S2R_DEP="$d" S2R_STATES=error
-      if s2_json "$1" "deployment $d statuses" "deployments/$d/statuses?per_page=100"; then
-        S2R_STATES="$(jq -r '[.[].state] | join(",")' <<<"$S2_J")"
+      if s2_json "deployments/$d/statuses?per_page=100"; then
+        S2R_STATES="$(s2_fields '[.[].state | word] | join(",")')"
+        s2_say "$1 deployment $d statuses: $S2R_STATES"
       fi
     fi
   fi
-  if s2_json "$1" approvals "actions/runs/$2/approvals"; then
-    S2R_APPROVALS="$(jq -r 'if type == "array" then "\(length) \([.[] | "\(.state):\(.user.login):\([.environments[]?.id] | join(","))"] | join(" "))" else "not a list" end' <<<"$S2_J")"
+  if s2_json "actions/runs/$2/approvals"; then
+    S2R_APPROVALS="$(s2_fields 'if type == "array" then "\(length) \([.[] | "\(.state | word):\(.user.login | login):\([.environments[]?.id | num] | join(","))"] | join(" "))" else "not a list" end')"
+    s2_say "$1 approvals: $S2R_APPROVALS"
   fi
 }
 
@@ -3423,92 +3443,144 @@ s2_approved_check() { # <run id> <sha> <actor> <Environment id> <deployment>
   fi
 }
 
+readonly S2D_WORDS="No pending deployment requests to approve or reject" # GitHub's, 2026-11-20
 S2D_HTTP=""       # GitHub's status for S2d's attempt, or unknown
 S2D_RC=""         # gh's exit status for it
-S2D_REQUEST_ID="" # its x-github-request-id: correlation only (the HTTPS connection says who answered)
+S2D_REQUEST_ID="" # its x-github-request-id (of its known form): correlation only; the authenticated
+#                   HTTPS connection is what says GitHub answered
 S2D_REMAINING=""  # its x-ratelimit-remaining
+S2D_RESOURCE=""   # its x-ratelimit-resource
 S2D_RETRY=""      # set when it carried a retry-after header (a rate-limit sign; the value isn't kept)
-S2D_BODY=""       # its body, compact JSON or the raw text
-S2D_ERRORS=""     # the body's errors, as text
-S2D_ERR=""        # gh's error output
+S2D_ANSWER=""     # what the body is, in known words and values only (never its text)
+S2D_ERRORS=""     # the body's errors as text: compared, never said
+S2D_GH_LINE=""    # whether gh's error line repeats GitHub's words: repeats | other | none
+S2D_LIMIT=""      # the rate-limit signs found, "; "-separated
+S2D_INCOMPLETE="" # why the answer isn't shown complete; empty when it is
 S2D_MISSING=""    # which of the criteria for a refusal didn't hold, "; "-separated
 
-s2d_post() { # <run id> <Environment id> — the attempt, its error output kept apart
-  owner_gh api -i -X POST "repos/$REPO/actions/runs/$1/pending_deployments" \
-    -F "environment_ids[]=$2" -f state=approved -f comment="FRG-26 S2d approval attempt" 2>"$WORK/s2d.err"
+# The attempt. Identity encoding is asked for, so the body arrives as GitHub sent it and its length can
+# be checked against Content-Length (round 80, C1): Go's client, which gh uses, drops Content-Length
+# when it decompresses an answer itself. Its output and error output go to files, read whole.
+s2d_post() { # <run id> <Environment id>
+  owner_gh api -i -X POST "repos/$REPO/actions/runs/$1/pending_deployments" -H "Accept-Encoding: identity" \
+    -F "environment_ids[]=$2" -f state=approved -f comment="FRG-26 S2d approval attempt" >"$WORK/s2d.out" 2>"$WORK/s2d.err"
 }
 
-# The owner's approval of the run's deployment. Said: GitHub's status line, the headers
-# x-github-request-id, x-ratelimit-remaining and x-ratelimit-resource (no other header is kept; a
-# retry-after header is only noted), the whole body and gh's error output. An answer without a
-# status line, or cut before its body, is HTTP unknown.
+# The owner's approval of the run's deployment. Kept: GitHub's status, gh's exit status, the request id,
+# x-ratelimit-remaining and x-ratelimit-resource (each of its known form), the body's kind and known
+# words, whether gh's error line repeats GitHub's words, and whether the answer is shown complete.
+# Never kept: the body's text, gh's error text, any other header.
 s2d_approve() { # <run id> <Environment id>
-  local out line name value kept="" body="" head=1 re='^HTTP/[0-9.]+ ([0-9]{3})( |$)'
-  S2D_RC=0 S2D_HTTP=unknown S2D_REQUEST_ID="" S2D_REMAINING="" S2D_RETRY="" S2D_ERRORS=""
+  # shellcheck disable=SC2034 # ignored: into's output, empty (the request writes its own files)
+  local LC_ALL=C raw first line name value head=1 offset=0 body="" length="" coding="" err ignored=""
+  local re='^HTTP/[0-9.]+ ([0-9]{3})( |$)'
+  S2D_RC=0 S2D_HTTP=unknown S2D_REQUEST_ID="" S2D_REMAINING="" S2D_RESOURCE="" S2D_RETRY="" S2D_ERRORS="" S2D_INCOMPLETE=""
+  : >"$WORK/s2d.out"
   : >"$WORK/s2d.err"
-  into out s2d_post "$1" "$2" || S2D_RC=$?
-  S2D_ERR="$(tr '\r\n' '  ' <"$WORK/s2d.err")"
-  line="${out%%$'\n'*}"
-  line="${line%$'\r'}"
-  if [[ "$line" =~ $re && "$out" == *$'\n'* ]]; then
+  into ignored s2d_post "$1" "$2" || S2D_RC=$?
+  raw="$(cat "$WORK/s2d.out"; printf x)"
+  raw="${raw%x}"
+  err="$(cat "$WORK/s2d.err")"
+  first="${raw%%$'\n'*}"
+  line="${first%$'\r'}"
+  if [[ "$line" =~ $re && "$raw" == *$'\n'* ]]; then
     S2D_HTTP="${BASH_REMATCH[1]}"
+    offset=$((${#first} + 1))
     while IFS= read -r line; do
+      offset=$((offset + ${#line} + 1))
       line="${line%$'\r'}"
-      if [[ -n "$head" ]]; then
-        if [[ -z "$line" ]]; then head=""; continue; fi
-        name="$(printf '%s' "${line%%:*}" | tr '[:upper:]' '[:lower:]')"
-        value="${line#*:}"
-        value="${value# }"
-        case "$name" in
-          x-github-request-id) S2D_REQUEST_ID="$value"; kept="$kept; $name: $value" ;;
-          x-ratelimit-remaining) S2D_REMAINING="$value"; kept="$kept; $name: $value" ;;
-          x-ratelimit-resource) kept="$kept; $name: $value" ;;
-          retry-after) S2D_RETRY=1 ;;
-        esac
-      else
-        body="$body$line"$'\n'
-      fi
-    done <<<"${out#*$'\n'}"
-    if [[ -n "$head" ]]; then S2D_HTTP=unknown S2D_REQUEST_ID="" S2D_REMAINING="" S2D_RETRY=""; fi
+      if [[ -z "$line" ]]; then head=""; break; fi
+      name="$(printf '%s' "${line%%:*}" | tr '[:upper:]' '[:lower:]')"
+      value="${line#*:}"
+      value="${value# }"
+      case "$name" in
+        x-github-request-id)
+          [[ "$value" =~ ^[A-Fa-f0-9:]{1,80}$ ]] || value="[other]"
+          S2D_REQUEST_ID="$value"
+          ;;
+        x-ratelimit-remaining)
+          [[ "$value" =~ ^[0-9]{1,10}$ ]] || value="[other]"
+          S2D_REMAINING="$value"
+          ;;
+        x-ratelimit-resource)
+          [[ "$value" =~ ^[a-z_]{1,40}$ ]] || value="[other]"
+          S2D_RESOURCE="$value"
+          ;;
+        retry-after) S2D_RETRY=1 ;;
+        content-length) if [[ -z "$length" && "$value" =~ ^[0-9]{1,12}$ ]]; then length="$value"; else length=bad; fi ;;
+        content-encoding) [[ "$value" == identity ]] || coding=1 ;;
+        transfer-encoding) coding=1 ;;
+      esac
+    done < <(printf '%s' "${raw#*$'\n'}")
+    if [[ -n "$head" ]]; then
+      S2D_HTTP=unknown S2D_REQUEST_ID="" S2D_REMAINING="" S2D_RETRY=""
+      S2D_INCOMPLETE="cut before the end of its headers"
+    else
+      body="${raw:$offset}"
+    fi
   else
-    body="$out"
+    body="$raw"
+    S2D_INCOMPLETE="no HTTP status line"
+  fi
+  # Complete only when GitHub's own length says so; gh's exit status and words only support it.
+  if [[ -z "$S2D_INCOMPLETE" ]]; then
+    if [[ -s "$WORK/timed-out" ]]; then S2D_INCOMPLETE="a request timed out"
+    elif [[ "$S2D_RC" != 0 && "$S2D_RC" != 1 ]]; then S2D_INCOMPLETE="gh exit status $S2D_RC"
+    elif [[ -n "$coding" ]]; then S2D_INCOMPLETE="a content or transfer encoding: the length can't be checked"
+    elif [[ -z "$length" ]]; then S2D_INCOMPLETE="no Content-Length: completion can't be told"
+    elif [[ "$length" == bad ]]; then S2D_INCOMPLETE="a Content-Length not of its form, or more than one"
+    elif [[ "${#body}" != "$length" ]]; then S2D_INCOMPLETE="the body is ${#body} bytes, Content-Length $length"
+    fi
   fi
   if jq -e . >/dev/null 2>&1 <<<"$body"; then
-    S2D_BODY="$(jq -c . <<<"$body")"
-    S2D_ERRORS="$(jq -r 'if type == "object" then (.errors | if type == "string" then . elif type == "array" then map(if type == "string" then . else (.message // tostring) end) | join("; ") else "" end) else "" end' <<<"$body")"
+    S2D_ANSWER="$(jq -r --arg words "$S2D_WORDS" '
+      def msg: . as $m | if $m == null then "none" elif ($m | type) != "string" then "[other]"
+        elif ([ "Validation Failed", "Not Found", "Forbidden", "Server Error", "Bad credentials",
+                "Resource not accessible by integration" ] | any(. == $m)) then $m
+        elif ($m | test("^API rate limit exceeded")) then "API rate limit exceeded"
+        elif ($m | test("secondary rate limit"; "i")) then "secondary rate limit" else "[other]" end;
+      if type == "object" then
+        (.message | msg) as $mc
+        | "error, message \($mc), errors \(if .errors == null then "none" elif .errors == $words then "GitHub'"'"'s words of 2026-11-20" else "other text (not kept)" end)"
+      elif type == "array" then "a list of \(length), ids \([.[] | .id? | select(type == "number") | tostring] | join(",") | if . == "" then "none" else . end)"
+      else "JSON of another kind (not kept)" end' <<<"$body" 2>/dev/null)" || S2D_ANSWER="[other]"
+    S2D_ERRORS="$(jq -r 'if type == "object" then (.errors | if type == "string" then . elif type == "array" then map(if type == "string" then . else (.message // tostring) end) | join("; ") else "" end) else "" end' <<<"$body" 2>/dev/null)" || S2D_ERRORS=""
+  elif [[ -z "$body" ]]; then
+    S2D_ANSWER="empty"
   else
-    S2D_BODY="$(printf '%s' "$body" | tr '\r\n' '  ')"
+    S2D_ANSWER="not JSON (not kept)"
   fi
-  s2_say "S2D approval: HTTP $S2D_HTTP (exit $S2D_RC); headers kept: ${kept#; }; body: $S2D_BODY; error output: $S2D_ERR${S2D_RETRY:+; a retry-after header (not kept)}"
+  if [[ -z "$err" ]]; then S2D_GH_LINE=none
+  elif [[ "$err" == *"$S2D_WORDS"* ]]; then S2D_GH_LINE=repeats
+  else S2D_GH_LINE=other
+  fi
+  S2D_LIMIT=""
+  [[ "$S2D_HTTP" != 429 && "$S2D_HTTP" != 403 ]] || S2D_LIMIT="$S2D_LIMIT HTTP $S2D_HTTP;"
+  [[ -z "$S2D_RETRY" ]] || S2D_LIMIT="$S2D_LIMIT a retry-after header;"
+  [[ "$S2D_REMAINING" != 0 ]] || S2D_LIMIT="$S2D_LIMIT x-ratelimit-remaining 0;"
+  if printf '%s %s' "$body" "$err" | grep -Eiq 'rate limit|abuse detection|secondary rate'; then S2D_LIMIT="$S2D_LIMIT rate-limit words;"; fi
+  S2D_LIMIT="${S2D_LIMIT# }"
+  s2_say "S2D approval: HTTP $S2D_HTTP (exit $S2D_RC); request id ${S2D_REQUEST_ID:-none}; x-ratelimit-remaining ${S2D_REMAINING:-none}; x-ratelimit-resource ${S2D_RESOURCE:-none}; answer: $S2D_ANSWER; completion: ${S2D_INCOMPLETE:-Content-Length $length matches the body}; gh's error line: $S2D_GH_LINE${S2D_RETRY:+; a retry-after header (not kept)}"
 }
 
 s2d_miss() { S2D_MISSING="${S2D_MISSING:+$S2D_MISSING; }$1"; }
 
-# A rate limit is told apart from a refusal on its own signs, not by the quota alone (a secondary rate
-# limit can come with quota left): a 429, a 403, a retry-after header, a quota of 0, or GitHub's
-# rate-limit words in the answer.
-s2d_rate_limit() { # prints the signs found, nothing when there are none
-  local s=""
-  [[ "$S2D_HTTP" != 429 && "$S2D_HTTP" != 403 ]] || s="$s HTTP $S2D_HTTP;"
-  [[ -z "$S2D_RETRY" ]] || s="$s a retry-after header;"
-  [[ "$S2D_REMAINING" != 0 ]] || s="$s x-ratelimit-remaining 0;"
-  if printf '%s %s' "$S2D_BODY" "$S2D_ERR" | grep -Eiq 'rate limit|abuse detection|secondary rate'; then s="$s rate-limit words;"; fi
-  printf '%s' "${s# }"
-}
-
 # The criteria for a refusal (owner, 2026-11-20): the reading before bound (checked by t_S2d before
-# any attempt); HTTP 422 with an x-github-request-id; the errors exactly GitHub's words of 2026-11-20;
-# no rate-limit sign and quota left; the reading after bound to the same deployment; S2b's control and
-# S2b's readings (criterion 6). The words support the reading; they don't prove the refusal's cause.
+# any attempt); an answer shown complete (round 80: GitHub's Content-Length, no encoding, no timeout;
+# gh's exit status 1 and its error line repeating GitHub's words only support it); HTTP 422 with a
+# request id; the errors exactly GitHub's words of 2026-11-20; no rate-limit sign and quota left; the
+# reading after bound to the same deployment; S2b's control and readings (criterion 6). The words
+# support the reading; they don't prove the refusal's cause.
 s2d_criteria() { # sets S2D_MISSING
-  local limit
   S2D_MISSING=""
+  [[ -z "$S2D_INCOMPLETE" ]] || s2d_miss "the answer is not shown complete ($S2D_INCOMPLETE)"
+  [[ "$S2D_RC" == 1 ]] || s2d_miss "gh's exit status $S2D_RC, not 1"
+  [[ "$S2D_GH_LINE" == repeats ]] || s2d_miss "gh's error line doesn't repeat GitHub's words ($S2D_GH_LINE)"
   [[ "$S2D_HTTP" == 422 ]] || s2d_miss "HTTP $S2D_HTTP, not 422"
-  [[ -n "$S2D_REQUEST_ID" ]] || s2d_miss "no x-github-request-id"
-  [[ "$S2D_ERRORS" == "No pending deployment requests to approve or reject" ]] || s2d_miss "errors '$S2D_ERRORS', not GitHub's words of 2026-11-20"
-  limit="$(s2d_rate_limit)"
-  [[ -z "$limit" ]] || s2d_miss "rate-limit signs: $limit"
-  [[ "$S2D_REMAINING" =~ ^[0-9]+$ && "$S2D_REMAINING" -gt 0 ]] || s2d_miss "x-ratelimit-remaining '$S2D_REMAINING', not above 0"
+  [[ -n "$S2D_REQUEST_ID" && "$S2D_REQUEST_ID" != "[other]" ]] || s2d_miss "no x-github-request-id of its form"
+  [[ "$S2D_ERRORS" == "$S2D_WORDS" ]] || s2d_miss "the errors are not GitHub's words of 2026-11-20 (their text is not kept)"
+  [[ -z "$S2D_LIMIT" ]] || s2d_miss "rate-limit signs: $S2D_LIMIT"
+  [[ "$S2D_REMAINING" =~ ^[0-9]+$ && "$S2D_REMAINING" -gt 0 ]] || s2d_miss "x-ratelimit-remaining '${S2D_REMAINING}', not above 0"
   [[ -z "$S2_WHY" ]] || s2d_miss "after it: $S2_WHY"
   [[ "$S2B_OWNER_APPROVAL" == ok ]] || s2d_miss "S2b's control was not ok"
   [[ "$S2B_READINGS" == ok ]] || s2d_miss "S2b's readings don't show an approval taking effect (${S2B_READINGS:-not read})"
@@ -3548,7 +3620,7 @@ t_S2d() {
       EV="allowed: GitHub answered HTTP $S2D_HTTP (exit $S2D_RC); after it: $after"
     elif [[ -z "$S2D_MISSING" ]]; then
       OBS=refused
-      EV="self-approval refused in this tested configuration (Environment $ENV_NAME, Prevent self-review on, $OWNER its only reviewer): HTTP 422, errors \"$S2D_ERRORS\", request $S2D_REQUEST_ID; deployment $dep pending before and after, no approval recorded; S2b's control ok and its readings show an approval taking effect. GitHub's words support this; they don't prove the refusal's cause"
+      EV="self-approval refused in this tested configuration (Environment $ENV_NAME, Prevent self-review on, $OWNER its only reviewer): a complete HTTP 422 answer whose errors are GitHub's words of 2026-11-20, request $S2D_REQUEST_ID; deployment $dep pending before and after, no approval recorded; S2b's control ok and its readings show an approval taking effect. GitHub's words support this; they don't prove the refusal's cause"
     else
       EV="inconclusive: $S2D_MISSING"
     fi

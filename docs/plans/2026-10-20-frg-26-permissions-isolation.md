@@ -581,9 +581,8 @@ commit, pushed by you to main), the Environment (exactly one pending deployment 
 reviewer, GitHub saying you can't approve it), the one deployment GitHub made for that commit and
 Environment (its id the same after as before, its statuses showing it neither started nor ended),
 and no approval recorded. No approval is sent unless the reading before is bound in every part. The
-attempt keeps GitHub's own status line, the whole body, gh's error output and only the headers
-x-github-request-id, x-ratelimit-remaining and x-ratelimit-resource; every reading is recorded in
-full, with this run's tokens and anything shaped like a GitHub token or a JWT hidden. Allowed (a
+attempt keeps GitHub's own status line (gh api -i), not gh's wording; what is recorded is set out
+under round 80, below. Allowed (a
 FAIL) when GitHub accepted the approval, recorded one, or the deployment started. Tests show a
 missing or changed pending state, unexpected answers and an incomplete read-back, none of them a
 pass. Whether a deployment waiting for review shows a deployment and its status before approval is
@@ -604,6 +603,25 @@ Environment, and the deployment started. The 422 and its words are supporting ev
 the refusal's cause. Anything short of all six is inconclusive, and names what was missing; S2b's
 own verdict doesn't depend on its readings. Tests show each criterion missing, and missing or
 ineffective S2b evidence, none of them a pass.
+
+**What S2 records, and when an answer is complete (owner, 2026-11-20, round 80).** Only the fields
+the checks need are kept, each as a value of its known form (an id, a commit, a state word, a login,
+true or false) or the one word wanted (frg26-test, main, frg26-s2), and "[other]" otherwise:
+payloads, descriptions, comments, commit messages, links, and an error's message, errors and
+documentation link are never kept, error answers included. The attempt's answer is recorded as its
+status, gh's exit status, the request id, x-ratelimit-remaining and x-ratelimit-resource (each of
+its form), the body's kind and known words (an error message from a short known list, errors as
+"GitHub's words of 2026-11-20" or "other text (not kept)", an accepted list's ids), whether gh's
+error line repeats GitHub's words, and whether the answer is shown complete. Complete means a
+Content-Length that matches the body byte for byte, with no content or transfer encoding and no
+timeout: the attempt asks for identity encoding, because Go's client, which gh uses, drops
+Content-Length when it decompresses an answer itself. A missing Content-Length never counts as
+complete; gh's exit status (1) and its error line only support completeness. A refusal also needs
+the answer shown complete, gh's exit status 1 and its error line repeating GitHub's words. Whether
+GitHub sends Content-Length for this answer when asked for identity encoding is Unconfirmed; if not,
+S2d stays inconclusive. Tests show credentials of other services in readings, error answers, gh's
+error text and an accepted answer, none of them recorded, and each way an answer can fail to be
+shown complete.
 
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.

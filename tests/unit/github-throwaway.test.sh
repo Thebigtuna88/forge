@@ -2040,9 +2040,15 @@ test_s2b_the_app_cannot_approve_its_own_deployment() {
 
 # GitHub's answer to the owner's approval of their own run, 2026-11-20 (part 0's environment-tests.log).
 S2D_422='{"message":"Validation Failed","errors":"No pending deployment requests to approve or reject","documentation_url":"https://docs.github.com/rest/actions/workflow-runs#review-pending-deployments-for-a-workflow-run","status":"422"}'
-S2D_HEADERS='Content-Type: application/json\r\nSet-Cookie: session=not-kept\r\nX-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979\r\nX-Ratelimit-Resource: core'
+S2D_GH_ERR="gh: No pending deployment requests to approve or reject (Validation Failed)"
+# Headers as gh api -i prints them; @LEN@ becomes the body's length in bytes.
+S2D_HEADERS='Content-Length: @LEN@\r\nContent-Type: application/json\r\nSet-Cookie: session=not-kept\r\nX-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979\r\nX-Ratelimit-Resource: core'
 
-# S2's GitHub (rounds 78-79): each owner read answers from a file, S2d's run 502 (deployment 7001) from
+run_json() { # <id> <status> <sha> <actor> — a workflow run as GitHub returns it (fields S2 reads, and one it must not keep)
+  printf '{"id":%s,"status":"%s","head_sha":"%s","actor":{"login":"%s"},"event":"push","head_branch":"main","name":"frg26-s2","head_commit":{"message":"a commit"}}\n' "$1" "$2" "$3" "$4"
+}
+
+# S2's GitHub (rounds 78-80): each owner read answers from a file, S2d's run 502 (deployment 7001) from
 # $T_TMP/gh, S2b's run 501 (deployment 6001) from $T_TMP/gh-b: <what>, or <what>.<n> for its n-th
 # call (1 before the approval, 2 after it); <file>.rc is its status, <file>.err its error output.
 s2d_stubs() {
@@ -2056,8 +2062,8 @@ s2d_stubs() {
     echo "owner_gh $*" >>"$T_TMP/calls"
     if [[ "$*" == *"/runs/501"* || "$*" == *"sha=$S2B_SHA&"* || "$*" == *"/deployments/6001/"* ]]; then d="$T_TMP/gh-b" r=501 s="$S2B_SHA" p=6001; fi
     case "$*" in
-      "api -i -X POST repos/$REPO/actions/runs/$r/pending_deployments "*) k=post ;;
-      "api repos/$REPO/actions/runs/$r --jq "*) k=run ;;
+      "api -i -X POST repos/$REPO/actions/runs/$r/pending_deployments -H Accept-Encoding: identity "*) k=post ;;
+      "api repos/$REPO/actions/runs/$r") k=run ;;
       "api repos/$REPO/actions/runs/$r/pending_deployments") k=pending ;;
       "api repos/$REPO/deployments?sha=$s&environment=frg26-test&per_page=100") k=deployments ;;
       "api repos/$REPO/deployments/$p/statuses?per_page=100") k=statuses ;;
@@ -2084,12 +2090,12 @@ s2d_fixtures() {
   rm -rf "$T_TMP/gh"
   mkdir -p "$T_TMP/gh"
   : >"$T_TMP/calls"
-  printf '502 waiting %s Thebigtuna88 push main frg26-s2\n' "$S2_OWNER_SHA" >"$T_TMP/gh/run"
+  run_json 502 waiting "$S2_OWNER_SHA" Thebigtuna88 >"$T_TMP/gh/run"
   echo '[{"environment":{"id":9,"name":"frg26-test"},"wait_timer":0,"current_user_can_approve":false,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88","id":42}}]}]' >"$T_TMP/gh/pending"
-  printf '[{"id":7001,"sha":"%s","environment":"frg26-test","task":"deploy"}]\n' "$S2_OWNER_SHA" >"$T_TMP/gh/deployments"
-  echo '[{"id":1,"state":"waiting"}]' >"$T_TMP/gh/statuses"
+  printf '[{"id":7001,"sha":"%s","environment":"frg26-test","task":"deploy","payload":{},"description":"a deployment"}]\n' "$S2_OWNER_SHA" >"$T_TMP/gh/deployments"
+  echo '[{"id":1,"state":"waiting","description":"waiting"}]' >"$T_TMP/gh/statuses"
   echo '[]' >"$T_TMP/gh/approvals"
-  s2d_post_answer 'HTTP/2.0 422 Unprocessable Entity' 1 "$S2D_422" "gh: No pending deployment requests to approve or reject (Validation Failed)"
+  s2d_post_answer 'HTTP/2.0 422 Unprocessable Entity' 1 "$S2D_422" "$S2D_GH_ERR"
 }
 
 # S2b's run (the app's, 501) as GitHub would show it around the owner's approval: waiting, the owner
@@ -2097,15 +2103,15 @@ s2d_fixtures() {
 s2b_fixtures() {
   rm -rf "$T_TMP/gh-b"
   mkdir -p "$T_TMP/gh-b"
-  printf '501 waiting %s frg26-test-app[bot] push main frg26-s2\n' "$S2B_SHA" >"$T_TMP/gh-b/run.1"
-  printf '501 completed %s frg26-test-app[bot] push main frg26-s2\n' "$S2B_SHA" >"$T_TMP/gh-b/run.2"
+  run_json 501 waiting "$S2B_SHA" "frg26-test-app[bot]" >"$T_TMP/gh-b/run.1"
+  run_json 501 completed "$S2B_SHA" "frg26-test-app[bot]" >"$T_TMP/gh-b/run.2"
   echo '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":true,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}]}]' >"$T_TMP/gh-b/pending.1"
   echo '[]' >"$T_TMP/gh-b/pending.2"
   printf '[{"id":6001,"sha":"%s","environment":"frg26-test"}]\n' "$S2B_SHA" >"$T_TMP/gh-b/deployments"
   echo '[{"state":"waiting"}]' >"$T_TMP/gh-b/statuses.1"
   echo '[{"state":"success"},{"state":"in_progress"},{"state":"waiting"}]' >"$T_TMP/gh-b/statuses.2"
   echo '[]' >"$T_TMP/gh-b/approvals.1"
-  echo '[{"state":"approved","user":{"login":"Thebigtuna88"},"environments":[{"id":9}]}]' >"$T_TMP/gh-b/approvals.2"
+  echo '[{"state":"approved","user":{"login":"Thebigtuna88"},"environments":[{"id":9}],"comment":"FRG-26 S2 approval attempt"}]' >"$T_TMP/gh-b/approvals.2"
   can_approve() { echo true; }
   app_git() { echo "app_git $*" >>"$T_TMP/calls"; [[ "$*" == *rev-parse* ]] && printf 'a%.0s' $(seq 1 40) && echo; return 0; }
   echo "501 waiting null frg26-test-app[bot]" >"$T_TMP/run-$S2B_SHA"
@@ -2113,11 +2119,15 @@ s2b_fixtures() {
   echo yes >"$T_TMP/log-501"
 }
 
+# The attempt's answer as gh api -i prints it: the status line, the headers, a blank line, the body
+# as GitHub sent it (no newline added). @LEN@ in the headers becomes the body's length in bytes.
 s2d_post_answer() { # <status line, or "" for none> <exit status> <body> <error output> [<headers, \r\n-joined>]
+  local LC_ALL=C h="${5-$S2D_HEADERS}"
+  h="${h//@LEN@/${#3}}"
   if [[ -n "$1" ]]; then
-    printf '%s\r\n%b\r\n\r\n%s\n' "$1" "${5-$S2D_HEADERS}" "$3" >"$T_TMP/gh/post"
+    printf '%s\r\n%b\r\n\r\n%s' "$1" "$h" "$3" >"$T_TMP/gh/post"
   else
-    printf '%s\n' "$3" >"$T_TMP/gh/post"
+    printf '%s' "$3" >"$T_TMP/gh/post"
   fi
   echo "$2" >"$T_TMP/gh/post.rc"
   printf '%s\n' "$4" >"$T_TMP/gh/post.err"
@@ -2125,40 +2135,58 @@ s2d_post_answer() { # <status line, or "" for none> <exit status> <body> <error 
 
 approvals_sent() { grep -c -- "-X POST repos/$REPO/actions/runs/502/pending_deployments" "$T_TMP/calls"; }
 
-# Rounds 78-79: GitHub's whole answer is kept (its own status line, the body, three headers, gh's error
-# line), each reading is bound to the run, commit, Environment and deployment, and with every
-# criterion met S2d passes only as "refused in this tested configuration".
-test_s2d_keeps_githubs_whole_answer_and_refuses_only_in_this_configuration() {
+# Rounds 78-80: GitHub's answer is kept only as the fields the checks need (its own status line, three
+# headers of their form, the body's kind and known words, whether it is shown complete), each reading
+# is bound to the run, commit, Environment and deployment, and with every criterion met S2d passes
+# only as "refused in this tested configuration".
+test_s2d_keeps_what_the_checks_need_and_refuses_only_in_this_configuration() {
   s2d_stubs
   local out
   out="$(t_S2d)"
-  assert_contains "$out" "RESULT S2d permissions PASS attempt=refused control=ok :: self-approval refused in this tested configuration (Environment frg26-test, Prevent self-review on, Thebigtuna88 its only reviewer): HTTP 422, errors \"No pending deployment requests to approve or reject\", request ABCD:1234; deployment 7001 pending before and after, no approval recorded; S2b's control ok and its readings show an approval taking effect. GitHub's words support this; they don't prove the refusal's cause"
+  assert_contains "$out" "RESULT S2d permissions PASS attempt=refused control=ok :: self-approval refused in this tested configuration (Environment frg26-test, Prevent self-review on, Thebigtuna88 its only reviewer): a complete HTTP 422 answer whose errors are GitHub's words of 2026-11-20, request ABCD:1234; deployment 7001 pending before and after, no approval recorded; S2b's control ok and its readings show an approval taking effect. GitHub's words support this; they don't prove the refusal's cause"
   assert_not_contains "$out" "guarantee"
+  assert_contains "$out" "S2D before run: 502 waiting $S2_OWNER_SHA Thebigtuna88 push main frg26-s2"
+  assert_contains "$out" "S2D before pending_deployments: 1 9 frg26-test false User:Thebigtuna88"
+  assert_contains "$out" "S2D before deployments: 1 7001 $S2_OWNER_SHA frg26-test"
+  assert_contains "$out" "S2D before deployment 7001 statuses: waiting"
+  assert_contains "$out" "S2D before approvals: 0 "
   assert_contains "$out" "S2D before: bound: run 502, commit $S2_OWNER_SHA, Environment frg26-test (9), deployment 7001"
-  assert_contains "$out" "S2D before pending_deployments: [{\"environment\":{\"id\":9,\"name\":\"frg26-test\"}"
-  assert_contains "$out" "S2D approval: HTTP 422 (exit 1); headers kept: x-github-request-id: ABCD:1234; x-ratelimit-remaining: 4979; x-ratelimit-resource: core; body: $S2D_422; error output: gh: No pending deployment requests to approve or reject (Validation Failed)"
+  assert_contains "$out" "S2D approval: HTTP 422 (exit 1); request id ABCD:1234; x-ratelimit-remaining 4979; x-ratelimit-resource core; answer: error, message Validation Failed, errors GitHub's words of 2026-11-20; completion: Content-Length ${#S2D_422} matches the body; gh's error line: repeats"
   assert_not_contains "$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')" "set-cookie" "a header that isn't one of the three"
   assert_not_contains "$out" "not-kept"
+  assert_not_contains "$out" "docs.github.com" "the documentation link"
+  assert_not_contains "$out" "a commit" "the run's commit message"
+  assert_not_contains "$out" "a deployment" "the deployment's description"
   assert_contains "$out" "S2D after: bound: the same run, commit, Environment and deployment, still pending, no approval"
   assert_eq "$(approvals_sent)" 1 "approvals sent"
+  assert_contains "$(cat "$T_TMP/calls")" "-H Accept-Encoding: identity" "the attempt asks for the body as sent"
   assert_eq "$(grep -c "api repos/$REPO/actions/runs/502/approvals" "$T_TMP/calls")" 2 "approvals read before and after"
   assert_contains "$(cat "$T_TMP/calls")" "owner_gh api -X POST repos/$REPO/actions/runs/502/cancel"
 }
 
-# Round 79: each criterion for a refusal on its own; without it S2d is inconclusive, and says which.
+# Rounds 79-80: each criterion for a refusal on its own; without it S2d is inconclusive, and says which.
 test_s2d_is_inconclusive_when_any_criterion_fails() {
   s2d_stubs
   local cases ran=0 name status headers body setup missing out
   read -r -d '' cases <<'EOF' || true
-no request id|HTTP/2.0 422 Unprocessable Entity|X-Ratelimit-Remaining: 4979|S2D_422|:|no x-github-request-id
-no quota header|HTTP/2.0 422 Unprocessable Entity|X-Github-Request-Id: ABCD:1234|S2D_422|:|x-ratelimit-remaining '', not above 0
-no quota left|HTTP/2.0 422 Unprocessable Entity|X-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 0|S2D_422|:|rate-limit signs: x-ratelimit-remaining 0;
-a retry-after header|HTTP/2.0 422 Unprocessable Entity|X-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979\r\nRetry-After: 60|S2D_422|:|rate-limit signs: a retry-after header;
-a secondary rate limit's words|HTTP/2.0 422 Unprocessable Entity|X-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979|{"message":"You have exceeded a secondary rate limit","errors":"No pending deployment requests to approve or reject"}|:|rate-limit signs: rate-limit words;
-other words|HTTP/2.0 422 Unprocessable Entity|X-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979|{"message":"Validation Failed","errors":"Invalid environment id"}|:|errors 'Invalid environment id', not GitHub's words of 2026-11-20
-the words as a message only|HTTP/2.0 422 Unprocessable Entity|X-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979|{"message":"No pending deployment requests to approve or reject"}|:|errors '', not GitHub's words of 2026-11-20
-a 403 with the words|HTTP/2.0 403 Forbidden|X-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979|S2D_422|:|HTTP 403, not 422; rate-limit signs: HTTP 403;
-a 404 with the words|HTTP/2.0 404 Not Found|X-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979|S2D_422|:|HTTP 404, not 422
+no request id|HTTP/2.0 422 Unprocessable Entity|Content-Length: @LEN@\r\nX-Ratelimit-Remaining: 4979|S2D_422|:|no x-github-request-id of its form
+a request id of another form|HTTP/2.0 422 Unprocessable Entity|Content-Length: @LEN@\r\nX-Github-Request-Id: not-a-request-id-secretword\r\nX-Ratelimit-Remaining: 4979|S2D_422|:|no x-github-request-id of its form
+no quota header|HTTP/2.0 422 Unprocessable Entity|Content-Length: @LEN@\r\nX-Github-Request-Id: ABCD:1234|S2D_422|:|x-ratelimit-remaining '', not above 0
+no quota left|HTTP/2.0 422 Unprocessable Entity|Content-Length: @LEN@\r\nX-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 0|S2D_422|:|rate-limit signs: x-ratelimit-remaining 0;
+a retry-after header|HTTP/2.0 422 Unprocessable Entity|Content-Length: @LEN@\r\nX-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979\r\nRetry-After: 60|S2D_422|:|rate-limit signs: a retry-after header;
+a secondary rate limit's words|HTTP/2.0 422 Unprocessable Entity||{"message":"You have exceeded a secondary rate limit","errors":"No pending deployment requests to approve or reject"}|:|rate-limit signs: rate-limit words;
+other words|HTTP/2.0 422 Unprocessable Entity||{"message":"Validation Failed","errors":"Invalid environment id"}|:|the errors are not GitHub's words of 2026-11-20 (their text is not kept)
+the words as a message only|HTTP/2.0 422 Unprocessable Entity||{"message":"No pending deployment requests to approve or reject"}|:|the errors are not GitHub's words of 2026-11-20 (their text is not kept)
+a 403 with the words|HTTP/2.0 403 Forbidden||S2D_422|:|HTTP 403, not 422; rate-limit signs: HTTP 403;
+a 404 with the words|HTTP/2.0 404 Not Found||S2D_422|:|HTTP 404, not 422
+no Content-Length|HTTP/2.0 422 Unprocessable Entity|X-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979|S2D_422|:|the answer is not shown complete (no Content-Length: completion can't be told)
+a body shorter than its Content-Length|HTTP/2.0 422 Unprocessable Entity|Content-Length: 9999\r\nX-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979|S2D_422|:|the answer is not shown complete (the body is
+two Content-Lengths|HTTP/2.0 422 Unprocessable Entity|Content-Length: @LEN@\r\nContent-Length: @LEN@\r\nX-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979|S2D_422|:|a Content-Length not of its form, or more than one
+a compressed body|HTTP/2.0 422 Unprocessable Entity|Content-Length: @LEN@\r\nContent-Encoding: gzip\r\nX-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979|S2D_422|:|a content or transfer encoding: the length can't be checked
+a chunked body|HTTP/2.0 422 Unprocessable Entity|Content-Length: @LEN@\r\nTransfer-Encoding: chunked\r\nX-Github-Request-Id: ABCD:1234\r\nX-Ratelimit-Remaining: 4979|S2D_422|:|a content or transfer encoding: the length can't be checked
+gh exit status 2|HTTP/2.0 422 Unprocessable Entity||S2D_422|echo 2 >"$T_TMP/gh/post.rc"|the answer is not shown complete (gh exit status 2); gh's exit status 2, not 1
+gh's error line in other words|HTTP/2.0 422 Unprocessable Entity||S2D_422|echo "gh: connection reset by peer" >"$T_TMP/gh/post.err"|gh's error line doesn't repeat GitHub's words (other)
+no error line from gh|HTTP/2.0 422 Unprocessable Entity||S2D_422|: >"$T_TMP/gh/post.err"|gh's error line doesn't repeat GitHub's words (none)
 S2b's control failed|HTTP/2.0 422 Unprocessable Entity||S2D_422|S2B_OWNER_APPROVAL=failed|S2b's control was not ok
 S2b's readings never made|HTTP/2.0 422 Unprocessable Entity||S2D_422|S2B_READINGS=""|S2b's readings don't show an approval taking effect (not read)
 S2b's readings show no approval|HTTP/2.0 422 Unprocessable Entity||S2D_422|S2B_READINGS="after it: no approval"|S2b's readings don't show an approval taking effect (after it: no approval)
@@ -2168,15 +2196,165 @@ EOF
     s2d_fixtures
     [[ "$body" != S2D_422 ]] || body="$S2D_422"
     [[ -n "$headers" ]] || headers="$S2D_HEADERS"
-    s2d_post_answer "$status" 1 "$body" "gh: an error" "$headers"
+    s2d_post_answer "$status" 1 "$body" "$S2D_GH_ERR" "$headers"
     eval "$setup"
     out="$(t_S2d)"
     assert_contains "$out" "RESULT S2d permissions FAIL attempt=inconclusive" "$name"
     assert_not_contains "$out" "S2d permissions PASS" "$name"
+    assert_contains "$out" "inconclusive: " "$name"
     assert_contains "$out" "$missing" "$name"
     assert_contains "$out" "S2D after: bound: " "$name: only this criterion is missing"
+    assert_not_contains "$out" "secretword" "$name: a header's text"
   done <<<"$cases"
-  assert_eq "$ran" 12 "cases run"
+  assert_eq "$ran" 21 "cases run"
+  # A request that timed out (in this shell or one it started) ends the run before S2d records anything.
+  s2d_fixtures
+  echo "stop owner gh api -i -X POST got no answer within its 20s" >"$WORK/timed-out"
+  out="$(t_S2d 2>&1)"
+  assert_not_contains "$out" "RESULT S2d" "a result after a timeout"
+  rm -f "$WORK/timed-out"
+}
+
+# Round 78: no approval is sent unless GitHub's state before it is bound in every part.
+test_s2d_sends_no_approval_unless_githubs_state_is_bound_first() {
+  s2d_stubs
+  local cases ran=0 name setup why out
+  read -r -d '' cases <<'EOF' || true
+no pending deployment|echo '[]' >"$T_TMP/gh/pending"|pending deployments '0 null null null ', not '1 9 frg26-test false User:Thebigtuna88'
+two pending deployments|echo '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":false,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}]},{"environment":{"id":10,"name":"other"}}]' >"$T_TMP/gh/pending"|pending deployments '2 9 frg26-test false User:Thebigtuna88', not '1 9 frg26-test false User:Thebigtuna88'
+another Environment|echo '[{"environment":{"id":10,"name":"frg26-test"},"current_user_can_approve":false,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}]}]' >"$T_TMP/gh/pending"|pending deployments '1 10 frg26-test false User:Thebigtuna88', not '1 9 frg26-test false User:Thebigtuna88'
+an Environment of another name|echo '[{"environment":{"id":9,"name":"secretword-name"},"current_user_can_approve":false,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}]}]' >"$T_TMP/gh/pending"|pending deployments '1 9 [other] false User:Thebigtuna88', not '1 9 frg26-test false User:Thebigtuna88'
+the owner may approve|echo '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":true,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}]}]' >"$T_TMP/gh/pending"|pending deployments '1 9 frg26-test true User:Thebigtuna88', not '1 9 frg26-test false User:Thebigtuna88'
+another reviewer|echo '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":false,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}},{"type":"Team","reviewer":{"login":"admins"}}]}]' >"$T_TMP/gh/pending"|pending deployments '1 9 frg26-test false User:Thebigtuna88,Team:admins', not '1 9 frg26-test false User:Thebigtuna88'
+a run on another commit|run_json 502 waiting "$(printf 'c%.0s' $(seq 1 40))" Thebigtuna88 >"$T_TMP/gh/run"|run '502 waiting $(printf 'c%.0s' $(seq 1 40)) Thebigtuna88 push main frg26-s2', not '502 waiting $S2_OWNER_SHA Thebigtuna88 push main frg26-s2'
+a run no longer waiting|run_json 502 completed "$S2_OWNER_SHA" Thebigtuna88 >"$T_TMP/gh/run"|run '502 completed $S2_OWNER_SHA
+a run by the app|run_json 502 waiting "$S2_OWNER_SHA" "frg26-test-app[bot]" >"$T_TMP/gh/run"|run '502 waiting $S2_OWNER_SHA frg26-test-app[bot]
+a run on another branch|run_json 502 waiting "$S2_OWNER_SHA" Thebigtuna88 >"$T_TMP/gh/run"; sed -i '' 's/"main"/"secretword-branch"/' "$T_TMP/gh/run"|run '502 waiting $S2_OWNER_SHA Thebigtuna88 push [other] frg26-s2'
+no deployment|echo '[]' >"$T_TMP/gh/deployments"|deployments '0 null null null', not '1  $S2_OWNER_SHA frg26-test'
+two deployments|printf '[{"id":7001,"sha":"%s","environment":"frg26-test"},{"id":7002,"sha":"%s","environment":"frg26-test"}]\n' "$S2_OWNER_SHA" "$S2_OWNER_SHA" >"$T_TMP/gh/deployments"|deployments '2 7001 $S2_OWNER_SHA frg26-test', not '1 7001 $S2_OWNER_SHA frg26-test'
+a deployment that started|echo '[{"id":2,"state":"in_progress"},{"id":1,"state":"waiting"}]' >"$T_TMP/gh/statuses"|deployment 7001 states in_progress,waiting: it started or ended
+an approval already recorded|echo '[{"state":"approved","user":{"login":"Thebigtuna88"}}]' >"$T_TMP/gh/approvals"|approvals '1 approved:Thebigtuna88:', not '0 '
+a failed run read|echo 1 >"$T_TMP/gh/run.rc"|the run read failed
+a failed pending read|echo 1 >"$T_TMP/gh/pending.rc"|the pending_deployments read failed
+a pending read that isn't JSON|echo 'gh: not json' >"$T_TMP/gh/pending"|the pending_deployments read failed
+a failed deployments read|echo 1 >"$T_TMP/gh/deployments.rc"|the deployments read failed
+a failed statuses read|echo 1 >"$T_TMP/gh/statuses.rc"|the deployment 7001 statuses read failed
+a failed approvals read|echo 1 >"$T_TMP/gh/approvals.rc"|the approvals read failed
+EOF
+  while IFS='|' read -r name setup why; do
+    ran=$((ran + 1))
+    s2d_fixtures
+    eval "$setup"
+    why="$(eval "printf '%s' \"$why\"")"
+    out="$(t_S2d)"
+    assert_contains "$out" "RESULT S2d permissions FAIL attempt=inconclusive control=ok" "$name"
+    assert_not_contains "$out" "S2d permissions PASS" "$name"
+    assert_contains "$out" "S2D before: NOT bound: " "$name"
+    assert_contains "$out" "$why" "$name"
+    assert_contains "$out" "inconclusive: no approval sent, GitHub's state before the attempt is not bound" "$name"
+    assert_not_contains "$out" "secretword" "$name: a field's text"
+    assert_eq "$(approvals_sent)" 0 "approvals sent: $name"
+    assert_contains "$(cat "$T_TMP/calls")" "owner_gh api -X POST repos/$REPO/actions/runs/502/cancel" "$name"
+  done <<<"$cases"
+  assert_eq "$ran" 20 "cases run"
+}
+
+# Rounds 78-80: an answer that isn't the one expected never passes; one that GitHub accepted is allowed.
+test_s2d_an_unexpected_answer_never_passes() {
+  s2d_stubs
+  local cases ran=0 name status rc body err want http answer out
+  read -r -d '' cases <<'EOF' || true
+accepted|HTTP/2.0 200 OK|0|[{"id":7001,"environment":"frg26-test"}]||allowed|200|a list of 1, ids 7001
+accepted, another 2xx|HTTP/2.0 201 Created|0|[]||allowed|201|a list of 0, ids none
+no status line (gh without -i)||1|{"message":"Validation Failed"}|gh: Validation Failed (HTTP 422)|inconclusive|unknown|error, message Validation Failed, errors none
+a rate limit|HTTP/2.0 429 Too Many Requests|1|{"message":"API rate limit exceeded for user ID 1."}|gh: API rate limit exceeded (HTTP 429)|inconclusive|429|error, message API rate limit exceeded, errors none
+a server error|HTTP/2.0 500 Internal Server Error|1|{"message":"Server Error"}|gh: Server Error (HTTP 500)|inconclusive|500|error, message Server Error, errors none
+a refusal in the words the old tests guessed|HTTP/2.0 422 Unprocessable Entity|1|{"message":"Can't approve your own deployment"}|gh: Can't approve your own deployment (HTTP 422)|inconclusive|422|error, message [other], errors none
+a refusal with exit 0|HTTP/2.0 422 Unprocessable Entity|0|{"message":"Validation Failed"}||allowed|422|error, message Validation Failed, errors none
+not JSON|HTTP/2.0 502 Bad Gateway|1|<html>bad gateway</html>|gh: HTTP 502|inconclusive|502|not JSON (not kept)
+EOF
+  while IFS='|' read -r name status rc body err want http answer; do
+    ran=$((ran + 1))
+    s2d_fixtures
+    s2d_post_answer "$status" "$rc" "$body" "$err"
+    out="$(t_S2d)"
+    assert_contains "$out" "RESULT S2d permissions FAIL attempt=$want control=ok" "$name"
+    assert_not_contains "$out" "S2d permissions PASS" "$name"
+    assert_contains "$out" "S2D approval: HTTP $http (exit $rc);" "$name"
+    assert_contains "$out" "answer: $answer;" "$name"
+  done <<<"$cases"
+  assert_eq "$ran" 8 "cases run"
+  # An answer cut before the end of its headers: GitHub's status can't be told.
+  s2d_fixtures
+  printf 'HTTP/2.0 422 Unprocessable Entity\r\nX-Github-Request-Id: ABCD:1234\r\n' >"$T_TMP/gh/post"
+  out="$(t_S2d)"
+  assert_contains "$out" "S2D approval: HTTP unknown (exit 1);" "an answer cut before its body"
+  assert_contains "$out" "completion: cut before the end of its headers" "an answer cut before its body"
+  assert_contains "$out" "RESULT S2d permissions FAIL attempt=inconclusive control=ok" "an answer cut before its body"
+}
+
+# Round 78: what is read back after the attempt must still be bound, the same deployment included.
+test_s2d_an_incomplete_read_back_never_passes() {
+  s2d_stubs
+  local cases ran=0 name setup why want out
+  read -r -d '' cases <<'EOF' || true
+no longer pending|echo '[]' >"$T_TMP/gh/pending.2"|pending deployments '0 null null null ', not '1 9 frg26-test false User:Thebigtuna88'|inconclusive
+the run went on|run_json 502 completed "$S2_OWNER_SHA" Thebigtuna88 >"$T_TMP/gh/run.2"|run '502 completed $S2_OWNER_SHA|inconclusive
+another deployment|printf '[{"id":7002,"sha":"%s","environment":"frg26-test"}]\n' "$S2_OWNER_SHA" >"$T_TMP/gh/deployments.2"|deployments '1 7002 $S2_OWNER_SHA frg26-test', not '1 7001 $S2_OWNER_SHA frg26-test'|inconclusive
+the deployment started|echo '[{"id":2,"state":"in_progress"},{"id":1,"state":"waiting"}]' >"$T_TMP/gh/statuses.2"|deployment 7001 states in_progress,waiting: it started or ended|allowed
+an approval recorded|echo '[{"state":"approved","user":{"login":"Thebigtuna88"}}]' >"$T_TMP/gh/approvals.2"|approvals '1 approved:Thebigtuna88:', not '0 '|allowed
+a failed approvals read|: >"$T_TMP/gh/approvals.2"; echo 1 >"$T_TMP/gh/approvals.2.rc"|the approvals read failed|inconclusive
+a failed pending read|: >"$T_TMP/gh/pending.2"; echo 1 >"$T_TMP/gh/pending.2.rc"|the pending_deployments read failed|inconclusive
+EOF
+  while IFS='|' read -r name setup why want; do
+    ran=$((ran + 1))
+    s2d_fixtures
+    eval "$setup"
+    why="$(eval "printf '%s' \"$why\"")"
+    out="$(t_S2d)"
+    assert_contains "$out" "RESULT S2d permissions FAIL attempt=$want control=ok" "$name"
+    assert_not_contains "$out" "S2d permissions PASS" "$name"
+    assert_contains "$out" "S2D before: bound: " "$name"
+    assert_contains "$out" "S2D after: NOT bound: " "$name"
+    assert_contains "$out" "$why" "$name"
+    assert_eq "$(approvals_sent)" 1 "approvals sent: $name"
+  done <<<"$cases"
+  assert_eq "$ran" 7 "cases run"
+}
+
+# Rounds 78-80: S2d's record never holds a credential: not this run's tokens, not text shaped like a
+# GitHub token or a JWT, and not any other secret in a field it doesn't need (a deployment's payload or
+# description, a status's description, an approval's comment, a commit message, an error's message,
+# errors or link, gh's error text, an accepted answer's body).
+test_s2d_keeps_credentials_out_of_its_record() {
+  s2d_stubs
+  local other out secret
+  secret="$(printf 'sk_%s_%s' live "$(printf 'Q%.0s' $(seq 1 24))")"
+  TOKEN="$(new_token)"
+  other="$(fake_token)"
+  # In the readings, an error answer and gh's error text.
+  run_json 502 waiting "$S2_OWNER_SHA" Thebigtuna88 | sed "s/a commit/$secret $other/" >"$T_TMP/gh/run"
+  printf '[{"id":7001,"sha":"%s","environment":"frg26-test","payload":{"api_key":"%s"},"description":"%s"}]\n' "$S2_OWNER_SHA" "$secret" "$TOKEN" >"$T_TMP/gh/deployments"
+  printf '[{"id":1,"state":"waiting","description":"%s","log_url":"https://example.com/%s"}]\n' "$secret" "$secret" >"$T_TMP/gh/statuses"
+  printf '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":false,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}],"note":"%s"}]\n' "$secret" >"$T_TMP/gh/pending"
+  s2d_post_answer 'HTTP/2.0 422 Unprocessable Entity' 1 "{\"message\":\"$secret\",\"errors\":\"$secret $TOKEN and $other\",\"documentation_url\":\"https://docs.github.com/$secret\"}" "gh: $secret $other (HTTP 422)"
+  out="$(t_S2d)"
+  assert_contains "$out" "S2D approval: HTTP 422 (exit 1);"
+  assert_contains "$out" "answer: error, message [other], errors other text (not kept)"
+  assert_contains "$out" "gh's error line: other"
+  assert_not_contains "$out" "$secret" "a non-GitHub credential (readings, error answer, gh's text)"
+  assert_not_contains "$out" "$TOKEN" "this run's token"
+  assert_not_contains "$out" "$other" "a token-shaped text"
+  assert_not_contains "$out" "eyJ" "a part of a JWT"
+  # In an accepted answer's body, and an approval's comment read back after it.
+  s2d_fixtures
+  s2d_post_answer 'HTTP/2.0 200 OK' 0 "[{\"id\":7001,\"environment\":\"frg26-test\",\"payload\":{\"api_key\":\"$secret\"},\"description\":\"$secret\"}]" ""
+  printf '[{"state":"approved","user":{"login":"Thebigtuna88"},"environments":[{"id":9}],"comment":"%s"}]\n' "$secret" >"$T_TMP/gh/approvals.2"
+  out="$(t_S2d)"
+  assert_contains "$out" "RESULT S2d permissions FAIL attempt=allowed control=ok"
+  assert_contains "$out" "answer: a list of 1, ids 7001;"
+  assert_not_contains "$out" "$secret" "a non-GitHub credential (an accepted answer, an approval's comment)"
+  end_stand_in_run
 }
 
 # Round 79, criterion 6: S2b's readings around the owner's approval must show it taking effect, or S2d
@@ -2207,6 +2385,7 @@ EOF
     assert_contains "$out" "RESULT S2b permissions PASS attempt=refused control=ok" "$name: S2b's own verdict"
     assert_contains "$out" "S2B before run: 501 waiting $S2B_SHA frg26-test-app[bot] push main frg26-s2" "$name"
     assert_contains "$out" "$why" "$name"
+    assert_not_contains "$out" "FRG-26 S2 approval attempt" "$name: an approval's comment"
     out="$(t_S2d)"
     if [[ "$why" == ok ]]; then
       assert_eq "$S2B_READINGS" ok "$name"
@@ -2218,126 +2397,6 @@ EOF
     fi
   done <<<"$cases"
   assert_eq "$ran" 9 "cases run"
-}
-
-# Round 78: no approval is sent unless GitHub's state before it is bound in every part.
-test_s2d_sends_no_approval_unless_githubs_state_is_bound_first() {
-  s2d_stubs
-  local cases ran=0 name setup why out
-  read -r -d '' cases <<'EOF' || true
-no pending deployment|echo '[]' >"$T_TMP/gh/pending"|pending deployments '0 null null null ', not '1 9 frg26-test false User:Thebigtuna88'
-two pending deployments|echo '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":false,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}]},{"environment":{"id":10,"name":"other"}}]' >"$T_TMP/gh/pending"|pending deployments '2 9 frg26-test false User:Thebigtuna88', not '1 9 frg26-test false User:Thebigtuna88'
-another Environment|echo '[{"environment":{"id":10,"name":"frg26-test"},"current_user_can_approve":false,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}]}]' >"$T_TMP/gh/pending"|pending deployments '1 10 frg26-test false User:Thebigtuna88', not '1 9 frg26-test false User:Thebigtuna88'
-the owner may approve|echo '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":true,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}]}]' >"$T_TMP/gh/pending"|pending deployments '1 9 frg26-test true User:Thebigtuna88', not '1 9 frg26-test false User:Thebigtuna88'
-another reviewer|echo '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":false,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}},{"type":"Team","reviewer":{"login":"admins"}}]}]' >"$T_TMP/gh/pending"|pending deployments '1 9 frg26-test false User:Thebigtuna88,Team:admins', not '1 9 frg26-test false User:Thebigtuna88'
-a run on another commit|printf '502 waiting %s Thebigtuna88 push main frg26-s2\n' "$(printf 'c%.0s' $(seq 1 40))" >"$T_TMP/gh/run"|run '502 waiting $(printf 'c%.0s' $(seq 1 40)) Thebigtuna88 push main frg26-s2', not '502 waiting $S2_OWNER_SHA Thebigtuna88 push main frg26-s2'
-a run no longer waiting|printf '502 completed %s Thebigtuna88 push main frg26-s2\n' "$S2_OWNER_SHA" >"$T_TMP/gh/run"|run '502 completed $S2_OWNER_SHA
-a run by the app|printf '502 waiting %s frg26-test-app[bot] push main frg26-s2\n' "$S2_OWNER_SHA" >"$T_TMP/gh/run"|run '502 waiting $S2_OWNER_SHA frg26-test-app[bot]
-no deployment|echo '[]' >"$T_TMP/gh/deployments"|deployments '0 null null null', not '1  $S2_OWNER_SHA frg26-test'
-two deployments|printf '[{"id":7001,"sha":"%s","environment":"frg26-test"},{"id":7002,"sha":"%s","environment":"frg26-test"}]\n' "$S2_OWNER_SHA" "$S2_OWNER_SHA" >"$T_TMP/gh/deployments"|deployments '2 7001 $S2_OWNER_SHA frg26-test', not '1 7001 $S2_OWNER_SHA frg26-test'
-a deployment that started|echo '[{"id":2,"state":"in_progress"},{"id":1,"state":"waiting"}]' >"$T_TMP/gh/statuses"|deployment 7001 states in_progress,waiting: it started or ended
-an approval already recorded|echo '[{"state":"approved","user":{"login":"Thebigtuna88"}}]' >"$T_TMP/gh/approvals"|approvals '1 approved:Thebigtuna88:', not '0 '
-a failed run read|echo 1 >"$T_TMP/gh/run.rc"|the run read failed
-a failed pending read|echo 1 >"$T_TMP/gh/pending.rc"|the pending_deployments read failed
-a pending read that isn't JSON|echo 'gh: not json' >"$T_TMP/gh/pending"|the pending_deployments read failed
-a failed deployments read|echo 1 >"$T_TMP/gh/deployments.rc"|the deployments read failed
-a failed statuses read|echo 1 >"$T_TMP/gh/statuses.rc"|the deployment 7001 statuses read failed
-a failed approvals read|echo 1 >"$T_TMP/gh/approvals.rc"|the approvals read failed
-EOF
-  while IFS='|' read -r name setup why; do
-    ran=$((ran + 1))
-    s2d_fixtures
-    eval "$setup"
-    why="$(eval "printf '%s' \"$why\"")"
-    out="$(t_S2d)"
-    assert_contains "$out" "RESULT S2d permissions FAIL attempt=inconclusive control=ok" "$name"
-    assert_not_contains "$out" "S2d permissions PASS" "$name"
-    assert_contains "$out" "S2D before: NOT bound: " "$name"
-    assert_contains "$out" "$why" "$name"
-    assert_contains "$out" "inconclusive: no approval sent, GitHub's state before the attempt is not bound" "$name"
-    assert_eq "$(approvals_sent)" 0 "approvals sent: $name"
-    assert_contains "$(cat "$T_TMP/calls")" "owner_gh api -X POST repos/$REPO/actions/runs/502/cancel" "$name"
-  done <<<"$cases"
-  assert_eq "$ran" 18 "cases run"
-}
-
-# Round 78: an answer that isn't the one expected never passes; one that GitHub accepted is allowed.
-test_s2d_an_unexpected_answer_never_passes() {
-  s2d_stubs
-  local cases ran=0 name status rc body err want http out
-  read -r -d '' cases <<'EOF' || true
-accepted|HTTP/2.0 200 OK|0|[{"id":7001,"environment":"frg26-test"}]||allowed|200
-accepted, another 2xx|HTTP/2.0 201 Created|0|[]||allowed|201
-no status line (gh without -i)||1|{"message":"Validation Failed"}|gh: Validation Failed (HTTP 422)|inconclusive|unknown
-a rate limit|HTTP/2.0 429 Too Many Requests|1|{"message":"API rate limit exceeded"}|gh: API rate limit exceeded (HTTP 429)|inconclusive|429
-a server error|HTTP/2.0 500 Internal Server Error|1|{"message":"Server Error"}|gh: Server Error (HTTP 500)|inconclusive|500
-a refusal in the words the old tests guessed|HTTP/2.0 422 Unprocessable Entity|1|{"message":"Can't approve your own deployment"}|gh: Can't approve your own deployment (HTTP 422)|inconclusive|422
-a refusal with exit 0|HTTP/2.0 422 Unprocessable Entity|0|{"message":"Validation Failed"}||allowed|422
-EOF
-  while IFS='|' read -r name status rc body err want http; do
-    ran=$((ran + 1))
-    s2d_fixtures
-    s2d_post_answer "$status" "$rc" "$body" "$err"
-    out="$(t_S2d)"
-    assert_contains "$out" "RESULT S2d permissions FAIL attempt=$want control=ok" "$name"
-    assert_not_contains "$out" "S2d permissions PASS" "$name"
-    assert_contains "$out" "S2D approval: HTTP $http (exit $rc);" "$name"
-    assert_contains "$out" "body: $body;" "$name"
-  done <<<"$cases"
-  assert_eq "$ran" 7 "cases run"
-  # An answer cut before its body: GitHub's status can't be told.
-  s2d_fixtures
-  printf 'HTTP/2.0 422 Unprocessable Entity\r\nX-Github-Request-Id: ABCD:1234\r\n' >"$T_TMP/gh/post"
-  out="$(t_S2d)"
-  assert_contains "$out" "S2D approval: HTTP unknown (exit 1);" "an answer cut before its body"
-  assert_contains "$out" "RESULT S2d permissions FAIL attempt=inconclusive control=ok" "an answer cut before its body"
-}
-
-# Round 78: what is read back after the attempt must still be bound, the same deployment included.
-test_s2d_an_incomplete_read_back_never_passes() {
-  s2d_stubs
-  local cases ran=0 name setup why want out
-  read -r -d '' cases <<'EOF' || true
-no longer pending|echo '[]' >"$T_TMP/gh/pending.2"|pending deployments '0 null null null ', not '1 9 frg26-test false User:Thebigtuna88'|inconclusive
-the run went on|printf '502 completed %s Thebigtuna88 push main frg26-s2\n' "$S2_OWNER_SHA" >"$T_TMP/gh/run.2"|run '502 completed $S2_OWNER_SHA|inconclusive
-another deployment|printf '[{"id":7002,"sha":"%s","environment":"frg26-test"}]\n' "$S2_OWNER_SHA" >"$T_TMP/gh/deployments.2"|deployments '1 7002 $S2_OWNER_SHA frg26-test', not '1 7001 $S2_OWNER_SHA frg26-test'|inconclusive
-the deployment started|echo '[{"id":2,"state":"in_progress"},{"id":1,"state":"waiting"}]' >"$T_TMP/gh/statuses.2"|deployment 7001 states in_progress,waiting: it started or ended|allowed
-an approval recorded|echo '[{"state":"approved","user":{"login":"Thebigtuna88"}}]' >"$T_TMP/gh/approvals.2"|approvals '1 approved:Thebigtuna88:', not '0 '|allowed
-a failed approvals read|: >"$T_TMP/gh/approvals.2"; echo 1 >"$T_TMP/gh/approvals.2.rc"|the approvals read failed|inconclusive
-a failed pending read|: >"$T_TMP/gh/pending.2"; echo 1 >"$T_TMP/gh/pending.2.rc"|the pending_deployments read failed|inconclusive
-EOF
-  while IFS='|' read -r name setup why want; do
-    ran=$((ran + 1))
-    s2d_fixtures
-    eval "$setup"
-    why="$(eval "printf '%s' \"$why\"")"
-    out="$(t_S2d)"
-    assert_contains "$out" "RESULT S2d permissions FAIL attempt=$want control=ok" "$name"
-    assert_not_contains "$out" "S2d permissions PASS" "$name"
-    assert_contains "$out" "S2D before: bound: " "$name"
-    assert_contains "$out" "S2D after: NOT bound: " "$name"
-    assert_contains "$out" "$why" "$name"
-    assert_eq "$(approvals_sent)" 1 "approvals sent: $name"
-  done <<<"$cases"
-  assert_eq "$ran" 7 "cases run"
-}
-
-# Round 78: S2d's record says GitHub's answers in full, but never a credential: this run's own
-# tokens, or any text shaped like a GitHub token or a JWT.
-test_s2d_keeps_credentials_out_of_its_record() {
-  s2d_stubs
-  local other out
-  TOKEN="$(new_token)"
-  other="$(fake_token)"
-  s2d_post_answer 'HTTP/2.0 422 Unprocessable Entity' 1 "{\"message\":\"Validation Failed\",\"errors\":\"$TOKEN and $other\"}" "gh: $other (HTTP 422)"
-  printf '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":false,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}],"note":"%s"}]\n' "$other" >"$T_TMP/gh/pending"
-  out="$(t_S2d)"
-  assert_not_contains "$out" "$TOKEN" "this run's token"
-  assert_not_contains "$out" "$other" "a token-shaped text"
-  assert_not_contains "$out" "eyJ" "a part of a JWT"
-  assert_contains "$out" "[REDACTED]"
-  assert_contains "$out" "S2D approval: HTTP 422 (exit 1);"
-  end_stand_in_run
 }
 
 test_s2a_a_feature_branch_never_gets_the_value() {
