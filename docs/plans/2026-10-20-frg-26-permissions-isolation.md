@@ -623,6 +623,39 @@ S2d stays inconclusive. Tests show credentials of other services in readings, er
 error text and an accepted answer, none of them recorded, and each way an answer can fail to be
 shown complete.
 
+**Lists and exact values, and waiting shown (owner, 2026-11-20, round 81).** A form check let a
+credential of that form through (a lowercase key as a deployment status state), so no field is kept
+by its form any more. Each is a value from GitHub's documented list, or the exact value wanted, and
+"[other]" otherwise: a run's status from the values "List workflow runs" filters by (the run object
+documents none); a deployment status's state from "List deployment statuses" (error, failure,
+inactive, in_progress, pending, queued, success), with waiting, which only GraphQL's
+DeploymentStatusState documents; an approval's state (approved, rejected, pending); a reviewer's type
+(User, Team); x-ratelimit-resource from the resources GET /rate_limit lists. The commit, the run's
+actor, the reviewer, the approver, the event, the branch, the workflow and the Environment are kept
+only when they are exactly the value wanted. Ids, can-approve and times count only as the JSON type
+GitHub documents (a number, a boolean, a date-time). GitHub doesn't document x-github-request-id's
+format, so it is kept only in the form GitHub has used (five groups of hex digits), and another form
+is a missing criterion. A missing x-ratelimit-resource, or one not on the list, is one too. Unknown,
+missing or malformed values never bind a reading and never support a pass. Before the attempt, and
+again after it, the deployment must be shown waiting:
+- at least one status;
+- every state on GitHub's list;
+- none started or ended;
+- the latest waiting, queued or pending.
+
+The latest is told by created_at, since GitHub doesn't document the order of the list. A time not
+of its form, or two states at the latest second, means the latest can't be told: not bound. Queued
+or pending only say the deployment hasn't started. That it waits for your review comes from the rest
+of the reading: the run waiting, your review pending for this Environment, no approval recorded.
+Three behaviours remain Unconfirmed, and none of them weakens the criteria:
+- whether GitHub shows the deployment before approval;
+- whether a waiting deployment has statuses at all, and in which state (the REST docs omit waiting);
+- whether GitHub sends a usable Content-Length when asked for identity encoding.
+
+If GitHub doesn't, S2d stays inconclusive. Tests put credential-shaped values (a lowercase key, a key
+of capitals and digits, a run of hex digits) in every kept field, and none is recorded or binds a
+reading. They also show each way the waiting evidence can be missing, none of them a pass.
+
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.
 

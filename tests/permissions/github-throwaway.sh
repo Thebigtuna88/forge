@@ -3150,8 +3150,8 @@ run_log_value() { # <run id> — yes (the job printed the dummy value's length),
 }
 
 # GitHub's own word on whether the owner may approve the run's waiting deployment.
-can_approve() { # <run id> — true | false | error
-  owner_gh api "repos/$REPO/actions/runs/$1/pending_deployments" --jq '.[0].current_user_can_approve' 2>/dev/null || echo error
+can_approve() { # <run id> — true | false | [other] | error
+  owner_gh api "repos/$REPO/actions/runs/$1/pending_deployments" --jq '.[0].current_user_can_approve | if type == "boolean" then tostring else "[other]" end' 2>/dev/null || echo error
 }
 
 github_refused() { # after capture: GitHub itself answered with a 4xx that isn't a rate limit
@@ -3300,12 +3300,13 @@ t_S2b() {
   CTL=failed
   local can logv="" before dep
   into can can_approve "$id"
-  s2_reading "S2B before" "$id" "$sha"
+  [[ "$can" == true || "$can" == false || "$can" == error ]] || can="[other]"
+  s2_reading "S2B before" "$id" "$sha" "$APP_BOT"
   s2_pending_check "$id" "$sha" "$APP_BOT" "$eid" true
   before="$S2_WHY" dep="$S2R_DEP"
   if [[ "$can" == true ]] && approve_run owner_gh "$id" "$eid" && wait_run "$sha" completed && into logv run_log_value "$id" && [[ "$logv" == yes ]]; then CTL=ok; fi
   EV="$EV GitHub says the owner can approve it: $can; owner approving: $(evidence), run $RUN"
-  s2_reading "S2B after" "$id" "$sha" "$dep"
+  s2_reading "S2B after" "$id" "$sha" "$APP_BOT" "$dep"
   s2_approved_check "$id" "$sha" "$APP_BOT" "$eid" "$dep"
   if [[ -z "$before" && -z "$S2_WHY" && -n "$dep" ]]; then
     S2B_READINGS=ok
@@ -3317,30 +3318,45 @@ t_S2b() {
   record_p S2b "$OBS" "$CTL" "$EV"
 }
 
-# S2's readings (rounds 78-80, owner 2026-11-20). On 2026-11-20 GitHub answered the owner's approval
+# S2's readings (rounds 78-81, owner 2026-11-20). On 2026-11-20 GitHub answered the owner's approval
 # of their own run with HTTP 422 "No pending deployment requests to approve or reject", which fits both
 # "pending, but not the owner's to review" and "nothing pending", and gh's error line named no HTTP
 # status. So GitHub's own state of a run is read around each owner approval, bound to the run, its
 # commit, the Environment and the one deployment GitHub made for them, and S2d's attempt keeps
-# GitHub's status line (gh api -i), not gh's wording. Only the fields the checks need are kept, each
-# as a value of a known form or a known word, else "[other]" (round 80, SEC-1): payloads,
-# descriptions, comments, messages and links can hold any text, a credential included.
+# GitHub's status line (gh api -i), not gh's wording. Only the fields the checks need are kept
+# (round 80, SEC-1): payloads, descriptions, comments, messages and links can hold any text, a
+# credential included. Each kept field is a value from GitHub's documented list, or the one value
+# wanted, else "[other]"; ids only when GitHub sent a number (round 81, SEC-1 of review-lens round
+# 78: a form check let a credential of that form through).
 S2R_RUN=""       # "id status sha actor event branch workflow", or error
 S2R_PENDING=""   # "count environment-id environment-name can-approve reviewers", or error
 S2R_DEPS=""      # "count id sha environment" of the deployments for the commit and Environment, or error
 S2R_DEP=""       # the deployment whose statuses were read: the one wanted, or the first found
-S2R_STATES=""    # its status states, newest first, or error
+S2R_STATES=""    # its status states in the order GitHub listed them (not documented), or error
+S2R_LATEST=""    # the state of its latest status by created_at: none, [unclear], or a state
 S2R_APPROVALS="" # "count state:login:environment-ids …", or error
 S2_J=""          # the JSON of the read s2_json made last (never said)
 S2_WHY=""        # what a check found that doesn't match, "; "-separated; empty when all of it does
 
-# jq's helpers for the kept fields: num, sha, word (lowercase), login, and is(<the one word wanted>).
-# null stays "null"; anything else not of the form is "[other]".
+# jq's helpers for the kept fields: known(<GitHub's documented list>), is(<the one value wanted>), num
+# (a JSON number) and bool (a JSON boolean). null stays "null"; anything else is "[other]". get(f) is
+# null where f can't be read (a field of something that isn't an object). The lists, from GitHub's
+# REST documentation (2026-11-20): a run's status from the values "List workflow runs" filters by
+# (the run object documents none); a deployment status's state from "List deployment statuses",
+# with waiting, which only GraphQL's DeploymentStatusState documents; an approval's state from "Get
+# the review history for a workflow run"; a reviewer's type from "Get pending deployments".
 # shellcheck disable=SC2016 # jq's own $variables
-readonly S2_JQ='def form(re): if . == null then "null" else (tostring) as $v | if ($v | test(re)) then $v else "[other]" end end;
-def num: form("^[0-9]{1,20}$"); def sha: form("^[0-9a-f]{40}$"); def word: form("^[a-z_]{1,40}$");
-def login: form("^[A-Za-z0-9-]{1,39}(\\[bot\\])?$"); def bool: form("^(true|false)$");
-def is($w): if . == null then "null" elif . == $w then $w else "[other]" end;'
+readonly S2_JQ='def known($list): . as $v | if $v == null then "null" elif ($list | any(. == $v)) then $v else "[other]" end;
+def is($w): known([$w]);
+def num: if type == "number" and . == floor and . >= 0 and . < 1e15 then tostring elif . == null then "null" else "[other]" end;
+def bool: if type == "boolean" then tostring elif . == null then "null" else "[other]" end;
+def get(f): try f catch null;
+def list(f): if type == "array" then f else "not a list" end;
+def run_status: known(["completed","action_required","cancelled","failure","neutral","skipped","stale","success","timed_out","in_progress","queued","requested","waiting","pending"]);
+def dep_state: known(["error","failure","inactive","in_progress","pending","queued","success","waiting"]);
+def approval_state: known(["approved","rejected","pending"]);
+def reviewer_type: known(["User","Team"]);
+def at: get(.created_at) | if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") then . else null end;'
 
 # Any text shaped like a GitHub token or a JWT hidden, not only this run's tokens: a second guard,
 # behind keeping only fields of a known form.
@@ -3364,41 +3380,53 @@ s2_json() { # <path> — one read as the owner, its JSON kept in S2_J (not said)
   S2_J="$j"
 }
 
-s2_fields() { # <jq filter> — the kept fields of S2_J
-  jq -r --arg env "$ENV_NAME" "$S2_JQ $1" <<<"$S2_J"
+S2_SHA="" S2_ACTOR="" # the commit and the run's actor s2_reading wants
+
+s2_fields() { # <jq filter> — the kept fields of S2_J, or [unreadable]
+  jq -r --arg env "$ENV_NAME" --arg owner "$OWNER" --arg sha "$S2_SHA" --arg actor "$S2_ACTOR" "$S2_JQ $1" <<<"$S2_J" 2>/dev/null || echo "[unreadable]"
 }
 
 # One reading of a run, its pending deployments, the deployments for its commit and the Environment
 # (and the statuses of the one wanted, or of the first found), and its approvals. Reads only; says
-# the kept fields of each.
-s2_reading() { # <label> <run id> <sha> [<deployment wanted>]
+# the kept fields of each. The latest status is told by created_at, since GitHub doesn't document the
+# list's order: none when there is none; [unclear] when a time isn't of its form, or the latest time
+# holds two states.
+s2_reading() { # <label> <run id> <sha> <the run's actor> [<deployment wanted>]
   local d
-  S2R_RUN=error S2R_PENDING=error S2R_DEPS=error S2R_DEP="" S2R_STATES="" S2R_APPROVALS=error
+  S2R_RUN=error S2R_PENDING=error S2R_DEPS=error S2R_DEP="" S2R_STATES="" S2R_LATEST="" S2R_APPROVALS=error
+  S2_SHA="$3" S2_ACTOR="$4"
   if s2_json "actions/runs/$2"; then
-    S2R_RUN="$(s2_fields '"\(.id | num) \(.status | word) \(.head_sha | sha) \(.actor.login | login) \(.event | word) \(.head_branch | is("main")) \(.name | is("frg26-s2"))"')"
+    # shellcheck disable=SC2016 # jq's own $sha and $actor
+    S2R_RUN="$(s2_fields 'if type == "object" then "\(.id | num) \(.status | run_status) \(.head_sha | is($sha)) \(get(.actor.login) | is($actor)) \(.event | is("push")) \(.head_branch | is("main")) \(.name | is("frg26-s2"))" else "not an object" end')"
     s2_say "$1 run: $S2R_RUN"
   fi
   if s2_json "actions/runs/$2/pending_deployments"; then
-    # shellcheck disable=SC2016 # jq's own $env
-    S2R_PENDING="$(s2_fields '"\(length) \(.[0].environment.id | num) \(.[0].environment.name | is($env)) \(.[0].current_user_can_approve | bool) \([.[0].reviewers[]? | "\(.type | form("^[A-Za-z]{1,20}$")):\(.reviewer.login | login)"] | join(","))"')"
+    # shellcheck disable=SC2016 # jq's own $env and $owner
+    S2R_PENDING="$(s2_fields 'list(.[0] as $p | "\(length) \($p | get(.environment.id) | num) \($p | get(.environment.name) | is($env)) \($p | get(.current_user_can_approve) | bool) \([$p | get(.reviewers) | if type == "array" then .[] else empty end | "\(get(.type) | reviewer_type):\(get(.reviewer.login) | is($owner))"] | join(","))")')"
     s2_say "$1 pending_deployments: $S2R_PENDING"
   fi
   if s2_json "deployments?sha=$3&environment=$ENV_NAME&per_page=100"; then
-    # shellcheck disable=SC2016 # jq's own $env
-    S2R_DEPS="$(s2_fields '"\(length) \(.[0].id | num) \(.[0].sha | sha) \(.[0].environment | is($env))"')"
+    # shellcheck disable=SC2016 # jq's own $sha and $env
+    S2R_DEPS="$(s2_fields 'list(.[0] as $d | "\(length) \($d | get(.id) | num) \($d | get(.sha) | is($sha)) \($d | get(.environment) | is($env))")')"
     s2_say "$1 deployments: $S2R_DEPS"
-    d="$(s2_fields '.[0].id | num')"
+    d="$(s2_fields 'list(.[0] | get(.id) | num)')"
     [[ "$d" =~ ^[0-9]+$ ]] || d=""
-    if [[ -n "$d" && ( -z "${4:-}" || "$d" == "$4" ) ]]; then
+    if [[ -n "$d" && ( -z "${5:-}" || "$d" == "$5" ) ]]; then
       S2R_DEP="$d" S2R_STATES=error
       if s2_json "deployments/$d/statuses?per_page=100"; then
-        S2R_STATES="$(s2_fields '[.[].state | word] | join(",")')"
-        s2_say "$1 deployment $d statuses: $S2R_STATES"
+        S2R_STATES="$(s2_fields 'list([.[] | get(.state) | dep_state] | join(","))')"
+        # shellcheck disable=SC2016 # jq's own $t, $m and $i
+        S2R_LATEST="$(s2_fields 'list(if length == 0 then "none" else [.[] | at] as $t
+          | if any($t[]; . == null) then "[unclear]" else ($t | max) as $m
+            | [range(length) as $i | select($t[$i] == $m) | .[$i] | get(.state) | dep_state] | unique
+            | if length == 1 then .[0] else "[unclear]" end end end)')"
+        s2_say "$1 deployment $d statuses: $S2R_STATES; latest $S2R_LATEST"
       fi
     fi
   fi
   if s2_json "actions/runs/$2/approvals"; then
-    S2R_APPROVALS="$(s2_fields 'if type == "array" then "\(length) \([.[] | "\(.state | word):\(.user.login | login):\([.environments[]?.id | num] | join(","))"] | join(" "))" else "not a list" end')"
+    # shellcheck disable=SC2016 # jq's own $owner
+    S2R_APPROVALS="$(s2_fields 'list("\(length) \([.[] | "\(get(.state) | approval_state):\(get(.user.login) | is($owner)):\([get(.environments) | if type == "array" then .[] else empty end | get(.id) | num] | join(","))"] | join(" "))")')"
     s2_say "$1 approvals: $S2R_APPROVALS"
   fi
 }
@@ -3407,10 +3435,21 @@ s2_read_ok() { # <what> <its reading> — false, and S2_WHY says so, when that r
   [[ "$2" != error ]] || { s2_why "the $1 read failed"; return 1; }
 }
 
+# The deployment's statuses as S2 needs them: a list, not empty, each state on GitHub's list. Sets
+# S2_WHY when not; true when they are.
+s2_states_known() {
+  local d="$S2R_DEP"
+  if [[ "$S2R_STATES" == "not a list" || "$S2R_STATES" == "[unreadable]" ]]; then s2_why "deployment $d's statuses are not a list"; return 1; fi
+  if [[ -z "$S2R_STATES" ]]; then s2_why "deployment $d has no status: GitHub doesn't show it waiting"; return 1; fi
+  if [[ ",$S2R_STATES," == *",[other],"* || ",$S2R_STATES," == *",null,"* ]]; then s2_why "deployment $d states '$S2R_STATES': a state not on GitHub's list"; return 1; fi
+}
+
 # The run still waits, untouched: on <sha>, pushed by <actor> to main; exactly one deployment pending,
 # for this Environment, the owner its only reviewer, current_user_can_approve as given; exactly one
-# deployment for the commit and Environment (the one found before, when given), its statuses showing
-# it neither started nor ended; no approval recorded. Sets S2_WHY.
+# deployment for the commit and Environment (the one found before, when given), shown waiting: each
+# status's state on GitHub's list, none started or ended, the latest waiting, queued or pending (round
+# 81, C1 of review-lens round 78); no approval recorded. Queued or pending say only that it hasn't
+# started: that it waits for the owner's review is the rest of the reading. Sets S2_WHY.
 s2_pending_check() { # <run id> <sha> <actor> <Environment id> <true|false> [<deployment>]
   local re=',(in_progress|success|failure|error|inactive),'
   S2_WHY=""
@@ -3418,24 +3457,32 @@ s2_pending_check() { # <run id> <sha> <actor> <Environment id> <true|false> [<de
   if s2_read_ok pending_deployments "$S2R_PENDING"; then s2_want "pending deployments" "$S2R_PENDING" "1 $4 $ENV_NAME $5 User:$OWNER"; fi
   if s2_read_ok deployments "$S2R_DEPS"; then s2_want deployments "$S2R_DEPS" "1 ${6:-$S2R_DEP} $2 $ENV_NAME"; fi
   if [[ -n "$S2R_DEP" ]] && s2_read_ok "deployment $S2R_DEP statuses" "$S2R_STATES"; then
-    [[ ! ",$S2R_STATES," =~ $re ]] || s2_why "deployment $S2R_DEP states $S2R_STATES: it started or ended"
+    if [[ ",$S2R_STATES," =~ $re ]]; then
+      s2_why "deployment $S2R_DEP states $S2R_STATES: it started or ended"
+    elif s2_states_known; then
+      case "$S2R_LATEST" in
+        waiting | queued | pending) ;;
+        *) s2_why "deployment $S2R_DEP's latest status can't be told by its time ('$S2R_LATEST')" ;;
+      esac
+    fi
   fi
   if s2_read_ok approvals "$S2R_APPROVALS"; then s2_want approvals "$S2R_APPROVALS" "0 "; fi
 }
 
-# After the owner's approval of <run id>: the same run, commit and deployment; nothing pending any
-# more; an approval by the owner recorded for this Environment; the deployment's statuses showing it
-# started. Sets S2_WHY.
+# After the owner's approval of <run id>: the same run, commit and deployment, the run's status on
+# GitHub's list; nothing pending any more; an approval by the owner recorded for this Environment;
+# the deployment's statuses, each on GitHub's list, showing it started. Sets S2_WHY.
 s2_approved_check() { # <run id> <sha> <actor> <Environment id> <deployment>
   local parts
   S2_WHY=""
   if s2_read_ok run "$S2R_RUN"; then
     read -r -a parts <<<"$S2R_RUN"
     s2_want run "${parts[0]:-} ${parts[2]:-} ${parts[3]:-} ${parts[4]:-} ${parts[5]:-} ${parts[6]:-}" "$1 $2 $3 push main frg26-s2"
+    [[ "${parts[1]:-}" != "[other]" && "${parts[1]:-}" != null && -n "${parts[1]:-}" ]] || s2_why "run status '${parts[1]:-}': not on GitHub's list"
   fi
   if s2_read_ok pending_deployments "$S2R_PENDING"; then s2_want "pending deployments" "$S2R_PENDING" "0 null null null "; fi
   if s2_read_ok deployments "$S2R_DEPS"; then s2_want deployments "$S2R_DEPS" "1 $5 $2 $ENV_NAME"; fi
-  if [[ -n "$5" && "$S2R_DEP" == "$5" ]] && s2_read_ok "deployment $5 statuses" "$S2R_STATES"; then
+  if [[ -n "$5" && "$S2R_DEP" == "$5" ]] && s2_read_ok "deployment $5 statuses" "$S2R_STATES" && s2_states_known; then
     [[ ",$S2R_STATES," == *,in_progress,* || ",$S2R_STATES," == *,success,* ]] || s2_why "deployment $5 states '$S2R_STATES': no sign it started"
   fi
   if s2_read_ok approvals "$S2R_APPROVALS"; then
@@ -3444,12 +3491,15 @@ s2_approved_check() { # <run id> <sha> <actor> <Environment id> <deployment>
 }
 
 readonly S2D_WORDS="No pending deployment requests to approve or reject" # GitHub's, 2026-11-20
+# The resources GET /rate_limit documents (2026-11-20).
+readonly S2D_RESOURCES="core graphql search code_search source_import integration_manifest actions_runner_registration scim dependency_snapshots dependency_sbom code_scanning_autofix copilot_usage_records"
 S2D_HTTP=""       # GitHub's status for S2d's attempt, or unknown
 S2D_RC=""         # gh's exit status for it
-S2D_REQUEST_ID="" # its x-github-request-id (of its known form): correlation only; the authenticated
-#                   HTTPS connection is what says GitHub answered
+S2D_REQUEST_ID="" # its x-github-request-id, in the form GitHub has used (five groups of hex digits;
+#                   GitHub doesn't document one): correlation only; the authenticated HTTPS
+#                   connection is what says GitHub answered
 S2D_REMAINING=""  # its x-ratelimit-remaining
-S2D_RESOURCE=""   # its x-ratelimit-resource
+S2D_RESOURCE=""   # its x-ratelimit-resource, one of S2D_RESOURCES
 S2D_RETRY=""      # set when it carried a retry-after header (a rate-limit sign; the value isn't kept)
 S2D_ANSWER=""     # what the body is, in known words and values only (never its text)
 S2D_ERRORS=""     # the body's errors as text: compared, never said
@@ -3495,7 +3545,7 @@ s2d_approve() { # <run id> <Environment id>
       value="${value# }"
       case "$name" in
         x-github-request-id)
-          [[ "$value" =~ ^[A-Fa-f0-9:]{1,80}$ ]] || value="[other]"
+          [[ "$value" =~ ^[A-Fa-f0-9]{1,16}(:[A-Fa-f0-9]{1,16}){4}$ ]] || value="[other]"
           S2D_REQUEST_ID="$value"
           ;;
         x-ratelimit-remaining)
@@ -3503,7 +3553,7 @@ s2d_approve() { # <run id> <Environment id>
           S2D_REMAINING="$value"
           ;;
         x-ratelimit-resource)
-          [[ "$value" =~ ^[a-z_]{1,40}$ ]] || value="[other]"
+          [[ " $S2D_RESOURCES " == *" $value "* && -n "$value" && "$value" != *" "* ]] || value="[other]"
           S2D_RESOURCE="$value"
           ;;
         retry-after) S2D_RETRY=1 ;;
@@ -3513,7 +3563,7 @@ s2d_approve() { # <run id> <Environment id>
       esac
     done < <(printf '%s' "${raw#*$'\n'}")
     if [[ -n "$head" ]]; then
-      S2D_HTTP=unknown S2D_REQUEST_ID="" S2D_REMAINING="" S2D_RETRY=""
+      S2D_HTTP=unknown S2D_REQUEST_ID="" S2D_REMAINING="" S2D_RESOURCE="" S2D_RETRY=""
       S2D_INCOMPLETE="cut before the end of its headers"
     else
       body="${raw:$offset}"
@@ -3542,7 +3592,7 @@ s2d_approve() { # <run id> <Environment id>
       if type == "object" then
         (.message | msg) as $mc
         | "error, message \($mc), errors \(if .errors == null then "none" elif .errors == $words then "GitHub'"'"'s words of 2026-11-20" else "other text (not kept)" end)"
-      elif type == "array" then "a list of \(length), ids \([.[] | .id? | select(type == "number") | tostring] | join(",") | if . == "" then "none" else . end)"
+      elif type == "array" then "a list of \(length), ids \([.[] | (try .id catch null) | if type == "number" and . == floor and . >= 0 and . < 1e15 then tostring else "[other]" end] | join(",") | if . == "" then "none" else . end)"
       else "JSON of another kind (not kept)" end' <<<"$body" 2>/dev/null)" || S2D_ANSWER="[other]"
     S2D_ERRORS="$(jq -r 'if type == "object" then (.errors | if type == "string" then . elif type == "array" then map(if type == "string" then . else (.message // tostring) end) | join("; ") else "" end) else "" end' <<<"$body" 2>/dev/null)" || S2D_ERRORS=""
   elif [[ -z "$body" ]]; then
@@ -3581,6 +3631,7 @@ s2d_criteria() { # sets S2D_MISSING
   [[ "$S2D_ERRORS" == "$S2D_WORDS" ]] || s2d_miss "the errors are not GitHub's words of 2026-11-20 (their text is not kept)"
   [[ -z "$S2D_LIMIT" ]] || s2d_miss "rate-limit signs: $S2D_LIMIT"
   [[ "$S2D_REMAINING" =~ ^[0-9]+$ && "$S2D_REMAINING" -gt 0 ]] || s2d_miss "x-ratelimit-remaining '${S2D_REMAINING}', not above 0"
+  [[ -n "$S2D_RESOURCE" && "$S2D_RESOURCE" != "[other]" ]] || s2d_miss "x-ratelimit-resource '${S2D_RESOURCE}', not one of GitHub's listed resources"
   [[ -z "$S2_WHY" ]] || s2d_miss "after it: $S2_WHY"
   [[ "$S2B_OWNER_APPROVAL" == ok ]] || s2d_miss "S2b's control was not ok"
   [[ "$S2B_READINGS" == ok ]] || s2d_miss "S2b's readings don't show an approval taking effect (${S2B_READINGS:-not read})"
@@ -3600,7 +3651,7 @@ t_S2d() {
   id="${RUN%% *}"
   [[ "$id" =~ ^[0-9]+$ ]] || { setup_fail_p S2d "unexpected run id ($RUN)"; return; }
   OBS=inconclusive
-  s2_reading "S2D before" "$id" "$S2_OWNER_SHA"
+  s2_reading "S2D before" "$id" "$S2_OWNER_SHA" "$OWNER"
   s2_pending_check "$id" "$S2_OWNER_SHA" "$OWNER" "$eid" false
   if [[ -n "$S2_WHY" ]]; then
     s2_say "S2D before: NOT bound: $S2_WHY"
@@ -3609,7 +3660,7 @@ t_S2d() {
     dep="$S2R_DEP"
     s2_say "S2D before: bound: run $id, commit $S2_OWNER_SHA, Environment $ENV_NAME ($eid), deployment $dep"
     s2d_approve "$id" "$eid"
-    s2_reading "S2D after" "$id" "$S2_OWNER_SHA" "$dep"
+    s2_reading "S2D after" "$id" "$S2_OWNER_SHA" "$OWNER" "$dep"
     s2_pending_check "$id" "$S2_OWNER_SHA" "$OWNER" "$eid" false "$dep"
     after="bound: the same run, commit, Environment and deployment, still pending, no approval"
     [[ -z "$S2_WHY" ]] || after="NOT bound: $S2_WHY"
