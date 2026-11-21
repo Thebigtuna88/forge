@@ -3334,6 +3334,7 @@ S2R_DEPS=""      # "count id sha environment" of the deployments for the commit 
 S2R_DEP=""       # the deployment whose statuses were read: the one wanted, or the first found
 S2R_STATES=""    # its status states in the order GitHub listed them (not documented), or error
 S2R_LATEST=""    # the state of its latest status by created_at: none, [unclear], or a state
+S2R_MORE=""      # why its statuses may go on past the page read (100 or more, a Link header); empty if not
 S2R_APPROVALS="" # "count state:login:environment-ids …", or error
 S2_J=""          # the JSON of the read s2_json made last (never said)
 S2_WHY=""        # what a check found that doesn't match, "; "-separated; empty when all of it does
@@ -3380,6 +3381,31 @@ s2_json() { # <path> — one read as the owner, its JSON kept in S2_J (not said)
   S2_J="$j"
 }
 
+# The same, as gh api -i prints it, for a list read one page at a time (round 82, C1 of review-lens
+# round 79): only a 200 answer whose headers end counts as read. S2_PAGED is set when it carried a
+# Link header, which GitHub sends only when the list has more than one page; its value isn't kept.
+S2_PAGED=""
+s2_json_page() { # <path>
+  local LC_ALL=C raw rest line head=1
+  S2_J="" S2_PAGED=""
+  into raw owner_gh api -i "repos/$REPO/$1" 2>/dev/null || return 1
+  line="${raw%%$'\n'*}"
+  [[ "${line%$'\r'}" =~ ^HTTP/[0-9.]+\ 200( |$) && "$raw" == *$'\n'* ]] || return 1
+  rest="${raw#*$'\n'}"
+  while [[ "$rest" == *$'\n'* ]]; do
+    line="${rest%%$'\n'*}"
+    rest="${rest#*$'\n'}"
+    line="${line%$'\r'}"
+    if [[ -z "$line" ]]; then head=""; break; fi
+    case "${line%%:*}" in
+      [Ll][Ii][Nn][Kk]) S2_PAGED=1 ;;
+    esac
+  done
+  [[ -z "$head" ]] || return 1
+  jq -e . >/dev/null 2>&1 <<<"$rest" || return 1
+  S2_J="$rest"
+}
+
 S2_SHA="" S2_ACTOR="" # the commit and the run's actor s2_reading wants
 
 s2_fields() { # <jq filter> — the kept fields of S2_J, or [unreadable]
@@ -3392,8 +3418,8 @@ s2_fields() { # <jq filter> — the kept fields of S2_J, or [unreadable]
 # list's order: none when there is none; [unclear] when a time isn't of its form, or the latest time
 # holds two states.
 s2_reading() { # <label> <run id> <sha> <the run's actor> [<deployment wanted>]
-  local d
-  S2R_RUN=error S2R_PENDING=error S2R_DEPS=error S2R_DEP="" S2R_STATES="" S2R_LATEST="" S2R_APPROVALS=error
+  local d n
+  S2R_RUN=error S2R_PENDING=error S2R_DEPS=error S2R_DEP="" S2R_STATES="" S2R_LATEST="" S2R_MORE="" S2R_APPROVALS=error
   S2_SHA="$3" S2_ACTOR="$4"
   if s2_json "actions/runs/$2"; then
     # shellcheck disable=SC2016 # jq's own $sha and $actor
@@ -3413,14 +3439,17 @@ s2_reading() { # <label> <run id> <sha> <the run's actor> [<deployment wanted>]
     [[ "$d" =~ ^[0-9]+$ ]] || d=""
     if [[ -n "$d" && ( -z "${5:-}" || "$d" == "$5" ) ]]; then
       S2R_DEP="$d" S2R_STATES=error
-      if s2_json "deployments/$d/statuses?per_page=100"; then
+      if s2_json_page "deployments/$d/statuses?per_page=100"; then
         S2R_STATES="$(s2_fields 'list([.[] | get(.state) | dep_state] | join(","))')"
+        n="$(s2_fields 'list(length)')"
+        if [[ "$n" =~ ^[0-9]+$ && "$n" -ge 100 ]]; then S2R_MORE="$n of them"; fi
+        if [[ -n "$S2_PAGED" ]]; then S2R_MORE="${S2R_MORE:+$S2R_MORE; }a Link header"; fi
         # shellcheck disable=SC2016 # jq's own $t, $m and $i
         S2R_LATEST="$(s2_fields 'list(if length == 0 then "none" else [.[] | at] as $t
           | if any($t[]; . == null) then "[unclear]" else ($t | max) as $m
             | [range(length) as $i | select($t[$i] == $m) | .[$i] | get(.state) | dep_state] | unique
             | if length == 1 then .[0] else "[unclear]" end end end)')"
-        s2_say "$1 deployment $d statuses: $S2R_STATES; latest $S2R_LATEST"
+        s2_say "$1 deployment $d statuses: $S2R_STATES; latest $S2R_LATEST${S2R_MORE:+; may go on past this page: $S2R_MORE}"
       fi
     fi
   fi
@@ -3435,10 +3464,11 @@ s2_read_ok() { # <what> <its reading> — false, and S2_WHY says so, when that r
   [[ "$2" != error ]] || { s2_why "the $1 read failed"; return 1; }
 }
 
-# The deployment's statuses as S2 needs them: a list, not empty, each state on GitHub's list. Sets
-# S2_WHY when not; true when they are.
+# The deployment's statuses as S2 needs them: all on the page read (fewer than 100, no Link header),
+# a list, not empty, each state on GitHub's list. Sets S2_WHY when not; true when they are.
 s2_states_known() {
   local d="$S2R_DEP"
+  if [[ -n "$S2R_MORE" ]]; then s2_why "deployment $d's statuses may go on past this page ($S2R_MORE): not all are shown"; return 1; fi
   if [[ "$S2R_STATES" == "not a list" || "$S2R_STATES" == "[unreadable]" ]]; then s2_why "deployment $d's statuses are not a list"; return 1; fi
   if [[ -z "$S2R_STATES" ]]; then s2_why "deployment $d has no status: GitHub doesn't show it waiting"; return 1; fi
   if [[ ",$S2R_STATES," == *",[other],"* || ",$S2R_STATES," == *",null,"* ]]; then s2_why "deployment $d states '$S2R_STATES': a state not on GitHub's list"; return 1; fi
@@ -3448,7 +3478,7 @@ s2_states_known() {
 # for this Environment, the owner its only reviewer, current_user_can_approve as given; exactly one
 # deployment for the commit and Environment (the one found before, when given), shown waiting: each
 # status's state on GitHub's list, none started or ended, the latest waiting, queued or pending (round
-# 81, C1 of review-lens round 78); no approval recorded. Queued or pending say only that it hasn't
+# 81, C1 of review-lens round 78), all of them on the page read (round 82); no approval recorded. Queued or pending say only that it hasn't
 # started: that it waits for the owner's review is the rest of the reading. Sets S2_WHY.
 s2_pending_check() { # <run id> <sha> <actor> <Environment id> <true|false> [<deployment>]
   local re=',(in_progress|success|failure|error|inactive),'

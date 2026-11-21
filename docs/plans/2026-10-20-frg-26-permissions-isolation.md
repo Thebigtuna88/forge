@@ -656,6 +656,12 @@ If GitHub doesn't, S2d stays inconclusive. Tests put credential-shaped values (a
 of capitals and digits, a run of hex digits) in every kept field, and none is recorded or binds a
 reading. They also show each way the waiting evidence can be missing, none of them a pass.
 
+**One page of statuses (owner, 2026-11-21, round 82).** The statuses are read as one page of up to
+100, so a started status, or the latest, could be on another page. A page of 100 or more, or a Link
+header (GitHub sends one only when a list has more pages), means not all are shown: the reading is
+not bound, before or after the attempt, and S2d stays inconclusive. The statuses are read with their
+headers, and only a 200 answer whose headers end counts as read; the Link header's value is not kept.
+
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.
 

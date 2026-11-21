@@ -2066,7 +2066,7 @@ s2d_stubs() {
       "api repos/$REPO/actions/runs/$r") k=run ;;
       "api repos/$REPO/actions/runs/$r/pending_deployments") k=pending ;;
       "api repos/$REPO/deployments?sha=$s&environment=frg26-test&per_page=100") k=deployments ;;
-      "api repos/$REPO/deployments/$p/statuses?per_page=100") k=statuses ;;
+      "api repos/$REPO/deployments/$p/statuses?per_page=100" | "api -i repos/$REPO/deployments/$p/statuses?per_page=100") k=statuses ;;
       "api repos/$REPO/actions/runs/$r/approvals") k=approvals ;;
       *) return 0 ;;
     esac
@@ -2075,7 +2075,18 @@ s2d_stubs() {
     f="$d/$k.$n"
     [[ -f "$f" ]] || f="$d/$k"
     [[ ! -f "$f.err" ]] || cat "$f.err" >&2
-    cat "$f" 2>/dev/null
+    # The statuses with -i, as gh api -i prints them: 200 OK and Content-Type, then <file>.head's
+    # header lines (\r\n-ended), a blank line and the body; or <file>.raw in place of all of it.
+    if [[ "$k" == statuses && "$2" == -i && -f "$f.raw" ]]; then
+      cat "$f.raw"
+    elif [[ "$k" == statuses && "$2" == -i ]]; then
+      printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n'
+      cat "$f.head" 2>/dev/null
+      printf '\r\n'
+      cat "$f" 2>/dev/null
+    else
+      cat "$f" 2>/dev/null
+    fi
     return "$(cat "$f.rc" 2>/dev/null || echo 0)"
   }
   s2d_fixtures
@@ -2559,6 +2570,74 @@ EOF
   out="$(cat "$T_TMP/s2b.out")"
   assert_contains "$out" "deployment 6001 states 'success,[other]': a state not on GitHub's list"
   [[ "$S2B_READINGS" != ok ]] || _t_fail "S2B_READINGS is ok with a state not on GitHub's list"
+}
+
+# Round 82 (C1 of review-lens round 79): the statuses are read as one page of up to 100, so a started
+# status, or the latest, may be on another. 100 or more on the page, or a Link header (GitHub sends
+# one only when the list has more pages), leaves the reading not bound, before and after the attempt
+# and in S2b's readings. The Link header's value is never said.
+test_s2_statuses_past_one_page_are_not_bound() {
+  s2d_stubs
+  local cases ran=0 name count head want why out secret
+  secret="sk_live_$(printf 'q%.0s' $(seq 1 24))"
+  read -r -d '' cases <<'EOF' || true
+99 statuses|99||bound|S2D before deployment 7001 statuses: waiting,
+one status|1||bound|statuses: waiting; latest waiting
+100 statuses|100||not|deployment 7001's statuses may go on past this page (100 of them): not all are shown
+101 statuses|101||not|deployment 7001's statuses may go on past this page (101 of them): not all are shown
+a Link header to the next page|1|Link: <https://api.github.com/repositories/1/deployments/7001/statuses?per_page=100&page=2>; rel="next"|not|deployment 7001's statuses may go on past this page (a Link header): not all are shown
+a Link header in lower case|1|link: <https://api.github.com/x>; rel="last"|not|(a Link header)
+a Link header holding a credential|1|Link: <https://api.github.com/x?k=@SECRET@>; rel="next"|not|(a Link header)
+100 statuses and a Link header|100|Link: <https://api.github.com/x>; rel="next"|not|(100 of them; a Link header)
+a status other than 200|1|@STATUS@|not|the deployment 7001 statuses read failed
+headers cut before their end|1|@CUT@|not|the deployment 7001 statuses read failed
+EOF
+  while IFS='|' read -r name count head want why; do
+    ran=$((ran + 1))
+    s2d_fixtures
+    jq -nc --argjson n "$count" '[range($n) | {state: "waiting", created_at: "2026-11-20T01:30:40Z"}]' >"$T_TMP/gh/statuses"
+    case "$head" in
+      @STATUS@) printf 'HTTP/2.0 304 Not Modified\r\n\r\n%s' "$(cat "$T_TMP/gh/statuses")" >"$T_TMP/gh/statuses.raw" ;;
+      @CUT@) printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\nX-Github-Request-Id: C0DE' >"$T_TMP/gh/statuses.raw" ;;
+      ?*) printf '%s\r\n' "${head//@SECRET@/$secret}" >"$T_TMP/gh/statuses.head" ;;
+    esac
+    out="$(t_S2d)"
+    if [[ "$want" == bound ]]; then
+      assert_contains "$out" "S2D before: bound: " "$name"
+      assert_contains "$out" "$why" "$name"
+      assert_contains "$out" "RESULT S2d permissions PASS attempt=refused control=ok" "$name"
+    else
+      assert_contains "$out" "S2D before: NOT bound: " "$name"
+      assert_contains "$out" "$why" "$name"
+      assert_contains "$out" "RESULT S2d permissions FAIL attempt=inconclusive control=ok" "$name"
+      assert_not_contains "$out" "S2d permissions PASS" "$name"
+      assert_eq "$(approvals_sent)" 0 "approvals sent: $name"
+    fi
+    assert_not_contains "$out" "$secret" "the Link header's value: $name"
+    assert_not_contains "$out" "api.github.com" "the Link header's value: $name"
+  done <<<"$cases"
+  assert_eq "$ran" 10 "cases run"
+  # Read back after the attempt, the same rule.
+  s2d_fixtures
+  jq -nc '[range(100) | {state: "waiting", created_at: "2026-11-20T01:30:40Z"}]' >"$T_TMP/gh/statuses.2"
+  out="$(t_S2d)"
+  assert_contains "$out" "S2D after: NOT bound: deployment 7001's statuses may go on past this page (100 of them)"
+  assert_contains "$out" "RESULT S2d permissions FAIL attempt=inconclusive control=ok"
+  s2d_fixtures
+  cp "$T_TMP/gh/statuses" "$T_TMP/gh/statuses.2"
+  printf 'Link: <https://api.github.com/x>; rel="next"\r\n' >"$T_TMP/gh/statuses.2.head"
+  out="$(t_S2d)"
+  assert_contains "$out" "S2D after: NOT bound: deployment 7001's statuses may go on past this page (a Link header)"
+  assert_contains "$out" "RESULT S2d permissions FAIL attempt=inconclusive control=ok"
+  # After the owner's approval in S2b, more pages keep S2b's readings from showing it took effect.
+  s2d_fixtures
+  s2b_fixtures
+  printf 'Link: <https://api.github.com/x>; rel="next"\r\n' >"$T_TMP/gh-b/statuses.2.head"
+  FAILS=0
+  t_S2b >"$T_TMP/s2b.out" 2>&1
+  out="$(cat "$T_TMP/s2b.out")"
+  assert_contains "$out" "deployment 6001's statuses may go on past this page (a Link header)"
+  [[ "$S2B_READINGS" != ok ]] || _t_fail "S2B_READINGS is ok with more pages of statuses"
 }
 
 test_s2a_a_feature_branch_never_gets_the_value() {
