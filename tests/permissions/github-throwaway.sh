@@ -1787,6 +1787,17 @@ cmd_status() {
   if [[ -n "$bad" ]]; then die "could not read:$bad"; fi
 }
 
+# The handoffs' exact-protection check (owner 2026-11-22, review-lens round 81, C1 = SEC-1): the
+# whole protection, compared as protect's own read-back compares it (verify_phase protected: dev and
+# main each exactly as protect applies it, no ruleset), where status prints only seven fields, which
+# a required check or a locked branch doesn't change. As the owner, reads only; no app token.
+cmd_exact_protection() {
+  need_owner
+  assert_throwaway
+  verify_phase protected
+  say "exact protection: dev and main exactly as protect applies them, no ruleset"
+}
+
 # --- Bypass tests -------------------------------------------------------------------------------
 
 # Expected result of each test in each phase (plan section 6): allowed | refused.
@@ -4277,7 +4288,8 @@ main() {
     delete-check) cmd_delete_check ;;
     actions-setting) cmd_actions_setting ;;
     status) cmd_status ;;
-    *) die "usage: github-throwaway.sh create|create-second|check-app|rate|allowance|reset|protect|unprotect|ruleset|tests <phase>|ptests|a2-probe|env-setup|env-tests|hold-token <name>|token-age-check|key-check|suspend-check|unsuspend-check|uninstall-check|delete-check|actions-setting|status" ;;
+    exact-protection) cmd_exact_protection ;;
+    *) die "usage: github-throwaway.sh create|create-second|check-app|rate|allowance|reset|protect|unprotect|ruleset|tests <phase>|ptests|a2-probe|env-setup|env-tests|hold-token <name>|token-age-check|key-check|suspend-check|unsuspend-check|uninstall-check|delete-check|actions-setting|status|exact-protection" ;;
   esac
 }
 

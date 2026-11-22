@@ -755,6 +755,103 @@ test_protected_means_exactly_what_protect_applies() {
   assert_contains "$out" "main protection is not exactly what protect applies"
 }
 
+exact_gh() { # GitHub for exact-protection, answered from $T_TMP (dev.json, main.json, rulesets); every call logged
+  protection_fixture dev >"$T_TMP/dev.json"
+  protection_fixture main >"$T_TMP/main.json"
+  echo 0 >"$T_TMP/rulesets"
+  : >"$T_TMP/calls"
+  owner_gh() {
+    echo "owner_gh $*" >>"$T_TMP/calls"
+    local f=""
+    case "$*" in
+      "api user --jq .login") echo "$OWNER"; return ;;
+      "api repos/$REPO --jq "*) printf '%s\t%s\t%s\tfalse\n' "$REPO" "$OWNER" "$MARKER"; return ;;
+      "api repos/$REPO/rulesets --jq length") cat "$T_TMP/rulesets"; return ;;
+      "api repos/$REPO/branches/dev --jq .protected") if [[ -s "$T_TMP/dev.json" ]]; then echo true; else echo false; fi; return ;;
+      "api repos/$REPO/branches/main --jq .protected") if [[ -s "$T_TMP/main.json" ]]; then echo true; else echo false; fi; return ;;
+      "api repos/$REPO/branches/dev/protection"*) f=dev ;;
+      "api repos/$REPO/branches/main/protection"*) f=main ;;
+      *) echo "gh: Not Found (HTTP 404)" >&2; return 1 ;;
+    esac
+    [[ -s "$T_TMP/$f.json" ]] || { echo "gh: Branch not protected (HTTP 404)" >&2; return 1; }
+    if [[ "${3:-}" == --jq ]]; then jq -r "$4" "$T_TMP/$f.json"; else cat "$T_TMP/$f.json"; fi
+  }
+  local f
+  for f in app_session mint_token load_app app_gh app_git app_curl; do
+    eval "$f() { echo \"$f \$*\" >>\"\$T_TMP/calls\"; }"
+  done
+}
+
+exact_reads_only() { # <what>: every request was an owner read; no app token asked for or used
+  assert_eq "$(grep -cv '^owner_gh api ' "$T_TMP/calls" || true)" 0 "$1: a call other than an owner read"
+  assert_eq "$(grep -cE -- ' (-X|--method|-f|-F|--field|--raw-field|--input)( |$)' "$T_TMP/calls" || true)" 0 "$1: a write"
+}
+
+test_exact_protection_compares_the_whole_protection_reading_only() {
+  # Owner 2026-11-22 (review-lens round 81, C1 = SEC-1): the handoffs' exact-protection check
+  # compares the whole protection, as protect's own read-back does, not the seven fields status
+  # prints; as the owner, reading only, with no app token issued.
+  load
+  exact_gh
+  local rc out
+  rc=0; out="$(cmd_exact_protection 2>&1)" || rc=$?
+  assert_exit 0 "$rc" "protect's own settings"
+  assert_contains "$out" "exact protection: dev and main exactly as protect applies them, no ruleset"
+  exact_reads_only "exact"
+  assert_contains "$(cat "$T_TMP/calls")" "owner_gh api repos/$REPO/branches/dev/protection"
+  assert_contains "$(cat "$T_TMP/calls")" "owner_gh api repos/$REPO/branches/main/protection"
+  # An extra required check on dev: the seven fields are unchanged.
+  exact_gh
+  jq -c '. + {required_status_checks: {url: "x", strict: true, contexts: ["owner-extra-check"], checks: [{context: "owner-extra-check", app_id: null}]}}' "$T_TMP/dev.json" >"$T_TMP/x" && mv "$T_TMP/x" "$T_TMP/dev.json"
+  assert_eq "$(protection_of dev)" "$WANT_DEV" "the seven fields with an extra required check"
+  : >"$T_TMP/calls"
+  rc=0; out="$(cmd_exact_protection 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "an extra required check on dev"
+  assert_contains "$out" "dev protection is not exactly what protect applies"
+  assert_not_contains "$out" "exact protection: dev and main"
+  exact_reads_only "an extra required check"
+  # A locked main: the seven fields are unchanged.
+  exact_gh
+  jq -c '.lock_branch.enabled = true' "$T_TMP/main.json" >"$T_TMP/x" && mv "$T_TMP/x" "$T_TMP/main.json"
+  assert_eq "$(protection_of main)" "$WANT_MAIN" "the seven fields with main locked"
+  : >"$T_TMP/calls"
+  rc=0; out="$(cmd_exact_protection 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "main locked"
+  assert_contains "$out" "main protection is not exactly what protect applies"
+  exact_reads_only "main locked"
+  # Restrictions on who may push to dev.
+  exact_gh
+  jq -c '. + {restrictions: {users: [], teams: [], apps: []}}' "$T_TMP/dev.json" >"$T_TMP/x" && mv "$T_TMP/x" "$T_TMP/dev.json"
+  rc=0; out="$(cmd_exact_protection 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "push restrictions on dev"
+  assert_contains "$out" "dev protection is not exactly what protect applies"
+  exact_reads_only "push restrictions"
+  # main unprotected.
+  exact_gh
+  : >"$T_TMP/main.json"
+  rc=0; out="$(cmd_exact_protection 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "main unprotected"
+  assert_contains "$out" "phase protected needs dev and main protected"
+  exact_reads_only "main unprotected"
+  # A ruleset.
+  exact_gh
+  echo 1 >"$T_TMP/rulesets"
+  rc=0; out="$(cmd_exact_protection 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a ruleset"
+  assert_contains "$out" "phase protected needs no ruleset"
+  exact_reads_only "a ruleset"
+  # The protection can't be read.
+  exact_gh
+  owner_gh() { echo "owner_gh $*" >>"$T_TMP/calls"; return 1; }
+  rc=0; out="$(cmd_exact_protection 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "nothing readable"
+  assert_not_contains "$out" "exact protection: dev and main"
+  exact_reads_only "nothing readable"
+  # The handoffs reach it as a command of its own.
+  assert_contains "$(grep -c '^    exact-protection) cmd_exact_protection ;;$' "$GT")" 1 "exact-protection dispatched"
+  assert_contains "$(grep 'die "usage: github-throwaway.sh' "$GT")" "|exact-protection" "exact-protection in the usage"
+}
+
 owner_cmd_stubs() { # an owner command's checks pass; its gh calls are logged to $T_TMP/owner
   load
   need_owner() { :; }
