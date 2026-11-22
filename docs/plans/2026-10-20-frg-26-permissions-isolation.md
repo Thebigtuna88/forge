@@ -672,7 +672,7 @@ restored. Accepted limit, for this stage 1 sequence only (not the broker): a fai
 runtime itself, Ctrl-C, closing the window or the process being ended can prevent the automatic
 restoration and may show no restore reminder. Deferred: a runtime improvement in `.harness/lib/`
 (a final step that always runs, or a reminder on any early end), through a PR you merge. It needs a
-ticket before FRG-26 merges (rule 5); not yet created.
+ticket before FRG-26 merges (rule 5): FRG-38 (#38), https://github.com/Thebigtuna88/forge/issues/38.
 
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.
