@@ -89,6 +89,7 @@ INSTALLATION_ID=""
 JWT=""
 TOKEN=""
 REVOKED_TOKENS=""
+REVOKE_SENT="" # tokens a revocation request went out for (round 84): revoke_outstanding counts by them
 REDACT_ONLY="" # tokens held for a later check: hidden like the others, never revoked by this run
 # Every token this run got that is neither revoked nor held: revocation of each is tried on exit, so
 # a session token set aside while a second token is minted is never abandoned (round 17, C2).
@@ -938,6 +939,7 @@ revoke_token() { # [seconds] DELETE /installation/token, which GitHub documents 
     return 124
   fi
   # A network hang can't hold it: at most CALL_SECS, less near the clean-up's cap (rounds 52, 53).
+  [[ " $REVOKE_SENT " == *" $TOKEN "* ]] || REVOKE_SENT="$REVOKE_SENT $TOKEN"
   with_timeout "$secs" app_gh api -X DELETE installation/token >/dev/null 2>&1 || rc=$?
   if [[ $rc -ne 0 ]]; then say "note: revoking a token failed or timed out; GitHub expires it within an hour"; fi
   REVOKED_TOKENS="$REVOKED_TOKENS $TOKEN"
@@ -1076,16 +1078,21 @@ outstanding_drop() { # <token> — revoked or held: no longer this run's to revo
 }
 
 revoke_outstanding() { # the current token, then every other token this run minted and still owns
-  local t n=0
+  local t n=0 sent=0
   revoke_token
   for t in $OUTSTANDING; do
     call_budget || break # the clean-up's time cap (round 52): what's left stays on the list, reported
     TOKEN="$t"
     revoke_token "$CALL_BUDGET"
   done
-  for t in $OUTSTANDING; do n=$((n + 1)); done
+  # Each token still outstanding counted once (round 84, review-lens round 80, C1 = SEC-1): a request
+  # went out for it, here or before, and was not confirmed, or none ever did (the cap came first).
+  for t in $OUTSTANDING; do
+    n=$((n + 1))
+    [[ " $REVOKE_SENT " != *" $t "* ]] || sent=$((sent + 1))
+  done
   if [[ $n -gt 0 ]]; then
-    say "note: $n token(s) of this run could not be revoked; GitHub expires each within an hour of its issue"
+    say "note: $n token(s) of this run still outstanding: $sent with a revocation request sent and not confirmed, $((n - sent)) with none sent (the clean-up's time cap was reached); GitHub expires each within an hour of its issue"
   fi
 }
 

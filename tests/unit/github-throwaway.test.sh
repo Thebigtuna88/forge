@@ -4929,6 +4929,44 @@ test_a_request_given_no_time_is_not_counted_as_sent() {
   assert_not_contains "$out" "revoking a token failed or timed out" "revoke_outstanding: a revocation never sent"
   assert_contains "$out" "still to settle: token2" "revoke_outstanding"
   assert_contains "$out" "still to settle: token3" "revoke_outstanding: the time is up for the rest too"
+  # Its last line (round 84, review-lens round 80, C1 = SEC-1): every token still outstanding counted
+  # once, as sent and not confirmed or as never sent, never a never-sent one as "could not be revoked".
+  assert_contains "$out" "note: 2 token(s) of this run still outstanding: 0 with a revocation request sent and not confirmed, 2 with none sent (the clean-up's time cap was reached)"
+  assert_not_contains "$out" "could not be revoked" "revoke_outstanding: revocations never sent"
+  # token1's revocation fails twice (as the current token, then in the loop), then the time is up:
+  # one token sent and not confirmed (counted once, not per try), two never sent.
+  cleanup_stubs
+  echo 1 >"$T_TMP/delete-fails"
+  turnover_after "api -X DELETE installation/token" 2
+  out="$(
+    TOKEN="$t1" OUTSTANDING=" $t1 $t2 $t3"
+    CLEANUP_DEADLINE=$(($(date +%s) + 6))
+    revoke_outstanding
+  )"
+  assert_eq "$(grep -c 'app_gh 1 api -X DELETE installation/token' "$T_TMP/calls")" 2 "revoke_outstanding: token1 tried twice"
+  assert_contains "$out" "note: 3 token(s) of this run still outstanding: 1 with a revocation request sent and not confirmed, 2 with none sent (the clean-up's time cap was reached)"
+  # token2's revocation was sent before (and failed); now the cap has passed: it is still a token
+  # whose request was sent, and token1 one whose request never was.
+  cleanup_stubs
+  echo 2 >"$T_TMP/delete-fails"
+  out="$(
+    CLEANUP_DEADLINE=$(($(date +%s) + 6))
+    TOKEN="$t2" OUTSTANDING=" $t1 $t2"
+    revoke_token || true
+    CLEANUP_DEADLINE=$(($(date +%s) - 1))
+    revoke_outstanding
+  )"
+  assert_eq "$(grep -c 'api -X DELETE installation/token' "$T_TMP/calls")" 1 "revoke_outstanding: nothing sent past the cap"
+  assert_contains "$out" "note: 2 token(s) of this run still outstanding: 1 with a revocation request sent and not confirmed, 1 with none sent (the clean-up's time cap was reached)"
+  # All revoked: no line.
+  cleanup_stubs
+  # shellcheck disable=SC2030 # the clean-up's state belongs to its own subshell
+  out="$(
+    TOKEN="$t1" OUTSTANDING=" $t1 $t2"
+    CLEANUP_DEADLINE=$(($(date +%s) + 6))
+    revoke_outstanding
+  )"
+  assert_not_contains "$out" "still outstanding" "revoke_outstanding: every token revoked"
 }
 
 # Round 73 (C1, SEC-1): a control's token stays in its control, which revokes it and confirms the
