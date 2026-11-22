@@ -852,6 +852,59 @@ test_exact_protection_compares_the_whole_protection_reading_only() {
   assert_contains "$(grep 'die "usage: github-throwaway.sh' "$GT")" "|exact-protection" "exact-protection in the usage"
 }
 
+test_a_protection_mismatch_names_only_listed_settings() {
+  # Owner 2026-11-22 (review-lens round 82, SEC-1): a protection that isn't exactly protect's is
+  # reported by the fixed names of the settings that differ; never a value GitHub returned, and never
+  # a name outside the list (a required check's name is free text, and could hold a credential).
+  load
+  exact_gh
+  local rc out canary
+  canary="$(printf 'sk_%s_%s' live FRG26canary0123456789)"
+  # An extra required check whose name is a credential.
+  jq -c --arg c "$canary" '. + {required_status_checks: {url: "x", strict: true, contexts: [$c], checks: [{context: $c, app_id: null}]}}' "$T_TMP/dev.json" >"$T_TMP/x" && mv "$T_TMP/x" "$T_TMP/dev.json"
+  rc=0; out="$(cmd_exact_protection 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a required check named like a credential"
+  assert_contains "$out" "dev protection is not exactly what protect applies (differs in: required_status_checks)"
+  assert_not_contains "$out" "$canary"
+  assert_not_contains "$out" '{"'
+  # A setting GitHub might add, with a credential for its name.
+  exact_gh
+  jq -c --arg c "$canary" '. + {($c): {enabled: true}}' "$T_TMP/main.json" >"$T_TMP/x" && mv "$T_TMP/x" "$T_TMP/main.json"
+  rc=0; out="$(cmd_exact_protection 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "an unlisted setting on main"
+  assert_contains "$out" "main protection is not exactly what protect applies (differs in: a setting not on the list)"
+  assert_not_contains "$out" "$canary"
+  # A listed setting that differs, holding a credential inside it, beside an unlisted one.
+  exact_gh
+  jq -c --arg c "$canary" '.lock_branch = {enabled: true, note: $c} | . + {($c): 1}' "$T_TMP/main.json" >"$T_TMP/x" && mv "$T_TMP/x" "$T_TMP/main.json"
+  rc=0; out="$(cmd_exact_protection 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "main locked, with an unlisted setting"
+  assert_contains "$out" "main protection is not exactly what protect applies (differs in: lock_branch, a setting not on the list)"
+  assert_not_contains "$out" "$canary"
+  # One of the seven status fields, holding a credential: named, not shown.
+  exact_gh
+  jq -c --arg c "$canary" '.required_pull_request_reviews.required_approving_review_count = $c' "$T_TMP/dev.json" >"$T_TMP/x" && mv "$T_TMP/x" "$T_TMP/dev.json"
+  rc=0; out="$(cmd_exact_protection 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a review count holding a credential"
+  assert_contains "$out" "dev protection is not exactly what protect applies (differs in: required_approving_review_count)"
+  assert_not_contains "$out" "$canary"
+  # The same, with a space in it, so the seven fields no longer line up.
+  exact_gh
+  jq -c --arg c "$canary and more" '.required_pull_request_reviews.dismiss_stale_reviews = $c' "$T_TMP/dev.json" >"$T_TMP/x" && mv "$T_TMP/x" "$T_TMP/dev.json"
+  rc=0; out="$(cmd_exact_protection 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "a review setting with spaces"
+  assert_contains "$out" "dev protection is not exactly what protect applies (differs in: an answer that can't be compared field by field)"
+  assert_not_contains "$out" "$canary"
+  # An answer that isn't an object.
+  exact_gh
+  printf '["%s"]\n' "$canary" >"$T_TMP/dev.json"
+  rc=0; out="$(verify_phase protected 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "an answer that is not an object"
+  assert_contains "$out" "dev protection is not exactly what protect applies"
+  assert_not_contains "$out" "$canary"
+  exact_reads_only "mismatches"
+}
+
 owner_cmd_stubs() { # an owner command's checks pass; its gh calls are logged to $T_TMP/owner
   load
   need_owner() { :; }

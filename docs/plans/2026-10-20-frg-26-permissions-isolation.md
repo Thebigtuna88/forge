@@ -662,6 +662,18 @@ header (GitHub sends one only when a list has more pages), means not all are sho
 not bound, before or after the attempt, and S2d stays inconclusive. The statuses are read with their
 headers, and only a 200 answer whose headers end counts as read; the Link header's value is not kept.
 
+**Stop-protection handoffs and their accepted limit (owner, 2026-11-22, review-lens rounds 81-82).**
+The exact-protection check only reads, and a mismatch names the settings that differ from fixed
+lists, never a value GitHub returned. The restore handoff is frozen and given to you before part 0,
+and part 0's first step asks you to confirm you have it. Unless part 0's final exact-protection
+check passes, the protection is unconfirmed: you stop testing and run the restore handoff. If that
+handoff fails too, its failure is reported and a recovery proposed; the protection is never called
+restored. Accepted limit, for this stage 1 sequence only (not the broker): a failure in the handoff
+runtime itself, Ctrl-C, closing the window or the process being ended can prevent the automatic
+restoration and may show no restore reminder. Deferred: a runtime improvement in `.harness/lib/`
+(a final step that always runs, or a reminder on any early end), through a PR you merge. It needs a
+ticket before FRG-26 merges (rule 5); not yet created.
+
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.
 

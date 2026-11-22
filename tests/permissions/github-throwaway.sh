@@ -1388,6 +1388,37 @@ want_protection() { # <enforce_admins true|false>
   printf '{"allow_deletions":{"enabled":false},"allow_force_pushes":{"enabled":false},"allow_fork_syncing":{"enabled":false},"block_creations":{"enabled":false},"enforce_admins":{"enabled":%s},"lock_branch":{"enabled":false},"required_conversation_resolution":{"enabled":false},"required_linear_history":{"enabled":false},"required_pull_request_reviews":{"dismiss_stale_reviews":true,"require_code_owner_reviews":true,"require_last_push_approval":true,"required_approving_review_count":1},"required_signatures":{"enabled":false}}\n' "$1"
 }
 
+# A protection that isn't protect's is reported by these fixed names only (review-lens round 82,
+# SEC-1): never a value GitHub returned and never another name, since a required check's name is
+# free text and could hold a credential. The settings of a whole protection, as GitHub names them:
+readonly PROTECTION_SETTINGS="allow_deletions allow_force_pushes allow_fork_syncing block_creations enforce_admins lock_branch required_conversation_resolution required_linear_history required_pull_request_reviews required_signatures required_status_checks restrictions"
+# and protection_of's seven fields, in its order.
+readonly SEVEN_FIELDS="required_approving_review_count require_code_owner_reviews require_last_push_approval dismiss_stale_reviews enforce_admins allow_force_pushes allow_deletions"
+
+protection_diff() { # <got> <want>: whole protections; the listed settings that differ, as one line
+  jq -n -r --argjson a "$1" --argjson b "$2" --arg names "$PROTECTION_SETTINGS" '
+    ($names | split(" ")) as $n
+    | if ($a | type) != "object" then "an answer that is not a protection" else
+        ([$a, $b] | map(keys) | add | unique | map(select($a[.] != $b[.]))) as $d
+        | [$d[] | select(. as $k | any($n[]; . == $k))]
+          + (if any($d[]; . as $k | any($n[]; . == $k) | not) then ["a setting not on the list"] else [] end)
+        | if length == 0 then "nothing that can be named" else join(", ") end
+      end' 2>/dev/null || echo "an answer that can't be read"
+}
+
+fields_diff() { # <got> <want>: protection_of lines; the names of the fields that differ
+  local -a got_fields want_fields field_names
+  local i out=""
+  read -r -a got_fields <<<"$1"
+  read -r -a want_fields <<<"$2"
+  read -r -a field_names <<<"$SEVEN_FIELDS"
+  if [[ ${#got_fields[@]} -ne ${#field_names[@]} ]]; then echo "an answer that can't be compared field by field"; return; fi
+  for ((i = 0; i < ${#field_names[@]}; i++)); do
+    [[ "${got_fields[$i]}" == "${want_fields[$i]}" ]] || out="${out:+$out, }${field_names[$i]}"
+  done
+  echo "${out:-nothing that can be named}"
+}
+
 ruleset_summary() { # one line describing the only ruleset, or error
   local id
   into id owner_gh api "repos/$REPO/rulesets" --jq '.[0].id' 2>/dev/null || { echo error; return; }
@@ -1414,16 +1445,17 @@ verify_phase() { # <phase> — the repository must be exactly in the state that 
       ;;
     protected | ruleset)
       [[ "$d" == protected && "$m" == protected ]] || die "phase $1 needs dev and main protected (dev $d, main $m)"
+      # A mismatch names the settings that differ, never what GitHub returned (round 82, SEC-1).
       into got protection_of dev
-      [[ "$got" == "$WANT_DEV" ]] || die "dev protection is '$got', expected '$WANT_DEV'"
+      [[ "$got" == "$WANT_DEV" ]] || die "dev protection is not exactly what protect applies (differs in: $(fields_diff "$got" "$WANT_DEV"))"
       into got protection_of main
-      [[ "$got" == "$WANT_MAIN" ]] || die "main protection is '$got', expected '$WANT_MAIN'"
+      [[ "$got" == "$WANT_MAIN" ]] || die "main protection is not exactly what protect applies (differs in: $(fields_diff "$got" "$WANT_MAIN"))"
       # All of it, not only those fields: an extra required check or restriction would make a
       # refusal pass for the wrong reason, and unprotect would delete what protect didn't apply.
       into got protection_full dev
-      [[ "$got" == "$(want_protection true)" ]] || die "dev protection is not exactly what protect applies: $got"
+      [[ "$got" == "$(want_protection true)" ]] || die "dev protection is not exactly what protect applies (differs in: $(protection_diff "$got" "$(want_protection true)"))"
       into got protection_full main
-      [[ "$got" == "$(want_protection false)" ]] || die "main protection is not exactly what protect applies: $got"
+      [[ "$got" == "$(want_protection false)" ]] || die "main protection is not exactly what protect applies (differs in: $(protection_diff "$got" "$(want_protection false)"))"
       if [[ "$1" == protected ]]; then
         [[ "$r" == 0 ]] || die "phase protected needs no ruleset (found $r)"
       else
