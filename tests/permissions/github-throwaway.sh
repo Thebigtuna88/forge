@@ -272,22 +272,22 @@ settle_tokens() { # <why>
       t="${e#*=}" label="${e%%=*}"
       [[ " $OUTSTANDING " == *" $t "* ]] || continue
       if [[ " $before " == *" $t "* ]]; then [[ $pass == again ]] || continue; else [[ $pass == new ]] || continue; fi
-      if ! in_time; then
+      if ! call_budget; then
         if [[ $pass == new ]]; then say "TOKEN $label revocation not tried: $1"; else say "TOKEN $label revocation not tried again: $1"; fi
         continue
       fi
       SETTLE_TRIED="$SETTLE_TRIED $t"
       TOKEN="$t"
-      revoke_token || true
+      revoke_token "$CALL_BUDGET" || true
     done
   done
   for e in $(settle_list); do
     t="${e#*=}" label="${e%%=*}"
-    if ! in_time; then
+    if ! call_budget; then
       say "TOKEN $label not checked yet: $1"
       continue
     fi
-    if token_refused "$t"; then
+    if token_refused "$t" "$CALL_BUDGET"; then
       revocation_judged "$label" "$t"
     else
       [[ " $OUTSTANDING " == *" $t "* ]] || OUTSTANDING="$OUTSTANDING $t"
@@ -926,12 +926,19 @@ need_installation_scope() {
   [[ "$got" == "$REPO" ]] || die "the app must be installed on $REPO only (it reaches: $(printf '%s' "$got" | tr '\n' ' '))"
 }
 
-revoke_token() { # DELETE /installation/token, which GitHub documents as stopping the token at once
-  # (for stateless tokens Unconfirmed until A5, plan 4.3); 1 if GitHub didn't confirm it
+revoke_token() { # [seconds] DELETE /installation/token, which GitHub documents as stopping the token
+  # at once (for stateless tokens Unconfirmed until A5, plan 4.3); 1 if GitHub didn't confirm it
   [[ -n "$TOKEN" ]] || return 0
-  local rc=0
+  local rc=0 secs="${1:-$(call_secs)}"
+  # No time left: not sent, and said so, never a failure or a timeout (round 83). It stays outstanding.
+  if [[ $secs -le 0 ]]; then
+    say "note: a token's revocation was not sent: the clean-up's time cap was reached"
+    REVOKED_TOKENS="$REVOKED_TOKENS $TOKEN"
+    TOKEN=""
+    return 124
+  fi
   # A network hang can't hold it: at most CALL_SECS, less near the clean-up's cap (rounds 52, 53).
-  with_timeout "$(call_secs)" app_gh api -X DELETE installation/token >/dev/null 2>&1 || rc=$?
+  with_timeout "$secs" app_gh api -X DELETE installation/token >/dev/null 2>&1 || rc=$?
   if [[ $rc -ne 0 ]]; then say "note: revoking a token failed or timed out; GitHub expires it within an hour"; fi
   REVOKED_TOKENS="$REVOKED_TOKENS $TOKEN"
   # Only a confirmed revocation leaves the list: a failed one is tried again on exit (round 26).
@@ -1043,6 +1050,15 @@ in_time() { # 1 once the clean-up's time cap has passed (no cap outside the clea
   [[ -z "$CLEANUP_DEADLINE" || $(date +%s) -lt $CLEANUP_DEADLINE ]]
 }
 
+# A token request's time, read once and given to the request (round 83): a check with in_time and
+# then call_secs read the clock twice, and a second turning over between them gave the request 0 s,
+# so it was never sent yet counted as a try. Sets CALL_BUDGET; 1 when none is left.
+CALL_BUDGET=""
+call_budget() {
+  CALL_BUDGET="$(call_secs)"
+  [[ $CALL_BUDGET -gt 0 ]]
+}
+
 pause() { # <seconds> — a wait between polls, never past the clean-up's cap (round 72, SEC-1)
   local s
   s="$(call_secs)"
@@ -1063,9 +1079,9 @@ revoke_outstanding() { # the current token, then every other token this run mint
   local t n=0
   revoke_token
   for t in $OUTSTANDING; do
-    in_time || break # the clean-up's time cap (round 52): what's left stays on the list, reported
+    call_budget || break # the clean-up's time cap (round 52): what's left stays on the list, reported
     TOKEN="$t"
-    revoke_token
+    revoke_token "$CALL_BUDGET"
   done
   for t in $OUTSTANDING; do n=$((n + 1)); done
   if [[ $n -gt 0 ]]; then
@@ -2667,11 +2683,17 @@ probe_label_of() { # <token> — its name in this run, never the token
   printf 'unnamed'
 }
 
-# Is the token now refused? A read with it, within call_secs; 0 only for HTTP 401 itself, never for
-# words alone (round 58, C2).
-token_refused() { # <token>
+# Is the token now refused? A read with it, within [seconds] (call_secs by default); 0 only for HTTP
+# 401 itself, never for words alone (round 58, C2). With no time left the read isn't sent, and
+# LAST_OUT says so (round 83).
+token_refused() { # <token> [seconds]
+  local secs="${2:-$(call_secs)}"
+  if [[ $secs -le 0 ]]; then
+    LAST_OUT="not sent: the clean-up's time cap was reached" LAST_RC=124
+    return 1
+  fi
   TOKEN="$1"
-  capture with_timeout "$(call_secs)" app_gh api "repos/$REPO" --jq .full_name || true
+  capture with_timeout "$secs" app_gh api "repos/$REPO" --jq .full_name || true
   TOKEN=""
   [[ $LAST_RC -ne 0 ]] && printf '%s' "$LAST_OUT" | grep -q 'HTTP 401'
 }
@@ -2685,18 +2707,18 @@ probe_settle_tokens() {
   for e in $ISSUED; do
     t="${e#*=}" label="${e%%=*}"
     [[ " $PROBE_CONFIRMED " != *" $t "* ]] || continue
-    if ! in_time; then
+    if ! call_budget; then
       say "TOKEN $label not checked: the clean-up's time cap (${CLEANUP_SECS}s) was reached"
       continue
     fi
     TOKEN="$t"
-    revoke_token || true
-    if ! in_time; then
+    revoke_token "$CALL_BUDGET" || true
+    if ! call_budget; then
       say "TOKEN $label revocation tried, not checked: the clean-up's time cap (${CLEANUP_SECS}s) was reached"
       [[ " $OUTSTANDING " == *" $t "* ]] || OUTSTANDING="$OUTSTANDING $t"
       continue
     fi
-    if token_refused "$t"; then
+    if token_refused "$t" "$CALL_BUDGET"; then
       PROBE_REVOKED=$((PROBE_REVOKED + 1))
       PROBE_CONFIRMED="$PROBE_CONFIRMED $t"
       say "TOKEN $label revoked: a read with it now gets HTTP 401"

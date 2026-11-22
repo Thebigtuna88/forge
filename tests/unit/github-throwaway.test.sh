@@ -4822,6 +4822,115 @@ test_hung_revocations_end_by_the_cap_and_name_each_tokens_state() {
   assert_not_contains "$OUT" "CLEANUP DONE" "everything hung"
 }
 
+# call_secs gives 0 once: the first time it runs after <n> calls in $T_TMP/calls contain <text>, as it
+# does when the clock's second turns over between a check of the deadline and the request's own
+# reading of it. After cleanup_stubs (which sources the script afresh).
+turnover_after() { # <text> <n>
+  TURN_TEXT="$1" TURN_N="$2"
+  rm -f "$T_TMP/turned"
+  eval "$(declare -f call_secs | sed '1s/^call_secs/real_call_secs/')"
+  call_secs() {
+    if [[ ! -f "$T_TMP/turned" && $(grep -cF -- "$TURN_TEXT" "$T_TMP/calls") -ge $TURN_N ]]; then
+      : >"$T_TMP/turned"
+      printf 0
+      return
+    fi
+    real_call_secs "$@"
+  }
+}
+
+# Waits for the start of the clock's next second (and 50 ms), so that a 1 s request's turn falls
+# where the case puts it, not past a deadline by where in its second the clean-up started.
+second_start() { perl -MTime::HiRes=time,sleep -e '$t = time; sleep(1 - ($t - int($t)) + 0.05)'; }
+
+# Round 83 (the round 81 failure, fixes.md "Revocation-cap failure investigation"): the clean-up read
+# the clock twice per request, once to check the deadline and once for the request's time. A
+# turnover between the two gave a request 0 s: it was never sent, yet counted as a try, so the token
+# waited behind the retries and its revocation could go unsent while others were retried, and the
+# record named a failure or a timeout. Now the time is read once, and 0 s means not tried or not
+# checked, named so.
+test_a_request_given_no_time_is_not_counted_as_sent() {
+  local t t1 t2 t3 out deletes notes after_sweep
+  t1="$(cleanup_token 1)" t2="$(cleanup_token 2)" t3="$(cleanup_token 3)"
+  # Everything hangs; no time for token3's first try: it is tried in the second share, ahead of the
+  # retries, and no failure or timeout is named for a request never sent.
+  cleanup_stubs
+  turnover_after "api -X DELETE installation/token" 2
+  printf 'app all\nowner pulls?state=open\n' >"$T_TMP/hang"
+  second_start
+  stopped_run_cleanup 1 "SWEEP_ON_EXIT=1 PHASE=open"
+  [[ -f "$T_TMP/turned" ]] || _t_fail "everything hung: the turnover never came"
+  ((SECS <= CLEANUP_SECS + 3)) || _t_fail "everything hung: the clean-up took ${SECS}s, over its ${CLEANUP_SECS}s cap"
+  assert_contains "$(cat "$T_TMP/calls")" "app_gh 3 api -X DELETE installation/token" "everything hung: token3's revocation sent"
+  after_sweep="$(sed -n '/^owner_gh api --paginate .*pulls?state=open/,$p' "$T_TMP/calls" | grep -m 1 'api -X DELETE installation/token')"
+  assert_eq "$after_sweep" "app_gh 3 api -X DELETE installation/token" "everything hung: the first revocation after the tidy-up"
+  assert_contains "$OUT" "TOKEN token3 revocation not tried: the clean-up's share for tokens (3s) was used up"
+  deletes="$(grep -c 'api -X DELETE installation/token' "$T_TMP/calls")"
+  notes="$(grep -c 'note: revoking a token failed or timed out' <<<"$OUT")"
+  assert_eq "$notes" "$deletes" "everything hung: a failure or timeout named for each revocation sent, and only those"
+  assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "NOT confirmed: token1 token2 token3;" "everything hung"
+  # Nothing hangs; no time for token1's first check: it is named not checked yet, never "no answer",
+  # and checked after the tidy-up.
+  cleanup_stubs
+  turnover_after "api -X DELETE installation/token" 3
+  stopped_run_cleanup 0 ""
+  [[ -f "$T_TMP/turned" ]] || _t_fail "a check: the turnover never came"
+  assert_not_contains "$OUT" "TOKEN token1 NOT confirmed revoked" "a check never sent"
+  assert_contains "$OUT" "TOKEN token1 not checked yet: the clean-up's share for tokens (3s) was used up"
+  assert_contains "$OUT" "TOKEN token1 revoked: a read with it now gets HTTP 401"
+  assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none"
+  # a2-probe's settling: no time for token2's revocation, then none for token1's check. Neither is
+  # reported as a revocation tried that a read still answers.
+  cleanup_stubs
+  turnover_after "app_gh 1 api repos/$REPO --jq .full_name" 1
+  out="$(
+    ISSUED=" whole=$t1 full=$t2" PROBE_CONFIRMED="" OUTSTANDING=" $t1 $t2"
+    CLEANUP_DEADLINE=$(($(date +%s) + 6))
+    probe_settle_tokens
+    for t in $OUTSTANDING; do echo "still to settle: token${t:11:1}"; done
+  )"
+  assert_not_contains "$(cat "$T_TMP/calls")" "app_gh 2 api -X DELETE" "a2-probe: token2's revocation given no time"
+  assert_not_contains "$(cat "$T_TMP/calls")" "app_gh 2 api repos/" "a2-probe: token2 read without a revocation"
+  assert_not_contains "$out" "TOKEN full still answers a read after its revocation was tried" "a2-probe: a revocation never sent"
+  assert_contains "$out" "TOKEN full not checked: the clean-up's time cap (6s) was reached"
+  assert_contains "$out" "still to settle: token2" "a2-probe"
+  cleanup_stubs
+  turnover_after "app_gh 1 api -X DELETE installation/token" 1
+  out="$(
+    ISSUED=" whole=$t1" PROBE_CONFIRMED="" OUTSTANDING=" $t1"
+    CLEANUP_DEADLINE=$(($(date +%s) + 6))
+    probe_settle_tokens
+  )"
+  assert_not_contains "$(cat "$T_TMP/calls")" "app_gh 1 api repos/" "a2-probe: token1's check given no time"
+  assert_not_contains "$out" "still answers a read after its revocation was tried" "a2-probe: a check never sent"
+  assert_contains "$out" "TOKEN whole revocation tried, not checked: the clean-up's time cap (6s) was reached"
+  # revoke_outstanding: no time for the current token's revocation (named not sent, never failed or
+  # timed out; the token stays outstanding, so the loop after it tries it again), or for the next
+  # one's (the time is up: it and the rest stay to settle).
+  cleanup_stubs
+  turnover_after "api -X DELETE installation/token" 0
+  out="$(
+    TOKEN="$t1" OUTSTANDING=" $t1"
+    CLEANUP_DEADLINE=$(($(date +%s) + 6))
+    revoke_outstanding
+  )"
+  assert_not_contains "$out" "revoking a token failed or timed out" "revoke_outstanding: the current token's revocation never sent"
+  assert_contains "$out" "note: a token's revocation was not sent: the clean-up's time cap was reached"
+  cleanup_stubs
+  turnover_after "api -X DELETE installation/token" 1
+  # shellcheck disable=SC2030 # the clean-up's state belongs to its own subshell
+  out="$(
+    TOKEN="$t1" OUTSTANDING=" $t1 $t2 $t3"
+    CLEANUP_DEADLINE=$(($(date +%s) + 6))
+    revoke_outstanding
+    for t in $OUTSTANDING; do echo "still to settle: token${t:11:1}"; done
+  )"
+  assert_not_contains "$(cat "$T_TMP/calls")" "app_gh 2 api -X DELETE" "revoke_outstanding: token2 given no time"
+  assert_not_contains "$out" "revoking a token failed or timed out" "revoke_outstanding: a revocation never sent"
+  assert_contains "$out" "still to settle: token2" "revoke_outstanding"
+  assert_contains "$out" "still to settle: token3" "revoke_outstanding: the time is up for the rest too"
+}
+
 # Round 73 (C1, SEC-1): a control's token stays in its control, which revokes it and confirms the
 # revocation with a read (HTTP 401), retrying within its own share; the run is told only its name
 # and its state, and names it in the clean-up's last line. A control that ends without telling
