@@ -4284,14 +4284,15 @@ test_mint_reports_a_token_request_with_no_complete_answer() {
   after="$(date +%s)"
   assert_exit 2 "$rc" "no answer"
   assert_contains "$out" "GitHub may have issued one this run never received"
-  # Owner, round 56: the latest it can expire, conservatively: an hour after the request was sent,
-  # plus a minute.
-  local line deadline
+  # Owner, 2026-11-23 (was round 56's latest expiry): the record keeps when the request was sent, by
+  # this Mac's clock, and no expiry is stated: GitHub may have issued it at a time this run can't know.
+  local line sent
   line="$(printf '%s\n' "$out" | sed -n 's/^unreceived=\[P1 \([^ ]*\) .*/\1/p')"
-  deadline="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$line" +%s 2>/dev/null)" || deadline=""
-  [[ "$deadline" =~ ^[0-9]+$ && $deadline -ge $((before + 3660)) && $deadline -le $((after + 3660)) ]] \
-    || _t_fail "the recorded deadline '$line' is not the request time plus 61 minutes"
-  assert_contains "$out" "by $line at the latest" "the deadline in mint's message"
+  sent="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$line" +%s 2>/dev/null)" || sent=""
+  [[ "$sent" =~ ^[0-9]+$ && $sent -ge $((before - 1)) && $sent -le $((after + 1)) ]] \
+    || _t_fail "the recorded time '$line' is not when the request was sent"
+  assert_contains "$out" "the request was sent at $line by this Mac's clock" "the request's time in mint's message"
+  assert_not_contains "$out" "at the latest" "a deadline in mint's message"
   assert_contains "$out" 'unreceived=[P1 '"$line"' {"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}'
   # Never asked again: one token request, in request_token, which mint calls once (round 60).
   assert_eq "$(grep -c 'access_tokens' <<<"$(declare -f request_token)")" 1 "request_token asks for a token more than once"
@@ -4425,7 +4426,8 @@ test_key_check_and_suspend_check_stop_on_a_token_possibly_issued() {
     assert_exit 2 "$rc" "$cmd"
     assert_contains "$out" "possibly issued, never received" "$cmd"
     assert_contains "$out" "repositories forge-frg26-throwaway; permissions $WANT_PERMS" "$cmd"
-    assert_contains "$out" "at the latest" "$cmd"
+    assert_contains "$out" "its expiry is unknown" "$cmd"
+    assert_not_contains "$out" "at the latest" "$cmd"
     assert_eq "$(cat "$T_TMP/calls")" "" "$cmd went on after the answer"
   done
 }
@@ -4445,7 +4447,8 @@ test_a_controls_token_possibly_issued_is_reported_and_stops_the_run() {
   assert_exit 2 "$rc"
   assert_contains "$out" "TOKEN P9 possibly issued, never received"
   assert_contains "$out" "repositories forge-frg26-throwaway; permissions {\"metadata\":\"read\"}"
-  assert_contains "$out" "expires by 2026-11-12T23:00:00Z at the latest"
+  assert_contains "$out" "its expiry is unknown"
+  assert_contains "$out" "the request was sent at 2026-11-12T23:00:00Z by this Mac's clock"
   assert_not_contains "$out" "went on"
 }
 
@@ -4536,7 +4539,7 @@ test_a_signal_while_a_controls_record_comes_in_keeps_it() {
     echo continued' _ "$GT" "$T_TMP/work" 2>&1)" || rc=$?
   assert_exit 143 "$rc"
   assert_contains "$out" "TOKEN P9 possibly issued, never received"
-  assert_contains "$out" "expires by 2026-11-12T23:00:00Z at the latest"
+  assert_contains "$out" "the request was sent at 2026-11-12T23:00:00Z by this Mac's clock"
   assert_contains "$out" "CLEANUP REPORTED=< P9>"
   assert_not_contains "$out" "continued"
 }
@@ -4647,7 +4650,7 @@ whole 2026-11-12T12:31:00Z {}
   out="$(probe_finish 2; echo "rc=$PROBE_RC"; echo "$PROBE_SUMMARY")"
   assert_contains "$out" "TOKEN P1 possibly issued, never received"
   assert_contains "$out" "it carries at most: repositories forge-frg26-throwaway; permissions {\"contents\":\"write\",\"metadata\":\"read\"}"
-  assert_contains "$out" "it expires by 2026-11-12T13:01:00Z at the latest"
+  assert_contains "$out" "its expiry is unknown: GitHub gives such a token one hour from when it issues it, and this run doesn't know whether or when that was (the request was sent at 2026-11-12T13:01:00Z by this Mac's clock)"
   assert_contains "$out" "TOKEN whole possibly issued, never received"
   assert_contains "$out" "it carries at most: repositories every repository the installation is on; permissions the installation's $WANT_PERMS"
   assert_contains "$out" "This run does not ask for it again"
@@ -5668,7 +5671,8 @@ EOF
     if [[ "$mode" != token ]]; then
       assert_contains "$OUT" "TOKEN token4 possibly issued, never received" "$name"
       assert_contains "$OUT" "it carries at most: repositories forge-frg26-throwaway; permissions $WANT_PERMS" "$name"
-      assert_contains "$OUT" "at the latest" "$name: its latest expiry"
+      assert_contains "$OUT" "its expiry is unknown" "$name: its expiry, unknown"
+      assert_not_contains "$OUT" "at the latest" "$name: no deadline"
       assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "CLEANUP INCOMPLETE" "$name"
     else
       assert_contains "$OUT" "TOKEN token4 revoked: a read with it now gets HTTP 401" "$name"
@@ -5731,6 +5735,48 @@ test_a_tidy_up_write_that_times_out_is_settled_or_its_outcome_unknown() {
       assert_not_contains "$OUT" "outcome is unknown" "$name"
     fi
   done
+}
+
+# Owner, 2026-11-23 (review-lens round 90, C1 = SEC-1): a token request with no complete answer may have been
+# issued at a time this run can't know, so no wall-clock expiry is stated for it, only that it lasts an hour from
+# its issue; the record keeps when the request was sent, by this Mac's clock. An expiry GitHub returned is kept
+# exactly as GitHub gave it.
+test_an_unreceived_tokens_expiry_is_unknown_and_a_received_ones_is_githubs() {
+  local out rc=0 tok sent at before after
+  mint_with_curl "" "curl: (28) Operation timed out" 000 28
+  before="$(date +%s)"
+  out="$( (MINT_LABEL=P1; trap 'declare -p UNRECEIVED' EXIT; mint '{"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}' narrowed '{"metadata":"read"}') 2>&1)" || rc=$?
+  after="$(date +%s)"
+  assert_exit 2 "$rc" "no answer"
+  sent="$(printf '%s\n' "$out" | sed -n 's/^declare -- UNRECEIVED="P1 \([^ ]*\) .*/\1/p')"
+  at="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$sent" +%s 2>/dev/null)" || at=""
+  [[ "$at" =~ ^[0-9]+$ && $at -ge $((before - 1)) && $at -le $((after + 1)) ]] \
+    || _t_fail "the record's time '$sent' is not when the request was sent"
+  assert_contains "$out" "if so its expiry is unknown: one hour from when GitHub issued it (the request was sent at $sent by this Mac's clock)" "mint's message"
+  assert_not_contains "$out" "at the latest" "a deadline in mint's message"
+  tok="$(new_token)"
+  mint_with_curl "{\"token\":\"$tok\",\"expires_at\":\"2026-11-12T13:37:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"selected\",\"repositories\":[{\"full_name\":\"$REPO\"}]}" "" 201 0
+  out="$( (MINT_LABEL=P3; trap revoke_outstanding EXIT; mint '{"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}' narrowed '{"metadata":"read"}'; printf 'answer=%s\nmeta=%s\n' "$MINT_ANSWER" "$ISSUED_META") 2>&1)" || rc=$?
+  assert_contains "$out" 'answer={"expires_at":"2026-11-12T13:37:00Z",' "GitHub's expiry, as GitHub gave it"
+  assert_contains "$out" 'meta=P3 {"expires_at":"2026-11-12T13:37:00Z",' "GitHub's expiry, kept for the clean-up"
+  assert_not_contains "$out" "$tok" "the token printed"
+}
+
+# The same for the clean-up's report (after the test above in this file: its quoted record would otherwise
+# reach the trap there in shellcheck's reading, SC2089/SC2090).
+test_an_unreceived_tokens_expiry_is_unknown_in_the_clean_ups_report() {
+  local out
+  probe_stubs
+  ISSUED=""
+  UNRECEIVED='P1 2026-11-12T12:01:00Z {"permissions":{"metadata":"read"},"repositories":["forge-frg26-throwaway"]}
+'
+  PROBE_END=""
+  out="$(probe_finish 2; echo "$PROBE_SUMMARY")"
+  assert_contains "$out" "TOKEN P1 possibly issued, never received"
+  assert_contains "$out" "its expiry is unknown: GitHub gives such a token one hour from when it issues it, and this run doesn't know whether or when that was (the request was sent at 2026-11-12T12:01:00Z by this Mac's clock)" "the clean-up's report"
+  assert_not_contains "$out" "at the latest" "a deadline in the clean-up's report"
+  assert_not_contains "$out" "expires by" "a deadline in the clean-up's report"
+  end_stand_in_run
 }
 
 run_tests

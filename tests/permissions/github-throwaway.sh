@@ -100,7 +100,7 @@ PROBE_SUMMARY="" # a2-probe's last line, printed by the exit clean-up after ever
 PROBE_RC=""      # a2-probe's exit status, decided by the exit clean-up
 ISSUED=""        # label=token for every token GitHub issued to this run, kept or not
 ISSUED_META=""   # one line per token: label, then GitHub's answer when it was issued (no token)
-UNRECEIVED=""    # per token request with no complete answer: label, latest expiry, the request
+UNRECEIVED=""    # per token request with no complete answer: label, when it was sent (this Mac's clock), the request
 PENDING_MINT=""  # the token request in progress, in the same form, until its answer is settled
 JWT_ERR=""
 JWT_RC=0
@@ -816,9 +816,10 @@ need_app_identity() {
 
 # The one token request (round 60, C1: mint, key-check and suspend-check all use it), with every
 # safeguard the clean-up relies on. Asked once, never again (owner, round 56). GitHub issues a token
-# for an hour, so one issued for it expires an hour after it is sent at the latest (plus a minute
-# for the clocks): REQ_BY. It is recorded as pending before it is sent, so a signal while it is out
-# still reaches the clean-up's report (round 57, C1). Catchable signals are held from before it is
+# for an hour from its issue, and a request with no complete answer may have been issued at a time
+# this run can't know, so no expiry is stated for it (owner, 2026-11-23): REQ_AT is only when the
+# request was sent, by this Mac's clock. It is recorded as pending before it is sent, so a signal
+# while it is out still reaches the clean-up's report (round 57, C1). Catchable signals are held from before it is
 # sent until a token its answer brings is registered (rounds 58, 59): a signal while it is out is
 # acted on once the answer is in hand, normally within curl's own CALL_SECS (20s), or CALL_SECS + 5
 # if curl fails to stop and app_curl's backstop ends it (an accepted limit for stage 1 commands only,
@@ -830,15 +831,15 @@ need_app_identity() {
 # transfer, a 5xx, a 2xx without a readable token (round 57, C2) - may mean a token this run never
 # received: it goes to UNRECEIVED for the clean-up's report (round 56, SEC-1). Never dies once the
 # request is sent. Sets REQ_OK (0 when curl finished cleanly with a 2xx), REQ_ANSWER (the body),
-# REQ_TOKEN (yes|no), REQ_UNRECEIVED (yes|no) and REQ_BY.
+# REQ_TOKEN (yes|no), REQ_UNRECEIVED (yes|no) and REQ_AT.
 request_token() { # <request json>
   local t meta label
   REQ_OK=0 REQ_TOKEN=no REQ_UNRECEIVED=no REQ_ANSWER=""
   printf '%s\n' "$1" >"$WORK/token-request.json" || die "writing the token request failed"
-  REQ_BY="$(date -u -r $(($(date +%s) + 3660)) +%Y-%m-%dT%H:%M:%SZ)"
+  REQ_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   label="${MINT_LABEL:-${CONTROL_ID:+$CONTROL_ID-}token$((MINTED + 1))}"
   defer_signals
-  PENDING_MINT="$label $REQ_BY $1"
+  PENDING_MINT="$label $REQ_AT $1"
   jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || REQ_OK=1
   REQ_ANSWER="$LAST_OUT"
   LAST_OUT=""
@@ -879,7 +880,7 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
   ans="$REQ_ANSWER" ok="$REQ_OK"
   if [[ "$REQ_TOKEN" == no ]]; then
     if [[ "$REQ_UNRECEIVED" == yes ]]; then
-      die "the token request got no usable answer (HTTP ${LAST_HTTP:-none}${JWT_ERR:+, $JWT_ERR}): it holds no installation token, but GitHub may have issued one this run never received, which can't be revoked from here; if so it expires by $REQ_BY at the latest. The run stops and does not ask again"
+      die "the token request got no usable answer (HTTP ${LAST_HTTP:-none}${JWT_ERR:+, $JWT_ERR}): it holds no installation token, but GitHub may have issued one this run never received, which can't be revoked from here; if so its expiry is unknown: one hour from when GitHub issued it (the request was sent at $REQ_AT by this Mac's clock). The run stops and does not ask again"
     fi
     die "GitHub refused the token request (HTTP $LAST_HTTP): $(printf '%s' "$ans" | tail -n 3 | tr '\n\t' '  ' | cut -c1-240)"
   fi
@@ -2687,8 +2688,9 @@ cmd_ptests() {
 #   2. reads back by number each object an attempt made;
 #   3. ends with one line naming the tokens confirmed revoked and those not, never a token itself.
 # A token request with no complete answer (a timeout, a broken transfer, a 5xx) stops the run and is
-# reported as a token possibly issued and never received, with the most it could carry and the latest
-# it can expire; it can't be revoked from here, and the run never asks again (round 56: a limit the
+# reported as a token possibly issued and never received, with the most it could carry and when its
+# request was sent; its expiry is unknown (an hour from an issue time this run can't know: owner,
+# 2026-11-23); it can't be revoked from here, and the run never asks again (round 56: a limit the
 # owner accepted for this throwaway investigation only, not for the broker).
 # Each revocation and each read is given at most CALL_SECS, and never more than is left of the
 # clean-up's CLEANUP_SECS; the deadline is checked before each step; a step the time cap leaves out
@@ -2827,7 +2829,7 @@ revoke_confirmed() { # <label> — revoke the current token; a read with it afte
 # request is reported once.
 UNRECEIVED_LABELS=""
 report_unreceived() {
-  local line label by req repos perms
+  local line label at req repos perms
   if [[ -n "$PENDING_MINT" ]]; then
     UNRECEIVED="$UNRECEIVED$PENDING_MINT
 "
@@ -2836,7 +2838,7 @@ report_unreceived() {
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     label="${line%% *}" line="${line#* }"
-    by="${line%% *}" req="${line#* }"
+    at="${line%% *}" req="${line#* }"
     UNRECEIVED_LABELS="$UNRECEIVED_LABELS $label"
     # At most what was asked; a request that names none asks for the installation's.
     repos="$(jq -r 'if .repositories then (.repositories | join(", ")) else empty end' <<<"$req" 2>/dev/null)" || repos=""
@@ -2844,7 +2846,7 @@ report_unreceived() {
     # (Defaults set apart: bash 3.2 misreads an apostrophe inside a quoted ${x:-...}.)
     [[ -n "$repos" ]] || repos="every repository the installation is on"
     [[ -n "$perms" ]] || perms="the installation's $WANT_PERMS"
-    say "TOKEN $label possibly issued, never received: its request got no complete answer, so this run can't revoke or check it. If GitHub issued it, it carries at most: repositories $repos; permissions $perms; it expires by $by at the latest. This run does not ask for it again"
+    say "TOKEN $label possibly issued, never received: its request got no complete answer, so this run can't revoke or check it. If GitHub issued it, it carries at most: repositories $repos; permissions $perms; its expiry is unknown: GitHub gives such a token one hour from when it issues it, and this run doesn't know whether or when that was (the request was sent at $at by this Mac's clock). This run does not ask for it again"
   done <<<"$UNRECEIVED"
   UNRECEIVED=""
 }
