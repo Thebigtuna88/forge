@@ -117,6 +117,9 @@ CONFIRMED_TOKENS="" # tokens confirmed revoked, outside a2-probe: see revocation
 REVOKE_OK=""        # tokens whose revocation GitHub answered as done (round 74, SEC-2)
 UNCONFIRMABLE=""    # token:kind for each token a read refused but whose revocation can't be confirmed
 CLEANUP_UNDONE=""   # every tidy-up left undone, on any finish, for the clean-up's last line
+RUN_ISSUES=""       # test issues this run made, by the number their create returned (round 102)
+ISSUES_CLOSE_SENT="" # test issues whose close this run has sent: never sent twice
+ISSUES_CLOSED=""    # test issues read back closed, by number, named in the clean-up's last line
 CONTROLS=0          # controls started (A9, E1), each named control<n> before it can ask for a token
 CONTROL_ID=""       # inside a control: its name, which its tokens' names start with
 CONTROL_PENDING=""  # controls that haven't said they are done: their tokens count as NOT confirmed
@@ -369,9 +372,11 @@ cleanup_summary() {
   # (round 75, C1).
   unknown="$(unknown_writes)"
   unknown="${unknown%;}"
-  [[ -n "$ISSUED$UNRECEIVED_LABELS$CLEANUP_UNDONE$CONTROL_CONFIRMED$CONTROL_UNCONFIRMED$CONTROL_PENDING$unknown" ]] || return 0
+  [[ -n "$ISSUED$UNRECEIVED_LABELS$CLEANUP_UNDONE$CONTROL_CONFIRMED$CONTROL_UNCONFIRMED$CONTROL_PENDING$unknown$ISSUES_CLOSED" ]] || return 0
   tokens="tokens confirmed revoked (HTTP 401):${yes:- none}; NOT confirmed:${no:- none}"
   tokens="$tokens${UNRECEIVED_LABELS:+; possibly issued, never received:$UNRECEIVED_LABELS}${held:+; held for a later check:$held}"
+  # Each test issue as its read-back by number found it, closed (round 102).
+  tokens="$tokens${ISSUES_CLOSED:+; test issues read back closed:$ISSUES_CLOSED}"
   tokens="$tokens${unknown:+; writes with outcome unknown (not retried, not reconciled: check them on GitHub):$unknown}"
   if [[ -z "$no$UNRECEIVED_LABELS$CLEANUP_UNDONE$unknown" ]]; then
     say "CLEANUP DONE: $tokens; nothing left undone"
@@ -2571,8 +2576,13 @@ t_A12() {
   try_reading A12 "gh issue create" app_gh issue create --repo "$REPO" --title "FRG-26 A12 ($(stamp))" --body "FRG-26 throwaway test A12."
   n="${LAST_OUT##*/}"
   if [[ $LAST_RC -eq 0 && "$n" =~ ^[0-9]+$ ]]; then
+    # Closed by this number, not only if a list finds it (round 102: part 0's #129).
+    RUN_ISSUES="$RUN_ISSUES $n"
     try_reading A12 "gh issue comment" app_gh issue comment "$n" --repo "$REPO" --body "FRG-26 A12 comment."
     try_reading A12 "gh issue view" app_gh issue view "$n" --repo "$REPO" --json title --jq .title
+  elif [[ $LAST_RC -eq 0 ]]; then
+    # Answered as made, but with no number to close it by: its outcome is unknown (round 102).
+    unsettled_write "answered without an issue number" app_gh issue create --repo "$REPO"
   fi
   try_reading A12 "gh issue list" app_gh issue list --repo "$REPO" --limit 1
   try_reading A12 "gh pr list" app_gh pr list --repo "$REPO" --limit 1
@@ -2585,39 +2595,69 @@ setup_fail_p() { # <id> <what failed>
   say "RESULT $1 permissions FAIL attempt=setup-failed :: $2"
 }
 
-# This run's test issues ("FRG-26 " titles carrying RUN_ID) are closed in the throwaway. The second
-# throwaway is only read (round 13, SEC-4): an "FRG-26 " issue or PR there carrying RUN_ID means
-# this run wrote there, and is reported for the owner to close; this script never writes there as
-# the owner.
+issue_state() { # <n> — open or closed, as a read of that issue by its number finds it
+  with_timeout "$(call_secs)" owner_gh api "repos/$REPO/issues/$1" --jq .state 2>/dev/null
+}
+
+# A test issue is closed at most once, then read back by its number; only one read back closed
+# counts as closed (round 102: part 0's #129 stayed open after CLEANUP DONE, and no close of it
+# was on GitHub's record). Bounded by owner_gh alone, as in close_if_open (round 77). A close with
+# no answer in time is settled by that read-back alone, never sent again; read back otherwise, it
+# is named outcome unknown.
+close_issue() { # <n>
+  local st late=""
+  if [[ " $ISSUES_CLOSE_SENT " != *" $1 "* ]]; then
+    ISSUES_CLOSE_SENT="$ISSUES_CLOSE_SENT $1"
+    owner_gh issue close "$1" --repo "$REPO" >/dev/null 2>&1 || late="$TIMED_OUT"
+  fi
+  into st issue_state "$1" || st=""
+  if [[ "$st" == closed ]]; then
+    [[ " $ISSUES_CLOSED " == *" #$1 "* ]] || ISSUES_CLOSED="$ISSUES_CLOSED #$1"
+    if [[ -n "$late" ]]; then
+      say "CLEANUP issue #$1 in $REPO: its close got no answer within ${late}s; read back: closed"
+    else
+      say "CLEANUP closed test issue #$1 in $REPO; read back: closed"
+    fi
+    return 0
+  fi
+  FAILS=$((FAILS + 1))
+  undone "closing the test issues"
+  if [[ -n "$late" ]]; then
+    unsettled_write "no answer within ${late}s; read back: ${st:-unreadable}" owner_gh issue close "$1" --repo "$REPO"
+    say "CLEANUP FAIL issue #$1 in $REPO: its close got no answer within ${late}s, so its outcome is unknown (not tried again; read back: ${st:-unreadable}): check it on GitHub"
+  else
+    say "CLEANUP FAIL issue #$1 in $REPO may still be open (read back: ${st:-unreadable}): close it on GitHub"
+  fi
+  return 1
+}
+
+# This run's test issues are closed in the throwaway: each one a create returned (RUN_ISSUES), and
+# any "FRG-26 " issue carrying RUN_ID a list finds (a list read just after a create can miss it:
+# round 102), each once. The second throwaway is only read (round 13, SEC-4): an "FRG-26 " issue or
+# PR there carrying RUN_ID means this run wrote there, and is reported for the owner to close; this
+# script never writes there as the owner.
 sweep_issues() {
-  local open n mine rc=0 TIDY_UP=1
+  local open n mine todo="" rc=0 TIDY_UP=1
   # Each call bounded, the clean-up's cap checked before each step (round 72, SEC-1).
   mine=".[] | select(.pull_request == null) | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number"
   into open with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO/issues?state=open&per_page=100" --jq "$mine" 2>/dev/null || rc=$?
   if [[ $rc -ne 0 ]]; then
+    open=""
     FAILS=$((FAILS + 1))
     undone "closing the test issues"; say "CLEANUP FAIL could not list the open issues in $REPO$(no_answer $rc): close any \"FRG-26 \" test issue on GitHub"
-  else
-    for n in $open; do
-      [[ "$n" =~ ^[0-9]+$ ]] || continue
-      if ! in_time; then
-        FAILS=$((FAILS + 1))
-        undone "closing the test issues"; say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before issue #$n was closed: close it, and any other \"FRG-26 \" test issue in $REPO, on GitHub"
-        break
-      fi
-      # Bounded by owner_gh alone, as in close_if_open (round 77). Not read back: a close with no
-      # answer in time is named outcome unknown, never sent again.
-      owner_gh issue close "$n" --repo "$REPO" >/dev/null 2>&1 && continue
-      FAILS=$((FAILS + 1))
-      undone "closing the test issues"
-      if [[ -n "$TIMED_OUT" ]]; then
-        unsettled_write "no answer within ${TIMED_OUT}s; not read back" owner_gh issue close "$n" --repo "$REPO"
-        say "CLEANUP FAIL issue #$n in $REPO: its close got no answer within ${TIMED_OUT}s, so its outcome is unknown (not tried again): check it on GitHub"
-      else
-        say "CLEANUP FAIL issue #$n in $REPO may still be open"
-      fi
-    done
   fi
+  for n in $RUN_ISSUES $open; do
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    [[ " $todo " == *" $n "* ]] || todo="$todo $n"
+  done
+  for n in $todo; do
+    if ! in_time; then
+      FAILS=$((FAILS + 1))
+      undone "closing the test issues"; say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before issue #$n was closed and read back: close it, and any other \"FRG-26 \" test issue in $REPO, on GitHub"
+      break
+    fi
+    close_issue "$n" || true
+  done
   if ! in_time; then
     FAILS=$((FAILS + 1))
     undone "checking $REPO2 for this run's issues"; say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before $REPO2 was checked: check it on GitHub for \"FRG-26 \" issues"

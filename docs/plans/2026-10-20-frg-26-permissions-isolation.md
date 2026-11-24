@@ -565,11 +565,24 @@ when a successful command follows it.
 cancelling an S2 run are bounded once, by the owner's request wrapper: the same 20 seconds, and less
 near the clean-up's cap. A timeout is named as a timeout ("no answer within" its limit), a stop as a
 stop ("cut short by the stop"), each with the repository and the issue, PR or run. It is never sent
-again. A read-back that shows the final state settles it, and the clean-up reports what it read (a
-PR closed or merged, a run no longer unfinished). Anything else stays outcome unknown in the
-clean-up's last line, which is then INCOMPLETE: an issue's close (not read back), a PR still open
-or unreadable, a run still unfinished or not listed again after its cancel. A test shows each case.
-a2-probe calls none of these tidy-ups, and its code and evidence are unchanged.
+again. A read-back that shows the final state settles it, and the clean-up reports what it read (an
+issue or PR closed, a PR merged, a run no longer unfinished). Anything else stays outcome unknown in
+the clean-up's last line, which is then INCOMPLETE: an issue still open or unreadable, a PR still
+open or unreadable, a run still unfinished or not listed again after its cancel. A test shows each
+case. a2-probe calls none of these tidy-ups, and its code and evidence are unchanged.
+
+**Test issues read back by number (owner, 2026-11-24, round 102).** Part 0's run on 2026-11-24 left
+its A12 issue (#129 on the first throwaway) open while its step said CLEANUP DONE: the clean-up
+found issues only by a list, and GitHub's record, read after the run, showed no close of #129. Now
+each issue a create returns is kept by its number and closed together with any the list finds, each
+at most once, and then read back by its number (`GET repos/<repo>/issues/<n>`); an issue counts as
+closed only when
+that read says closed, and CLEANUP DONE names each one so read. A close that gets no answer is
+settled by that read-back alone and never sent again. A create with no answer, or one answered
+without an issue number, stays a write with outcome unknown, so the clean-up is INCOMPLETE whatever
+is closed later. Each read-back is a moment's reading, not a guarantee for later. The second
+throwaway is still only read; its kept A2 issues are never touched. Only the existing limits bound
+these calls (20 seconds a call, and the clean-up's cap).
 
 **S2d's evidence (owner, 2026-11-20, round 78).** Part 0's run on 2026-11-20 stopped at S2d,
 inconclusive: GitHub said you can't approve your own run, then answered the approval with HTTP 422

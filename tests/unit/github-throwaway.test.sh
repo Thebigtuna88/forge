@@ -2076,6 +2076,7 @@ test_a_permission_run_closes_its_test_issues() {
     echo "$*" >>"$T_TMP/owner"
     case "$*" in
       *"/issues?state=open"*) printf '11\n12\n' ;;
+      "api repos/$REPO/issues/"*" --jq .state") echo closed ;;
     esac
   }
   : >"$T_TMP/owner"
@@ -2085,6 +2086,9 @@ test_a_permission_run_closes_its_test_issues() {
   out="$(sweep_issues; echo "fails=$FAILS")"
   assert_contains "$(cat "$T_TMP/owner")" "issue close 11 --repo $REPO"
   assert_contains "$(cat "$T_TMP/owner")" "issue close 12 --repo $REPO"
+  # Round 102: each read back by its number.
+  assert_contains "$(cat "$T_TMP/owner")" "api repos/$REPO/issues/11 --jq .state"
+  assert_contains "$(cat "$T_TMP/owner")" "api repos/$REPO/issues/12 --jq .state"
   assert_contains "$(grep "repos/$REPO/issues" "$T_TMP/owner")" "20261102T010203Z-77" "only this run's issues are closed"
   # Round 13, SEC-4: the second throwaway is only read; an issue there is reported, never closed.
   assert_contains "$(cat "$T_TMP/owner")" "repos/$REPO2/issues?state=open"
@@ -5521,6 +5525,10 @@ case "$*" in
   # unfinished ones (runs-1 at the first list, then runs-2).
   *"repos/$FAKE_REPO/issues?state=open"*) cat "$T_TMP/open-issues" 2>/dev/null ;;
   *"repos/$FAKE_REPO/pulls?state=open"*) cat "$T_TMP/open-prs" 2>/dev/null ;;
+  # A test issue (round 102): its create answers with create-url; its state, read by its number,
+  # is issue-state-<n>, closed if none is written.
+  "issue create "*) cat "$T_TMP/create-url" 2>/dev/null ;;
+  "api repos/$FAKE_REPO/issues/"*" --jq .state") cat "$T_TMP/issue-state-${2##*/}" 2>/dev/null || echo closed ;;
   "pr view "*"--json state --jq .state")
     if [[ -f "$T_TMP/pr-viewed" ]]; then cat "$T_TMP/pr-state"; else : >"$T_TMP/pr-viewed"; echo OPEN; fi ;;
   *"actions/runs?head_sha="*) [[ ! -f "$T_TMP/runs-1" ]] || echo 1 ;;
@@ -5533,7 +5541,8 @@ EOF
   : >"$T_TMP/tools"
   : >"$T_TMP/revoked"
   : >"$T_TMP/hang-on"
-  rm -f "$T_TMP/open-issues" "$T_TMP/open-prs" "$T_TMP/pr-viewed" "$T_TMP/pr-state" "$T_TMP/runs-1" "$T_TMP/runs-2" "$T_TMP/runs-listed"
+  rm -f "$T_TMP/open-issues" "$T_TMP/open-prs" "$T_TMP/pr-viewed" "$T_TMP/pr-state" "$T_TMP/runs-1" "$T_TMP/runs-2" "$T_TMP/runs-listed" \
+    "$T_TMP/create-url" "$T_TMP"/issue-state-*
   export T_TMP FAKE_REPO="$REPO"
   PATH="$T_TMP/bin:$PATH"
 }
@@ -5689,11 +5698,13 @@ EOF
 # and doesn't stop the run. A read-back that shows the final state settles it, and is reported; any
 # other is named in the last line with its repository and object, its outcome unknown, as a timeout
 # (not a stop), and the clean-up is INCOMPLETE. The last case runs in the clean-up itself, to its cap.
+# Round 102: an issue is read back by its number too (closed unless issue-state-<n> says otherwise).
 test_a_tidy_up_write_that_times_out_is_settled_or_its_outcome_unknown() {
-  local case name prep setup call hang exit_rc rc_want child last unknown undo said sha
+  local case name prep setup call hang exit_rc rc_want child last unknown undo said sha closed
   child=$(((RANDOM % 900 + 100) * 100)) # as above
   sha="$(printf 'e%.0s' $(seq 1 40))"
-  for case in "an issue close, not read back%echo 11 >\$T_TMP/open-issues; echo 12 >>\$T_TMP/open-issues%RUN_ID=r1%sweep_issues%issue close 11 %0%1" \
+  for case in "an issue close, read back open%echo 11 >\$T_TMP/open-issues; echo 12 >>\$T_TMP/open-issues; echo open >\$T_TMP/issue-state-11%RUN_ID=r1%sweep_issues%issue close 11 %0%1" \
+    "an issue close, read back closed%echo 11 >\$T_TMP/open-issues%RUN_ID=r1%sweep_issues%issue close 11 %0%0" \
     "a PR close, read back closed%echo 5 >\$T_TMP/open-prs; echo CLOSED >\$T_TMP/pr-state%%sweep_prs%pr close 5 %0%0" \
     "a PR close, read back open%echo 5 >\$T_TMP/open-prs; echo OPEN >\$T_TMP/pr-state%%sweep_prs || true%pr close 5 %0%1" \
     "an S2 cancel, read back finished%echo 9001 >\$T_TMP/runs-1; : >\$T_TMP/runs-2%S2_SHAS=$sha%cancel_waiting_runs%runs/9001/cancel%0%0" \
@@ -5713,13 +5724,17 @@ test_a_tidy_up_write_that_times_out_is_settled_or_its_outcome_unknown() {
     assert_not_contains "$OUT" "the run starts no further test action" "$name: a tidy-up's timeout stopped the run"
     [[ -z "$call" ]] || assert_contains "$OUT" "NEXT STEP" "$name: a tidy-up's timeout stopped the run"
     assert_not_contains "$OUT" "cut short by the stop" "$name: a timeout named as a stop"
-    unknown="" undo="" said=""
+    unknown="" undo="" said="" closed=""
     case "$name" in
-      "an issue close"*)
-        unknown="owner gh issue close 11 --repo $REPO (no answer within 1s; not read back)" undo="closing the test issues"
-        said="CLEANUP FAIL issue #11 in $REPO: its close got no answer within 1s, so its outcome is unknown (not tried again): check it on GitHub"
+      *"issue close, read back open")
+        unknown="owner gh issue close 11 --repo $REPO (no answer within 1s; read back: open)" undo="closing the test issues"
+        said="CLEANUP FAIL issue #11 in $REPO: its close got no answer within 1s, so its outcome is unknown (not tried again; read back: open): check it on GitHub"
+        closed="; test issues read back closed: #12"
         assert_eq "$(grep -c 'gh issue close 12 ' "$T_TMP/tools")" 1 "$name: the next issue's close"
-        assert_not_contains "$OUT" "issue #12 in" "$name: the next issue" ;;
+        assert_contains "$OUT" "CLEANUP closed test issue #12 in $REPO; read back: closed" "$name: the next issue" ;;
+      *"issue close, read back closed")
+        said="CLEANUP issue #11 in $REPO: its close got no answer within 1s; read back: closed"
+        closed="; test issues read back closed: #11" ;;
       *"read back closed") said="CLEANUP PR #5 in $REPO: its close got no answer within 1s; read back: CLOSED" ;;
       *"read back open")
         unknown="owner gh pr close 5 --repo $REPO (no answer within 1s; read back: OPEN)" undo="closing the open test PRs"
@@ -5732,11 +5747,86 @@ test_a_tidy_up_write_that_times_out_is_settled_or_its_outcome_unknown() {
     assert_contains "$OUT" "$said" "$name"
     last="$(printf '%s\n' "$OUT" | tail -n 1)"
     if [[ -n "$unknown" ]]; then
-      assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; writes with outcome unknown (not retried, not reconciled: check them on GitHub): $unknown; not done: $undo (CLEANUP FAIL above);" "$name"
+      assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none$closed; writes with outcome unknown (not retried, not reconciled: check them on GitHub): $unknown; not done: $undo (CLEANUP FAIL above);" "$name"
     else
-      assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; nothing left undone" "$name"
+      assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none$closed; nothing left undone" "$name"
       assert_not_contains "$OUT" "outcome is unknown" "$name"
     fi
+  done
+}
+
+# Round 102 (owner, 2026-11-24): part 0's A12 issue (#129) stayed open while its step said CLEANUP
+# DONE: the list that should have found it didn't show it, or a close didn't take, and nothing was
+# read back. Each issue a create returns is tracked by its number, closed at most once with any the
+# list finds, and read back by that number; only one read back closed counts, and the last line
+# names each. A create with no answer, or answered without a number, stays a write with outcome
+# unknown, whatever is closed later. The second throwaway is only read.
+test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
+  local case name prep setup after hang rc_want child last done_line incomplete unknown
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  for case in "the list misses the created issue%%%t_A12; sweep_issues%%0" \
+    "the list finds it too, two sweeps%echo 129 >\$T_TMP/open-issues%%t_A12; sweep_issues; sweep_issues%%0" \
+    "its close answered, read back open%echo open >\$T_TMP/issue-state-129%%t_A12; sweep_issues%%1" \
+    "its read-back gets no answer%%%t_A12; sweep_issues%issues/129 --jq .state%1" \
+    "its create gets no answer, the issue made%echo 129 >\$T_TMP/open-issues%SWEEP_ON_EXIT=1%t_A12; echo NEXT TEST ACTION%issue create %2" \
+    "its create gets no answer, nothing found%%SWEEP_ON_EXIT=1%t_A12; echo NEXT TEST ACTION%issue create %2" \
+    "its create answered without a number%echo 'Creating issue' >\$T_TMP/create-url%%t_A12; sweep_issues%%1"; do
+    IFS='%' read -r name prep setup after hang rc_want <<<"$case"
+    child=$((child + 1))
+    short_copy
+    WORK="$T_TMP/work"
+    request_tools "$child"
+    echo "https://github.com/$REPO/issues/129" >"$T_TMP/create-url"
+    # Lists that answer, with nothing open, unless the case says otherwise (a missing file is an error).
+    : >"$T_TMP/open-issues"
+    : >"$T_TMP/open-prs"
+    eval "$prep"
+    printf '%s\n' "$hang" >"$T_TMP/hang-on"
+    stopped_run_cleanup 0 "PHASE=permissions RUN_ID=r1 $setup" "$after"
+    assert_exit "$rc_want" "$RC" "$name: the run's status (137: still running after 20s)"
+    ((SECS <= CLEANUP_SECS + 3)) || _t_fail "$name: ended after ${SECS}s; a call's limit is 1s, the clean-up's cap ${CLEANUP_SECS}s"
+    assert_eq "$(still_running "$child")" "" "$name: a process a request started still runs"
+    assert_eq "$(grep -c 'gh issue create ' "$T_TMP/tools")" 1 "$name: creates sent"
+    assert_not_contains "$(cat "$T_TMP/tools")" "--repo $REPO2" "$name: a write to the second throwaway"
+    assert_eq "$(grep -c "repos/$REPO2/issues/[0-9]" "$T_TMP/tools")" 0 "$name: a second-throwaway issue read by number"
+    last="$(printf '%s\n' "$OUT" | tail -n 1)"
+    done_line="CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; test issues read back closed: #129; nothing left undone"
+    incomplete="CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; not done: closing the test issues (CLEANUP FAIL above);"
+    unknown="writes with outcome unknown (not retried, not reconciled: check them on GitHub): app gh issue create --repo $REPO"
+    case "$name" in
+      "the list misses"*)
+        assert_eq "$(grep -c 'gh issue close 129 ' "$T_TMP/tools")" 1 "$name: closes of #129"
+        assert_contains "$(cat "$T_TMP/tools")" "gh api repos/$REPO/issues/129 --jq .state" "$name: read back by its number"
+        assert_contains "$OUT" "CLEANUP closed test issue #129 in $REPO; read back: closed" "$name"
+        assert_eq "$last" "$done_line" "$name" ;;
+      *"two sweeps")
+        assert_eq "$(grep -c 'gh issue close 129 ' "$T_TMP/tools")" 1 "$name: closes of #129"
+        assert_eq "$(grep -c "gh api repos/$REPO/issues/129 --jq .state" "$T_TMP/tools")" 2 "$name: read-backs of #129"
+        assert_eq "$last" "$done_line" "$name" ;;
+      *"read back open")
+        assert_eq "$(grep -c 'gh issue close 129 ' "$T_TMP/tools")" 1 "$name: closes of #129"
+        assert_contains "$OUT" "CLEANUP FAIL issue #129 in $REPO may still be open (read back: open): close it on GitHub" "$name"
+        assert_contains "$last" "$incomplete" "$name" ;;
+      *"read-back gets no answer")
+        assert_eq "$(grep -c 'gh issue close 129 ' "$T_TMP/tools")" 1 "$name: closes of #129"
+        assert_eq "$(grep -c "gh api repos/$REPO/issues/129 --jq .state" "$T_TMP/tools")" 1 "$name: read-backs of #129"
+        assert_contains "$OUT" "CLEANUP FAIL issue #129 in $REPO may still be open (read back: unreadable): close it on GitHub" "$name"
+        assert_contains "$last" "$incomplete" "$name" ;;
+      *"the issue made")
+        assert_not_contains "$OUT" "NEXT TEST ACTION" "$name: a test action after the timeout"
+        assert_eq "$(grep -c 'gh issue close 129 ' "$T_TMP/tools")" 1 "$name: closes of #129"
+        assert_contains "$OUT" "CLEANUP closed test issue #129 in $REPO; read back: closed" "$name"
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; test issues read back closed: #129; $unknown (no answer within 1s);" "$name" ;;
+      *"nothing found")
+        assert_not_contains "$OUT" "NEXT TEST ACTION" "$name: a test action after the timeout"
+        assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (no answer within 1s);" "$name" ;;
+      *)
+        assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
+        assert_not_contains "$(cat "$T_TMP/tools")" "issue comment" "$name: a comment on an unknown issue"
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (answered without an issue number);" "$name" ;;
+    esac
+    if [[ "$rc_want" == 0 ]]; then assert_contains "$last" "CLEANUP DONE" "$name"; else assert_not_contains "$OUT" "CLEANUP DONE" "$name"; fi
   done
 }
 
