@@ -4465,6 +4465,9 @@ test_a_control_record_that_cannot_be_handed_over_still_stops_the_run() {
   out="$(control_token lost_record 2>&1; echo "went on")" || rc=$?
   assert_exit 2 "$rc"
   assert_contains "$out" "its record of it could not be handed over"
+  # Owner, 2026-11-24 (round 98): its issue time is unknown, so no expiry is stated from the request.
+  assert_contains "$out" "its expiry is unknown: one hour from when GitHub issued it, if it did" "the expiry of a token never received"
+  assert_not_contains "$out" "within an hour of the request" "an expiry stated from the request"
   assert_not_contains "$out" "went on"
   # Round 74: the record comes through a file again (the control runs in the background), its write
   # checked as above; no file is left behind.

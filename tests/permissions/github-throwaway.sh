@@ -1305,7 +1305,7 @@ control_end() { # [cap, in seconds since 1970]
     say "note: $id ended without reporting on its tokens (status $CONTROL_RC): any it holds is NOT confirmed revoked"
   fi
   if [[ $CONTROL_RC -eq 5 ]]; then
-    say "a control's token request got no usable answer, and its record of it could not be handed over: GitHub may have issued a token this run never received (it expires within an hour of the request)"
+    say "a control's token request got no usable answer, and its record of it could not be handed over: GitHub may have issued a token this run never received (its expiry is unknown: one hour from when GitHub issued it, if it did)"
   fi
 }
 
@@ -2698,12 +2698,13 @@ cmd_ptests() {
 # the run makes is bounded the same way (round 55), so a stop signal, which bash acts on only when
 # the request in progress returns, reaches the clean-up within CALL_SECS. Limits: a force-kill, a power loss, or a
 # revocation that fails or times out leaves a token unconfirmed, and a token request with no
-# complete answer may leave a token this run never received. It may stay valid until its
-# expires_at, printed when it was issued. What it can do is what its TOKEN lines show for the first
+# complete answer may leave a token this run never received. One left unconfirmed may stay valid
+# until its expires_at, printed when it was issued; one never received, until an expiry this run
+# can't know (an hour from its issue). What it can do is what its TOKEN lines show for the first
 # throwaway, plus what this run's readings show on a public repository it isn't installed on (A2).
 # Accepted by the owner for this investigation only (2026-11-13): a Ctrl-C or a closed window at an
 # unlucky moment may leave the report incomplete or a revocation unconfirmed; such a token stays
-# within the scope and expiry above. A clean-up is never reported successful without a 401 for each
+# within the scope above, for as long as said above. A clean-up is never reported successful without a 401 for each
 # token. Not extended to the other stage 1 commands or the broker without separate approval.
 
 readonly PROBE_PERMS_P1='{"contents":"write","metadata":"read"}'
@@ -2825,8 +2826,8 @@ revoke_confirmed() { # <label> — revoke the current token; a read with it afte
 
 # Every token GitHub may have issued that this run never received (round 56, SEC-1), a request still
 # pending included (round 57, C1), reported whole: the requested repositories and permissions and
-# the latest it can expire. Shared by every command (round 61, C1). Sets UNRECEIVED_LABELS; each
-# request is reported once.
+# when the request was sent; its expiry is unknown (owner, 2026-11-24). Shared by every command
+# (round 61, C1). Sets UNRECEIVED_LABELS; each request is reported once.
 UNRECEIVED_LABELS=""
 report_unreceived() {
   local line label at req repos perms
