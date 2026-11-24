@@ -662,17 +662,48 @@ header (GitHub sends one only when a list has more pages), means not all are sho
 not bound, before or after the attempt, and S2d stays inconclusive. The statuses are read with their
 headers, and only a 200 answer whose headers end counts as read; the Link header's value is not kept.
 
-**Stop-protection handoffs and their accepted limit (owner, 2026-11-22, review-lens rounds 81-82).**
-The exact-protection check only reads, and a mismatch names the settings that differ from fixed
-lists, never a value GitHub returned. The restore handoff is frozen and given to you before part 0,
-and part 0's first step asks you to confirm you have it. Unless part 0's final exact-protection
-check passes, the protection is unconfirmed: you stop testing and run the restore handoff. If that
-handoff fails too, its failure is reported and a recovery proposed; the protection is never called
-restored. Accepted limit, for this stage 1 sequence only (not the broker): a failure in the handoff
-runtime itself, Ctrl-C, closing the window or the process being ended can prevent the automatic
-restoration and may show no restore reminder. Deferred: a runtime improvement in `.harness/lib/`
-(a final step that always runs, or a reminder on any early end), through a PR you merge. It needs a
-ticket before FRG-26 merges (rule 5): FRG-38 (#38), https://github.com/Thebigtuna88/forge/issues/38.
+**Stop-protection handoffs and their accepted limits (owner, 2026-11-22 and 2026-11-24, review-lens
+rounds 81-91).** The exact-protection check only reads, and a mismatch names the settings that
+differ from fixed lists, never a value GitHub returned. The restore handoff is frozen and given to
+you before part 0, and part 0's first step asks you to confirm you have it. Unless part 0's final
+exact-protection check passes, the protection is unconfirmed, and it counts as back only as its
+separate reads observed it, one after another.
+
+Recovery is restart-first (owner, 2026-11-23). However part 0 ends, you restart the Mac before the
+next FRG-26 handoff: a restart ends what runs on the Mac, but not writes GitHub already received.
+Then Claude Code checks only GitHub, with read-only requests on the two throwaways, before the next
+step is decided. Without a pass, you stop testing, and after the restart you run the restore
+handoff when Claude Code says. After a pass, the restart alone is no reason to restore: you run it
+only if a fresh read shows the protection changed and you approve. Those are steps you and Claude
+Code follow, not checks the handoff makes. If the restore handoff fails too, its failure is reported
+and a recovery proposed; the protection is never called restored.
+
+Accepted limit 1 (2026-11-22), for this stage 1 sequence only, not the broker: a failure in the
+handoff runtime itself, Ctrl-C, closing the window or the process being ended can prevent the
+automatic restoration and may show no restore reminder.
+
+Accepted limit 2 (2026-11-24, review-lens round 86's finding 3), for part 0 and its restore handoff
+only, in this stage 1 sequence, on the first throwaway; not FORGE, the broker, 5:00 or any other
+handoff. The runtime waits for each step with no deadline, so a step that hangs is noticed only by
+you watching. After 30 minutes with no ✔ or ✘ (a time to step in, not proof of a hang), you press
+Ctrl-C once, wait 10 minutes, and recover as above. Accepted with it:
+- recovery has no time bound, and the first throwaway's protection may stay off until it is
+  confirmed;
+- writes GitHub already received, the run's own or the app's B12 and M4 attempts, can still change
+  the protection after any read-back, and a restart doesn't cancel them;
+- a stop during protect can leave the protection partial, one branch protected and the other not;
+- a token requested during a hang may be issued and never received: its expiry is unknown, and it
+  can't be revoked from here;
+- a test PR may stay open with auto-merge armed (B11);
+- not every leftover can be identified: a write left without an answer, a token never received, or
+  a PR or issue made just before a check can be missed.
+The app's key and tokens are real credentials, limited to the app's installation and permissions.
+
+Deferred, through PRs you merge in `.harness/lib/`: a final step that always runs, or a reminder
+on any early end; and a deadline for a step that hangs. FRG-38 (#38),
+https://github.com/Thebigtuna88/forge/issues/38, records the first (created before FRG-26 merges,
+rule 5); the second is added to it by an owner handoff. Recording them doesn't authorize
+implementation.
 
 Rules found while building carry over unchanged: per-test stop, sweep on every exit, exact
 protection compare, fail-closed allowance gate, a fresh open phase on the final reviewed commit.
