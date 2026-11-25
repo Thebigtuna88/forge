@@ -585,11 +585,14 @@ throwaway is still only read; its kept A2 issues are never touched. Only the exi
 these calls (20 seconds a call, and the clean-up's cap).
 Review-lens round 92 (owner, 2026-11-24): the create is recorded as pending before it is sent, and
 the pending record is cleared only once its answer is settled (its number kept, in the same command);
-a create that fails is outcome unknown unless a complete answer refuses it in GitHub's own words (a
-status code alone proves nothing). A close is marked started before it is sent, and never sent
-again; a stop before the run's issue sweep has ended (the final one included) has the clean-up
-resume it within its cap, reading back what was already started, and an issue read back closed
-settles a close whose outcome was unknown. Any issue the run made or closed that isn't read back
+a create that returns no issue number is outcome unknown, whatever its answer says (round 93: no
+refusal is taken from an answer's text), and its pending record is cleared only once that record is
+written, so a record that can't be written leaves it pending, still named, and INCOMPLETE. A close
+is marked started before it is sent, and never sent again; a stop before the run's issue sweep has
+ended (the final one included) has the clean-up resume it within its cap, its work list being the
+issues created, every close already started and what the list finds (round 93: a list read after a
+stop may not show an issue already closed), each read back by its number; an issue read back
+closed settles a close whose outcome was unknown. Any issue the run made or closed that isn't read back
 closed makes the clean-up INCOMPLETE. An item is this run's only if its title ends with the run's id
 in its own parentheses, so another run's id that starts with it is not taken.
 

@@ -5784,9 +5784,10 @@ final_sweep() {
 # read back. Each issue a create returns is tracked by its number, closed at most once with any the
 # list finds, and read back by that number; only one read back closed counts, and the last line
 # names each. A create with no answer, or answered without a number, stays a write with outcome
-# unknown, whatever is closed later. The second throwaway is only read. Review-lens round 92 (C1 =
-# SEC-3): a create that fails is outcome unknown too, unless a complete answer (gh's own error
-# exit, 1) refuses it in GitHub's own words; a status code alone proves nothing.
+# unknown, whatever is closed later. The second throwaway is only read. Review-lens rounds 92 (C1 =
+# SEC-3) and 93 (C2 = SEC-1): a create that fails is outcome unknown too, whatever its answer says
+# (no refusal is taken from its text). Round 93 (C1): if that record can't be written, the create
+# stays pending, still named, and the clean-up is INCOMPLETE.
 test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
   local case name prep setup after hang rc_want child last done_line incomplete unknown
   child=$(((RANDOM % 900 + 100) * 100)) # as above
@@ -5796,7 +5797,9 @@ test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
     "its read-back gets no answer%%%t_A12; sweep_issues%issues/129 --jq .state%1" \
     "its create gets no answer, the issue made%echo 129 >\$T_TMP/open-issues%SWEEP_ON_EXIT=1%t_A12; echo NEXT TEST ACTION%issue create %2" \
     "its create gets no answer, nothing found%%SWEEP_ON_EXIT=1%t_A12; echo NEXT TEST ACTION%issue create %2" \
-    "its create refused in GitHub's words%echo 'GraphQL: Resource not accessible by integration (createIssue)' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc%%t_A12; sweep_issues%%0" \
+    "its create's answer quotes a refusal%echo 'GraphQL: Resource not accessible by integration (createIssue)' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
+    "its create fails, its record can't be written%echo 'HTTP 403: Forbidden (https://api.github.com/graphql)' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc; mkdir \$WORK/unsettled%%t_A12; sweep_issues%%1" \
+    "its create has no number, its record can't be written%echo 'Creating issue' >\$T_TMP/create-url; mkdir \$WORK/unsettled%%t_A12; sweep_issues%%1" \
     "its create fails with an HTTP 403 alone%echo 'HTTP 403: Forbidden (https://api.github.com/graphql)' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
     "its create's connection fails%echo 'Post https://api.github.com/graphql: unexpected EOF' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
     "its create's refusal ends abnormally%echo 'GraphQL: Resource not accessible by integration (createIssue)' >\$T_TMP/create-url; echo 2 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
@@ -5846,13 +5849,13 @@ test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
         assert_not_contains "$OUT" "NEXT TEST ACTION" "$name: a test action after the timeout"
         assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
         assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (no answer within 1s);" "$name" ;;
-      *"GitHub's words")
+      *"record can't be written")
+        assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (no complete answer registered: it may have been made);" "$name" ;;
+      *"quotes a refusal" | *"HTTP 403 alone" | *"connection fails" | *"ends abnormally")
         assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
         assert_contains "$OUT" "READING A12 gh issue create: fails" "$name"
-        assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; nothing left undone" "$name" ;;
-      *"HTTP 403 alone" | *"connection fails" | *"ends abnormally")
-        assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
-        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (failed without a refusal in GitHub's own words: it may have been made);" "$name" ;;
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (failed, with no issue number: it may have been made);" "$name" ;;
       "the list fails"*)
         assert_eq "$(grep -c 'gh issue close 129 ' "$T_TMP/tools")" 1 "$name: closes of #129"
         assert_contains "$OUT" "CLEANUP FAIL could not list the open issues in $REPO" "$name"
@@ -5880,7 +5883,8 @@ test_a_stop_at_each_issue_step_never_ends_in_a_false_done() {
   for case in "before the create is sent" "as the create's answer comes, the list shows it" \
     "as the create's answer comes, the list misses it" "during the create" "after its number is kept" \
     "at the start of the final sweep" "after a close is started, before it is sent" \
-    "after a close is sent, before its read-back" "during a close"; do
+    "after a close is sent, before its read-back" "during a close" \
+    "a listed issue's close sent, the resumed list omits it"; do
     name="$case"
     child=$((child + 1))
     issue_run "$child"
@@ -5929,6 +5933,21 @@ test_a_stop_at_each_issue_step_never_ends_in_a_false_done() {
           fi
           orig_owner_gh "$@"
         } ;;
+      "a listed issue's close sent"*)
+        # Round 93 (C3 = SEC-2): #77, found only by the list, is closed; the stop comes before its
+        # read-back, and the list the resumed sweep reads no longer shows it.
+        echo 77 >"$T_TMP/open-issues"
+        keep_as_orig owner_gh
+        owner_gh() {
+          local rc=0
+          orig_owner_gh "$@" || rc=$?
+          if [[ "$*" == "issue close 77 "* ]]; then
+            echo sent >>"$T_TMP/close-calls"
+            : >"$T_TMP/open-issues"
+            stop_here
+          fi
+          return "$rc"
+        } ;;
     esac
     : >"$T_TMP/close-calls"
     stopped_run_cleanup 0 "PHASE=permissions RUN_ID=r1 SWEEP_ON_EXIT=1" "$after; echo NEXT STEP"
@@ -5961,17 +5980,23 @@ test_a_stop_at_each_issue_step_never_ends_in_a_false_done() {
         assert_eq "$closes" 0 "$name: a close started but never sent is not sent later"
         assert_contains "$OUT" "CLEANUP FAIL issue #129 in $REPO may still be open (its close was started earlier in this run, not sent again; read back: open): close it on GitHub" "$name"
         assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; test issues not read back closed: #129; not done: closing the test issues (CLEANUP FAIL above);" "$name" ;;
+      "a listed issue's close sent"*)
+        assert_eq "$closes" 1 "$name: closes of #129"
+        assert_eq "$(grep -c 'gh issue close 77 ' "$T_TMP/tools")" 1 "$name: closes of #77 (never sent again)"
+        assert_contains "$(cat "$T_TMP/tools")" "gh api repos/$REPO/issues/77 --jq .state" "$name: #77 read back by its number"
+        assert_contains "$OUT" "CLEANUP issue #77 in $REPO: its close was started earlier in this run (not sent again); read back: closed" "$name"
+        assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; test issues read back closed: #129 #77; nothing left undone" "$name" ;;
       *)
         assert_eq "$closes" 1 "$name: closes of #129 (never sent again)"
         assert_contains "$OUT" "CLEANUP issue #129 in $REPO: its close was started earlier in this run (not sent again); read back: closed" "$name"
         assert_eq "$last" "$done_line" "$name" ;;
     esac
     case "$name" in
-      "at the start of the final sweep" | "after a close"* | "during a close")
+      "at the start of the final sweep" | "after a close"* | "during a close" | "a listed issue's"*)
         assert_contains "$OUT" "PHASE permissions: stopped before its test issues were swept; sweeping them now" "$name: the sweep resumed" ;;
     esac
     case "$name" in
-      "after a close"* | "during a close") assert_eq "$(wc -l <"$T_TMP/close-calls" | tr -d ' ')" 1 "$name: closes of #129 started" ;;
+      "after a close"* | "during a close" | "a listed issue's"*) assert_eq "$(wc -l <"$T_TMP/close-calls" | tr -d ' ')" 1 "$name: closes started (the watched issue)" ;;
     esac
   done
 }

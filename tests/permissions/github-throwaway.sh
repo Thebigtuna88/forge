@@ -441,10 +441,13 @@ issues_unconfirmed() {
 # A tidy-up's write that got no answer in time and that no read-back settled (round 77): never sent
 # again blindly, and named in the clean-up's last line, its outcome unknown, so the clean-up is
 # INCOMPLETE. In the run's own shell or the clean-up, where a tidy-up's timeout doesn't stop the run.
+# 1 if it couldn't be recorded (review-lens round 93, C1): a caller keeping a record of its own (a
+# pending create) then keeps it.
 unsettled_write() { # <why> <runner> <args…> — the request, described by request_what
   local why="$1"
   shift
-  if [[ -n "$WORK" && -d "$WORK" ]]; then printf '%s (%s)\n' "$(request_what "$@")" "$why" >>"$WORK/unsettled"; fi
+  [[ -n "$WORK" && -d "$WORK" ]] || return 1
+  { printf '%s (%s)\n' "$(request_what "$@")" "$why" >>"$WORK/unsettled"; } 2>/dev/null
 }
 trap cleanup EXIT
 # Closing the Terminal, Ctrl-C or a kill also end through cleanup, with the usual status (round 51,
@@ -2622,18 +2625,14 @@ t_A12() {
     RUN_ISSUES="$RUN_ISSUES $n" PENDING_CREATE=""
     try_reading A12 "gh issue comment" app_gh issue comment "$n" --repo "$REPO" --body "FRG-26 A12 comment."
     try_reading A12 "gh issue view" app_gh issue view "$n" --repo "$REPO" --json title --jq .title
-  elif [[ $LAST_RC -eq 1 ]] && printf '%s' "$LAST_OUT" | grep -q 'Resource not accessible by integration'; then
-    # Refused in GitHub's own words, in a complete answer (gh's own error exit): nothing was made.
-    PENDING_CREATE=""
+  elif [[ $LAST_RC -eq 0 ]]; then
+    # Answered as made, with no number to close it by: its outcome is unknown. The pending record
+    # is cleared only once this one is written (review-lens round 93, C1), else it stays, named.
+    unsettled_write "answered without an issue number" app_gh issue create --repo "$REPO" && PENDING_CREATE=""
   else
-    # Answered as made with no number to close it by, or failed otherwise (a status code alone
-    # proves nothing: round 92, C1 = SEC-3): its outcome is unknown.
-    if [[ $LAST_RC -eq 0 ]]; then
-      unsettled_write "answered without an issue number" app_gh issue create --repo "$REPO"
-    else
-      unsettled_write "failed without a refusal in GitHub's own words: it may have been made" app_gh issue create --repo "$REPO"
-    fi
-    PENDING_CREATE=""
+    # Failed, with no number: its outcome is unknown, whatever the answer says (no refusal is taken
+    # from its text: rounds 92, C1 = SEC-3, and 93, C2 = SEC-1). Cleared as above.
+    unsettled_write "failed, with no issue number: it may have been made" app_gh issue create --repo "$REPO" && PENDING_CREATE=""
   fi
   try_reading A12 "gh issue list" app_gh issue list --repo "$REPO" --limit 1
   try_reading A12 "gh pr list" app_gh pr list --repo "$REPO" --limit 1
@@ -2696,9 +2695,9 @@ run_title_jq() { printf 'select(.title | startswith("FRG-26 ")) | select(.title 
 run_issues_jq() { printf '.[] | select(.pull_request == null) | %s | .number' "$(run_title_jq)"; } # issues only
 run_items_jq() { printf '.[] | %s | .number' "$(run_title_jq)"; } # issues and PRs
 
-# This run's test issues are closed in the throwaway: each one a create returned (RUN_ISSUES), and
-# any of this run's a list finds (run_issues_jq; a list read just after a create can miss it: round
-# 102), each once. The second throwaway is only read (round 13, SEC-4): an "FRG-26 " issue or PR of
+# This run's test issues are closed in the throwaway: each one a create returned (RUN_ISSUES), each
+# one whose close was already started (ISSUES_CLOSE_SENT: only read back), and any of this run's a
+# list finds (run_issues_jq; a list read just after a create can miss it: round 102), each once. The second throwaway is only read (round 13, SEC-4): an "FRG-26 " issue or PR of
 # this run's there means this run wrote there, and is reported for the owner to close; this script
 # never writes there as the owner. ISSUES_SWEPT is set once the sweep has ended, however it ended;
 # a stop before that has the clean-up resume it (cleanup_tokens_first).
@@ -2712,7 +2711,9 @@ sweep_issues() {
     FAILS=$((FAILS + 1))
     undone "closing the test issues"; say "CLEANUP FAIL could not list the open issues in $REPO$(no_answer $rc): close any \"FRG-26 \" test issue on GitHub"
   fi
-  for n in $RUN_ISSUES $open; do
+  # Every close already started too (review-lens round 93, C3 = SEC-2): a list read after a stop may
+  # no longer show an issue whose close was sent, so it is read back by its number (not sent again).
+  for n in $RUN_ISSUES $ISSUES_CLOSE_SENT $open; do
     [[ "$n" =~ ^[0-9]+$ ]] || continue
     [[ " $todo " == *" $n "* ]] || todo="$todo $n"
   done
