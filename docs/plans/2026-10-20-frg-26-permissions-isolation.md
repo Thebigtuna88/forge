@@ -587,7 +587,9 @@ Review-lens round 92 (owner, 2026-11-24): the create is recorded as pending befo
 the pending record is cleared only once its answer is settled (its number kept, in the same command);
 a create that returns no issue number is outcome unknown, whatever its answer says (round 93: no
 refusal is taken from an answer's text), and its pending record is cleared only once that record is
-written, so a record that can't be written leaves it pending, still named, and INCOMPLETE. A close
+written, so a record that can't be written leaves it pending, still named, and INCOMPLETE; the
+pending create is named whether or not the work folder is there, and if the folder the run made is
+gone, the records it held are named unreadable, their outcomes unknown (round 94). A close
 is marked started before it is sent, and never sent again; a stop before the run's issue sweep has
 ended (the final one included) has the clean-up resume it within its cap, its work list being the
 issues created, every close already started and what the list finds (round 93: a list read after a

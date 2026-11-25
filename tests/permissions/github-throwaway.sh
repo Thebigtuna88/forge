@@ -147,6 +147,7 @@ TIMED_OUT=""        # the limit (seconds) of the request with_timeout last stopp
 STOP_WHY=""         # why the run stopped, said first by the clean-up (a request that timed out)
 LAST_HTTP=""
 WORK=""
+WORK_MADE=""        # the work folder make_work made: gone at the clean-up's end, its records are unknown (round 94)
 CLONE=""
 PHASE=""
 FAILS=0
@@ -404,17 +405,23 @@ cleanup_summary() {
 # Each write of this run's that got no answer in time, or that a stop cut short (its note is still
 # there: with_timeout), once, on one line. Round 102 (round 92, C2 = SEC-1): a test issue's create
 # still pending (PENDING_CREATE) is one too, unless already named so; a close of a test issue read
-# back closed is settled by that read-back, and not named.
+# back closed is settled by that read-back, and not named. Review-lens round 94 (C1 = SEC-1): the
+# pending create is named whether or not the work folder is there, and if the folder make_work made
+# is gone, the records it held can't be read: that is named too, never an empty list.
 unknown_writes() {
-  local f all n settled
-  [[ -n "$WORK" && -d "$WORK" ]] || return 0
-  all="$({
-    if [[ -f "$WORK/timed-out" ]]; then sed -n 's/^write //p' "$WORK/timed-out"; fi
-    if [[ -f "$WORK/unsettled" ]]; then cat "$WORK/unsettled"; fi
-    for f in "$WORK"/out-write.*; do
-      if [[ -f "$f" ]]; then printf '%s (cut short by the stop)\n' "$(cat "$f")"; fi
-    done
-  } | sort -u)"
+  local f all="" n settled
+  if [[ -n "$WORK" && -d "$WORK" ]]; then
+    all="$({
+      if [[ -f "$WORK/timed-out" ]]; then sed -n 's/^write //p' "$WORK/timed-out"; fi
+      if [[ -f "$WORK/unsettled" ]]; then cat "$WORK/unsettled"; fi
+      for f in "$WORK"/out-write.*; do
+        if [[ -f "$f" ]]; then printf '%s (cut short by the stop)\n' "$(cat "$f")"; fi
+      done
+    } | sort -u)"
+  fi
+  if [[ -n "$WORK_MADE" && ! -d "$WORK_MADE" ]]; then
+    all="$all"$'\n'"this run's records of writes with no answer, in $WORK_MADE, can't be read (the folder is gone): any write they held has an unknown outcome"
+  fi
   if [[ -n "$PENDING_CREATE" && $'\n'"$all" != *$'\n'"$PENDING_CREATE ("* ]]; then
     all="$all"$'\n'"$PENDING_CREATE (no complete answer registered: it may have been made)"
   fi
@@ -1387,6 +1394,7 @@ assert_second() { # writes to the second throwaway are attempts only, and only t
 
 make_work() {
   WORK="$(mktemp -d "/private/tmp/frg26.XXXXXX")" || die "mktemp failed"
+  WORK_MADE="$WORK"
   chmod 700 "$WORK" || die "chmod failed"
   mkdir -m 700 "$WORK/home" "$WORK/gh-app" "$WORK/template" || die "mkdir failed"
   cat >"$WORK/askpass" <<'EOF'

@@ -6001,6 +6001,42 @@ test_a_stop_at_each_issue_step_never_ends_in_a_false_done() {
   done
 }
 
+# Review-lens round 94 (C1 = SEC-1), owner 2026-11-24: a create still pending is named whether or not
+# the work folder is there. If the run's own folder (make_work's) is gone, the records of writes with
+# no answer it held can't be read: that is named, their outcomes unknown, and the clean-up is
+# INCOMPLETE, never an empty list. A folder the run didn't make (a test's) proves nothing either way.
+test_a_pending_create_or_a_lost_work_folder_is_never_an_empty_list() {
+  load
+  end_stand_in_run
+  local out rc pending gone
+  pending="writes with outcome unknown (not retried, not reconciled: check them on GitHub): app gh issue create --repo $REPO (no complete answer registered: it may have been made);"
+  gone="this run's records of writes with no answer, in $T_TMP/gone, can't be read (the folder is gone): any write they held has an unknown outcome;"
+  WORK="" WORK_MADE="" PENDING_CREATE="app gh issue create --repo $REPO"
+  rc=0; out="$(cleanup_summary)" || rc=$?
+  assert_exit 1 "$rc" "no work folder, a create pending"
+  assert_contains "$out" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): none; NOT confirmed: none; $pending" "no work folder"
+  WORK="$T_TMP/gone" WORK_MADE="$T_TMP/gone"
+  rc=0; out="$(cleanup_summary)" || rc=$?
+  assert_exit 1 "$rc" "the run's folder gone, a create pending"
+  assert_contains "$out" "CLEANUP INCOMPLETE:" "the run's folder gone, a create pending"
+  assert_contains "$out" " app gh issue create --repo $REPO (no complete answer registered: it may have been made);" "the run's folder gone: the create"
+  assert_contains "$out" "$gone" "the run's folder gone: its records"
+  PENDING_CREATE=""
+  rc=0; out="$(cleanup_summary)" || rc=$?
+  assert_exit 1 "$rc" "the run's folder gone, nothing pending"
+  assert_contains "$out" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): none; NOT confirmed: none; writes with outcome unknown (not retried, not reconciled: check them on GitHub): $gone" "the run's folder gone"
+  # Controls: the run's folder there with nothing in it, and a folder the run didn't make missing.
+  mkdir "$T_TMP/here"
+  WORK="$T_TMP/here" WORK_MADE="$T_TMP/here"
+  rc=0; out="$(cleanup_summary)" || rc=$?
+  assert_exit 0 "$rc" "the run's folder there, nothing to report"
+  assert_eq "$out" "" "the run's folder there, nothing to report"
+  WORK="$T_TMP/other" WORK_MADE=""
+  rc=0; out="$(cleanup_summary)" || rc=$?
+  assert_exit 0 "$rc" "a folder the run didn't make, missing"
+  assert_eq "$out" "" "a folder the run didn't make, missing"
+}
+
 # Review-lens round 92 (C3 = SEC-4): an issue or PR is this run's only if its title ends with this
 # run's id in its own parentheses; another run's id that starts with it, or contains it, is not.
 # shellcheck disable=SC2016 # sweep_issues' own source text is searched for literally
