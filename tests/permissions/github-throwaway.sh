@@ -128,11 +128,15 @@ CONTROL_ID=""       # inside a control: its name, which its tokens' names start 
 CONTROL_PENDING=""  # controls that haven't said they are done: their tokens count as NOT confirmed
 CONTROL_CONFIRMED="" # names of control tokens their control confirmed revoked (HTTP 401)
 CONTROL_UNCONFIRMED="" # names of control tokens their control could not confirm
+CONTROL_UNTRUSTED="" # controls whose record came cut short or malformed: their tokens NOT confirmed (round 109)
 CONTROL_PID=""      # the control running now, in the background (round 74, C1, SEC-1)
 CONTROL_NAME=""     # its name
 CONTROL_WATCH=""    # its watchdog
-CONTROL_REC=""      # the file its record comes through
-CONTROL_RC=""       # its exit status, once it has ended
+CONTROL_WRAP=""     # the wrapper whose unnamed pipe (fd 8) brings its record (round 109)
+CONTROL_LINES=""    # what has come through that pipe so far
+CONTROL_PARTIAL=""  # set if a line came cut short
+CONTROL_KILLED=""   # set if it was stopped outright
+CONTROL_RC=""       # its exit status, as its wrapper said it, once it has ended
 CONTROL_TOLD=""     # set once a stop has been passed on to it
 CONTROL_UNREC=""    # the requests it reports as possibly issued, never received
 CONTROL_END=""      # inside a control: when its own clean-up must have ended
@@ -147,17 +151,18 @@ TIMED_OUT=""        # the limit (seconds) of the request with_timeout last stopp
 STOP_WHY=""         # why the run stopped, said first by the clean-up (a request that timed out)
 LAST_HTTP=""
 WORK=""
-WORK_MADE=""        # the work folder make_work made: gone at the clean-up's end, its records are unknown (round 94)
-WORK_MARK=""        # the random value make_work wrote in it: supporting evidence it is still that folder (round 95)
-WORK_LOST=""        # set when the clean-up found it gone, replaced or unreadable: its records are lost
-RECOVER_DIR=""      # the fresh private folder the clean-up then made for its own requests
-RECOVER_MARK=""     # the random value it wrote in that one
-RECOVER_COUNT=0     # fresh folders made: at most three (round 96)
-RECOVER_LOST=""     # fresh folders found gone, replaced or unusable later in the clean-up
-SCRATCH_NONE=""     # set when no usable one is left: requests that need a folder are not sent, and said so
-SCRATCH_FAIL=""     # set when a request or record of the clean-up's own got no file: what it held is unknown
-CLEANUP_OWN=""      # set while the clean-up of a command other than a2-probe runs
-INTO_UNSENT=""      # set by into when it did not run its command (no usable folder), for capture
+WORK_MADE=""        # the work folder make_work made, which the clean-up never deletes (round 96)
+# Round 109 (owner, 2026-11-25): the state of the run's writes is kept here, in the run's own shell,
+# never in a file. A write is noted before it is sent and cleared only once its answer is stored and
+# shows GitHub's own reply (answer_validated); a lost or malformed answer leaves it outcome unknown.
+WRITES_OUT=""       # writes sent and not yet answered, one per line: <n> <what>
+WRITES_UNKNOWN=""   # writes whose outcome is unknown, one per line: <what> (<why>)
+WRITE_SEQ=0
+STOP_LINES=""       # requests with no answer within their limit, one per line: why the run stops
+IN_JOB=""           # set inside into's job: its write and timeout are the run's shell's to note; a
+#                     timeout there ends the job with 124, which into in the run's shell records
+STOPS_HELD=""       # set while stops are ignored (a clean-up) or held (defer_signals): into then
+#                     holds each answer in memory, through a command substitution (round 108)
 CLONE=""
 PHASE=""
 FAILS=0
@@ -196,6 +201,8 @@ cleanup() {
   # its limit), and every wait and loop checks the cap: the whole clean-up ends within CLEANUP_SECS
   # plus a few seconds (the last call may end up to a second past it; the local work after it).
   trap '' HUP INT TERM
+  # Stops are ignored from here, so each answer is held in memory (into, rounds 108-109).
+  STOPS_HELD=1
   start=$(date +%s)
   # A request a stop found running is stopped first, with everything it started (round 75, C1).
   stop_requests
@@ -209,10 +216,7 @@ cleanup() {
     if [[ -n "$PENDING_MINT" || -n "$UNRECEIVED" ]]; then report_unreceived; fi
     revoke_outstanding
   else
-    # Its work folder first: gone, replaced, unreadable or unusable, it is set aside (round 95), and
-    # so is any folder in use found so later in the clean-up (into, round 96).
-    CLEANUP_OWN=1
-    if ! work_intact; then work_recover; fi
+    # Round 109: the clean-up uses no folder; what it reports is in the run's own memory.
     cleanup_tokens_first "$rc" "$start" || incomplete=1
   fi
   if [[ -n "$HELD_LOCKED" ]]; then rmdir "$HELD.lock" 2>/dev/null || true; HELD_LOCKED=""; fi
@@ -393,6 +397,8 @@ cleanup_summary() {
   # may hold one, NOT confirmed (round 73, C1, SEC-1).
   yes="$yes$CONTROL_CONFIRMED" no="$no$CONTROL_UNCONFIRMED"
   for t in $CONTROL_PENDING; do no="$no $t (no result)"; done
+  # One whose record came cut short or malformed: none of it taken (round 109).
+  for t in $CONTROL_UNTRUSTED; do no="$no $t (no trusted result)"; done
   # A write that got no answer in time may have taken effect: named until someone reads it back
   # (round 75, C1).
   unknown="$(unknown_writes)"
@@ -400,7 +406,7 @@ cleanup_summary() {
   # A test issue the run made, or whose close it started, counts only once read back closed
   # (round 92, SEC-2): any other is named, and the clean-up is INCOMPLETE.
   left="$(issues_unconfirmed)"
-  [[ -n "$ISSUED$UNRECEIVED_LABELS$CLEANUP_UNDONE$CONTROL_CONFIRMED$CONTROL_UNCONFIRMED$CONTROL_PENDING$unknown$ISSUES_CLOSED$left" ]] || return 0
+  [[ -n "$ISSUED$UNRECEIVED_LABELS$CLEANUP_UNDONE$CONTROL_CONFIRMED$CONTROL_UNCONFIRMED$CONTROL_PENDING$CONTROL_UNTRUSTED$unknown$ISSUES_CLOSED$left" ]] || return 0
   tokens="tokens confirmed revoked (HTTP 401):${yes:- none}; NOT confirmed:${no:- none}"
   tokens="$tokens${UNRECEIVED_LABELS:+; possibly issued, never received:$UNRECEIVED_LABELS}${held:+; held for a later check:$held}"
   # Each test issue as its read-back by number found it, closed (round 102).
@@ -420,52 +426,22 @@ cleanup_summary() {
   return 1
 }
 
-# Each write of this run's that got no answer in time, or that a stop cut short (its note is still
-# there: with_timeout), once, on one line. Round 102 (round 92, C2 = SEC-1): a test issue's create
-# still pending (PENDING_CREATE) is one too, unless already named so; a close of a test issue read
-# back closed is settled by that read-back, and not named. Review-lens round 94 (C1 = SEC-1): the
-# pending create is named whether or not the work folder is there. Round 95 (C2 = SEC-2): each
-# record's read is checked, and one that is there but can't be read is named, never taken as empty;
-# the records of a folder that is gone, replaced, unreadable or unusable (WORK_LOST, or make_work's
-# folder no longer shown to be the run's) are named lost. Round 96: so are those of a fresh folder
-# found so (RECOVER_LOST, or the one in use failing its check now), and the clean-up's own requests
-# or records that got no file (SCRATCH_FAIL); a folder that fails its check is not read.
+# Each write of this run's that got no complete answer or none in time, or that a stop cut short (it
+# is still out), once, on one line. Round 102 (round 92, C2 = SEC-1): a test issue's create still
+# pending (PENDING_CREATE) is one too, unless already named so; a close of a test issue read back
+# closed is settled by that read-back, and not named. Round 109 (owner, 2026-11-25): all of it is
+# the run's own memory (WRITES_UNKNOWN, WRITES_OUT, a control's as it reported them), never a file,
+# so nothing a folder holds or loses can hide a write or add one.
 unknown_writes() {
-  local f l all="" bad="" lost="" n settled fresh
-  if [[ -n "$WORK" && -d "$WORK" ]] && scratch_ok; then
-    if [[ -e "$WORK/timed-out" ]]; then
-      if l="$(sed -n 's/^write //p' "$WORK/timed-out" 2>/dev/null)"; then all="$all$l"$'\n'; else bad="$bad timed-out"; fi
-    fi
-    if [[ -e "$WORK/unsettled" ]]; then
-      if l="$(cat "$WORK/unsettled" 2>/dev/null)"; then all="$all$l"$'\n'; else bad="$bad unsettled"; fi
-    fi
-    for f in "$WORK"/out-write.*; do
-      [[ -e "$f" ]] || continue
-      if l="$(cat "$f" 2>/dev/null)"; then all="$all$l (cut short by the stop)"$'\n'; else bad="$bad ${f##*/}"; fi
-    done
-    all="$(printf '%s' "$all" | sort -u)"
-  fi
-  if [[ -n "$WORK_LOST" ]]; then
-    lost="$WORK_LOST"
-  elif [[ -n "$WORK_MADE" ]] && ! work_intact; then
-    lost="$WORK_MADE"
-  fi
+  local f all n settled
+  all="$WRITES_UNKNOWN"
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    all="$all${f#* } (cut short by the stop)"$'\n'
+  done <<<"$WRITES_OUT"
+  all="$(printf '%s' "$all" | sort -u)"
   if [[ -n "$PENDING_CREATE" && $'\n'"$all" != *$'\n'"$PENDING_CREATE ("* ]]; then
     all="$all"$'\n'"$PENDING_CREATE (no complete answer registered: it may have been made)"
-  fi
-  for f in $bad; do
-    all="$all"$'\n'"this run's record $f, in $WORK, can't be read: any write it held has an unknown outcome"
-  done
-  if [[ -n "$lost" ]]; then
-    all="$all"$'\n'"this run's records of writes with no answer, in $lost, can't be read (the folder is gone, replaced, unreadable or unusable): any write they held has an unknown outcome"
-  fi
-  fresh="$RECOVER_LOST"
-  if [[ -n "$RECOVER_DIR" && "$WORK" == "$RECOVER_DIR" ]] && ! scratch_ok; then fresh="$fresh $RECOVER_DIR"; fi
-  for f in $fresh; do
-    all="$all"$'\n'"the clean-up's fresh folder $f, can't be read (gone, replaced, unreadable or unusable): any record written there is lost"
-  done
-  if [[ -n "$SCRATCH_FAIL" ]]; then
-    all="$all"$'\n'"the clean-up's own requests or records that needed a file were not made (no usable folder): what they would have shown is unknown"
   fi
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
@@ -490,20 +466,47 @@ issues_unconfirmed() {
 # A tidy-up's write that got no answer in time and that no read-back settled (round 77): never sent
 # again blindly, and named in the clean-up's last line, its outcome unknown, so the clean-up is
 # INCOMPLETE. In the run's own shell or the clean-up, where a tidy-up's timeout doesn't stop the run.
-# 1 if it couldn't be recorded (review-lens round 93, C1): a caller keeping a record of its own (a
-# pending create) then keeps it.
-# In the clean-up, a folder not shown to be the run's is never written to, and a record that can't be
-# written is noted (SCRATCH_FAIL), so the clean-up is INCOMPLETE (round 96).
+# Round 109: kept in the run's memory (WRITES_UNKNOWN), never a file, so it can't fail; a caller
+# keeping a record of its own (a pending create) clears it only after this (review-lens round 93).
 unsettled_write() { # <why> <runner> <args…> — the request, described by request_what
   local why="$1"
   shift
-  if [[ -n "$CLEANUP_OWN" ]] && ! scratch_ok; then SCRATCH_FAIL=1; return 1; fi
-  if [[ -n "$WORK" && -d "$WORK" ]] && { printf '%s (%s)\n' "$(request_what "$@")" "$why" >>"$WORK/unsettled"; } 2>/dev/null; then
-    return 0
-  fi
-  [[ -z "$CLEANUP_OWN" ]] || SCRATCH_FAIL=1
-  return 1
+  write_unknown "$(request_what "$@")" "$why"
 }
+
+# Round 109 (owner, 2026-11-25): a write's pending state, in the shell that sends it. write_out notes it
+# before it is sent, its number in WRITE_N; write_done clears it once its answer is stored and judged;
+# write_unknown names it outcome unknown, with why.
+write_out() { # <what> — sets WRITE_N
+  WRITE_SEQ=$((WRITE_SEQ + 1))
+  WRITE_N=$WRITE_SEQ
+  WRITES_OUT="$WRITES_OUT$WRITE_N $(one_line "$1")"$'\n'
+}
+one_line() { printf '%s' "$1" | tr '\n\t\r' '   ' | cut -c1-200; } # <text> — a write's note is one line
+write_done() { # <n>
+  local l keep=""
+  while IFS= read -r l; do
+    [[ -z "$l" || "${l%% *}" == "$1" ]] || keep="$keep$l"$'\n'
+  done < <(printf '%s' "$WRITES_OUT")
+  WRITES_OUT="$keep"
+}
+write_unknown() { # <what> <why>
+  WRITES_UNKNOWN="$WRITES_UNKNOWN$(one_line "$1 ($2)")"$'\n'
+}
+
+# 0 if a write's stored answer is GitHub's own reply: success (status 0), or a refusal in GitHub's own
+# words, as classify_api and classify_push read them. Anything else (a transport error, an empty or
+# cut answer, a timeout) leaves the write's outcome unknown.
+answer_validated() { # <status> <answer>
+  [[ "$1" -eq 0 ]] && return 0
+  [[ "$1" -ne 124 && "$1" -ne 137 ]] || return 1
+  # grep reads it all (no -q): an early exit would fail printf under pipefail.
+  printf '%s' "$2" | grep -E 'HTTP [1-5][0-9][0-9]|GH[0-9][0-9][0-9]|\[remote rejected\]|\[rejected\]|GraphQL: |is not mergeable|Resource not accessible by integration|Must have admin rights|protected branch|Cannot force-push|cannot delete' >/dev/null
+}
+
+# Helper functions that send a write of their own when into runs them (round 109): into can't see
+# the request inside, so it notes the helper itself, by name and arguments.
+readonly WRITE_HELPERS=" put_file_commit " # s2d_post's write is noted by s2d_approve, which reads its whole answer
 trap cleanup EXIT
 # Closing the Terminal, Ctrl-C or a kill also end through cleanup, with the usual status (round 51,
 # SEC-1): an explicit exit, so it holds whatever the signal finds bash doing. A force-kill (KILL)
@@ -561,31 +564,40 @@ owner_gh_run() {
 }
 
 # The app's installation token, for this one process only: an exported variable, never an argument
-# (so it isn't in the process list), and an empty gh config folder (none of the owner's settings);
-# with no work folder (a clean-up that could make none, round 95), the system's empty, read-only
-# /var/empty.
+# (so it isn't in the process list), and for gh's settings the system's empty, read-only /var/empty
+# (none of the owner's settings, and no folder of the run's own another process could change; round
+# 109). Checked with gh 2.102.0, offline only: it starts, reads its defaults there and builds its
+# requests (evidence 267); GitHub's answers weren't part of that check.
 # shellcheck disable=SC2030,SC2031 # as above
 app_gh_run() {
   (
     unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO
-    export GH_TOKEN="$TOKEN" GH_HOST=github.com GH_CONFIG_DIR="${WORK:+$WORK/gh-app}" \
+    export GH_TOKEN="$TOKEN" GH_HOST=github.com GH_CONFIG_DIR=/var/empty \
       GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1
-    [[ -n "$GH_CONFIG_DIR" ]] || export GH_CONFIG_DIR=/var/empty
     exec gh "$@"
   )
 }
 
 # git as the app: no GIT_* variable, no system or global config (so no credential helper or
-# URL rewrite of the owner's applies), no hooks, credentials only from our askpass script.
+# URL rewrite of the owner's applies), no hooks. Round 109: no password helper and no home folder of
+# the run's own: HOME is the system's empty /var/empty and git's prompt is /usr/bin/false. The token
+# goes only to a request to GitHub (clone, fetch, push, pull, ls-remote), and only in git's
+# environment, as an extra header for https://github.com/ (GIT_CONFIG_COUNT/KEY_0/VALUE_0), encoded
+# through a pipe; never an argument. A local git command gets no token at all.
 app_git_run() {
   (
     local v
     for v in $(compgen -e); do
       case "$v" in GIT_* | SSH_ASKPASS) unset "$v" ;; esac
     done
-    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 HOME="$WORK/home"
-    export FRG26_ASK_USER=x-access-token FRG26_ASK_PASS="$TOKEN" GIT_ASKPASS="$WORK/askpass"
-    exec git -c credential.helper= -c core.askPass="$WORK/askpass" -c core.hooksPath=/dev/null \
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 HOME=/var/empty GIT_ASKPASS=/usr/bin/false
+    case "$(git_subcommand "$@")" in
+      clone | fetch | push | pull | ls-remote)
+        v="$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')" || exit 1
+        export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $v"
+        ;;
+    esac
+    exec git -c credential.helper= -c core.askPass=/usr/bin/false -c core.hooksPath=/dev/null \
       -c commit.gpgsign=false -c protocol.allow=never -c protocol.https.allow=always \
       -c user.name="frg26-app-test" -c user.email="frg26-app-test@users.noreply.github.com" "$@"
   )
@@ -595,8 +607,6 @@ app_git_run() {
 capture() {
   local out rc=0
   into -2 out "$@" || rc=$?
-  # Not sent: the clean-up had no usable folder for its output (rounds 95-96).
-  if [[ $rc -eq 125 && -n "$INTO_UNSENT" ]]; then out="not sent: no usable folder for its output (the run's work folder was lost)"; fi
   LAST_OUT="$(redact "$out")"
   LAST_RC=$rc
   return $rc
@@ -605,39 +615,95 @@ capture() {
 # A command's output, as "$(command…)" would give it, without the command substitution (round 75,
 # C1): bash holds a stop until a command substitution returns, but acts on it at once while the
 # shell waits for a job. <var> gets the output, its trailing newlines removed; the status is the
-# command's. With -2 its error output is kept too, as 2>&1 inside would. In the clean-up (CLEANUP_OWN,
-# rounds 95-96), the folder in use is checked before each file is made there; one that fails, or
-# can't take the file, is set aside for a fresh one (work_recover); with none usable, the command is
-# not run: 125, <var> empty, INTO_UNSENT set, and the clean-up goes on (it never stops here).
+# command's. With -2 its error output is kept too, as 2>&1 inside would. Where stops are ignored (a
+# clean-up) or held anyway (defer_signals: a token request), the command substitution itself is used:
+# the answer is held in memory, and no file is made, read or removed (review-lens round 97, C1, C2;
+# round 109). Elsewhere the answer passes through a private file in the work folder, so a stop acts
+# at once (round 75): not in this round's scope (owner, 2026-11-25), an open limit.
+# Round 109 (owner, 2026-11-25): the command runs as a job (IN_JOB), and what it means for the run is
+# noted here, in this shell: a write before it starts, cleared only once its answer is stored and
+# answer_validated accepts it, else outcome unknown; a job ended by its limit (124) stops the run.
 into() { # [-2] <var> <command…>
-  local _i_both="" _i_var _i_f="" _i_pid _i_rc=0
+  local _i_both="" _i_var _i_f _i_pid _i_rc=0 _i_out _i_n=""
   if [[ "$1" == -2 ]]; then _i_both=1; shift; fi
   _i_var="$1"
   shift
-  INTO_UNSENT=""
-  if [[ -n "$CLEANUP_OWN" && -z "$SCRATCH_NONE" ]] && ! scratch_ok; then work_recover; fi
-  if [[ -z "$SCRATCH_NONE" ]]; then
-    _i_f="$(umask 077 && mktemp "${WORK:-${TMPDIR:-/tmp}}/out.XXXXXX" 2>/dev/null)" || _i_f=""
-    if [[ -z "$_i_f" && -n "$CLEANUP_OWN" ]]; then
-      work_recover
-      [[ -n "$SCRATCH_NONE" ]] || _i_f="$(umask 077 && mktemp "$WORK/out.XXXXXX" 2>/dev/null)" || _i_f=""
+  into_req "$@"
+  if [[ -n "$IR_WRITE" && -z "$IN_JOB" && -z "$PROBE_ACTIVE" ]]; then
+    write_out "$IR_WHAT"
+    _i_n=$WRITE_N
+  fi
+  if [[ -n "$STOPS_HELD$DEFERRING" ]]; then
+    if [[ -n "$_i_both" ]]; then
+      _i_out="$(in_job "$@" 2>&1 3>&- 8<&-)" || _i_rc=$?
+    else
+      _i_out="$(in_job "$@" 3>&- 8<&-)" || _i_rc=$?
     fi
+  else
+    _i_f="$(umask 077 && mktemp "${WORK:-${TMPDIR:-/tmp}}/out.XXXXXX" 2>/dev/null)" || die "can't make a file for a request's output"
+    if [[ -n "$_i_both" ]]; then
+      in_job "$@" >"$_i_f" 2>&1 3>&- 8<&- &
+    else
+      in_job "$@" >"$_i_f" 3>&- 8<&- &
+    fi
+    _i_pid=$!
+    REQ_JOBS="$REQ_JOBS $_i_pid"
+    job_wait "$_i_pid" || _i_rc=$?
+    jobs_drop "$_i_pid"
+    _i_out="$(cat "$_i_f")"
+    rm -f "$_i_f"
   fi
-  if [[ -z "$_i_f" ]]; then
-    [[ -n "$CLEANUP_OWN" ]] || die "can't make a file for a request's output"
-    INTO_UNSENT=1 SCRATCH_FAIL=1
-    printf -v "$_i_var" '%s' ""
-    return 125
-  fi
-  if [[ -n "$_i_both" ]]; then "$@" >"$_i_f" 2>&1 & else "$@" >"$_i_f" & fi
-  _i_pid=$!
-  REQ_JOBS="$REQ_JOBS $_i_pid"
-  job_wait "$_i_pid" || _i_rc=$?
-  jobs_drop "$_i_pid"
-  printf -v "$_i_var" '%s' "$(cat "$_i_f")"
-  rm -f "$_i_f"
+  printf -v "$_i_var" '%s' "$_i_out"
+  into_settle "$_i_rc" "$_i_out" "$_i_n"
   timeout_check
   return $_i_rc
+}
+
+in_job() { IN_JOB=1; "$@"; } # <command…> — into's job (a subshell): what it means is into's to note
+
+# What into is about to run, for its notes (round 109): the request's own words (request_what), its
+# time limit and whether it may write, past a leading "with_timeout <seconds>". A helper function is
+# known by its name and arguments; one of WRITE_HELPERS may write.
+into_req() { # <command…> — sets IR_WHAT, IR_SECS (empty: unknown), IR_WRITE
+  IR_WHAT="" IR_SECS="" IR_WRITE=""
+  if [[ "$1" == with_timeout ]]; then IR_SECS="$2"; shift 2; fi
+  case "$1" in
+    owner_gh | app_gh | owner_gh_run | app_gh_run) [[ -n "$IR_SECS" ]] || IR_SECS="$(call_secs)" ;;
+    app_git | app_git_run) [[ -n "$IR_SECS" ]] || IR_SECS="$(git_secs "${@:2}")" ;;
+    app_curl | jwt_curl) [[ -n "$IR_SECS" ]] || IR_SECS=$((CALL_SECS + 5)) ;;
+    *)
+      IR_WHAT="a request in $(one_line "$*" | cut -c1-120)"
+      [[ "$WRITE_HELPERS" != *" $1 "* ]] || IR_WRITE=1
+      return 0
+      ;;
+  esac
+  IR_WHAT="$(request_what "$@")"
+  if request_writes "$@" && [[ "$*" != *" installation/token"* ]]; then IR_WRITE=1; fi
+  return 0
+}
+
+# What into's job meant for the run, from its stored answer and status (round 109). A write noted
+# before the job is cleared only if answer_validated accepts the answer; otherwise it is named
+# outcome unknown. A job ended by its limit (124, or 137 for a KILL) stops the run, as
+# request_timed_out does, except where a timeout doesn't (a clean-up, a tidy-up, a2-probe); inside a
+# job of a job, that job ends too, for the shell above it to note.
+into_settle() { # <status> <answer> <write number, or empty>
+  local rc="$1" secs="${IR_SECS:+${IR_SECS}s}"
+  if [[ -n "$3" ]]; then
+    if answer_validated "$rc" "$2"; then :
+    elif [[ $rc -eq 124 || $rc -eq 137 ]]; then write_unknown "$IR_WHAT" "no answer within ${secs:-its limit}"
+    else write_unknown "$IR_WHAT" "no complete answer: status $rc"
+    fi
+    write_done "$3"
+  fi
+  [[ $rc -eq 124 || $rc -eq 137 ]] || return 0
+  [[ -z "$CLEANUP_DEADLINE" && -z "$PROBE_ACTIVE" && -z "$TIDY_UP" && -n "$WORK" ]] || return 0
+  [[ -z "$IN_JOB" ]] || exit 124
+  if [[ -n "$IR_WRITE" ]]; then
+    STOP_LINES="$STOP_LINES$IR_WHAT got no answer within its ${secs:-limit} (a write: its outcome is unknown; it may have taken effect, and it is not tried again)"$'\n'
+  else
+    STOP_LINES="$STOP_LINES$IR_WHAT got no answer within its ${secs:-limit}"$'\n'
+  fi
 }
 
 # Waits for a job to end; a caught signal interrupts wait while it may still run, so wait again
@@ -670,7 +736,7 @@ stop_requests() {
 # the foreground ended.
 nap() { # <seconds>
   local pid
-  sleep "$1" &
+  sleep "$1" 3>&- 8<&- & # a control's pipe closed for it (round 109)
   pid=$!
   REQ_JOBS="$REQ_JOBS $pid"
   job_wait "$pid" || true
@@ -685,23 +751,32 @@ nap() { # <seconds>
 # and checks every token.
 request_timed_out() { # <seconds> <runner> <args…>
   [[ -z "$CLEANUP_DEADLINE" && -z "$PROBE_ACTIVE" && -z "$TIDY_UP" && -n "$WORK" ]] || return 0
+  # Round 109: in into's job, the job ends here with 124; into notes it in the run's own shell.
+  [[ -z "$IN_JOB" ]] || exit 124
+  stop_note "$@"
+  timeout_check
+}
+
+# A request with no answer within its limit, noted in this shell's memory (round 109: never a file):
+# why the run stops, and a write's outcome unknown.
+stop_note() { # <seconds> <runner> <args…>
   local secs="$1" what
   shift
   what="$(request_what "$@")"
   if request_writes "$@" && [[ "$*" != *" installation/token"* ]]; then
-    printf 'write %s (no answer within %ss)\n' "$what" "$secs" >>"$WORK/timed-out"
-    printf 'stop %s got no answer within its %ss (a write: its outcome is unknown; it may have taken effect, and it is not tried again)\n' "$what" "$secs" >>"$WORK/timed-out"
+    write_unknown "$what" "no answer within ${secs}s"
+    STOP_LINES="$STOP_LINES$what got no answer within its ${secs}s (a write: its outcome is unknown; it may have taken effect, and it is not tried again)"$'\n'
   else
-    printf 'stop %s got no answer within its %ss\n' "$what" "$secs" >>"$WORK/timed-out"
+    STOP_LINES="$STOP_LINES$what got no answer within its ${secs}s"$'\n'
   fi
-  timeout_check
 }
 
-# Once a request has timed out (in this shell or one it started), no new request starts: the run
-# stops here, for its clean-up (round 75, C1).
+# Once a request has timed out (in this shell, one of its jobs, or a control it ran), no new request
+# starts: the run stops here, for its clean-up (round 75, C1). In into's job, the job ends (124).
 timeout_check() {
-  [[ -z "$CLEANUP_DEADLINE" && -z "$PROBE_ACTIVE" && -z "$TIDY_UP" && -n "$WORK" && -s "$WORK/timed-out" ]] || return 0
-  STOP_WHY="STOPPED: $(sed -n 's/^stop //p' "$WORK/timed-out" | sort -u | tr '\n' ';' | sed 's/;$//'); the run starts no further test action"
+  [[ -z "$CLEANUP_DEADLINE" && -z "$PROBE_ACTIVE" && -z "$TIDY_UP" && -n "$WORK" && -n "$STOP_LINES" ]] || return 0
+  [[ -z "$IN_JOB" ]] || exit 124
+  STOP_WHY="STOPPED: $(printf '%s' "$STOP_LINES" | sort -u | tr '\n' ';' | sed 's/;$//'); the run starts no further test action"
   exit 2
 }
 
@@ -713,6 +788,7 @@ request_what() { # <runner> <args…>
     owner_gh | owner_gh_run) who="owner gh" ;;
     app_gh | app_gh_run) who="app gh" ;;
     app_git | app_git_run) who="app git" ;;
+    app_curl | jwt_curl) who="app curl" ;;
     *) who="app $1" ;;
   esac
   shift
@@ -764,7 +840,7 @@ request_writes() { # <runner> <args…> — 0 if the request may change somethin
   shift
   case "$runner" in
     app_git | app_git_run) [[ "$(git_subcommand "$@")" == push ]]; return ;;
-    curl) return 1 ;; # the app's own requests: a token request's answer is settled by request_token
+    curl | app_curl | jwt_curl) return 1 ;; # the app's own requests: a token request's answer is settled by request_token
   esac
   if [[ "${1:-}" != api ]]; then
     case "${1:-} ${2:-}" in
@@ -872,7 +948,8 @@ load_app() { # the app's id and private key: present, private (mode 600 in a mod
 b64url() { base64 | tr -d '\n=' | tr '/+' '_-'; }
 
 # A JWT that says "I am app APP_ID" for at most 9 minutes (GitHub allows 10), signed RS256 with the
-# app's key. It goes to curl only through a mode-600 header file, never as an argument.
+# app's key. Round 109: it stays in this shell's memory; it reaches curl only on curl's standard
+# input, through a pipe (jwt_curl), never a file or an argument.
 make_jwt() {
   local now h p sig
   now="$(date +%s)" || die "can't read the clock"
@@ -881,29 +958,36 @@ make_jwt() {
   sig="$(printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -sign "$APP_KEY" -binary | b64url)" || die "signing the JWT failed"
   [[ -n "$sig" ]] || die "signing the JWT failed"
   JWT="$h.$p.$sig"
-  (
-    umask 077
-    printf 'Authorization: Bearer %s\nAccept: application/vnd.github+json\nX-GitHub-Api-Version: 2022-11-28\n' "$JWT" >"$WORK/jwt.hdr"
-  ) || die "writing the JWT header file failed"
 }
 
 # A request as the app itself (with the JWT), for what only the app can ask: who it is, where it is
 # installed, a token. -q first: no ~/.curlrc. Sets LAST_OUT (the body only), LAST_HTTP, JWT_ERR
-# (curl's own messages, kept apart so they can't spoil the body: round 56) and JWT_RC (curl's
-# status); 1 unless curl finished cleanly with a 2xx.
-jwt_call() { # <method> <path> [json body file]
-  local args=(-q -sS --proto "=https" --max-time "$CALL_SECS" -X "$1" -H @"$WORK/jwt.hdr" -w '\nHTTP %{http_code}')
-  local out
-  if [[ -n "${3:-}" ]]; then args+=(-H "Content-Type: application/json" --data-binary @"$3"); fi
+# (curl's own message, kept apart so it can't spoil the body: round 56) and JWT_RC (curl's status);
+# 1 unless curl finished cleanly with a 2xx. Round 109: no file at all. The headers come on curl's
+# standard input (-H @-), the body (no secret in it) is an argument, and curl's own message comes in
+# its answer (-w %{errormsg}, curl -s printing none of its own).
+jwt_call() { # <method> <path> [json body]
+  local args=(-q -s --proto "=https" --max-time "$CALL_SECS" -X "$1" -H @- -w '\nFRG26-ERR %{errormsg}\nHTTP %{http_code}')
+  local out err=""
+  if [[ -n "${3:-}" ]]; then args+=(-H "Content-Type: application/json" --data-binary "$3"); fi
   JWT_RC=0
-  # curl's own messages go to a file (--stderr), not through into: -q must stay curl's first argument.
-  into out app_curl "${args[@]}" --stderr "$WORK/jwt.err" "https://api.github.com/$2" || JWT_RC=$?
+  into out jwt_curl "${args[@]}" "https://api.github.com/$2" || JWT_RC=$?
   LAST_HTTP="$(printf '%s\n' "$out" | tail -n 1 | sed -n 's/^HTTP \([0-9][0-9][0-9]\)$/\1/p')"
   if [[ -n "$LAST_HTTP" ]]; then out="$(printf '%s\n' "$out" | sed '$d')"; fi
+  if [[ "$(printf '%s\n' "$out" | tail -n 1)" == "FRG26-ERR"* ]]; then
+    err="$(printf '%s\n' "$out" | tail -n 1 | sed 's/^FRG26-ERR *//')"
+    out="$(printf '%s\n' "$out" | sed '$d')"
+  fi
   LAST_OUT="$(redact "$out")"
-  JWT_ERR="$(redact "$(tr '\n' ' ' <"$WORK/jwt.err" 2>/dev/null | cut -c1-200)")"
-  rm -f "$WORK/jwt.err"
+  JWT_ERR="$(redact "${err:+curl: ($JWT_RC) $err}" | cut -c1-200)"
   [[ $JWT_RC -eq 0 && "$LAST_HTTP" =~ ^2[0-9][0-9]$ ]]
+}
+
+# curl as the app, the JWT's headers on its standard input through a pipe (round 109): a process
+# substitution, never a here-string (a temp file in bash 3.2), nor a pipeline (held stops). printf is
+# a builtin: the JWT is never in a process's arguments. Bounded by app_curl.
+jwt_curl() { # <curl args…>
+  WT_STDIN=1 app_curl "$@" < <(printf 'Authorization: Bearer %s\nAccept: application/vnd.github+json\nX-GitHub-Api-Version: 2022-11-28\n' "$JWT")
 }
 
 # The key must belong to the owner's app, which asks for exactly the four permissions, installed
@@ -958,15 +1042,16 @@ need_app_identity() {
 request_token() { # <request json>
   local t meta label
   REQ_OK=0 REQ_TOKEN=no REQ_UNRECEIVED=no REQ_ANSWER=""
-  printf '%s\n' "$1" >"$WORK/token-request.json" || die "writing the token request failed"
   REQ_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   label="${MINT_LABEL:-${CONTROL_ID:+$CONTROL_ID-}token$((MINTED + 1))}"
+  # Signals held from here (DEFERRING): into holds the answer, which holds the token, in memory.
   defer_signals
   PENDING_MINT="$label $REQ_AT $1"
-  jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$WORK/token-request.json" || REQ_OK=1
+  jwt_call POST "app/installations/$INSTALLATION_ID/access_tokens" "$1" || REQ_OK=1
   REQ_ANSWER="$LAST_OUT"
   LAST_OUT=""
-  t="$(jq -r '.token // empty' <<<"$REQ_ANSWER" 2>/dev/null)" || t=""
+  # Through pipes, never a here-string: bash 3.2 keeps a here-string in a temp file (round 109).
+  t="$(printf '%s' "$REQ_ANSWER" | jq -r '.token // empty' 2>/dev/null)" || t=""
   if [[ -z "$t" ]]; then
     t="$(printf '%s' "$REQ_ANSWER" | grep -Eo '"token"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n 1 | sed -E 's/^"token"[[:space:]]*:[[:space:]]*"//; s/"$//')" || t=""
   fi
@@ -974,7 +1059,7 @@ request_token() { # <request json>
     # On the exit list before it is judged, so a failed revocation is tried again on exit (round 32,
     # C1); what GitHub said it issued (named fields only, no token) kept too, so a token refused
     # later is still described if its revocation isn't confirmed (round 54, SEC-1).
-    meta="$(jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' <<<"$REQ_ANSWER" 2>/dev/null || echo unreadable)"
+    meta="$(printf '%s' "$REQ_ANSWER" | jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' 2>/dev/null || echo unreadable)"
     TOKEN="$t"
     OUTSTANDING="$OUTSTANDING $t"
     MINTED=$((MINTED + 1))
@@ -1025,9 +1110,10 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
     fi
     die "GitHub's answer holds a token in a form this script doesn't expect, and revoking it failed: it may work until it expires, within an hour; the exit clean-up tries once more"
   fi
-  perms="$(jq -S -c .permissions <<<"$ans" 2>/dev/null)" || perms=error
-  sel="$(jq -r .repository_selection <<<"$ans" 2>/dev/null)" || sel=error
-  repos="$(jq -c '[.repositories[]?.full_name]' <<<"$ans" 2>/dev/null)" || repos=error
+  # The answer holds the token: read through pipes, never a here-string's temp file (round 109).
+  perms="$(printf '%s' "$ans" | jq -S -c .permissions 2>/dev/null)" || perms=error
+  sel="$(printf '%s' "$ans" | jq -r .repository_selection 2>/dev/null)" || sel=error
+  repos="$(printf '%s' "$ans" | jq -c '[.repositories[]?.full_name]' 2>/dev/null)" || repos=error
   if [[ "$perms" != "$want" || "$sel" != selected ]] || [[ "$2" == narrowed && "$repos" != "[\"$REPO\"]" ]]; then
     if revoke_token; then
       die "the token GitHub issued carries more than was asked (permissions $perms, repositories $sel $repos): it was revoked"
@@ -1035,7 +1121,7 @@ mint() { # <request json> <narrowed|whole> [permissions json, sorted]
     die "the token GitHub issued carries more than was asked (permissions $perms, repositories $sel $repos), and revoking it failed: it may work until it expires, within an hour; the exit clean-up tries once more"
   fi
   # Named fields only, so nothing else GitHub may add to its answer is ever printed.
-  MINT_ANSWER="$(jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' <<<"$ans" 2>/dev/null)" || MINT_ANSWER=unreadable
+  MINT_ANSWER="$(printf '%s' "$ans" | jq -S -c '{expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' 2>/dev/null)" || MINT_ANSWER=unreadable
 }
 
 mint_token() { mint "{\"repositories\":[\"$REPO_NAME\"],\"permissions\":$WANT_PERMS}" narrowed; }
@@ -1078,15 +1164,20 @@ revoke_token() { # [seconds] DELETE /installation/token, which GitHub documents 
 }
 
 # A catchable signal waits while a token is being registered (round 58, C1, SEC-1): the clean-up
-# then finds the registration whole. resume_signals acts on a signal that came meanwhile.
+# then finds the registration whole. resume_signals acts on a signal that came meanwhile. While a stop
+# waits anyway, into holds each answer in memory (DEFERRING, round 109): a token request's answer,
+# which holds the new token, is never in a file.
 DEFERRED_SIG=""
+DEFERRING=""
 defer_signals() {
   DEFERRED_SIG=""
+  DEFERRING=1
   trap 'DEFERRED_SIG=129' HUP
   trap 'DEFERRED_SIG=130' INT
   trap 'DEFERRED_SIG=143' TERM
 }
 resume_signals() {
+  DEFERRING=""
   stop_traps
   if [[ -n "$DEFERRED_SIG" ]]; then
     trap '' HUP INT TERM
@@ -1101,42 +1192,38 @@ resume_signals() {
 # nowhere, so a command substitution around this never waits for it. Both are on REQ_JOBS while they
 # run, so a stop's clean-up stops them at once (round 75, C1). A GitHub request (through an identity)
 # that times out stops the run (request_timed_out), and none starts once one has (timeout_check).
+# A timeout is told by the command's own status, never by a file (review-lens round 97, SEC-1,
+# SEC-3): the watchdog ends it with KILL, so it ends with 137. A command ended by KILL from anywhere
+# else has no answer either, and is taken the same way: stopped at its limit, its outcome unknown.
+# Round 109: neither the command nor the watchdog gets a control's pipe (fds 3 and 8), so nothing it
+# starts can add to a control's record or hold it open. Its standard input is /dev/null, as for any
+# command bash starts in the background, unless WT_STDIN is set (jwt_call: the JWT on a pipe).
 with_timeout() { # <seconds> <command…>
-  local secs="$1" pid w rc=0 mark out=""
+  local secs="$1" pid w rc=0 n=""
   shift
   TIMED_OUT=""
   timeout_check
   [[ "$secs" =~ ^[0-9]+$ && $secs -gt 0 ]] || return 124
-  # A write is noted while it is out: one a stop cuts short is named by the clean-up, its outcome
-  # unknown, as is one that times out (round 75, C1).
+  # A write is noted while it is out, in this shell's memory (round 109; into notes its own job's): one
+  # a stop cuts short is named by the clean-up, its outcome unknown, as is one that times out (round
+  # 75, C1).
   case "$1" in
     owner_gh_run | app_gh_run | app_git_run)
-      if [[ -z "$CLEANUP_DEADLINE" && -z "$PROBE_ACTIVE" && -n "$WORK" ]] && request_writes "$@" && [[ "$*" != *" installation/token"* ]]; then
-        out="$(umask 077 && mktemp "$WORK/out-write.XXXXXX" 2>/dev/null)" || die "can't note a write that is about to go out"
-        request_what "$@" >"$out"
+      if [[ -z "$IN_JOB" && -z "$CLEANUP_DEADLINE" && -z "$PROBE_ACTIVE" ]] && request_writes "$@" && [[ "$*" != *" installation/token"* ]]; then
+        write_out "$(request_what "$@")"
+        n=$WRITE_N
       fi
       ;;
   esac
-  "$@" &
+  if [[ -n "${WT_STDIN:-}" ]]; then "$@" <&0 3>&- 8<&- & else "$@" 3>&- 8<&- & fi
   pid=$!
-  # Named by the command's own process (round 74): a control runs beside the run, and a background
-  # subshell of bash 3.2 repeats the run's $RANDOM, so a name from it could be shared.
-  # With no usable private folder (rounds 95-96) there is no mark: the request still ends at its
-  # limit, but is then told only by its status, never written under a guessable name in a shared
-  # folder, nor in one that isn't shown to be the run's (scratch_ok).
-  mark=""
-  if [[ -z "$SCRATCH_NONE" ]] && { [[ -z "$CLEANUP_OWN" ]] || scratch_ok; }; then
-    mark="${WORK:-${TMPDIR:-/tmp}}/timeout-$$-$pid"
-    rm -f "$mark"
-  fi
   (
     # A signal to the whole process group (closing the window) must not end the watchdog: a subshell
     # resets caught signals to their default, so it ignores them itself (round 67, C1).
     trap '' HUP INT TERM
     /bin/sleep "$secs" # the clock itself, never a function of that name (round 72)
-    if [[ -n "$mark" ]]; then echo stopped >"$mark"; fi
     kill_tree "$pid"
-  ) </dev/null >/dev/null 2>&1 &
+  ) </dev/null >/dev/null 2>&1 3>&- 8<&- &
   w=$!
   REQ_JOBS="$REQ_JOBS $pid $w"
   # A caught signal interrupts wait while the command may still run: job_wait waits again, under the
@@ -1145,9 +1232,14 @@ with_timeout() { # <seconds> <command…>
   kill_tree "$w"
   wait "$w" 2>/dev/null
   jobs_drop "$pid" "$w"
-  if [[ -n "$out" ]]; then rm -f "$out"; fi
-  if [[ -n "$mark" && -f "$mark" ]]; then
-    rm -f "$mark"
+  # Its answer went to the caller, so only its status is seen here: success clears it; a tidy-up's
+  # caller reads the state back itself (round 77); anything else leaves it outcome unknown (a timeout
+  # is noted by request_timed_out).
+  if [[ -n "$n" ]]; then
+    if [[ $rc -ne 0 && $rc -ne 137 && -z "$TIDY_UP" ]]; then write_unknown "$(request_what "$@")" "no complete answer: status $rc"; fi
+    write_done "$n"
+  fi
+  if [[ $rc -eq 137 ]]; then
     TIMED_OUT="$secs"
     case "$1" in
       owner_gh | app_gh | app_git | owner_gh_run | app_gh_run | app_git_run | curl) request_timed_out "$secs" "$@" ;;
@@ -1228,17 +1320,25 @@ revoke_outstanding() { # the current token, then every other token this run mint
 
 # A control's own token request (A9, E1) runs in a subshell whose output is hidden, and its tokens
 # are revoked as it ends. Its exit list dies with it, so a token it could not revoke is reported
-# here (round 35, C1/SEC-1): status 3 (the request worked) or 4 (it failed) from its exit trap.
+# here (round 35, C1/SEC-1). Round 109 (owner, 2026-11-25): what it reports reaches the run only
+# through an unnamed pipe (fd 3 here, fd 8 in the run), never a file, all at once: a line naming how
+# many lines follow, each token's state, each request that may have issued a token never received,
+# each request of its with no answer in time (why the run stops) and each write with an unknown
+# outcome, whether it was told to stop, then "done". Its status: 0 (its command worked, every token
+# confirmed revoked), 6 (its command failed, every token confirmed), 3 or 4 (likewise, a token not
+# confirmed), 5 (the record could not be handed over).
 control_exit() {
   local rc=$?
   # Like the clean-up, it runs to its end: a further signal (closing the window signals every
   # process, this subshell too) can't cut it short and hide a token it couldn't revoke (round 65).
   trap '' HUP INT TERM
+  # Stops ignored: its answers are held in memory (round 109).
+  STOPS_HELD=1
   # A request it was told to stop in is stopped first, whole (round 75, C1).
   stop_requests
-  # Its requests that may have issued a token never received go to the caller (round 61, SEC-1),
-  # on fd 3, a file only the caller reads (round 74: the control runs in the background). The write
-  # is checked: if it fails, status 5 tells the caller a record was lost (round 62, C1, SEC-1).
+  # Its requests that may have issued a token never received go to the caller (round 61, SEC-1).
+  # The write is checked: if it fails, status 5 tells the caller a record was lost (round 62, C1,
+  # SEC-1).
   if [[ -n "$PENDING_MINT" ]]; then UNRECEIVED="$UNRECEIVED$PENDING_MINT
 "; fi
   # Its own tokens are settled here and never leave it (round 73, C1, SEC-1): each revoked and its
@@ -1246,7 +1346,7 @@ control_exit() {
   # past CONTROL_END, the end of the control's own time (round 74, C1). The caller is told each
   # one's name and state, then "done"; a control that never says "done" leaves its tokens NOT
   # confirmed.
-  local n e t res="" bad="" kind
+  local n e t res="" bad="" kind l count
   CLEANUP_DEADLINE=$(($(date +%s) + REVOKE_SECS))
   if [[ -n "$CONTROL_END" && $CONTROL_END -lt $CLEANUP_DEADLINE ]]; then CLEANUP_DEADLINE=$CONTROL_END; fi
   settle_register
@@ -1268,17 +1368,31 @@ control_exit() {
       bad=1
     fi
   done
-  printf '%s%sCONTROL %s done\n' "$UNRECEIVED" "$res" "$CONTROL_ID" >&3 2>/dev/null || exit 5
+  while IFS= read -r l; do
+    [[ -z "$l" ]] || res="${res}CONTROL $CONTROL_ID unreceived $l"$'\n'
+  done < <(printf '%s' "$UNRECEIVED")
+  while IFS= read -r l; do
+    [[ -z "$l" ]] || res="${res}CONTROL $CONTROL_ID stop $l"$'\n'
+  done < <(printf '%s' "$STOP_LINES")
+  while IFS= read -r l; do
+    [[ -z "$l" ]] || res="${res}CONTROL $CONTROL_ID write $l"$'\n'
+  done < <(printf '%s' "$WRITES_UNKNOWN"; printf '%s' "$WRITES_OUT" | sed 's/^[0-9]* \(.*\)$/\1 (cut short by the stop)/')
+  [[ $rc -ne 143 ]] || res="${res}CONTROL $CONTROL_ID stopped"$'\n'
+  count="$(printf '%s' "$res" | grep -c . || true)"
+  printf 'CONTROL %s begin %s\n%sCONTROL %s done\n' "$CONTROL_ID" "$count" "$res" "$CONTROL_ID" >&3 2>/dev/null || exit 5
   if [[ -n "$bad" ]]; then
     if [[ $rc -eq 0 ]]; then exit 3; fi
     exit 4
   fi
+  [[ $rc -ne 0 ]] || exit 0
+  exit 6
 }
 
-control_begin() { # <name> — inside a control: only its own tokens, named after it
+control_begin() { # <name> — inside a control: only its own tokens, named after it, and its own notes
   CONTROL_ID="$1"
   TOKEN="" OUTSTANDING="" ISSUED="" ISSUED_META="" CONFIRMED_TOKENS="" SETTLE_TRIED="" UNRECEIVED="" PENDING_MINT=""
   REVOKE_OK="" UNCONFIRMABLE="" CONTROL_PID="" REQ_JOBS=""
+  WRITES_OUT="" WRITES_UNKNOWN="" STOP_LINES=""
 }
 
 # A control runs in the background, bounded as a whole (round 74, C1, SEC-1). Its watchdog tells it
@@ -1289,8 +1403,6 @@ control_begin() { # <name> — inside a control: only its own tokens, named afte
 # (control_collect). A control stopped outright, or one that never reports, leaves its tokens NOT
 # confirmed and the clean-up INCOMPLETE.
 control_token() { # <command> — 0 if it got its token; its tokens are settled in it and reported here
-  CONTROL_REC="$(umask 077 && mktemp "${WORK:-${TMPDIR:-/tmp}}/control.XXXXXX" 2>/dev/null)" \
-    || die "can't make the file a control's record comes through; no control ran"
   # Named, and counted as not done, before it can ask for a token (round 73, C1, SEC-1).
   CONTROLS=$((CONTROLS + 1))
   CONTROL_NAME="control$CONTROLS"
@@ -1308,134 +1420,212 @@ control_token() { # <command> — 0 if it got its token; its tokens are settled 
     report_unreceived
     die "a control's token request got no usable answer: GitHub may have issued a token this run never received; the run stops"
   fi
-  [[ $CONTROL_RC -ne 5 ]] || die "a control's record could not be handed over; the run stops"
+  [[ "$CONTROL_RC" != 5 ]] || die "a control's record could not be handed over; the run stops"
   # A request of the control's that timed out stops the run too (round 75, C1).
   timeout_check
-  [[ $CONTROL_RC -eq 0 || $CONTROL_RC -eq 3 ]]
+  [[ "$CONTROL_RC" == 0 || "$CONTROL_RC" == 3 ]]
 }
 
-control_start() { # <command…> — the control, and its watchdog
-  local stop_in=$((CONTROL_SECS - REVOKE_SECS - CALL_SECS - 5))
+# The control, its record coming through an unnamed pipe (round 109), and its watchdog. A wrapper
+# starts the control with the pipe as its fd 3 (its output and errors go nowhere), says the control's
+# process id first, waits for it and says its status last; the run reads the pipe on fd 8. Nothing
+# else is given the pipe: every program with_timeout, into and nap start has fds 3 and 8 closed.
+control_start() { # <command…>
+  local stop_in=$((CONTROL_SECS - REVOKE_SECS - CALL_SECS - 5)) line=""
   CONTROL_END=$(($(date +%s) + CONTROL_SECS - 5))
-  CONTROL_RC="" CONTROL_WATCH="" CONTROL_TOLD=""
-  (
-    control_begin "$CONTROL_NAME"
-    trap control_exit EXIT
-    resume_signals
-    "$@"
-  ) 3>"$CONTROL_REC" >/dev/null 2>&1 </dev/null &
-  CONTROL_PID=$!
+  CONTROL_RC="" CONTROL_WATCH="" CONTROL_TOLD="" CONTROL_PID="" CONTROL_LINES="" CONTROL_PARTIAL="" CONTROL_KILLED=""
+  exec 8< <(
+    (
+      control_begin "$CONTROL_NAME"
+      trap control_exit EXIT
+      resume_signals
+      "$@"
+    ) 3>&1 >/dev/null 2>&1 </dev/null &
+    c=$!
+    # Started first, so the control keeps its own signals; the wrapper itself ignores them.
+    trap '' HUP INT TERM
+    echo "CONTROL $CONTROL_NAME pid $c"
+    rc=0
+    wait "$c" || rc=$?
+    echo "CONTROL $CONTROL_NAME status $rc"
+  )
+  CONTROL_WRAP=$!
+  IFS= read -r -t 5 line <&8 || true
+  if [[ "$line" =~ ^CONTROL\ $CONTROL_NAME\ pid\ ([0-9]+)$ ]]; then
+    CONTROL_PID="${BASH_REMATCH[1]}"
+  else
+    CONTROL_LINES="$line"$'\n' CONTROL_PARTIAL=1
+    return 0
+  fi
+  # Told to stop (TERM) once its work has had its share; stopped outright (status 11) at its limit.
   (
     trap '' HUP INT TERM
     /bin/sleep "$stop_in"
     kill -0 "$CONTROL_PID" 2>/dev/null || exit 0
-    echo stopped >"$CONTROL_REC.stopped"
     kill -TERM "$CONTROL_PID" 2>/dev/null
     /bin/sleep $((REVOKE_SECS + CALL_SECS + 5))
     kill -0 "$CONTROL_PID" 2>/dev/null || exit 0
-    echo killed >"$CONTROL_REC.killed"
     kill_tree "$CONTROL_PID"
-  ) </dev/null >/dev/null 2>&1 &
+    exit 11
+  ) </dev/null >/dev/null 2>&1 3>&- 8<&- &
   CONTROL_WATCH=$!
 }
 
-# 0 once the control has ended (CONTROL_RC); 1 as soon as a stop comes instead, or if one came while
-# it started. A stop is passed on to the control as it comes, so one that lands just before the
-# wait below still ends the control promptly. Signals are held again once it has ended.
+# 0 once the control's record has ended; 1 as soon as a stop comes instead, or if one came while it
+# started. A stop is passed on to the control as it comes; it is acted on within a second (bash 3.2's
+# read of a pipe isn't cut short by a signal, so the pipe is read a second at a time). Signals are
+# held again once it has ended.
 control_wait() {
-  local rc
   trap 'control_stop 129' HUP
   trap 'control_stop 130' INT
   trap 'control_stop 143' TERM
   [[ -z "$DEFERRED_SIG" ]] || control_stop "$DEFERRED_SIG"
   while :; do
     [[ -z "$DEFERRED_SIG" ]] || return 1
-    rc=0
-    wait "$CONTROL_PID" 2>/dev/null || rc=$?
-    if [[ $rc -gt 128 ]] && kill -0 "$CONTROL_PID" 2>/dev/null; then continue; fi
-    CONTROL_RC=$rc
-    trap 'DEFERRED_SIG=129' HUP
-    trap 'DEFERRED_SIG=130' INT
-    trap 'DEFERRED_SIG=143' TERM
-    return 0
+    control_read $((CONTROL_END + 10)) || break
   done
+  trap 'DEFERRED_SIG=129' HUP
+  trap 'DEFERRED_SIG=130' INT
+  trap 'DEFERRED_SIG=143' TERM
+  return 0
 }
 
 control_stop() { # <status> — a stop while a control runs: kept, and passed on to the control once
   DEFERRED_SIG="$1"
-  [[ -n "$CONTROL_TOLD" ]] || kill -TERM "$CONTROL_PID" 2>/dev/null
+  [[ -n "$CONTROL_TOLD" || -z "$CONTROL_PID" ]] || kill -TERM "$CONTROL_PID" 2>/dev/null
   CONTROL_TOLD=1
 }
 
+# One read of the control's pipe, for at most a second. bash 3.2's read gives the same status when
+# nothing came within the second and at the pipe's end, so the end is told otherwise: 1 once the
+# wrapper's status line has come, the wrapper is gone, or <cap> has passed. A last line cut short (no
+# newline) is kept, and marks the record partial.
+control_read() { # <cap, in seconds since 1970>
+  local line="" rc=0
+  IFS= read -r -t 1 line <&8 || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    CONTROL_LINES="$CONTROL_LINES$line"$'\n'
+    [[ "$line" != "CONTROL $CONTROL_NAME status "* ]] || return 1
+    return 0
+  fi
+  if [[ -n "$line" ]]; then CONTROL_LINES="$CONTROL_LINES$line"$'\n' CONTROL_PARTIAL=1; fi
+  kill -0 "$CONTROL_WRAP" 2>/dev/null || return 1
+  [[ $(date +%s) -lt $1 ]] || return 1
+  return 0
+}
+
 # The control's end and its record: once it has ended, or (in the clean-up) by <cap> at the latest,
-# when it is stopped outright. Its tokens' names and states are registered, what it reports is said,
-# and a request it reports as possibly issued goes to UNRECEIVED (and CONTROL_UNREC).
+# when it is stopped outright. The record is judged (control_judge), its tokens' names and states
+# registered, what it reports said, and a request it reports as possibly issued goes to UNRECEIVED
+# (and CONTROL_UNREC).
 control_end() { # [cap, in seconds since 1970]
-  local w s rec line rest label state bad="" stopped="" killed="" id="$CONTROL_NAME"
-  if [[ -n "$1" ]]; then
-    s=$(($1 - $(date +%s)))
-    [[ $s -gt 0 ]] || s=0
-    (
-      trap '' HUP INT TERM
-      /bin/sleep "$s"
-      kill -0 "$CONTROL_PID" 2>/dev/null || exit 0
-      echo killed >"$CONTROL_REC.killed"
+  local id="$CONTROL_NAME" w
+  if [[ -n "$1" && -n "$CONTROL_PID" ]]; then
+    while control_read "$1"; do :; done
+    if [[ "$CONTROL_LINES" != *"CONTROL $id status "* ]] && kill -0 "$CONTROL_PID" 2>/dev/null; then
       kill_tree "$CONTROL_PID"
-    ) </dev/null >/dev/null 2>&1 &
-    w=$!
-    CONTROL_RC=0
-    wait "$CONTROL_PID" 2>/dev/null || CONTROL_RC=$?
-    kill_tree "$w"
-    wait "$w" 2>/dev/null
+      CONTROL_KILLED=1
+      while control_read $(($(date +%s) + 3)); do :; done
+    fi
   fi
   if [[ -n "$CONTROL_WATCH" ]]; then
-    kill_tree "$CONTROL_WATCH"
-    wait "$CONTROL_WATCH" 2>/dev/null
+    if kill -0 "$CONTROL_WATCH" 2>/dev/null; then
+      kill_tree "$CONTROL_WATCH"
+      wait "$CONTROL_WATCH" 2>/dev/null
+    else
+      w=0
+      wait "$CONTROL_WATCH" 2>/dev/null || w=$?
+      [[ $w -ne 11 ]] || CONTROL_KILLED=1
+    fi
   fi
-  rec="$(cat "$CONTROL_REC" 2>/dev/null)" || rec=""
-  [[ ! -f "$CONTROL_REC.stopped" ]] || stopped=1
-  [[ ! -f "$CONTROL_REC.killed" ]] || killed=1
-  rm -f "$CONTROL_REC" "$CONTROL_REC.stopped" "$CONTROL_REC.killed"
+  if kill -0 "$CONTROL_WRAP" 2>/dev/null; then kill_tree "$CONTROL_WRAP"; fi
+  exec 8<&-
   CONTROL_PID="" CONTROL_WATCH="" CONTROL_UNREC=""
-  while IFS= read -r line; do
-    case "$line" in
-      "") ;;
-      "CONTROL $id done")
-        s=" $CONTROL_PENDING "
-        CONTROL_PENDING="${s// $id / }"
-        ;;
-      "CONTROL $id "*" "*)
-        rest="${line#"CONTROL $id "}"
-        label="${rest%% *}" state="${rest#* }"
-        case "$state" in
-          confirmed) CONTROL_CONFIRMED="$CONTROL_CONFIRMED $label" ;;
-          NOT-confirmed*)
-            label="$label$(unconfirmed_why "${state#NOT-confirmed }")"
-            CONTROL_UNCONFIRMED="$CONTROL_UNCONFIRMED $label"
-            bad="$bad $label"
-            ;;
-          *) CONTROL_UNREC="$CONTROL_UNREC$line
-" ;;
-        esac
-        ;;
-      *) CONTROL_UNREC="$CONTROL_UNREC$line
-" ;;
-    esac
-  done <<<"$rec"
-  if [[ -n "$CONTROL_UNREC" ]]; then UNRECEIVED="$UNRECEIVED$CONTROL_UNREC"; fi
-  # What the control reports is said before a held signal acts (round 64, C1, SEC-1): its tokens
-  # and a record it couldn't hand over live only in its subshell.
-  if [[ -n "$bad" ]]; then
-    say "note: a control's token could not be revoked, or its revocation not confirmed:$bad; it may work until it expires, within an hour of its issue"
-  fi
-  if [[ -n "$stopped" ]]; then say "note: $id's work took longer than its share of its ${CONTROL_SECS}s: it was told to stop"; fi
-  if [[ -n "$killed" ]]; then say "note: $id did not end in time and was stopped outright, before it could report"; fi
+  control_judge "$id"
+  if [[ -n "$CONTROL_KILLED" ]]; then say "note: $id did not end in time and was stopped outright, before it could report"; fi
   if [[ " $CONTROL_PENDING " == *" $id "* ]]; then
-    say "note: $id ended without reporting on its tokens (status $CONTROL_RC): any it holds is NOT confirmed revoked"
+    say "note: $id ended without reporting on its tokens (status ${CONTROL_RC:-unknown}): any it holds is NOT confirmed revoked"
   fi
-  if [[ $CONTROL_RC -eq 5 ]]; then
+  if [[ "$CONTROL_RC" == 5 ]]; then
     say "a control's token request got no usable answer, and its record of it could not be handed over: GitHub may have issued a token this run never received (its expiry is unknown: one hour from when GitHub issued it, if it did)"
   fi
+}
+
+# A control's record counts only whole and well formed (owner, 2026-11-25): its wrapper's status
+# line last, and before it exactly the control's block, a count, that many lines each of a known form
+# naming each of its tokens once, then "done", with a status that agrees (0 or 6 with every token
+# confirmed, 3 or 4 with one not). Anything else (a cut or malformed line, a line outside the block,
+# a token named twice, a status that disagrees) and none of it is taken: the control has no trusted
+# result, its tokens are NOT confirmed and the clean-up is INCOMPLETE. With no block at all (it
+# ended, or was stopped, before reporting) it has no result, as before.
+control_judge() { # <id>
+  local id="$1" l body status="" begin="" n=0 count="" done="" bad_line="" rest label state labels=" " notc=0
+  local conf="" unconf="" unrec="" stops="" writes="" stopped="" s
+  body="$CONTROL_LINES"
+  l="$(printf '%s' "$body" | tail -n 1)"
+  if [[ "$l" =~ ^CONTROL\ $id\ status\ ([0-9]+)$ ]]; then
+    status="${BASH_REMATCH[1]}"
+    body="$(printf '%s' "$body" | sed '$d')"
+  fi
+  CONTROL_RC="$status"
+  [[ -n "$body" ]] || return 0
+  while IFS= read -r l; do
+    if [[ -z "$begin" ]]; then
+      if [[ "$l" =~ ^CONTROL\ $id\ begin\ ([0-9]+)$ ]]; then begin=1 count="${BASH_REMATCH[1]}"; else bad_line=1; fi
+      continue
+    fi
+    if [[ -n "$done" ]]; then bad_line=1; continue; fi
+    if [[ "$l" == "CONTROL $id done" && $n -eq $count ]]; then done=1; continue; fi
+    n=$((n + 1))
+    [[ "$l" == "CONTROL $id "* ]] || { bad_line=1; continue; }
+    rest="${l#"CONTROL $id "}"
+    case "$rest" in
+      "unreceived "?*) unrec="$unrec${rest#unreceived }"$'\n' ;;
+      "stop "?*) stops="$stops${rest#stop }"$'\n' ;;
+      "write "?*) writes="$writes${rest#write }"$'\n' ;;
+      stopped) stopped=1 ;;
+      *)
+        label="${rest%% *}" state="${rest#* }"
+        if [[ ! "$label" =~ ^$id-[a-z0-9]+$ || "$labels" == *" $label "* ]]; then bad_line=1; continue; fi
+        labels="$labels$label "
+        case "$state" in
+          confirmed) conf="$conf $label" ;;
+          NOT-confirmed | "NOT-confirmed expired" | "NOT-confirmed unknown" | "NOT-confirmed unanswered")
+            unconf="$unconf $label$(unconfirmed_why "${state#NOT-confirmed }")"
+            notc=$((notc + 1))
+            ;;
+          *) bad_line=1 ;;
+        esac
+        ;;
+    esac
+  done < <(printf '%s\n' "$body")
+  # No block at all: no result, as before (round 73). The control is still pending.
+  [[ -n "$begin" ]] || { [[ -z "$bad_line" ]] || control_untrusted "$id"; return 0; }
+  if [[ -n "$bad_line" || -n "$CONTROL_PARTIAL" || -z "$done" || $n -ne $count ]] ||
+    ! { { [[ "$status" == 0 || "$status" == 6 ]] && [[ $notc -eq 0 ]]; } || { [[ "$status" == 3 || "$status" == 4 ]] && [[ $notc -gt 0 ]]; }; }; then
+    control_untrusted "$id"
+    return 0
+  fi
+  s=" $CONTROL_PENDING "
+  CONTROL_PENDING="${s// $id / }"
+  CONTROL_CONFIRMED="$CONTROL_CONFIRMED$conf"
+  CONTROL_UNCONFIRMED="$CONTROL_UNCONFIRMED$unconf"
+  if [[ -n "$unrec" ]]; then CONTROL_UNREC="$unrec" UNRECEIVED="$UNRECEIVED$unrec"; fi
+  STOP_LINES="$STOP_LINES$stops"
+  WRITES_UNKNOWN="$WRITES_UNKNOWN$writes"
+  # What the control reports is said before a held signal acts (round 64, C1, SEC-1): its tokens
+  # live only in its subshell.
+  if [[ -n "$unconf" ]]; then
+    say "note: a control's token could not be revoked, or its revocation not confirmed:$unconf; it may work until it expires, within an hour of its issue"
+  fi
+  if [[ -n "$stopped" && -z "$CONTROL_TOLD" ]]; then say "note: $id's work took longer than its share of its ${CONTROL_SECS}s: it was told to stop"; fi
+}
+
+control_untrusted() { # <id> — its record can't be trusted: none of it is taken
+  local s=" $CONTROL_PENDING "
+  CONTROL_PENDING="${s// $1 / }"
+  CONTROL_UNTRUSTED="$CONTROL_UNTRUSTED $1"
+  say "note: $1's record came cut short or malformed: none of it is taken, and any token it holds is NOT confirmed revoked (no trusted result)"
 }
 
 # In the clean-up: a control the stop found running, collected by the clean-up's cap at the latest.
@@ -1468,79 +1658,15 @@ assert_second() { # writes to the second throwaway are attempts only, and only t
     || die "$REPO2 is not the public second throwaway this script created (description must be: $MARKER2)"
 }
 
-# 0 if WORK is still the folder make_work made, as its marker shows (or the run made none: a test's
-# WORK). The marker is supporting evidence, not protection: a folder swapped in at the same path
-# after this check isn't seen (review-lens round 95; owner, 2026-11-24).
-folder_ok() { # <dir> <mark> — 0 if <dir> is there, not a link, and holds that marker
-  local m
-  [[ -n "$1" && -d "$1" && ! -L "$1" ]] || return 1
-  m="$(cat "$1/work-mark" 2>/dev/null)" || return 1
-  [[ -n "$2" && "$m" == "$2" ]]
-}
-
-work_intact() {
-  [[ -n "$WORK_MADE" ]] || return 0
-  [[ "$WORK" == "$WORK_MADE" ]] && folder_ok "$WORK" "$WORK_MARK"
-}
-
-# 0 if WORK may be used now: the run's own folder, or the fresh one, as its marker shows (or the run
-# made none: a test's WORK). Checked before each file the clean-up makes there (round 96).
-scratch_ok() {
-  [[ -n "$WORK_MADE" ]] || return 0
-  if [[ "$WORK" == "$WORK_MADE" ]]; then folder_ok "$WORK" "$WORK_MARK"; return; fi
-  [[ -n "$RECOVER_DIR" && "$WORK" == "$RECOVER_DIR" ]] && folder_ok "$WORK" "$RECOVER_MARK"
-}
-
-# The folder in use is gone, replaced, unreadable or unusable (review-lens rounds 95-96, C1 = SEC-1):
-# the run's own as the clean-up starts or during it, or a fresh one later. Its records are lost, and
-# named so (unknown_writes); it is never written to again or deleted (it may not be the run's), but
-# left for a later, owner-approved clean-up. What the run keeps in memory (its tokens, a pending
-# create, its issues) is kept. The clean-up's own requests use a fresh private folder, at most three
-# in all; with none left, the revocations are still sent (with_timeout needs none), and each request
-# that needs one is not sent, and said so (into).
-work_recover() {
-  local w="" m=""
-  if [[ -n "$WORK" && "$WORK" == "$RECOVER_DIR" ]]; then
-    RECOVER_LOST="$RECOVER_LOST $RECOVER_DIR"
-    say "CLEANUP the fresh folder $RECOVER_DIR is gone, replaced, unreadable or unusable: what was written there is lost; it is left as it is, not deleted"
-  elif [[ -z "$WORK_LOST" ]]; then
-    WORK_LOST="$WORK_MADE"
-    say "CLEANUP the run's work folder $WORK_MADE is gone, replaced, unreadable or unusable: its records of writes are lost (outcomes unknown); it is left as it is, not deleted"
-  fi
-  WORK="" RECOVER_DIR="" RECOVER_MARK=""
-  while [[ $RECOVER_COUNT -lt 3 ]]; do
-    RECOVER_COUNT=$((RECOVER_COUNT + 1))
-    w="$(umask 077 && mktemp -d "${TMPDIR:-/private/tmp}/frg26-recover.XXXXXX" 2>/dev/null)" || break
-    m="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
-    if [[ ${#m} -eq 32 ]] && chmod 700 "$w" 2>/dev/null && mkdir -m 700 "$w/gh-app" 2>/dev/null &&
-      (umask 077 && printf '%s' "$m" >"$w/work-mark") 2>/dev/null; then
-      WORK="$w" RECOVER_DIR="$w" RECOVER_MARK="$m"
-      say "CLEANUP a fresh private folder $w is used for the clean-up's own requests; it is kept, private, not deleted: remove it later, once you approve"
-      return 0
-    fi
-    # Made, but not usable: kept as it is, and named.
-    RECOVER_LOST="$RECOVER_LOST $w"
-  done
-  SCRATCH_NONE=1
-  say "CLEANUP no fresh folder could be made for the clean-up's own requests: the revocations are sent, but none can be confirmed"
-}
-
+# The run's private work folder: its clone, the clone's template and the payloads of its requests.
+# Round 109: nothing the clean-up relies on is in it, and no credential: no password helper, no home
+# folder, no gh settings, no JWT, no record of a write (all kept in the run's own shell). It is never
+# deleted (owner, 2026-11-24): the clean-up says so.
 make_work() {
   WORK="$(mktemp -d "/private/tmp/frg26.XXXXXX")" || die "mktemp failed"
   WORK_MADE="$WORK"
   chmod 700 "$WORK" || die "chmod failed"
-  mkdir -m 700 "$WORK/home" "$WORK/gh-app" "$WORK/template" || die "mkdir failed"
-  WORK_MARK="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
-  [[ ${#WORK_MARK} -eq 32 ]] || die "can't make the work folder's marker"
-  (umask 077 && printf '%s' "$WORK_MARK" >"$WORK/work-mark") || die "can't write the work folder's marker"
-  cat >"$WORK/askpass" <<'EOF'
-#!/bin/bash
-case "${1:-}" in
-  Username*) printf '%s\n' "$FRG26_ASK_USER" ;;
-  *) printf '%s\n' "$FRG26_ASK_PASS" ;;
-esac
-EOF
-  chmod 700 "$WORK/askpass" || die "chmod failed"
+  mkdir -m 700 "$WORK/template" || die "mkdir failed"
 }
 
 # --- Repository state ---------------------------------------------------------------------------
@@ -3224,9 +3350,16 @@ probe_reading() { # <id> <what was tried>
 
 probe_refs() { # the second throwaway's branches and tags with their commits, as the owner reads them
   local h t
-  h="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO2/git/matching-refs/heads" --jq '.[] | "\(.ref) \(.object.sha)"' 2>/dev/null)" || { echo error; return; }
-  t="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO2/git/matching-refs/tags" --jq '.[] | "\(.ref) \(.object.sha)"' 2>/dev/null)" || { echo error; return; }
+  # A read with no answer within its limit, outside a2-probe, ends into's job with 124 (round 109), so
+  # the run still stops for it.
+  h="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO2/git/matching-refs/heads" --jq '.[] | "\(.ref) \(.object.sha)"' 2>/dev/null)" || { probe_refs_timeout $?; echo error; return; }
+  t="$(with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO2/git/matching-refs/tags" --jq '.[] | "\(.ref) \(.object.sha)"' 2>/dev/null)" || { probe_refs_timeout $?; echo error; return; }
   printf '%s\n%s\n' "$h" "$t"
+}
+
+probe_refs_timeout() { # <status> — in into's job, outside a2-probe, a timeout (124) ends the job
+  [[ "$1" -eq 124 && -n "$IN_JOB" && -z "$PROBE_ACTIVE" ]] || return 0
+  exit 124
 }
 
 probe_refs_same() { # 1 (and both lists shown) if they changed since the run began
@@ -3885,6 +4018,10 @@ s2d_approve() { # <run id> <Environment id>
   S2D_RC=0 S2D_HTTP=unknown S2D_REQUEST_ID="" S2D_REMAINING="" S2D_RESOURCE="" S2D_RETRY="" S2D_ERRORS="" S2D_INCOMPLETE=""
   : >"$WORK/s2d.out"
   : >"$WORK/s2d.err"
+  # The approval is a write: noted here, in the run's memory, and cleared only once its whole answer
+  # is read and shown complete below (round 109); else its outcome is unknown.
+  write_out "owner gh api POST repos/$REPO/actions/runs/$1/pending_deployments"
+  local wn=$WRITE_N
   into ignored s2d_post "$1" "$2" || S2D_RC=$?
   raw="$(cat "$WORK/s2d.out"; printf x)"
   raw="${raw%x}"
@@ -3932,7 +4069,7 @@ s2d_approve() { # <run id> <Environment id>
   fi
   # Complete only when GitHub's own length says so; gh's exit status and words only support it.
   if [[ -z "$S2D_INCOMPLETE" ]]; then
-    if [[ -s "$WORK/timed-out" ]]; then S2D_INCOMPLETE="a request timed out"
+    if [[ -n "$STOP_LINES" || "$S2D_RC" == 124 ]]; then S2D_INCOMPLETE="a request timed out"
     elif [[ "$S2D_RC" != 0 && "$S2D_RC" != 1 ]]; then S2D_INCOMPLETE="gh exit status $S2D_RC"
     elif [[ -n "$coding" ]]; then S2D_INCOMPLETE="a content or transfer encoding: the length can't be checked"
     elif [[ -z "$length" ]]; then S2D_INCOMPLETE="no Content-Length: completion can't be told"
@@ -3958,6 +4095,10 @@ s2d_approve() { # <run id> <Environment id>
   else
     S2D_ANSWER="not JSON (not kept)"
   fi
+  if [[ -n "$S2D_INCOMPLETE" || ! "$S2D_HTTP" =~ ^[0-9]{3}$ ]]; then
+    write_unknown "owner gh api POST repos/$REPO/actions/runs/$1/pending_deployments" "no complete answer: ${S2D_INCOMPLETE:-no HTTP status}"
+  fi
+  write_done "$wn"
   if [[ -z "$err" ]]; then S2D_GH_LINE=none
   elif [[ "$err" == *"$S2D_WORDS"* ]]; then S2D_GH_LINE=repeats
   else S2D_GH_LINE=other
@@ -4409,7 +4550,7 @@ cmd_suspend_check() {
     obs=allowed
     revoke_token || true
   elif [[ "$LAST_HTTP" =~ ^2 ]]; then obs=allowed
-  elif [[ "$LAST_HTTP" =~ ^(401|403|404)$ ]] && ! grep -Eiq 'rate limit|abuse detection' <<<"$REQ_ANSWER"; then obs=refused
+  elif [[ "$LAST_HTTP" =~ ^(401|403|404)$ ]] && ! printf '%s' "$REQ_ANSWER" | grep -Ei 'rate limit|abuse detection' >/dev/null; then obs=refused
   fi
   # As in key-check (round 61, C1): reported whole, then the step stops at once.
   if [[ "$REQ_UNRECEIVED" == yes ]]; then

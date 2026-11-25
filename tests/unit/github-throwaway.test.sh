@@ -46,14 +46,16 @@ EOF
 #!/bin/bash
 {
   printf 'git-args:%s\n' "$*"
-  printf 'git-global:%s nosystem:%s prompt:%s askpass:%s home:%s\n' "${GIT_CONFIG_GLOBAL:-}" "${GIT_CONFIG_NOSYSTEM:-}" "${GIT_TERMINAL_PROMPT:-}" "${GIT_ASKPASS:+set}" "${HOME:-}"
+  printf 'git-global:%s nosystem:%s prompt:%s askpass:%s home:%s\n' "${GIT_CONFIG_GLOBAL:-}" "${GIT_CONFIG_NOSYSTEM:-}" "${GIT_TERMINAL_PROMPT:-}" "${GIT_ASKPASS:-}" "${HOME:-}"
   printf 'git-leaked:%s%s%s\n' "${GIT_COMMON_DIR:-}" "${GIT_TEMPLATE_DIR:-}" "${GIT_DIR:-}"
 } >>"$FAKE_LOG"
 EOF
   cat >"$T_TMP/bin/curl" <<'EOF'
 #!/bin/bash
 printf 'curl-args:%s\n' "$*" >>"$FAKE_LOG"
-printf '{"fake":"answer"}\nHTTP %s' "${FAKE_HTTP:-201}"
+# Its standard input (round 109: the headers, when -H @- asks for them), one line each.
+if [[ " $* " == *" -H @- "* ]]; then sed 's/^/curl-stdin:/' >>"$FAKE_LOG"; fi
+printf '{"fake":"answer"}\nFRG26-ERR \nHTTP %s' "${FAKE_HTTP:-201}"
 EOF
   chmod +x "$T_TMP/bin/gh" "$T_TMP/bin/git" "$T_TMP/bin/curl"
   export FAKE_LOG="$T_TMP/fake.log"
@@ -1225,6 +1227,10 @@ test_app_merge_needs_a_blocked_mergeable_pr_to_count_as_refused() {
   app_merge B6 7 --squash
   assert_eq "$OBS" inconclusive "state unreadable (network)"
   assert_contains "$LAST_OUT" "never settled"
+  # Round 109: the stand-in merges with no answer in GitHub's words (no HTTP status) are writes of
+  # unknown outcome; a stand-in run's end is no clean-up.
+  assert_contains "$(unknown_writes)" "app gh pr merge 7 --repo $REPO (no complete answer: status 1);" "a merge with no answer in GitHub's words"
+  end_stand_in_run
 }
 
 test_branch_updated_waits_for_a_head_with_dev_as_parent() {
@@ -1263,7 +1269,7 @@ test_app_gh_passes_the_token_only_in_the_environment() {
   GITHUB_TOKEN=should-be-unset app_gh api user --jq .login >/dev/null
   assert_eq "$(grep '^gh-token-set:' "$FAKE_LOG")" "gh-token-set:yes"
   assert_eq "$(grep '^gh-github-token-set:' "$FAKE_LOG")" "gh-github-token-set:" "GITHUB_TOKEN reached the app's gh"
-  assert_eq "$(grep '^gh-config-dir:' "$FAKE_LOG")" "gh-config-dir:$T_TMP/work/gh-app" "the owner's gh config"
+  assert_eq "$(grep '^gh-config-dir:' "$FAKE_LOG")" "gh-config-dir:/var/empty" "the owner's gh config (round 109: always /var/empty)"
   assert_not_contains "$(grep '^gh-args:' "$FAKE_LOG")" "$TOKEN" "token in gh's arguments"
   # A stand-in run's token: its end is no clean-up (round 74: nor a request to GitHub).
   end_stand_in_run
@@ -1287,7 +1293,7 @@ test_app_git_is_isolated_from_the_owners_git_config() {
   GIT_COMMON_DIR=/tmp/x GIT_TEMPLATE_DIR=/tmp/y GIT_DIR=/tmp/z app_git status
   local log
   log="$(cat "$FAKE_LOG")"
-  assert_contains "$log" "git-global:/dev/null nosystem:1 prompt:0 askpass:set home:$T_TMP/work/home"
+  assert_contains "$log" "git-global:/dev/null nosystem:1 prompt:0 askpass:/usr/bin/false home:/var/empty"
   assert_eq "$(grep '^git-leaked:' "$FAKE_LOG")" "git-leaked:" "a GIT_* variable reached the app's git"
   assert_contains "$log" "-c credential.helper= "
   assert_contains "$log" "-c core.hooksPath=/dev/null"
@@ -1354,7 +1360,7 @@ app_stubs() { # the JWT calls answer from the fixtures above (or $T_TMP/<name>.j
   make_jwt() { JWT=jwt-stand-in; }
   jwt_call() {
     echo "$1 $2" >>"$T_TMP/jwt-calls"
-    [[ -n "${3:-}" ]] && cp "$3" "$T_TMP/last-body.json"
+    [[ -n "${3:-}" ]] && printf '%s\n' "$3" >"$T_TMP/last-body.json" # round 109: the body itself, no file
     LAST_HTTP=200
     case "$1 $2" in
       "GET app") LAST_OUT="$(cat "$T_TMP/app.json" 2>/dev/null || app_fixture)" ;;
@@ -1450,8 +1456,8 @@ test_jwt_is_rs256_short_lived_and_signed_by_the_key() {
   b64url_decode "$s" >"$T_TMP/sig"
   openssl rsa -in "$T_TMP/app.pem" -pubout -out "$T_TMP/pub.pem" 2>/dev/null
   assert_contains "$(openssl dgst -sha256 -verify "$T_TMP/pub.pem" -signature "$T_TMP/sig" "$T_TMP/signed" 2>&1)" "Verified OK" "signature"
-  assert_file_mode "$WORK/jwt.hdr" 600
-  assert_contains "$(cat "$WORK/jwt.hdr")" "Authorization: Bearer $JWT"
+  # Round 109: the JWT stays in memory; no header file holds it.
+  assert_eq "$(ls -A "$WORK")" "" "a file made for the JWT"
 }
 
 test_jwt_call_keeps_the_jwt_out_of_arguments() {
@@ -1460,17 +1466,19 @@ test_jwt_call_keeps_the_jwt_out_of_arguments() {
   WORK="$T_TMP/work"
   mkdir -m 700 "$WORK"
   JWT="header.payload.signature-not-real"
-  printf 'Authorization: Bearer %s\n' "$JWT" >"$WORK/jwt.hdr"
-  printf '{"x":1}' >"$T_TMP/body.json"
-  jwt_call POST app/installations/77/access_tokens "$T_TMP/body.json" || _t_fail "a 201 answer was a failure"
+  jwt_call POST app/installations/77/access_tokens '{"x":1}' || _t_fail "a 201 answer was a failure"
   local args
   args="$(grep '^curl-args:' "$FAKE_LOG")"
   assert_contains "$args" "curl-args:-q " "the user curlrc must not apply (-q comes first)"
-  assert_contains "$args" "-H @$WORK/jwt.hdr"
+  # Round 109: the headers, the JWT among them, come on curl's standard input; the body (no secret
+  # in it) is an argument.
+  assert_contains "$args" "-H @-"
   assert_contains "$args" "--proto =https"
   assert_contains "$args" "https://api.github.com/app/installations/77/access_tokens"
-  assert_contains "$args" "--data-binary @$T_TMP/body.json"
+  assert_contains "$args" '--data-binary {"x":1}'
+  assert_contains "$(grep '^curl-stdin:' "$FAKE_LOG")" "curl-stdin:Authorization: Bearer $JWT" "the JWT on curl's standard input"
   assert_not_contains "$args" "$JWT" "the JWT in curl's arguments"
+  assert_eq "$(ls -A "$WORK")" "" "a file left in the work folder"
   assert_eq "$LAST_HTTP" 201
   assert_eq "$LAST_OUT" '{"fake":"answer"}'
   export FAKE_HTTP=401
@@ -2375,12 +2383,11 @@ EOF
     assert_not_contains "$out" "secretword" "$name: a header's text"
   done <<<"$cases"
   assert_eq "$ran" 24 "cases run"
-  # A request that timed out (in this shell or one it started) ends the run before S2d records anything.
+  # A request that timed out (in this shell or one it started) ends the run before S2d records anything
+  # (round 109: noted in the run's memory, never a file).
   s2d_fixtures
-  echo "stop owner gh api -i -X POST got no answer within its 20s" >"$WORK/timed-out"
-  out="$(t_S2d 2>&1)"
+  out="$(STOP_LINES="owner gh api -i -X POST got no answer within its 20s"$'\n'; t_S2d 2>&1)"
   assert_not_contains "$out" "RESULT S2d" "a result after a timeout"
-  rm -f "$WORK/timed-out"
 }
 
 # Round 78: no approval is sent unless GitHub's state before it is bound in every part.
@@ -3845,10 +3852,11 @@ test_a_controls_token_that_cannot_be_revoked_is_reported() {
   load
   local tok rc out
   tok="ghs_control$(printf 'C%.0s' $(seq 1 30))"
-  # Registered as request_token does, with its expiry (round 74).
+  # Registered as request_token does, named after its control (round 109: a record names only its
+  # control's own tokens), with its expiry (round 74).
   mint_ok() {
-    TOKEN="$tok" OUTSTANDING="$OUTSTANDING $tok" ISSUED="$ISSUED control-token=$tok"
-    ISSUED_META="control-token {\"expires_at\":\"$(date -u -v+50M +%Y-%m-%dT%H:%M:%SZ)\"}
+    TOKEN="$tok" OUTSTANDING="$OUTSTANDING $tok" ISSUED="$ISSUED $CONTROL_ID-token=$tok"
+    ISSUED_META="$CONTROL_ID-token {\"expires_at\":\"$(date -u -v+50M +%Y-%m-%dT%H:%M:%SZ)\"}
 "
   }
   mint_bad() { mint_ok; die "refused"; }
@@ -4001,9 +4009,9 @@ probe_stubs() {
     local n p
     n=$(($(cat "$T_TMP/minted") + 1))
     echo "$n" >"$T_TMP/minted"
-    cp "$3" "$T_TMP/request-$n.json"
+    printf '%s\n' "$3" >"$T_TMP/request-$n.json" # round 109: the body itself, no file
     if [[ -f "$T_TMP/fail-$n" ]]; then LAST_HTTP=502; LAST_OUT='{"message":"Server Error"}'; return 1; fi
-    p="$(jq -c '.permissions // empty' "$3")"
+    p="$(printf '%s' "$3" | jq -c '.permissions // empty')"
     [[ -n "$p" ]] || p="$WANT_PERMS"
     LAST_HTTP=201
     # GitHub issues each token for an hour: here it expires 59 minutes from now ($T_TMP/expires-<n>).
@@ -4337,7 +4345,7 @@ test_a_signal_during_token_registration_waits_until_it_is_whole() {
   body="$(printf '%s\n' "$body" | awk '/defer_signals/ { on = 1 } on { print } /resume_signals/ { exit }')"
   assert_contains "$body" "jwt_call POST" "the token request outside the deferred section"
   # shellcheck disable=SC2016 # the literal source text is what's searched for
-  assert_contains "$body" 'meta="$(jq' "the answer's summary outside the deferred section"
+  assert_contains "$body" 'meta="$(printf' "the answer's summary outside the deferred section"
   # shellcheck disable=SC2016 # the literal source text is what's searched for
   assert_contains "$body" 'ISSUED="$ISSUED' "ISSUED outside the deferred section"
   # shellcheck disable=SC2016 # as above
@@ -5521,6 +5529,8 @@ if [[ -n "\$h" && "$t \$*" == *"\$h"* ]]; then /bin/sleep "\$(cat "\$T_TMP/child
 EOF
   done
   cat >>"$T_TMP/bin/gh" <<'EOF'
+# Each answered call's gh settings folder, with the call (round 108): app gh's; empty for the owner's.
+printf '%s %s\n' "${GH_CONFIG_DIR:-}" "$*" >>"$T_TMP/gh-config"
 case "$*" in
   "api -X DELETE installation/token") printf '%s\n' "$GH_TOKEN" >>"$T_TMP/revoked" ;;
   "api repos/$FAKE_REPO --jq .full_name")
@@ -5536,6 +5546,8 @@ case "$*" in
   # none); its state, read by its number, is issue-state-<n>, closed if none is written.
   "issue create "*) cat "$T_TMP/create-url" 2>/dev/null; exit "$(cat "$T_TMP/create-rc" 2>/dev/null || echo 0)" ;;
   "api repos/$FAKE_REPO/issues/"*" --jq .state") cat "$T_TMP/issue-state-${2##*/}" 2>/dev/null || echo closed ;;
+  # A write's answer (round 109): patch-out, ending with patch-rc (0 if none).
+  "api -X PATCH "*) cat "$T_TMP/patch-out" 2>/dev/null; exit "$(cat "$T_TMP/patch-rc" 2>/dev/null || echo 0)" ;;
   "pr view "*"--json state --jq .state")
     if [[ -f "$T_TMP/pr-viewed" ]]; then cat "$T_TMP/pr-state"; else : >"$T_TMP/pr-viewed"; echo OPEN; fi ;;
   *"actions/runs?head_sha="*) [[ ! -f "$T_TMP/runs-1" ]] || echo 1 ;;
@@ -5546,10 +5558,11 @@ EOF
   chmod +x "$T_TMP/bin/gh" "$T_TMP/bin/git" "$T_TMP/bin/curl"
   echo "$1" >"$T_TMP/child"
   : >"$T_TMP/tools"
+  : >"$T_TMP/gh-config"
   : >"$T_TMP/revoked"
   : >"$T_TMP/hang-on"
   rm -f "$T_TMP/open-issues" "$T_TMP/open-prs" "$T_TMP/pr-viewed" "$T_TMP/pr-state" "$T_TMP/runs-1" "$T_TMP/runs-2" "$T_TMP/runs-listed" \
-    "$T_TMP/create-url" "$T_TMP/create-rc" "$T_TMP"/issue-state-*
+    "$T_TMP/create-url" "$T_TMP/create-rc" "$T_TMP"/issue-state-* "$T_TMP/patch-out" "$T_TMP/patch-rc"
   export T_TMP FAKE_REPO="$REPO"
   PATH="$T_TMP/bin:$PATH"
 }
@@ -5794,7 +5807,8 @@ final_sweep() {
 # unknown, whatever is closed later. The second throwaway is only read. Review-lens rounds 92 (C1 =
 # SEC-3) and 93 (C2 = SEC-1): a create that fails is outcome unknown too, whatever its answer says
 # (no refusal is taken from its text). Round 93 (C1): if that record can't be written, the create
-# stays pending, still named, and the clean-up is INCOMPLETE.
+# stays pending, still named, and the clean-up is INCOMPLETE. Round 109: the record is in the run's
+# memory, so it can't fail to be written; those two cases are gone.
 test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
   local case name prep setup after hang rc_want child last done_line incomplete unknown
   child=$(((RANDOM % 900 + 100) * 100)) # as above
@@ -5805,8 +5819,6 @@ test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
     "its create gets no answer, the issue made%echo 129 >\$T_TMP/open-issues%SWEEP_ON_EXIT=1%t_A12; echo NEXT TEST ACTION%issue create %2" \
     "its create gets no answer, nothing found%%SWEEP_ON_EXIT=1%t_A12; echo NEXT TEST ACTION%issue create %2" \
     "its create's answer quotes a refusal%echo 'GraphQL: Resource not accessible by integration (createIssue)' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
-    "its create fails, its record can't be written%echo 'HTTP 403: Forbidden (https://api.github.com/graphql)' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc; mkdir \$WORK/unsettled%%t_A12; sweep_issues%%1" \
-    "its create has no number, its record can't be written%echo 'Creating issue' >\$T_TMP/create-url; mkdir \$WORK/unsettled%%t_A12; sweep_issues%%1" \
     "its create fails with an HTTP 403 alone%echo 'HTTP 403: Forbidden (https://api.github.com/graphql)' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
     "its create's connection fails%echo 'Post https://api.github.com/graphql: unexpected EOF' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
     "its create's refusal ends abnormally%echo 'GraphQL: Resource not accessible by integration (createIssue)' >\$T_TMP/create-url; echo 2 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
@@ -5856,9 +5868,6 @@ test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
         assert_not_contains "$OUT" "NEXT TEST ACTION" "$name: a test action after the timeout"
         assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
         assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (no answer within 1s);" "$name" ;;
-      *"record can't be written")
-        assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
-        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (no complete answer registered: it may have been made);" "$name" ;;
       *"quotes a refusal" | *"HTTP 403 alone" | *"connection fails" | *"ends abnormally")
         assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
         assert_contains "$OUT" "READING A12 gh issue create: fails" "$name"
@@ -6008,201 +6017,184 @@ test_a_stop_at_each_issue_step_never_ends_in_a_false_done() {
   done
 }
 
-# As make_work leaves it (round 95): the folder recorded as the run's own, with its marker.
-own_work() {
-  WORK_MADE="$WORK"
-  WORK_MARK="mark-$RANDOM$RANDOM"
-  printf '%s' "$WORK_MARK" >"$WORK/work-mark"
-}
-
-# Review-lens round 95 (C1 = SEC-1, C2 = SEC-2), owner 2026-11-24: if the run's work folder is gone,
-# replaced or unreadable when the clean-up starts, its records are named lost and the clean-up is
-# INCOMPLETE; the tokens, kept in memory, are still revoked and confirmed, the clean-up's own requests
-# using a fresh private folder, which it removes; the original path is never deleted. A record that
-# can't be read is named, never empty. If no fresh folder can be made, the revocations are still
-# sent, none is claimed confirmed, and the clean-up is INCOMPLETE.
-test_a_lost_work_folder_still_revokes_and_reports_incomplete() {
-  local case name after tmpd child last n lost
+# Owner, 2026-11-24 (review-lens rounds 95-97), and round 109: the clean-up relies on no folder. The
+# run's work folder gone, replaced or unreadable before the clean-up, or gone, replaced or unwritable
+# during it, changes nothing it reports: every token is revoked and confirmed within the cap. The
+# folder, or what replaced it, is never deleted or written to, its contents untouched, and no fresh
+# folder is made. A token whose confirming read gets no answer stays NOT confirmed, the clean-up
+# INCOMPLETE.
+test_a_lost_or_replaced_work_folder_changes_nothing_the_clean_up_reports() {
+  local case name before lose child last n
   child=$(((RANDOM % 900 + 100) * 100)) # as above
-  for case in "the folder removed%rm -rf \$WORK" \
-    "the folder replaced%rm -rf \$WORK; mkdir \$WORK; echo keep >\$WORK/keep" \
-    "the folder unreadable%chmod 000 \$WORK" \
-    "a record unreadable%echo 'owner gh x (no answer within 1s)' >\$WORK/unsettled; chmod 000 \$WORK/unsettled" \
-    "no fresh folder can be made%rm -rf \$WORK"; do
-    IFS='%' read -r name after <<<"$case"
-    child=$((child + 1))
-    short_copy
-    WORK="$T_TMP/work"
-    request_tools "$child"
-    tmpd="$T_TMP/tmpd"
-    mkdir -p "$tmpd"
-    [[ "$name" != "no fresh folder"* ]] || tmpd="$T_TMP/none"
-    stopped_run_cleanup 0 "own_work; TMPDIR=$tmpd" "$after"
-    [[ "$name" != *"unreadable" ]] || chmod -R 700 "$WORK" 2>/dev/null
-    assert_exit 1 "$RC" "$name: the run's status (137: still running after 20s; 2: the clean-up stopped)"
-    ((SECS <= REVOKE_SECS + CLEANUP_SECS + 3)) || _t_fail "$name: ended after ${SECS}s"
-    last="$(printf '%s\n' "$OUT" | tail -n 1)"
-    lost="this run's records of writes with no answer, in $WORK, can't be read (the folder is gone, replaced, unreadable or unusable): any write they held has an unknown outcome;"
-    assert_not_contains "$OUT" "CLEANUP DONE" "$name"
-    case "$name" in
-      "no fresh folder"*)
-        n="$(grep -c 'gh api -X DELETE installation/token' "$T_TMP/tools")"
-        ((n >= 3)) || _t_fail "$name: revocations sent: $n, not every token's"
-        assert_contains "$OUT" "CLEANUP no fresh folder could be made for the clean-up's own requests" "$name"
-        assert_not_contains "$OUT" "revoked: a read with it now gets HTTP 401" "$name: a revocation claimed confirmed"
-        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): none; NOT confirmed: token1 token2 token3;" "$name"
-        assert_contains "$last" "$lost" "$name" ;;
-      *)
-        for n in 1 2 3; do
-          assert_contains "$OUT" "TOKEN token$n revoked: a read with it now gets HTTP 401" "$name: token$n confirmed"
-        done
-        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; writes with outcome unknown (not retried, not reconciled: check them on GitHub):" "$name" ;;
-    esac
-    case "$name" in
-      "a record unreadable")
-        assert_contains "$last" "this run's record unsettled, in $WORK, can't be read: any write it held has an unknown outcome;" "$name"
-        [[ -d "$WORK" ]] || _t_fail "$name: the run's own folder was deleted (owner, round 96: never deleted)" ;;
-      "no fresh folder"*) ;;
-      *)
-        assert_contains "$OUT" "CLEANUP the run's work folder $WORK is gone, replaced, unreadable or unusable" "$name"
-        assert_contains "$last" "$lost" "$name" ;;
-    esac
-    case "$name" in
-      "the folder replaced") [[ -f "$WORK/keep" ]] || _t_fail "$name: the folder at the run's path was deleted" ;;
-      "the folder unreadable") [[ -d "$WORK" ]] || _t_fail "$name: the folder at the run's path was deleted" ;;
-    esac
-    # Owner, round 96: neither folder is deleted; each is kept, private, for the owner to remove.
-    assert_contains "$OUT" "CLEANUP this run's work folder $WORK is not deleted: it stays, private, for you to remove later once approved (nothing in it is shown)" "$name"
-    n="$(find "$T_TMP/tmpd" -mindepth 1 -maxdepth 1 -name 'frg26-recover.*' 2>/dev/null | wc -l | tr -d ' ')"
-    case "$name" in
-      "the folder"*)
-        assert_eq "$n" 1 "$name: the fresh folder, kept"
-        assert_eq "$(stat -f '%Lp' "$T_TMP"/tmpd/frg26-recover.*)" 700 "$name: the fresh folder's mode"
-        assert_contains "$OUT" "is used for the clean-up's own requests; it is kept, private, not deleted" "$name" ;;
-      *) assert_eq "$n" 0 "$name: a fresh folder made" ;;
-    esac
-    rm -rf "$WORK" "$T_TMP/tmpd"
-  done
-}
-
-# Review-lens round 96 (C1 = SEC-1, C2 = SEC-2), owner 2026-11-24: the folder in use, the run's own or
-# a fresh one, lost, replaced or unwritable during the clean-up never stops it: before each request
-# that needs a file, the folder is checked against its marker; one that fails is set aside (never
-# written to or deleted, its contents untouched) and a fresh private folder used, at most three in
-# all. The revocations (which need none) are sent within the cap; a request that can't get a file is
-# not sent, and said so; nothing is claimed confirmed that wasn't read; the clean-up is INCOMPLETE.
-# Neither the run's folder nor a fresh one is ever deleted.
-test_a_folder_lost_during_the_clean_up_never_stops_it() {
-  local case name before lose tmpd child last n fresh
-  child=$(((RANDOM % 900 + 100) * 100)) # as above
-  for case in "the run's folder removed during it%%rm -rf \"\$WORK\"" \
-    "the run's folder replaced during it%%rm -rf \"\$WORK\"; mkdir \"\$WORK\"; echo keep >\"\$WORK/keep\"" \
-    "the run's folder unwritable during it%%chmod 500 \"\$WORK\"" \
-    "the fresh folder removed during it%rm -rf \$WORK%rm -rf \"\$RECOVER_DIR\"" \
-    "the fresh folder replaced during it%rm -rf \$WORK%rm -rf \"\$RECOVER_DIR\"; mkdir \"\$RECOVER_DIR\"; echo keep >\"\$RECOVER_DIR/keep\"" \
-    "the run's folder unwritable, no fresh one possible%%chmod 500 \"\$WORK\"" \
-    "nothing lost%%"; do
+  for case in "removed before it%rm -rf \$WORK%" \
+    "replaced before it%rm -rf \$WORK; mkdir \$WORK; echo keep >\$WORK/keep%" \
+    "unreadable before it%chmod 000 \$WORK%" \
+    "removed during it%%rm -rf \"\$WORK\"" \
+    "replaced during it%%rm -rf \"\$WORK\"; mkdir \"\$WORK\"; echo keep >\"\$WORK/keep\"" \
+    "unwritable during it%%chmod 500 \"\$WORK\"" \
+    "removed, no answer to the confirming reads%rm -rf \$WORK%"; do
     IFS='%' read -r name before lose <<<"$case"
     child=$((child + 1))
     short_copy
     WORK="$T_TMP/work"
     request_tools "$child"
-    tmpd="$T_TMP/tmpd"
-    mkdir -p "$tmpd"
-    [[ "$name" != *"no fresh one possible" ]] || tmpd="$T_TMP/none"
-    # The change comes once the clean-up has begun, after its first check of the folder.
+    mkdir -p "$T_TMP/tmpd"
+    [[ "$name" != *"no answer"* ]] || printf '%s\n' '--jq .full_name' >"$T_TMP/hang-on"
+    # The change during the clean-up comes once it has begun.
     LOSE="$lose"
     keep_as_orig settle_register
     settle_register() { eval "$LOSE"; orig_settle_register; }
-    stopped_run_cleanup 0 "own_work; TMPDIR=$tmpd" "$before"
-    chmod -R u+rwx "$T_TMP/work" "$T_TMP/tmpd" 2>/dev/null
+    stopped_run_cleanup 0 "WORK_MADE=\$WORK; TMPDIR=$T_TMP/tmpd" "$before"
+    chmod -R u+rwx "$T_TMP/work" 2>/dev/null
     ((SECS <= REVOKE_SECS + CLEANUP_SECS + 3)) || _t_fail "$name: ended after ${SECS}s"
     last="$(printf '%s\n' "$OUT" | tail -n 1)"
     n="$(grep -c 'gh api -X DELETE installation/token' "$T_TMP/tools")"
     ((n >= 3)) || _t_fail "$name: revocations sent: $n, not every token's"
-    if [[ "$name" == "nothing lost" ]]; then
-      assert_exit 0 "$RC" "$name: the run's status"
-      assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; nothing left undone" "$name"
-      [[ -f "$WORK/work-mark" ]] || _t_fail "$name: the run's folder was deleted"
-      rm -rf "$T_TMP/work" "$T_TMP/tmpd"
-      continue
-    fi
-    assert_exit 1 "$RC" "$name: the run's status (137: still running after 20s; 2: the clean-up stopped)"
-    assert_not_contains "$OUT" "CLEANUP DONE" "$name"
-    assert_contains "$last" "this run's records of writes with no answer, in $WORK, can't be read (the folder is gone, replaced, unreadable or unusable): any write they held has an unknown outcome;" "$name"
-    if [[ "$name" == *"no fresh one possible" ]]; then
+    if [[ "$name" == *"no answer"* ]]; then
+      assert_exit 1 "$RC" "$name: the run's status (137: still running after 20s)"
       assert_not_contains "$OUT" "revoked: a read with it now gets HTTP 401" "$name: a revocation claimed confirmed"
       assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): none; NOT confirmed: token1 token2 token3;" "$name"
-      assert_contains "$OUT" "not sent: no usable folder for its output" "$name"
-      assert_contains "$last" "the clean-up's own requests or records that needed a file were not made (no usable folder): what they would have shown is unknown;" "$name"
     else
-      for n in 1 2 3; do
-        assert_contains "$OUT" "TOKEN token$n revoked: a read with it now gets HTTP 401" "$name: token$n confirmed"
-      done
-      assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none;" "$name"
+      assert_exit 0 "$RC" "$name: the run's status (137: still running after 20s)"
+      assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; nothing left undone" "$name"
     fi
     case "$name" in
-      "the fresh folder"*)
-        assert_contains "$last" "can't be read (gone, replaced, unreadable or unusable): any record written there is lost;" "$name: the first fresh folder" ;;
-    esac
-    case "$name" in
-      "the run's folder replaced"*)
+      "replaced"*)
         assert_eq "$(ls -A "$WORK")" "keep" "$name: the replacement's contents"
         assert_eq "$(cat "$WORK/keep")" "keep" "$name: the replacement's file" ;;
-      "the fresh folder replaced"*)
-        for fresh in "$tmpd"/frg26-recover.*; do
-          [[ ! -f "$fresh/keep" ]] || break
-        done
-        assert_eq "$(ls -A "$fresh")" "keep" "$name: the replacement's contents"
-        assert_eq "$(cat "$fresh/keep")" "keep" "$name: the replacement's file" ;;
+      "unreadable"* | "unwritable"*) assert_eq "$(ls -A "$WORK")" "$(ls -A "$T_TMP/work")" "$name" ;;
     esac
-    # Kept, not deleted: the run's folder (where it still stands) and every fresh one still standing.
-    case "$name" in
-      *"unwritable"*) [[ -f "$WORK/work-mark" ]] || _t_fail "$name: the run's folder was deleted" ;;
-    esac
-    if [[ "$name" != *"no fresh one possible" ]]; then
-      n="$(find "$tmpd" -mindepth 1 -maxdepth 1 -name 'frg26-recover.*' | wc -l | tr -d ' ')"
-      ((n >= 1)) || _t_fail "$name: no fresh folder kept"
-    fi
+    # Never deleted (owner, round 96), and said so; no fresh folder made.
+    assert_contains "$OUT" "CLEANUP this run's work folder $WORK is not deleted: it stays, private, for you to remove later once approved (nothing in it is shown)" "$name"
+    assert_eq "$(ls -A "$T_TMP/tmpd")" "" "$name: a folder or file made in TMPDIR"
+    assert_eq "$(grep -E 'installation/token$|--jq \.full_name$' "$T_TMP/gh-config" | grep -vc '^/var/empty ' || true)" 0 "$name: app gh calls with settings from a folder"
     rm -rf "$T_TMP/work" "$T_TMP/tmpd"
   done
 }
 
+timeout_case() { # <name> — in a subshell: the folder as named, then a hang, owner_gh's, and an own status
+  local rc late
+  WORK="$T_TMP/work" STOPS_HELD="" TMPDIR="$T_TMP/tmpd"
+  case "$1" in
+    "no folder") WORK=""; chmod 500 "$T_TMP/tmpd" ;;
+    "a missing folder") WORK="$T_TMP/gone" ;;
+    "an unwritable folder") chmod 500 "$T_TMP/work" ;;
+    *"in the clean-up"*) WORK="" STOPS_HELD=1; chmod 500 "$T_TMP/tmpd" ;;
+  esac
+  rc=0; with_timeout 1 /bin/sleep 10 || rc=$?
+  echo "hang rc=$rc timed=[$TIMED_OUT]"
+  owner_gh_run() { /bin/sleep 10; }
+  CLEANUP_DEADLINE=$(($(date +%s) + 60)) late=""
+  owner_gh api -X POST "repos/$REPO/actions/runs/1/cancel" >/dev/null 2>&1 || late="$TIMED_OUT"
+  echo "owner_gh late=[$late]"
+  rc=0; with_timeout 5 /bin/sh -c 'exit 3' || rc=$?
+  echo "own rc=$rc timed=[$TIMED_OUT]"
+}
+# Review-lens round 97 (SEC-1, SEC-3), owner 2026-11-25: a timeout is told by the command's own
+# status, never by a file: the watchdog stops it with KILL. So it is reported (124, TIMED_OUT) with a
+# usable folder, none, or one that can't be used, and reaches owner_gh's caller as the clean-up's
+# writes use it (late="$TIMED_OUT"). A command's own status is kept, and no file is made.
+test_a_timeout_is_told_by_its_status_with_or_without_a_folder() {
+  local name out
+  short_copy
+  for name in "a usable folder" "no folder" "a missing folder" "an unwritable folder" "no folder in the clean-up"; do
+    rm -rf "$T_TMP/work" "$T_TMP/tmpd"
+    mkdir -m 700 "$T_TMP/work" "$T_TMP/tmpd"
+    out="$(timeout_case "$name")"
+    chmod 700 "$T_TMP/work" "$T_TMP/tmpd"
+    assert_contains "$out" "hang rc=124 timed=[1]" "$name: a hang"
+    assert_contains "$out" "owner_gh late=[1]" "$name: owner_gh's caller"
+    assert_contains "$out" "own rc=3 timed=[]" "$name: a command's own status"
+    assert_eq "$(ls -A "$T_TMP/tmpd")" "" "$name: a file left in TMPDIR"
+  done
+  assert_not_contains "$(declare -f with_timeout)" "timeout-" "with_timeout makes a mark file"
+}
+
+# Review-lens round 97 (SEC-3), owner 2026-11-25: with the run's folder gone before the clean-up, an
+# S2 cancellation with no answer is still told as a timeout: it is sent once, never again at the
+# polls that follow, and named (round 109: from the run's memory); the tokens are still revoked, and
+# the clean-up ends within its cap, INCOMPLETE.
+test_a_cancel_with_no_answer_is_sent_once_with_no_usable_folder() {
+  local child sha last n
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  sha="$(printf 'e%.0s' $(seq 1 40))"
+  short_copy
+  WORK="$T_TMP/work"
+  request_tools "$child"
+  echo 9001 >"$T_TMP/runs-1"
+  echo 9001 >"$T_TMP/runs-2"
+  echo runs/9001/cancel >"$T_TMP/hang-on"
+  stopped_run_cleanup 1 "WORK_MADE=\$WORK; CANCEL_ON_EXIT=1 S2_SHAS=$sha" "rm -rf \$WORK"
+  assert_exit 1 "$RC" "the run's status (137: still running after 20s)"
+  ((SECS <= REVOKE_SECS + CLEANUP_SECS + 3)) || _t_fail "ended after ${SECS}s"
+  assert_eq "$(grep -cF runs/9001/cancel "$T_TMP/tools")" 1 "how often the cancel was sent"
+  assert_eq "$(still_running "$child")" "" "a process the cancel started still runs"
+  n="$(grep -c 'gh api -X DELETE installation/token' "$T_TMP/tools")"
+  ((n >= 3)) || _t_fail "revocations sent: $n, not every token's"
+  last="$(printf '%s\n' "$OUT" | tail -n 1)"
+  assert_contains "$last" "CLEANUP INCOMPLETE:" "the summary"
+  assert_contains "$last" "owner gh api POST repos/$REPO/actions/runs/9001/cancel (no answer within 1s; read back: still unfinished);" "the cancel's record"
+  assert_contains "$last" "not done: cancelling the waiting S2 runs (CLEANUP FAIL above);" "the summary"
+}
+
+# Review-lens round 97 (C1, C2 = SEC-1), owner 2026-11-25: where stops are ignored (a clean-up) or held
+# (round 109: a token request), into holds each answer in memory: no file is made, read or removed,
+# in the work folder or anywhere, and with no folder at all the request is still sent. Its status and
+# error output are kept. Elsewhere, into still uses a private file in the work folder, so a stop acts
+# at once (round 75).
+test_the_clean_up_holds_each_answer_in_memory() {
+  local v rc held
+  load
+  for held in STOPS_HELD DEFERRING; do
+    rm -rf "$T_TMP/work" "$T_TMP/tmpd"
+    WORK="$T_TMP/work"
+    mkdir -m 700 "$WORK" "$T_TMP/tmpd"
+    TMPDIR="$T_TMP/tmpd" STOPS_HELD="" DEFERRING=""
+    printf -v "$held" '%s' 1
+    rc=0
+    # shellcheck disable=SC2016 # the inner script is single-quoted on purpose: sh expands it
+    into v /bin/sh -c 'ls -A "$1"; echo -; ls -A "$2"; echo err >&2; exit 3' _ "$WORK" "$T_TMP/tmpd" 2>"$T_TMP/err" || rc=$?
+    assert_exit 3 "$rc" "$held: the command's status"
+    assert_eq "$v" "-" "$held: the folders while it ran (a file made for its answer)"
+    assert_eq "$(cat "$T_TMP/err")" err "$held: its error output"
+    into -2 v /bin/sh -c 'echo out; echo err >&2'
+    assert_eq "$v" "out"$'\n'"err" "$held: -2: both"
+    WORK=""
+    rc=0
+    into v /bin/sh -c 'echo sent' || rc=$?
+    assert_exit 0 "$rc" "$held: no folder: the command's status"
+    assert_eq "$v" sent "$held: no folder: its answer"
+    capture /bin/sh -c 'echo answer'
+    assert_eq "$LAST_OUT" answer "$held: capture, no folder"
+    assert_eq "$(ls -A "$T_TMP/tmpd")" "" "$held: a file left in TMPDIR"
+  done
+  WORK="$T_TMP/work" STOPS_HELD="" DEFERRING=""
+  # shellcheck disable=SC2016 # as above
+  into v /bin/sh -c 'ls -A "$1"' _ "$WORK"
+  assert_contains "$v" "out." "outside the clean-up: its private file"
+  assert_eq "$(ls -A "$WORK")" "" "outside the clean-up: its file removed"
+  end_stand_in_run
+}
+
 # Review-lens round 94 (C1 = SEC-1), owner 2026-11-24: a create still pending is named whether or not
-# the work folder is there. If the run's own folder (make_work's) is gone, the records of writes with
-# no answer it held can't be read: that is named, their outcomes unknown, and the clean-up is
-# INCOMPLETE, never an empty list. A folder the run didn't make (a test's) proves nothing either way.
+# the work folder is there, never an empty list. Round 109: the records are the run's memory, so a
+# folder there or gone adds nothing and loses nothing.
 test_a_pending_create_or_a_lost_work_folder_is_never_an_empty_list() {
   load
   end_stand_in_run
-  local out rc pending gone
+  local out rc pending where
   pending="writes with outcome unknown (not retried, not reconciled: check them on GitHub): app gh issue create --repo $REPO (no complete answer registered: it may have been made);"
-  gone="this run's records of writes with no answer, in $T_TMP/gone, can't be read (the folder is gone, replaced, unreadable or unusable): any write they held has an unknown outcome;"
-  WORK="" WORK_MADE="" PENDING_CREATE="app gh issue create --repo $REPO"
-  rc=0; out="$(cleanup_summary)" || rc=$?
-  assert_exit 1 "$rc" "no work folder, a create pending"
-  assert_contains "$out" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): none; NOT confirmed: none; $pending" "no work folder"
-  WORK="$T_TMP/gone" WORK_MADE="$T_TMP/gone"
-  rc=0; out="$(cleanup_summary)" || rc=$?
-  assert_exit 1 "$rc" "the run's folder gone, a create pending"
-  assert_contains "$out" "CLEANUP INCOMPLETE:" "the run's folder gone, a create pending"
-  assert_contains "$out" " app gh issue create --repo $REPO (no complete answer registered: it may have been made);" "the run's folder gone: the create"
-  assert_contains "$out" "$gone" "the run's folder gone: its records"
-  PENDING_CREATE=""
-  rc=0; out="$(cleanup_summary)" || rc=$?
-  assert_exit 1 "$rc" "the run's folder gone, nothing pending"
-  assert_contains "$out" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): none; NOT confirmed: none; writes with outcome unknown (not retried, not reconciled: check them on GitHub): $gone" "the run's folder gone"
-  # Controls: the run's folder there with nothing in it, and a folder the run didn't make missing.
-  mkdir "$T_TMP/here"
-  WORK="$T_TMP/here" WORK_MADE="$T_TMP/here" WORK_MARK=m
-  printf m >"$T_TMP/here/work-mark"
-  rc=0; out="$(cleanup_summary)" || rc=$?
-  assert_exit 0 "$rc" "the run's folder there, nothing to report"
-  assert_eq "$out" "" "the run's folder there, nothing to report"
-  WORK="$T_TMP/other" WORK_MADE=""
-  rc=0; out="$(cleanup_summary)" || rc=$?
-  assert_exit 0 "$rc" "a folder the run didn't make, missing"
-  assert_eq "$out" "" "a folder the run didn't make, missing"
+  for where in "" "$T_TMP/gone" "$T_TMP/here"; do
+    [[ "$where" != "$T_TMP/here" ]] || mkdir -p "$where"
+    WORK="$where" WORK_MADE="$where" PENDING_CREATE="app gh issue create --repo $REPO"
+    rc=0; out="$(cleanup_summary)" || rc=$?
+    assert_exit 1 "$rc" "${where:-no folder}: a create pending"
+    assert_contains "$out" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): none; NOT confirmed: none; $pending" "${where:-no folder}"
+    PENDING_CREATE=""
+    rc=0; out="$(cleanup_summary)" || rc=$?
+    assert_exit 0 "$rc" "${where:-no folder}: nothing pending"
+    assert_eq "$out" "" "${where:-no folder}: nothing to report"
+  done
 }
 
 # Review-lens round 92 (C3 = SEC-4): an issue or PR is this run's only if its title ends with this
@@ -6269,6 +6261,243 @@ test_an_unreceived_tokens_expiry_is_unknown_in_the_clean_ups_report() {
   assert_not_contains "$out" "at the latest" "a deadline in the clean-up's report"
   assert_not_contains "$out" "expires by" "a deadline in the clean-up's report"
   end_stand_in_run
+}
+
+# Round 109 (owner, 2026-11-25): a write's pending state is kept in the run's own shell, never in a
+# file: noted before it is sent, cleared only once its answer is stored and shows GitHub's own reply
+# (success, or a refusal in GitHub's words). A lost or malformed answer stays outcome unknown, named in
+# the last line, the clean-up INCOMPLETE; nothing about it is in the work folder, so removing the
+# folder before the clean-up loses nothing.
+test_a_write_is_pending_in_the_run_until_a_validated_answer_is_stored() {
+  local case name answer rc rc_want unknown last child
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  for case in "answered|https://example.invalid/answer|0|0|" \
+    "refused in GitHub's words|gh: Resource not accessible by integration (HTTP 403)|1|0|" \
+    "a transport error|error connecting to api.github.com|1|1|app gh api PATCH repos/\$REPO (no complete answer: status 1)" \
+    "an empty answer||1|1|app gh api PATCH repos/\$REPO (no complete answer: status 1)"; do
+    IFS='|' read -r name answer rc rc_want unknown <<<"$case"
+    child=$((child + 1))
+    short_copy
+    WORK="$T_TMP/work"
+    request_tools "$child"
+    printf '%s\n' "$answer" >"$T_TMP/patch-out"
+    echo "$rc" >"$T_TMP/patch-rc"
+    eval "unknown=\"$unknown\""
+    stopped_run_cleanup 0 "" "capture app_gh api -X PATCH repos/\$REPO -f description=x || true; rm -rf \$WORK"
+    assert_exit "$rc_want" "$RC" "$name: the run's status (137: still running after 20s)"
+    last="$(printf '%s\n' "$OUT" | tail -n 1)"
+    assert_eq "$(grep -c 'gh api -X PATCH' "$T_TMP/tools")" 1 "$name: how often the write was sent"
+    if [[ -n "$unknown" ]]; then
+      assert_contains "$last" "CLEANUP INCOMPLETE:" "$name"
+      assert_contains "$last" "writes with outcome unknown (not retried, not reconciled: check them on GitHub): $unknown;" "$name"
+    else
+      assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; nothing left undone" "$name"
+    fi
+    rm -rf "$T_TMP/work"
+  done
+}
+
+# Round 109: a request with no answer within its limit still stops the run, the request named, and a
+# write among them named outcome unknown, with no record written to the work folder: no timed-out,
+# unsettled or out-write file. The same for a read inside a function run through into.
+test_a_request_with_no_answer_stops_the_run_and_writes_no_record() {
+  local case name call hang rest child last f
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  for case in "a write|capture app_gh api -X PATCH repos/\$REPO -f description=x|-X PATCH|app gh api PATCH repos/\$REPO (no answer within 1s);" \
+    "a read inside a function|into v branch_state dev|branches/dev|"; do
+    IFS='|' read -r name call hang rest <<<"$case"
+    child=$((child + 1))
+    short_copy
+    WORK="$T_TMP/work"
+    request_tools "$child"
+    printf '%s\n' "$hang" >"$T_TMP/hang-on"
+    eval "rest=\"$rest\""
+    stopped_run_cleanup 0 "" "$call; echo NEXT TEST ACTION"
+    assert_exit 2 "$RC" "$name: the run's status (137: still running after 20s)"
+    assert_contains "$OUT" "STOPPED:" "$name"
+    assert_not_contains "$OUT" "NEXT TEST ACTION" "$name: a test action after the timeout"
+    for f in "$WORK"/timed-out "$WORK"/unsettled "$WORK"/out-write.*; do
+      [[ ! -e "$f" ]] || _t_fail "$name: a record file in the work folder: ${f##*/}"
+    done
+    last="$(printf '%s\n' "$OUT" | tail -n 1)"
+    [[ -z "$rest" ]] || assert_contains "$last" "$rest" "$name"
+    rm -rf "$T_TMP/work"
+  done
+}
+
+# Round 109: a write a stop cuts short is named from the run's own memory, even with the work folder
+# removed while it was out.
+test_a_write_cut_short_by_a_stop_is_named_from_the_runs_memory() {
+  local child last
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  short_copy
+  WORK="$T_TMP/work"
+  request_tools "$child"
+  printf '%s\n' "-X PATCH" >"$T_TMP/hang-on"
+  # shellcheck disable=SC2016 # run inside the stopped run: $PPID there is the run itself
+  stopped_run_cleanup 0 "" '/bin/sh -c "/bin/sleep 0.5; rm -rf $WORK; kill -TERM \$PPID" & capture app_gh api -X PATCH repos/$REPO -f description=x; echo NEXT TEST ACTION'
+  assert_exit 143 "$RC" "the run's status (137: still running after 20s)"
+  assert_not_contains "$OUT" "NEXT TEST ACTION"
+  last="$(printf '%s\n' "$OUT" | tail -n 1)"
+  assert_contains "$last" "CLEANUP INCOMPLETE:"
+  assert_contains "$last" "app gh api PATCH repos/$REPO (cut short by the stop);" "the write cut short"
+  assert_not_contains "$last" "can't be read" "a record read from a folder"
+}
+
+# Round 109 (owner, 2026-11-25): a control's result comes only through an unnamed pipe, never a file,
+# and counts only whole and well formed: a malformed or partial line, or a label told twice with two
+# states, leaves the control with no trusted result (its tokens NOT confirmed, the clean-up INCOMPLETE).
+# A control that dies before it reports has no result; one whose own command fails still reports. A
+# program a control starts through with_timeout holds neither end of the pipe, so it can't add a line.
+test_a_controls_result_counts_only_whole_and_well_formed_through_its_pipe() {
+  local case name cmd works rc_want want bad
+  for case in "well formed|good_cmd||0|NOT confirmed: none;|" \
+    "a malformed line|garbage_cmd||1|NOT confirmed: control1 (no trusted result);|control1-token4" \
+    "a partial line|partial_cmd||1|NOT confirmed: control1 (no trusted result);|control1-token4" \
+    "a label told twice|twice_cmd|4|1|NOT confirmed: control1 (no trusted result);|control1-token4" \
+    "a line from a program it started|forge_cmd||0|NOT confirmed: none;|control1-forged" \
+    "its command fails|fail_cmd||0|NOT confirmed: none;|" \
+    "it dies before it reports|vanish_cmd||1|NOT confirmed: control1 (no result);|control1-token4"; do
+    IFS='|' read -r name cmd works rc_want want bad <<<"$case"
+    cleanup_stubs
+    printf '%s\n' "$works" >"$T_TMP/works"
+    : >"$T_TMP/leak"
+    mkdir -p "$T_TMP/bin"
+    # shellcheck disable=SC2016 # the stand-in's own lines are single-quoted on purpose: it expands them
+    printf '%s\n' '#!/bin/bash' \
+      '{ echo "CONTROL control1 forged confirmed" >&3; } 2>/dev/null && echo "fd 3" >>"$T_TMP/leak"' \
+      '{ : <&8; } 2>/dev/null && echo "fd 8" >>"$T_TMP/leak"' 'exit 0' >"$T_TMP/bin/gh"
+    chmod 700 "$T_TMP/bin/gh"
+    export T_TMP
+    good_cmd() { request_token '{}'; ls -A "$WORK" >"$T_TMP/during"; }
+    garbage_cmd() { request_token '{}'; echo garbage >&3; }
+    partial_cmd() { request_token '{}'; printf 'CONTROL control1 tok' >&3; }
+    twice_cmd() { request_token '{}'; echo "CONTROL control1 token4 confirmed" >&3; }
+    forge_cmd() { request_token '{}'; PATH="$T_TMP/bin:$PATH" with_timeout 5 app_gh_run api rate_limit >/dev/null 2>&1; }
+    fail_cmd() { request_token '{}'; return 9; }
+    vanish_cmd() { request_token '{}'; /bin/sh -c 'kill -KILL $PPID'; /bin/sleep 1; }
+    stopped_run_cleanup 0 "" "control_token $cmd || true"
+    assert_exit "$rc_want" "$RC" "$name: the run's status (137: still running after 20s)"
+    ((SECS <= REVOKE_SECS + CLEANUP_SECS + 3)) || _t_fail "$name: took ${SECS}s"
+    assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "$want" "$name"
+    [[ -z "$bad" ]] || assert_not_contains "$(printf '%s\n' "$OUT" | tail -n 1 | sed 's/NOT confirmed:.*//')" "$bad" "$name: confirmed"
+    case "$name" in
+      "well formed") assert_eq "$(grep -c '^control\.' "$T_TMP/during" || true)" 0 "$name: a control's record file in the work folder" ;;
+      "a line from"*) assert_eq "$(cat "$T_TMP/leak")" "" "$name: a started program held the pipe" ;;
+    esac
+  done
+}
+
+# Round 109 (owner, 2026-11-25): the app's JWT never reaches a file or an argument: it goes to curl on
+# its standard input, through a pipe. A token request's answer, which holds the new token, is held in
+# memory, never in a file, even while curl runs; nothing is left in the work folder or the temp folder.
+test_the_jwt_and_a_token_answer_never_reach_a_file_or_an_argument() {
+  local tok
+  load
+  app_files 123456
+  SECRETS="$FRG26_SECRETS" APP_KEY="$FRG26_APP_KEY"
+  WORK="$T_TMP/work"
+  mkdir -m 700 "$WORK" "$T_TMP/tmpd"
+  TMPDIR="$T_TMP/tmpd"
+  load_app
+  INSTALLATION_ID=77
+  tok="$(new_token)"
+  mkdir -p "$T_TMP/bin"
+  # shellcheck disable=SC2016 # as above
+  printf '%s\n' '#!/bin/bash' 'printf "%s\n" "$@" >"$T_TMP/curl-args"' 'cat >"$T_TMP/curl-stdin"' \
+    'printf "%s" "$CURL_BODY"' '/bin/sleep 0.3' \
+    'grep -rl -- "$CURL_TOK" "$T_TMP/work" "$T_TMP/tmpd" >"$T_TMP/curl-during" 2>/dev/null' \
+    'printf "\nFRG26-ERR \nHTTP 201"' >"$T_TMP/bin/curl"
+  chmod 700 "$T_TMP/bin/curl"
+  export T_TMP CURL_TOK="$tok" CURL_BODY="{\"token\":\"$tok\",\"expires_at\":\"2026-11-25T23:00:00Z\",\"permissions\":{\"metadata\":\"read\"},\"repository_selection\":\"selected\",\"repositories\":[{\"full_name\":\"$REPO\"}]}"
+  PATH="$T_TMP/bin:$PATH"
+  make_jwt
+  request_token '{"repositories":["forge-frg26-throwaway"],"permissions":{"metadata":"read"}}'
+  assert_eq "$REQ_TOKEN" yes "the token was taken from the answer"
+  assert_eq "$TOKEN" "$tok" "the token"
+  assert_not_contains "$(cat "$T_TMP/curl-args")" "$JWT" "the JWT in curl's arguments"
+  assert_not_contains "$(cat "$T_TMP/curl-args")" "$tok" "the token in curl's arguments"
+  assert_contains "$(cat "$T_TMP/curl-args")" "@-" "curl reads its headers from its standard input"
+  assert_contains "$(cat "$T_TMP/curl-stdin")" "Authorization: Bearer $JWT" "the JWT on curl's standard input"
+  assert_eq "$(cat "$T_TMP/curl-during")" "" "a file held the token while curl ran"
+  assert_eq "$(ls -A "$WORK")" "" "files left in the work folder"
+  assert_eq "$(ls -A "$T_TMP/tmpd")" "" "files left in the temp folder"
+  assert_eq "$(grep -rl -e "$JWT" -e "$tok" "$WORK" "$T_TMP/tmpd" 2>/dev/null || true)" "" "a file holding the JWT or the token"
+  end_stand_in_run
+}
+
+# Round 109 (owner, 2026-11-25): app git has no password helper file and no home folder in the work
+# folder. The token reaches git only for a request to GitHub (clone, fetch, push), and only as a setting
+# in git's environment (http.https://github.com/.extraheader), never as an argument; a local git
+# command gets no token at all. HOME is /var/empty; git's own prompt for a password is /usr/bin/false.
+test_app_git_gets_the_token_only_for_requests_to_github_never_as_an_argument() {
+  local log want
+  load
+  mkdir -p "$T_TMP/bin"
+  # shellcheck disable=SC2016 # the stand-in's own lines are single-quoted on purpose: it expands them
+  printf '%s\n' '#!/bin/bash' \
+    'printf "args:%s\n" "$*" >>"$T_TMP/git.log"' \
+    'printf "home:%s askpass:%s count:%s key:%s value:%s\n" "${HOME:-}" "${GIT_ASKPASS:-}" "${GIT_CONFIG_COUNT:-}" "${GIT_CONFIG_KEY_0:-}" "${GIT_CONFIG_VALUE_0:-}" >>"$T_TMP/git.log"' \
+    'if env | grep -v "^FAKE_TOKEN=" | grep -qF -- "$FAKE_TOKEN"; then echo "token-in-env:yes" >>"$T_TMP/git.log"; else echo "token-in-env:no" >>"$T_TMP/git.log"; fi' >"$T_TMP/bin/git"
+  chmod 700 "$T_TMP/bin/git"
+  TOKEN="$(fake_token)"
+  export T_TMP FAKE_TOKEN="$TOKEN"
+  PATH="$T_TMP/bin:$PATH"
+  WORK="$T_TMP/work"
+  mkdir -m 700 "$WORK"
+  app_git -C "$WORK" rev-parse HEAD
+  log="$(cat "$T_TMP/git.log")"
+  assert_contains "$log" "home:/var/empty askpass:/usr/bin/false count: key: value:" "a local command"
+  assert_contains "$log" "token-in-env:no" "a local command: the token in git's environment"
+  : >"$T_TMP/git.log"
+  app_git -C "$WORK" push -q origin HEAD:refs/heads/b1
+  log="$(cat "$T_TMP/git.log")"
+  want="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')"
+  assert_contains "$log" "home:/var/empty askpass:/usr/bin/false count:1 key:http.https://github.com/.extraheader value:$want" "a push"
+  assert_contains "$log" "token-in-env:no" "a push: the raw token in git's environment"
+  assert_contains "$log" "-c core.askPass=/usr/bin/false" "a push: git's prompt"
+  assert_not_contains "$(grep '^args:' "$T_TMP/git.log")" "$TOKEN" "the token in git's arguments"
+  assert_not_contains "$(grep '^args:' "$T_TMP/git.log")" "${want#AUTHORIZATION: basic }" "the encoded token in git's arguments"
+  [[ ! -e "$WORK/askpass" && ! -e "$WORK/home" ]] || _t_fail "a password helper or home folder in the work folder"
+  assert_not_contains "$(declare -f make_work)" "askpass" "make_work writes a password helper"
+  end_stand_in_run
+}
+
+# Round 109 (owner, 2026-11-25): app gh always takes its settings from the system's empty, read-only
+# /var/empty (checked with gh 2.102.0, offline: evidence 267), in the run and in its clean-up alike.
+test_app_gh_always_takes_its_settings_from_var_empty() {
+  local child
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  short_copy
+  WORK="$T_TMP/work"
+  request_tools "$child"
+  stopped_run_cleanup 0 "" "capture app_gh api repos/\$REPO --jq .full_name || true"
+  assert_exit 0 "$RC" "the run's status (137: still running after 20s)"
+  assert_eq "$(grep -E 'installation/token$|--jq \.full_name$' "$T_TMP/gh-config" | grep -vc '^/var/empty ' || true)" 0 "app gh calls with settings from elsewhere"
+  [[ ! -e "$WORK/gh-app" ]] || _t_fail "a gh settings folder in the work folder"
+  assert_not_contains "$(declare -f make_work)" "gh-app" "make_work makes a gh settings folder"
+}
+
+# Round 109 (owner, 2026-11-25): no credential reaches an argument, a log or a file the run keeps: the
+# run's tokens (and git's encoded form of each) appear in no tool's arguments, nowhere in the run's
+# output, and in no file left in the work folder. Not proof of isolation: what this run's own code does
+# with them, with stand-in tools.
+test_no_credential_reaches_an_argument_a_log_or_a_kept_file() {
+  local child n t enc f
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  short_copy
+  WORK="$T_TMP/work"
+  request_tools "$child"
+  stopped_run_cleanup 0 "" "capture app_gh api repos/\$REPO --jq .full_name || true; capture app_git -C \$WORK/clone push -q origin HEAD:refs/heads/b1 || true"
+  for n in 1 2 3; do
+    t="$(cleanup_token "$n")"
+    enc="$(printf 'x-access-token:%s' "$t" | base64 | tr -d '\n')"
+    assert_not_contains "$(cat "$T_TMP/tools")" "$t" "token$n in a tool's arguments"
+    assert_not_contains "$(cat "$T_TMP/tools")" "$enc" "token$n, encoded, in a tool's arguments"
+    assert_not_contains "$OUT" "$t" "token$n in the run's output"
+    f="$(grep -rl -e "$t" -e "$enc" "$WORK" 2>/dev/null || true)"
+    assert_eq "$f" "" "token$n in a file left in the work folder"
+  done
 }
 
 run_tests
