@@ -589,7 +589,15 @@ a create that returns no issue number is outcome unknown, whatever its answer sa
 refusal is taken from an answer's text), and its pending record is cleared only once that record is
 written, so a record that can't be written leaves it pending, still named, and INCOMPLETE; the
 pending create is named whether or not the work folder is there, and if the folder the run made is
-gone, the records it held are named unreadable, their outcomes unknown (round 94). A close
+gone, the records it held are named unreadable, their outcomes unknown (round 94). Round 95: the
+clean-up first checks that the work folder is still the one the run made (a random marker it wrote
+there: supporting evidence, not protection against a folder swapped in later); gone, replaced or
+unreadable, its records are named lost and the clean-up is INCOMPLETE, what the run holds in memory
+(tokens, a pending create, its issues) is kept, its own requests use a fresh private folder (which
+it removes), and the folder at the old path is never deleted, but left for a later, owner-approved
+clean-up; if no fresh folder can be made, the revocations are still sent, the requests that need one
+are not sent and said so, and no revocation is claimed confirmed. Every record's read is checked:
+one that can't be read is named, never taken as empty. A close
 is marked started before it is sent, and never sent again; a stop before the run's issue sweep has
 ended (the final one included) has the clean-up resume it within its cap, its work list being the
 issues created, every close already started and what the list finds (round 93: a list read after a
