@@ -120,6 +120,9 @@ CLEANUP_UNDONE=""   # every tidy-up left undone, on any finish, for the clean-up
 RUN_ISSUES=""       # test issues this run made, by the number their create returned (round 102)
 ISSUES_CLOSE_SENT="" # test issues whose close this run has sent: never sent twice
 ISSUES_CLOSED=""    # test issues read back closed, by number, named in the clean-up's last line
+PENDING_CREATE=""   # a test issue's create from before it is sent until its answer is settled (round 102)
+ISSUES_SWEEP_BEGUN="" # set when sweep_issues starts, and ISSUES_SWEPT when it has ended (round 102)
+ISSUES_SWEPT=""
 CONTROLS=0          # controls started (A9, E1), each named control<n> before it can ask for a token
 CONTROL_ID=""       # inside a control: its name, which its tokens' names start with
 CONTROL_PENDING=""  # controls that haven't said they are done: their tokens count as NOT confirmed
@@ -220,11 +223,19 @@ cleanup_tokens_first() { # <status> <start>
   settle_tokens "the clean-up's share for tokens (${REVOKE_SECS}s) was used up; tried again after the tidy-up if time allows"
   CLEANUP_DEADLINE=$(($2 + CLEANUP_SECS))
   # Each tidy-up records what it leaves undone itself, here as on a normal finish (round 73, C2).
+  local swept=""
   if [[ -n "$SWEEP_ON_EXIT" ]]; then
     SWEEP_ON_EXIT=""
     say "PHASE $PHASE: STOPPED by an error (status $1); closing the open test PRs"
     sweep_prs || true
-    if [[ "$PHASE" == permissions ]]; then sweep_issues; fi
+    if [[ "$PHASE" == permissions ]]; then sweep_issues; swept=1; fi
+  fi
+  # A permission run stopped before its issue sweep ended (the final one, run after SWEEP_ON_EXIT is
+  # cleared, included), with that sweep begun or an issue of its not read back closed: the sweep
+  # resumes here, within the cap; a close already started is only read back (round 92, SEC-2).
+  if [[ "$PHASE" == permissions && -z "$swept" && -z "$ISSUES_SWEPT" ]] && [[ -n "$ISSUES_SWEEP_BEGUN" || -n "$(issues_unconfirmed)" ]]; then
+    say "PHASE permissions: stopped before its test issues were swept; sweeping them now"
+    sweep_issues
   fi
   if [[ -n "$CANCEL_ON_EXIT" ]]; then
     CANCEL_ON_EXIT=""
@@ -356,7 +367,7 @@ unconfirmed_why() { # <kind> — how the last line names it
 # The clean-up's last line, without a token: each token confirmed revoked or not, held ones apart,
 # and what was left undone. Nothing when the run had no token and no tidy-up. 1 unless complete.
 cleanup_summary() {
-  local e t yes="" no="" held="" tokens unknown
+  local e t yes="" no="" held="" tokens unknown left
   for e in $ISSUED; do
     t="${e#*=}"
     if [[ " $HELD_KEPT " == *" $t "* ]]; then held="$held ${e%%=*}"
@@ -372,13 +383,17 @@ cleanup_summary() {
   # (round 75, C1).
   unknown="$(unknown_writes)"
   unknown="${unknown%;}"
-  [[ -n "$ISSUED$UNRECEIVED_LABELS$CLEANUP_UNDONE$CONTROL_CONFIRMED$CONTROL_UNCONFIRMED$CONTROL_PENDING$unknown$ISSUES_CLOSED" ]] || return 0
+  # A test issue the run made, or whose close it started, counts only once read back closed
+  # (round 92, SEC-2): any other is named, and the clean-up is INCOMPLETE.
+  left="$(issues_unconfirmed)"
+  [[ -n "$ISSUED$UNRECEIVED_LABELS$CLEANUP_UNDONE$CONTROL_CONFIRMED$CONTROL_UNCONFIRMED$CONTROL_PENDING$unknown$ISSUES_CLOSED$left" ]] || return 0
   tokens="tokens confirmed revoked (HTTP 401):${yes:- none}; NOT confirmed:${no:- none}"
   tokens="$tokens${UNRECEIVED_LABELS:+; possibly issued, never received:$UNRECEIVED_LABELS}${held:+; held for a later check:$held}"
   # Each test issue as its read-back by number found it, closed (round 102).
   tokens="$tokens${ISSUES_CLOSED:+; test issues read back closed:$ISSUES_CLOSED}"
   tokens="$tokens${unknown:+; writes with outcome unknown (not retried, not reconciled: check them on GitHub):$unknown}"
-  if [[ -z "$no$UNRECEIVED_LABELS$CLEANUP_UNDONE$unknown" ]]; then
+  tokens="$tokens${left:+; test issues not read back closed:$left}"
+  if [[ -z "$no$UNRECEIVED_LABELS$CLEANUP_UNDONE$unknown$left" ]]; then
     say "CLEANUP DONE: $tokens; nothing left undone"
     return 0
   fi
@@ -387,17 +402,40 @@ cleanup_summary() {
 }
 
 # Each write of this run's that got no answer in time, or that a stop cut short (its note is still
-# there: with_timeout), once, on one line.
+# there: with_timeout), once, on one line. Round 102 (round 92, C2 = SEC-1): a test issue's create
+# still pending (PENDING_CREATE) is one too, unless already named so; a close of a test issue read
+# back closed is settled by that read-back, and not named.
 unknown_writes() {
-  local f
+  local f all n settled
   [[ -n "$WORK" && -d "$WORK" ]] || return 0
-  {
+  all="$({
     if [[ -f "$WORK/timed-out" ]]; then sed -n 's/^write //p' "$WORK/timed-out"; fi
     if [[ -f "$WORK/unsettled" ]]; then cat "$WORK/unsettled"; fi
     for f in "$WORK"/out-write.*; do
       if [[ -f "$f" ]]; then printf '%s (cut short by the stop)\n' "$(cat "$f")"; fi
     done
-  } | sort -u | while IFS= read -r f; do printf ' %s;' "$f"; done
+  } | sort -u)"
+  if [[ -n "$PENDING_CREATE" && $'\n'"$all" != *$'\n'"$PENDING_CREATE ("* ]]; then
+    all="$all"$'\n'"$PENDING_CREATE (no complete answer registered: it may have been made)"
+  fi
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    settled=""
+    for n in $ISSUES_CLOSED; do
+      [[ "$f" != "owner gh issue close ${n#\#} --repo $REPO ("* ]] || settled=1
+    done
+    [[ -n "$settled" ]] || printf ' %s;' "$f"
+  done <<<"$all"
+}
+
+# This run's test issues it made, or whose close it started, not read back closed: " #n" each.
+issues_unconfirmed() {
+  local n seen=""
+  for n in $RUN_ISSUES $ISSUES_CLOSE_SENT; do
+    [[ " $seen " != *" $n "* ]] || continue
+    seen="$seen $n"
+    [[ " $ISSUES_CLOSED " == *" #$n "* ]] || printf ' #%s' "$n"
+  done
 }
 
 # A tidy-up's write that got no answer in time and that no read-back settled (round 77): never sent
@@ -2573,16 +2611,29 @@ try_reading() { # <id> <label> <command…> — "works" or "fails" with GitHub's
 # A12: the gh commands FORGE uses, with the app's token. Readings, not results.
 t_A12() {
   local n
+  # Pending from before it is sent until its answer is settled (review-lens round 92, C2 = SEC-1): a
+  # stop meanwhile leaves it a write with outcome unknown (unknown_writes). As request_what names it.
+  PENDING_CREATE="app gh issue create --repo $REPO"
   try_reading A12 "gh issue create" app_gh issue create --repo "$REPO" --title "FRG-26 A12 ($(stamp))" --body "FRG-26 throwaway test A12."
   n="${LAST_OUT##*/}"
   if [[ $LAST_RC -eq 0 && "$n" =~ ^[0-9]+$ ]]; then
-    # Closed by this number, not only if a list finds it (round 102: part 0's #129).
-    RUN_ISSUES="$RUN_ISSUES $n"
+    # Closed by this number, not only if a list finds it (round 102: part 0's #129). The number is
+    # kept before the pending record is cleared, in one command, so no stop comes between them.
+    RUN_ISSUES="$RUN_ISSUES $n" PENDING_CREATE=""
     try_reading A12 "gh issue comment" app_gh issue comment "$n" --repo "$REPO" --body "FRG-26 A12 comment."
     try_reading A12 "gh issue view" app_gh issue view "$n" --repo "$REPO" --json title --jq .title
-  elif [[ $LAST_RC -eq 0 ]]; then
-    # Answered as made, but with no number to close it by: its outcome is unknown (round 102).
-    unsettled_write "answered without an issue number" app_gh issue create --repo "$REPO"
+  elif [[ $LAST_RC -eq 1 ]] && printf '%s' "$LAST_OUT" | grep -q 'Resource not accessible by integration'; then
+    # Refused in GitHub's own words, in a complete answer (gh's own error exit): nothing was made.
+    PENDING_CREATE=""
+  else
+    # Answered as made with no number to close it by, or failed otherwise (a status code alone
+    # proves nothing: round 92, C1 = SEC-3): its outcome is unknown.
+    if [[ $LAST_RC -eq 0 ]]; then
+      unsettled_write "answered without an issue number" app_gh issue create --repo "$REPO"
+    else
+      unsettled_write "failed without a refusal in GitHub's own words: it may have been made" app_gh issue create --repo "$REPO"
+    fi
+    PENDING_CREATE=""
   fi
   try_reading A12 "gh issue list" app_gh issue list --repo "$REPO" --limit 1
   try_reading A12 "gh pr list" app_gh pr list --repo "$REPO" --limit 1
@@ -2603,10 +2654,13 @@ issue_state() { # <n> — open or closed, as a read of that issue by its number 
 # counts as closed (round 102: part 0's #129 stayed open after CLEANUP DONE, and no close of it
 # was on GitHub's record). Bounded by owner_gh alone, as in close_if_open (round 77). A close with
 # no answer in time is settled by that read-back alone, never sent again; read back otherwise, it
-# is named outcome unknown.
+# is named outcome unknown. A close is marked started (ISSUES_CLOSE_SENT) before it is sent, so a
+# sweep resumed after a stop never sends it again, only reads the issue back (round 92, SEC-2).
 close_issue() { # <n>
-  local st late=""
-  if [[ " $ISSUES_CLOSE_SENT " != *" $1 "* ]]; then
+  local st late="" again=""
+  if [[ " $ISSUES_CLOSE_SENT " == *" $1 "* ]]; then
+    again=1
+  else
     ISSUES_CLOSE_SENT="$ISSUES_CLOSE_SENT $1"
     owner_gh issue close "$1" --repo "$REPO" >/dev/null 2>&1 || late="$TIMED_OUT"
   fi
@@ -2615,6 +2669,8 @@ close_issue() { # <n>
     [[ " $ISSUES_CLOSED " == *" #$1 "* ]] || ISSUES_CLOSED="$ISSUES_CLOSED #$1"
     if [[ -n "$late" ]]; then
       say "CLEANUP issue #$1 in $REPO: its close got no answer within ${late}s; read back: closed"
+    elif [[ -n "$again" ]]; then
+      say "CLEANUP issue #$1 in $REPO: its close was started earlier in this run (not sent again); read back: closed"
     else
       say "CLEANUP closed test issue #$1 in $REPO; read back: closed"
     fi
@@ -2625,22 +2681,32 @@ close_issue() { # <n>
   if [[ -n "$late" ]]; then
     unsettled_write "no answer within ${late}s; read back: ${st:-unreadable}" owner_gh issue close "$1" --repo "$REPO"
     say "CLEANUP FAIL issue #$1 in $REPO: its close got no answer within ${late}s, so its outcome is unknown (not tried again; read back: ${st:-unreadable}): check it on GitHub"
+  elif [[ -n "$again" ]]; then
+    say "CLEANUP FAIL issue #$1 in $REPO may still be open (its close was started earlier in this run, not sent again; read back: ${st:-unreadable}): close it on GitHub"
   else
     say "CLEANUP FAIL issue #$1 in $REPO may still be open (read back: ${st:-unreadable}): close it on GitHub"
   fi
   return 1
 }
 
+# The jq selecting this run's own test items from a list of issues: a title "FRG-26 …" that ends with
+# this run's id in its own parentheses, as every title this run makes does (stamp), so another run's
+# id that starts with or contains this one's is not taken (review-lens round 92, C3 = SEC-4).
+run_title_jq() { printf 'select(.title | startswith("FRG-26 ")) | select(.title | endswith(" (%s)"))' "$RUN_ID"; }
+run_issues_jq() { printf '.[] | select(.pull_request == null) | %s | .number' "$(run_title_jq)"; } # issues only
+run_items_jq() { printf '.[] | %s | .number' "$(run_title_jq)"; } # issues and PRs
+
 # This run's test issues are closed in the throwaway: each one a create returned (RUN_ISSUES), and
-# any "FRG-26 " issue carrying RUN_ID a list finds (a list read just after a create can miss it:
-# round 102), each once. The second throwaway is only read (round 13, SEC-4): an "FRG-26 " issue or
-# PR there carrying RUN_ID means this run wrote there, and is reported for the owner to close; this
-# script never writes there as the owner.
+# any of this run's a list finds (run_issues_jq; a list read just after a create can miss it: round
+# 102), each once. The second throwaway is only read (round 13, SEC-4): an "FRG-26 " issue or PR of
+# this run's there means this run wrote there, and is reported for the owner to close; this script
+# never writes there as the owner. ISSUES_SWEPT is set once the sweep has ended, however it ended;
+# a stop before that has the clean-up resume it (cleanup_tokens_first).
 sweep_issues() {
-  local open n mine todo="" rc=0 TIDY_UP=1
+  local open n todo="" rc=0 TIDY_UP=1
+  ISSUES_SWEEP_BEGUN=1
   # Each call bounded, the clean-up's cap checked before each step (round 72, SEC-1).
-  mine=".[] | select(.pull_request == null) | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number"
-  into open with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO/issues?state=open&per_page=100" --jq "$mine" 2>/dev/null || rc=$?
+  into open with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO/issues?state=open&per_page=100" --jq "$(run_issues_jq)" 2>/dev/null || rc=$?
   if [[ $rc -ne 0 ]]; then
     open=""
     FAILS=$((FAILS + 1))
@@ -2661,12 +2727,13 @@ sweep_issues() {
   if ! in_time; then
     FAILS=$((FAILS + 1))
     undone "checking $REPO2 for this run's issues"; say "CLEANUP FAIL the clean-up's time cap (${CLEANUP_SECS}s) was reached before $REPO2 was checked: check it on GitHub for \"FRG-26 \" issues"
+    ISSUES_SWEPT=1
     return 0
   fi
   # Only this run's: issues #1-#3 there are the A2 evidence, kept open (owner, 2026-11-11).
   rc=0
   into open with_timeout "$(call_secs)" owner_gh api --paginate "repos/$REPO2/issues?state=open&per_page=100" \
-    --jq ".[] | select(.title | startswith(\"FRG-26 \")) | select(.title | contains(\"$RUN_ID\")) | .number" 2>/dev/null || rc=$?
+    --jq "$(run_items_jq)" 2>/dev/null || rc=$?
   if [[ $rc -ne 0 ]]; then
     FAILS=$((FAILS + 1))
     undone "checking $REPO2 for this run's issues"; say "CLEANUP FAIL could not list the open issues in $REPO2$(no_answer $rc): check it on GitHub for \"FRG-26 \" issues"
@@ -2674,6 +2741,7 @@ sweep_issues() {
     FAILS=$((FAILS + 1))
     undone "closing this run's issues or PRs on $REPO2"; say "CLEANUP FAIL $REPO2 has open \"FRG-26 \" issues or PRs (#$(printf '%s' "$open" | tr '\n' ' ')): the app wrote there; close them on GitHub"
   fi
+  ISSUES_SWEPT=1
 }
 
 cmd_ptests() {

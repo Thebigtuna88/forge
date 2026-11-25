@@ -583,6 +583,15 @@ without an issue number, stays a write with outcome unknown, so the clean-up is 
 is closed later. Each read-back is a moment's reading, not a guarantee for later. The second
 throwaway is still only read; its kept A2 issues are never touched. Only the existing limits bound
 these calls (20 seconds a call, and the clean-up's cap).
+Review-lens round 92 (owner, 2026-11-24): the create is recorded as pending before it is sent, and
+the pending record is cleared only once its answer is settled (its number kept, in the same command);
+a create that fails is outcome unknown unless a complete answer refuses it in GitHub's own words (a
+status code alone proves nothing). A close is marked started before it is sent, and never sent
+again; a stop before the run's issue sweep has ended (the final one included) has the clean-up
+resume it within its cap, reading back what was already started, and an issue read back closed
+settles a close whose outcome was unknown. Any issue the run made or closed that isn't read back
+closed makes the clean-up INCOMPLETE. An item is this run's only if its title ends with the run's id
+in its own parentheses, so another run's id that starts with it is not taken.
 
 **S2d's evidence (owner, 2026-11-20, round 78).** Part 0's run on 2026-11-20 stopped at S2d,
 inconclusive: GitHub said you can't approve your own run, then answered the approval with HTTP 422

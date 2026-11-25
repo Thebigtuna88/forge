@@ -5525,9 +5525,9 @@ case "$*" in
   # unfinished ones (runs-1 at the first list, then runs-2).
   *"repos/$FAKE_REPO/issues?state=open"*) cat "$T_TMP/open-issues" 2>/dev/null ;;
   *"repos/$FAKE_REPO/pulls?state=open"*) cat "$T_TMP/open-prs" 2>/dev/null ;;
-  # A test issue (round 102): its create answers with create-url; its state, read by its number,
-  # is issue-state-<n>, closed if none is written.
-  "issue create "*) cat "$T_TMP/create-url" 2>/dev/null ;;
+  # A test issue (round 102): its create answers with create-url and ends with create-rc (0 if
+  # none); its state, read by its number, is issue-state-<n>, closed if none is written.
+  "issue create "*) cat "$T_TMP/create-url" 2>/dev/null; exit "$(cat "$T_TMP/create-rc" 2>/dev/null || echo 0)" ;;
   "api repos/$FAKE_REPO/issues/"*" --jq .state") cat "$T_TMP/issue-state-${2##*/}" 2>/dev/null || echo closed ;;
   "pr view "*"--json state --jq .state")
     if [[ -f "$T_TMP/pr-viewed" ]]; then cat "$T_TMP/pr-state"; else : >"$T_TMP/pr-viewed"; echo OPEN; fi ;;
@@ -5542,7 +5542,7 @@ EOF
   : >"$T_TMP/revoked"
   : >"$T_TMP/hang-on"
   rm -f "$T_TMP/open-issues" "$T_TMP/open-prs" "$T_TMP/pr-viewed" "$T_TMP/pr-state" "$T_TMP/runs-1" "$T_TMP/runs-2" "$T_TMP/runs-listed" \
-    "$T_TMP/create-url" "$T_TMP"/issue-state-*
+    "$T_TMP/create-url" "$T_TMP/create-rc" "$T_TMP"/issue-state-*
   export T_TMP FAKE_REPO="$REPO"
   PATH="$T_TMP/bin:$PATH"
 }
@@ -5700,7 +5700,7 @@ EOF
 # (not a stop), and the clean-up is INCOMPLETE. The last case runs in the clean-up itself, to its cap.
 # Round 102: an issue is read back by its number too (closed unless issue-state-<n> says otherwise).
 test_a_tidy_up_write_that_times_out_is_settled_or_its_outcome_unknown() {
-  local case name prep setup call hang exit_rc rc_want child last unknown undo said sha closed
+  local case name prep setup call hang exit_rc rc_want child last unknown undo said sha closed left
   child=$(((RANDOM % 900 + 100) * 100)) # as above
   sha="$(printf 'e%.0s' $(seq 1 40))"
   for case in "an issue close, read back open%echo 11 >\$T_TMP/open-issues; echo 12 >>\$T_TMP/open-issues; echo open >\$T_TMP/issue-state-11%RUN_ID=r1%sweep_issues%issue close 11 %0%1" \
@@ -5724,12 +5724,12 @@ test_a_tidy_up_write_that_times_out_is_settled_or_its_outcome_unknown() {
     assert_not_contains "$OUT" "the run starts no further test action" "$name: a tidy-up's timeout stopped the run"
     [[ -z "$call" ]] || assert_contains "$OUT" "NEXT STEP" "$name: a tidy-up's timeout stopped the run"
     assert_not_contains "$OUT" "cut short by the stop" "$name: a timeout named as a stop"
-    unknown="" undo="" said="" closed=""
+    unknown="" undo="" said="" closed="" left=""
     case "$name" in
       *"issue close, read back open")
         unknown="owner gh issue close 11 --repo $REPO (no answer within 1s; read back: open)" undo="closing the test issues"
         said="CLEANUP FAIL issue #11 in $REPO: its close got no answer within 1s, so its outcome is unknown (not tried again; read back: open): check it on GitHub"
-        closed="; test issues read back closed: #12"
+        closed="; test issues read back closed: #12" left="; test issues not read back closed: #11"
         assert_eq "$(grep -c 'gh issue close 12 ' "$T_TMP/tools")" 1 "$name: the next issue's close"
         assert_contains "$OUT" "CLEANUP closed test issue #12 in $REPO; read back: closed" "$name: the next issue" ;;
       *"issue close, read back closed")
@@ -5747,7 +5747,7 @@ test_a_tidy_up_write_that_times_out_is_settled_or_its_outcome_unknown() {
     assert_contains "$OUT" "$said" "$name"
     last="$(printf '%s\n' "$OUT" | tail -n 1)"
     if [[ -n "$unknown" ]]; then
-      assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none$closed; writes with outcome unknown (not retried, not reconciled: check them on GitHub): $unknown; not done: $undo (CLEANUP FAIL above);" "$name"
+      assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none$closed; writes with outcome unknown (not retried, not reconciled: check them on GitHub): $unknown$left; not done: $undo (CLEANUP FAIL above);" "$name"
     else
       assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none$closed; nothing left undone" "$name"
       assert_not_contains "$OUT" "outcome is unknown" "$name"
@@ -5755,12 +5755,38 @@ test_a_tidy_up_write_that_times_out_is_settled_or_its_outcome_unknown() {
   done
 }
 
+# A short run with the stand-in tools (request_tools): A12's create answers with issue #129, and the
+# issue and PR lists answer, with nothing open (a missing list file would be an error).
+issue_run() { # <child seconds>
+  short_copy
+  WORK="$T_TMP/work"
+  request_tools "$1"
+  echo "https://github.com/$REPO/issues/129" >"$T_TMP/create-url"
+  : >"$T_TMP/open-issues"
+  : >"$T_TMP/open-prs"
+}
+
+# A stop (TERM) to the shell that calls this, which its trap acts on as soon as the call returns. Run
+# in the run's own shell: the stand-in sh's parent is that shell (bash 3.2 has no BASHPID).
+stop_here() { /bin/sh -c 'kill -TERM $PPID'; }
+
+keep_as_orig() { eval "orig_$1() $(declare -f "$1" | tail -n +2)"; } # <function>: kept as orig_<function>
+
+# The end of cmd_ptests: SWEEP_ON_EXIT is cleared, then the run tidies up itself.
+final_sweep() {
+  SWEEP_ON_EXIT=""
+  sweep_prs
+  sweep_issues
+}
+
 # Round 102 (owner, 2026-11-24): part 0's A12 issue (#129) stayed open while its step said CLEANUP
 # DONE: the list that should have found it didn't show it, or a close didn't take, and nothing was
 # read back. Each issue a create returns is tracked by its number, closed at most once with any the
 # list finds, and read back by that number; only one read back closed counts, and the last line
 # names each. A create with no answer, or answered without a number, stays a write with outcome
-# unknown, whatever is closed later. The second throwaway is only read.
+# unknown, whatever is closed later. The second throwaway is only read. Review-lens round 92 (C1 =
+# SEC-3): a create that fails is outcome unknown too, unless a complete answer (gh's own error
+# exit, 1) refuses it in GitHub's own words; a status code alone proves nothing.
 test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
   local case name prep setup after hang rc_want child last done_line incomplete unknown
   child=$(((RANDOM % 900 + 100) * 100)) # as above
@@ -5770,16 +5796,15 @@ test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
     "its read-back gets no answer%%%t_A12; sweep_issues%issues/129 --jq .state%1" \
     "its create gets no answer, the issue made%echo 129 >\$T_TMP/open-issues%SWEEP_ON_EXIT=1%t_A12; echo NEXT TEST ACTION%issue create %2" \
     "its create gets no answer, nothing found%%SWEEP_ON_EXIT=1%t_A12; echo NEXT TEST ACTION%issue create %2" \
+    "its create refused in GitHub's words%echo 'GraphQL: Resource not accessible by integration (createIssue)' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc%%t_A12; sweep_issues%%0" \
+    "its create fails with an HTTP 403 alone%echo 'HTTP 403: Forbidden (https://api.github.com/graphql)' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
+    "its create's connection fails%echo 'Post https://api.github.com/graphql: unexpected EOF' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
+    "its create's refusal ends abnormally%echo 'GraphQL: Resource not accessible by integration (createIssue)' >\$T_TMP/create-url; echo 2 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
+    "the list fails, the recorded issue still closed%rm -f \$T_TMP/open-issues%%t_A12; sweep_issues%%1" \
     "its create answered without a number%echo 'Creating issue' >\$T_TMP/create-url%%t_A12; sweep_issues%%1"; do
     IFS='%' read -r name prep setup after hang rc_want <<<"$case"
     child=$((child + 1))
-    short_copy
-    WORK="$T_TMP/work"
-    request_tools "$child"
-    echo "https://github.com/$REPO/issues/129" >"$T_TMP/create-url"
-    # Lists that answer, with nothing open, unless the case says otherwise (a missing file is an error).
-    : >"$T_TMP/open-issues"
-    : >"$T_TMP/open-prs"
+    issue_run "$child"
     eval "$prep"
     printf '%s\n' "$hang" >"$T_TMP/hang-on"
     stopped_run_cleanup 0 "PHASE=permissions RUN_ID=r1 $setup" "$after"
@@ -5791,7 +5816,7 @@ test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
     assert_eq "$(grep -c "repos/$REPO2/issues/[0-9]" "$T_TMP/tools")" 0 "$name: a second-throwaway issue read by number"
     last="$(printf '%s\n' "$OUT" | tail -n 1)"
     done_line="CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; test issues read back closed: #129; nothing left undone"
-    incomplete="CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; not done: closing the test issues (CLEANUP FAIL above);"
+    incomplete="CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; test issues not read back closed: #129; not done: closing the test issues (CLEANUP FAIL above);"
     unknown="writes with outcome unknown (not retried, not reconciled: check them on GitHub): app gh issue create --repo $REPO"
     case "$name" in
       "the list misses"*)
@@ -5821,6 +5846,17 @@ test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
         assert_not_contains "$OUT" "NEXT TEST ACTION" "$name: a test action after the timeout"
         assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
         assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (no answer within 1s);" "$name" ;;
+      *"GitHub's words")
+        assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
+        assert_contains "$OUT" "READING A12 gh issue create: fails" "$name"
+        assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; nothing left undone" "$name" ;;
+      *"HTTP 403 alone" | *"connection fails" | *"ends abnormally")
+        assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (failed without a refusal in GitHub's own words: it may have been made);" "$name" ;;
+      "the list fails"*)
+        assert_eq "$(grep -c 'gh issue close 129 ' "$T_TMP/tools")" 1 "$name: closes of #129"
+        assert_contains "$OUT" "CLEANUP FAIL could not list the open issues in $REPO" "$name"
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; test issues read back closed: #129; not done: closing the test issues (CLEANUP FAIL above);" "$name" ;;
       *)
         assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
         assert_not_contains "$(cat "$T_TMP/tools")" "issue comment" "$name: a comment on an unknown issue"
@@ -5828,6 +5864,140 @@ test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
     esac
     if [[ "$rc_want" == 0 ]]; then assert_contains "$last" "CLEANUP DONE" "$name"; else assert_not_contains "$OUT" "CLEANUP DONE" "$name"; fi
   done
+}
+
+# Review-lens round 92 (C2 = SEC-1, SEC-2), owner 2026-11-24: a stop at each step of a test issue's
+# record never ends in a false CLEANUP DONE. The create is pending from before it is sent until its
+# number is kept (one command); a stop before its number is kept leaves it outcome unknown. A stop
+# before the run's issue sweep has ended (the final one, after SWEEP_ON_EXIT is cleared, included)
+# has it resumed in the clean-up, within its cap: a close already started is never sent again, only
+# read back, and a read back closed settles it. Any issue the run made or closed that isn't read back
+# closed makes the clean-up INCOMPLETE.
+test_a_stop_at_each_issue_step_never_ends_in_a_false_done() {
+  local case name after rc_want child last done_line unknown closes
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  done_line="CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; test issues read back closed: #129; nothing left undone"
+  for case in "before the create is sent" "as the create's answer comes, the list shows it" \
+    "as the create's answer comes, the list misses it" "during the create" "after its number is kept" \
+    "at the start of the final sweep" "after a close is started, before it is sent" \
+    "after a close is sent, before its read-back" "during a close"; do
+    name="$case"
+    child=$((child + 1))
+    issue_run "$child"
+    after="t_A12; final_sweep"
+    rc_want=143
+    case "$name" in
+      "before the create is sent")
+        keep_as_orig try_reading
+        try_reading() { if [[ "$2" == "gh issue create" ]]; then stop_here; fi; orig_try_reading "$@"; } ;;
+      "as the create's answer comes"*)
+        [[ "$name" == *"misses it" ]] || echo 129 >"$T_TMP/open-issues"
+        keep_as_orig try_reading
+        try_reading() { orig_try_reading "$@"; if [[ "$2" == "gh issue create" ]]; then stop_here; fi; } ;;
+      "during the create")
+        echo "issue create " >"$T_TMP/hang-on"
+        # shellcheck disable=SC2016 # run inside the stopped run: $PPID there is the run itself
+        after='/bin/sh -c "/bin/sleep 0.3; kill -TERM \$PPID" & t_A12; final_sweep' ;;
+      "after its number is kept")
+        keep_as_orig try_reading
+        try_reading() { if [[ "$2" == "gh issue comment" ]]; then stop_here; fi; orig_try_reading "$@"; } ;;
+      "at the start of the final sweep")
+        keep_as_orig sweep_prs
+        sweep_prs() { stop_here; orig_sweep_prs; } ;;
+      "after a close is started"*)
+        echo open >"$T_TMP/issue-state-129"
+        keep_as_orig owner_gh
+        owner_gh() {
+          if [[ "$*" == "issue close 129 "* ]]; then echo started >>"$T_TMP/close-calls"; stop_here; return 1; fi
+          orig_owner_gh "$@"
+        } ;;
+      "after a close is sent"*)
+        keep_as_orig owner_gh
+        owner_gh() {
+          local rc=0
+          orig_owner_gh "$@" || rc=$?
+          if [[ "$*" == "issue close 129 "* ]]; then echo sent >>"$T_TMP/close-calls"; stop_here; fi
+          return "$rc"
+        } ;;
+      "during a close")
+        echo "issue close 129 " >"$T_TMP/hang-on"
+        keep_as_orig owner_gh
+        owner_gh() {
+          if [[ "$*" == "issue close 129 "* ]]; then
+            echo sent >>"$T_TMP/close-calls"
+            /bin/sh -c '/bin/sleep 0.3; kill -TERM $PPID' &
+          fi
+          orig_owner_gh "$@"
+        } ;;
+    esac
+    : >"$T_TMP/close-calls"
+    stopped_run_cleanup 0 "PHASE=permissions RUN_ID=r1 SWEEP_ON_EXIT=1" "$after; echo NEXT STEP"
+    assert_exit "$rc_want" "$RC" "$name: the run's status (137: still running after 20s)"
+    ((SECS <= CLEANUP_SECS + 3)) || _t_fail "$name: ended after ${SECS}s; the clean-up's cap is ${CLEANUP_SECS}s"
+    assert_not_contains "$OUT" "NEXT STEP" "$name: the run went on after the stop"
+    assert_eq "$(still_running "$child")" "" "$name: a process a request started still runs"
+    assert_not_contains "$(cat "$T_TMP/tools")" "--repo $REPO2" "$name: a write to the second throwaway"
+    last="$(printf '%s\n' "$OUT" | tail -n 1)"
+    unknown="writes with outcome unknown (not retried, not reconciled: check them on GitHub): app gh issue create --repo $REPO"
+    closes="$(grep -c 'gh issue close 129 ' "$T_TMP/tools")"
+    case "$name" in
+      "before the create is sent")
+        assert_eq "$(grep -c 'gh issue create ' "$T_TMP/tools")" 0 "$name: creates sent"
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (no complete answer registered: it may have been made);" "$name" ;;
+      *"the list shows it")
+        assert_eq "$closes" 1 "$name: closes of #129"
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; test issues read back closed: #129; $unknown (no complete answer registered: it may have been made);" "$name" ;;
+      *"the list misses it")
+        assert_eq "$closes" 0 "$name: closes of #129"
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (no complete answer registered: it may have been made);" "$name" ;;
+      "during the create")
+        assert_eq "$(grep -c 'gh issue create ' "$T_TMP/tools")" 1 "$name: creates sent"
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (cut short by the stop);" "$name"
+        assert_eq "$(grep -o 'app gh issue create' <<<"$last" | wc -l | tr -d ' ')" 1 "$name: the create named once" ;;
+      "after its number is kept" | "at the start of the final sweep")
+        assert_eq "$closes" 1 "$name: closes of #129"
+        assert_eq "$last" "$done_line" "$name" ;;
+      "after a close is started"*)
+        assert_eq "$closes" 0 "$name: a close started but never sent is not sent later"
+        assert_contains "$OUT" "CLEANUP FAIL issue #129 in $REPO may still be open (its close was started earlier in this run, not sent again; read back: open): close it on GitHub" "$name"
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; test issues not read back closed: #129; not done: closing the test issues (CLEANUP FAIL above);" "$name" ;;
+      *)
+        assert_eq "$closes" 1 "$name: closes of #129 (never sent again)"
+        assert_contains "$OUT" "CLEANUP issue #129 in $REPO: its close was started earlier in this run (not sent again); read back: closed" "$name"
+        assert_eq "$last" "$done_line" "$name" ;;
+    esac
+    case "$name" in
+      "at the start of the final sweep" | "after a close"* | "during a close")
+        assert_contains "$OUT" "PHASE permissions: stopped before its test issues were swept; sweeping them now" "$name: the sweep resumed" ;;
+    esac
+    case "$name" in
+      "after a close"* | "during a close") assert_eq "$(wc -l <"$T_TMP/close-calls" | tr -d ' ')" 1 "$name: closes of #129 started" ;;
+    esac
+  done
+}
+
+# Review-lens round 92 (C3 = SEC-4): an issue or PR is this run's only if its title ends with this
+# run's id in its own parentheses; another run's id that starts with it, or contains it, is not.
+# shellcheck disable=SC2016 # sweep_issues' own source text is searched for literally
+test_the_issue_selectors_match_the_exact_run_id() {
+  load
+  local json
+  json='[{"number":1,"title":"FRG-26 A12 (20261124T194646Z-12)"},
+    {"number":2,"title":"FRG-26 A12 (20261124T194646Z-123)"},
+    {"number":3,"title":"FRG-26 A12 (x20261124T194646Z-12)"},
+    {"number":4,"title":"FRG-26 A12 (20261124T194646Z-12) again"},
+    {"number":5,"title":"FRG-26 A12 (20261124T194646Z-1)"},
+    {"number":6,"title":"FRG-26 A2 probe P4 (20261124T194646Z-12)","pull_request":{"url":"x"}},
+    {"number":7,"title":"Other (20261124T194646Z-12)"}]'
+  RUN_ID=20261124T194646Z-12
+  assert_eq "$(jq -r "$(run_issues_jq)" <<<"$json" | tr '\n' ' ')" "1 " "this run's issues in the throwaway"
+  assert_eq "$(jq -r "$(run_items_jq)" <<<"$json" | tr '\n' ' ')" "1 6 " "this run's issues and PRs in the second throwaway"
+  RUN_ID=20261124T194646Z-1
+  assert_eq "$(jq -r "$(run_issues_jq)" <<<"$json" | tr '\n' ' ')" "5 " "a run whose id prefixes another's"
+  # Both sweeps use them.
+  assert_contains "$(declare -f sweep_issues)" '--jq "$(run_issues_jq)"'
+  assert_contains "$(declare -f sweep_issues)" '--jq "$(run_items_jq)"'
+  end_stand_in_run
 }
 
 # Owner, 2026-11-23 (review-lens round 90, C1 = SEC-1): a token request with no complete answer may have been
