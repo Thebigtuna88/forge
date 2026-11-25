@@ -151,7 +151,13 @@ WORK_MADE=""        # the work folder make_work made: gone at the clean-up's end
 WORK_MARK=""        # the random value make_work wrote in it: supporting evidence it is still that folder (round 95)
 WORK_LOST=""        # set when the clean-up found it gone, replaced or unreadable: its records are lost
 RECOVER_DIR=""      # the fresh private folder the clean-up then made for its own requests
-SCRATCH_NONE=""     # set when none could be made: requests that need a folder are not sent, and said so
+RECOVER_MARK=""     # the random value it wrote in that one
+RECOVER_COUNT=0     # fresh folders made: at most three (round 96)
+RECOVER_LOST=""     # fresh folders found gone, replaced or unusable later in the clean-up
+SCRATCH_NONE=""     # set when no usable one is left: requests that need a folder are not sent, and said so
+SCRATCH_FAIL=""     # set when a request or record of the clean-up's own got no file: what it held is unknown
+CLEANUP_OWN=""      # set while the clean-up of a command other than a2-probe runs
+INTO_UNSENT=""      # set by into when it did not run its command (no usable folder), for capture
 CLONE=""
 PHASE=""
 FAILS=0
@@ -203,20 +209,13 @@ cleanup() {
     if [[ -n "$PENDING_MINT" || -n "$UNRECEIVED" ]]; then report_unreceived; fi
     revoke_outstanding
   else
-    # Its work folder first: gone, replaced or unreadable, it is set aside (round 95).
+    # Its work folder first: gone, replaced, unreadable or unusable, it is set aside (round 95), and
+    # so is any folder in use found so later in the clean-up (into, round 96).
+    CLEANUP_OWN=1
     if ! work_intact; then work_recover; fi
     cleanup_tokens_first "$rc" "$start" || incomplete=1
   fi
   if [[ -n "$HELD_LOCKED" ]]; then rmdir "$HELD.lock" 2>/dev/null || true; HELD_LOCKED=""; fi
-  # Deleted only if it is the fresh folder the clean-up made, or still shown to be the run's own: a
-  # folder whose identity is uncertain is left as it is (round 95; owner, 2026-11-24).
-  if [[ -n "$WORK" && -d "$WORK" ]]; then
-    if [[ "$WORK" == "$RECOVER_DIR" ]] || work_intact; then
-      rm -rf "$WORK"
-    else
-      say "CLEANUP the work folder $WORK is left as it is (not shown to be this run's own): check it before removing it"
-    fi
-  fi
   # a2-probe's summary is the last line, which the owner's handoff result shows (round 48).
   if [[ -n "$PROBE_SUMMARY" ]]; then say "$PROBE_SUMMARY"; fi
   if [[ -n "$PROBE_RC" ]]; then exit "$PROBE_RC"; fi
@@ -408,6 +407,11 @@ cleanup_summary() {
   tokens="$tokens${ISSUES_CLOSED:+; test issues read back closed:$ISSUES_CLOSED}"
   tokens="$tokens${unknown:+; writes with outcome unknown (not retried, not reconciled: check them on GitHub):$unknown}"
   tokens="$tokens${left:+; test issues not read back closed:$left}"
+  # No work folder is deleted, nor anything in it (owner, 2026-11-24, round 96): said here, just
+  # before the last line, which stays the summary.
+  if [[ -n "$WORK_MADE" ]]; then
+    say "CLEANUP this run's work folder $WORK_MADE is not deleted: it stays, private, for you to remove later once approved (nothing in it is shown)"
+  fi
   if [[ -z "$no$UNRECEIVED_LABELS$CLEANUP_UNDONE$unknown$left" ]]; then
     say "CLEANUP DONE: $tokens; nothing left undone"
     return 0
@@ -422,11 +426,13 @@ cleanup_summary() {
 # back closed is settled by that read-back, and not named. Review-lens round 94 (C1 = SEC-1): the
 # pending create is named whether or not the work folder is there. Round 95 (C2 = SEC-2): each
 # record's read is checked, and one that is there but can't be read is named, never taken as empty;
-# the records of a folder that is gone, replaced or unreadable (WORK_LOST, or make_work's folder no
-# longer shown to be the run's) are named lost.
+# the records of a folder that is gone, replaced, unreadable or unusable (WORK_LOST, or make_work's
+# folder no longer shown to be the run's) are named lost. Round 96: so are those of a fresh folder
+# found so (RECOVER_LOST, or the one in use failing its check now), and the clean-up's own requests
+# or records that got no file (SCRATCH_FAIL); a folder that fails its check is not read.
 unknown_writes() {
-  local f l all="" bad="" lost="" n settled
-  if [[ -n "$WORK" && -d "$WORK" ]]; then
+  local f l all="" bad="" lost="" n settled fresh
+  if [[ -n "$WORK" && -d "$WORK" ]] && scratch_ok; then
     if [[ -e "$WORK/timed-out" ]]; then
       if l="$(sed -n 's/^write //p' "$WORK/timed-out" 2>/dev/null)"; then all="$all$l"$'\n'; else bad="$bad timed-out"; fi
     fi
@@ -451,7 +457,15 @@ unknown_writes() {
     all="$all"$'\n'"this run's record $f, in $WORK, can't be read: any write it held has an unknown outcome"
   done
   if [[ -n "$lost" ]]; then
-    all="$all"$'\n'"this run's records of writes with no answer, in $lost, can't be read (the folder is gone, replaced or unreadable): any write they held has an unknown outcome"
+    all="$all"$'\n'"this run's records of writes with no answer, in $lost, can't be read (the folder is gone, replaced, unreadable or unusable): any write they held has an unknown outcome"
+  fi
+  fresh="$RECOVER_LOST"
+  if [[ -n "$RECOVER_DIR" && "$WORK" == "$RECOVER_DIR" ]] && ! scratch_ok; then fresh="$fresh $RECOVER_DIR"; fi
+  for f in $fresh; do
+    all="$all"$'\n'"the clean-up's fresh folder $f, can't be read (gone, replaced, unreadable or unusable): any record written there is lost"
+  done
+  if [[ -n "$SCRATCH_FAIL" ]]; then
+    all="$all"$'\n'"the clean-up's own requests or records that needed a file were not made (no usable folder): what they would have shown is unknown"
   fi
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
@@ -478,11 +492,17 @@ issues_unconfirmed() {
 # INCOMPLETE. In the run's own shell or the clean-up, where a tidy-up's timeout doesn't stop the run.
 # 1 if it couldn't be recorded (review-lens round 93, C1): a caller keeping a record of its own (a
 # pending create) then keeps it.
+# In the clean-up, a folder not shown to be the run's is never written to, and a record that can't be
+# written is noted (SCRATCH_FAIL), so the clean-up is INCOMPLETE (round 96).
 unsettled_write() { # <why> <runner> <args…> — the request, described by request_what
   local why="$1"
   shift
-  [[ -n "$WORK" && -d "$WORK" ]] || return 1
-  { printf '%s (%s)\n' "$(request_what "$@")" "$why" >>"$WORK/unsettled"; } 2>/dev/null
+  if [[ -n "$CLEANUP_OWN" ]] && ! scratch_ok; then SCRATCH_FAIL=1; return 1; fi
+  if [[ -n "$WORK" && -d "$WORK" ]] && { printf '%s (%s)\n' "$(request_what "$@")" "$why" >>"$WORK/unsettled"; } 2>/dev/null; then
+    return 0
+  fi
+  [[ -z "$CLEANUP_OWN" ]] || SCRATCH_FAIL=1
+  return 1
 }
 trap cleanup EXIT
 # Closing the Terminal, Ctrl-C or a kill also end through cleanup, with the usual status (round 51,
@@ -575,8 +595,8 @@ app_git_run() {
 capture() {
   local out rc=0
   into -2 out "$@" || rc=$?
-  # Not sent: the clean-up had no private folder for its output (round 95).
-  if [[ $rc -eq 125 && -n "$SCRATCH_NONE" ]]; then out="not sent: no private folder for its output (the run's work folder was lost)"; fi
+  # Not sent: the clean-up had no usable folder for its output (rounds 95-96).
+  if [[ $rc -eq 125 && -n "$INTO_UNSENT" ]]; then out="not sent: no usable folder for its output (the run's work folder was lost)"; fi
   LAST_OUT="$(redact "$out")"
   LAST_RC=$rc
   return $rc
@@ -585,18 +605,30 @@ capture() {
 # A command's output, as "$(command…)" would give it, without the command substitution (round 75,
 # C1): bash holds a stop until a command substitution returns, but acts on it at once while the
 # shell waits for a job. <var> gets the output, its trailing newlines removed; the status is the
-# command's. With -2 its error output is kept too, as 2>&1 inside would. In a clean-up that could make
-# no private folder (work_recover), the command is not run: 125, and <var> empty (round 95).
+# command's. With -2 its error output is kept too, as 2>&1 inside would. In the clean-up (CLEANUP_OWN,
+# rounds 95-96), the folder in use is checked before each file is made there; one that fails, or
+# can't take the file, is set aside for a fresh one (work_recover); with none usable, the command is
+# not run: 125, <var> empty, INTO_UNSENT set, and the clean-up goes on (it never stops here).
 into() { # [-2] <var> <command…>
-  local _i_both="" _i_var _i_f _i_pid _i_rc=0
+  local _i_both="" _i_var _i_f="" _i_pid _i_rc=0
   if [[ "$1" == -2 ]]; then _i_both=1; shift; fi
   _i_var="$1"
   shift
-  if [[ -n "$SCRATCH_NONE" ]]; then
+  INTO_UNSENT=""
+  if [[ -n "$CLEANUP_OWN" && -z "$SCRATCH_NONE" ]] && ! scratch_ok; then work_recover; fi
+  if [[ -z "$SCRATCH_NONE" ]]; then
+    _i_f="$(umask 077 && mktemp "${WORK:-${TMPDIR:-/tmp}}/out.XXXXXX" 2>/dev/null)" || _i_f=""
+    if [[ -z "$_i_f" && -n "$CLEANUP_OWN" ]]; then
+      work_recover
+      [[ -n "$SCRATCH_NONE" ]] || _i_f="$(umask 077 && mktemp "$WORK/out.XXXXXX" 2>/dev/null)" || _i_f=""
+    fi
+  fi
+  if [[ -z "$_i_f" ]]; then
+    [[ -n "$CLEANUP_OWN" ]] || die "can't make a file for a request's output"
+    INTO_UNSENT=1 SCRATCH_FAIL=1
     printf -v "$_i_var" '%s' ""
     return 125
   fi
-  _i_f="$(umask 077 && mktemp "${WORK:-${TMPDIR:-/tmp}}/out.XXXXXX" 2>/dev/null)" || die "can't make a file for a request's output"
   if [[ -n "$_i_both" ]]; then "$@" >"$_i_f" 2>&1 & else "$@" >"$_i_f" & fi
   _i_pid=$!
   REQ_JOBS="$REQ_JOBS $_i_pid"
@@ -1089,10 +1121,11 @@ with_timeout() { # <seconds> <command…>
   pid=$!
   # Named by the command's own process (round 74): a control runs beside the run, and a background
   # subshell of bash 3.2 repeats the run's $RANDOM, so a name from it could be shared.
-  # With no private folder (round 95) there is no mark: the request still ends at its limit, but is
-  # then told only by its status, never written under a guessable name in a shared folder.
+  # With no usable private folder (rounds 95-96) there is no mark: the request still ends at its
+  # limit, but is then told only by its status, never written under a guessable name in a shared
+  # folder, nor in one that isn't shown to be the run's (scratch_ok).
   mark=""
-  if [[ -z "$SCRATCH_NONE" ]]; then
+  if [[ -z "$SCRATCH_NONE" ]] && { [[ -z "$CLEANUP_OWN" ]] || scratch_ok; }; then
     mark="${WORK:-${TMPDIR:-/tmp}}/timeout-$$-$pid"
     rm -f "$mark"
   fi
@@ -1438,31 +1471,57 @@ assert_second() { # writes to the second throwaway are attempts only, and only t
 # 0 if WORK is still the folder make_work made, as its marker shows (or the run made none: a test's
 # WORK). The marker is supporting evidence, not protection: a folder swapped in at the same path
 # after this check isn't seen (review-lens round 95; owner, 2026-11-24).
-work_intact() {
+folder_ok() { # <dir> <mark> — 0 if <dir> is there, not a link, and holds that marker
   local m
-  [[ -n "$WORK_MADE" ]] || return 0
-  [[ "$WORK" == "$WORK_MADE" && -d "$WORK" && ! -L "$WORK" ]] || return 1
-  m="$(cat "$WORK/work-mark" 2>/dev/null)" || return 1
-  [[ -n "$WORK_MARK" && "$m" == "$WORK_MARK" ]]
+  [[ -n "$1" && -d "$1" && ! -L "$1" ]] || return 1
+  m="$(cat "$1/work-mark" 2>/dev/null)" || return 1
+  [[ -n "$2" && "$m" == "$2" ]]
 }
 
-# The run's work folder gone, replaced or unreadable, as the clean-up starts (review-lens round 95,
-# C1 = SEC-1): its records are lost, and named so (unknown_writes); the folder at that path is
-# never deleted (it may not be the run's), but left for a later, owner-approved clean-up. What the
-# run keeps in memory (its tokens, a pending create, its issues) is kept. The clean-up's own requests
-# use a fresh private folder; if none can be made, the revocations are still sent (with_timeout
-# needs none), and each request that needs one is not sent, and said so (into).
+work_intact() {
+  [[ -n "$WORK_MADE" ]] || return 0
+  [[ "$WORK" == "$WORK_MADE" ]] && folder_ok "$WORK" "$WORK_MARK"
+}
+
+# 0 if WORK may be used now: the run's own folder, or the fresh one, as its marker shows (or the run
+# made none: a test's WORK). Checked before each file the clean-up makes there (round 96).
+scratch_ok() {
+  [[ -n "$WORK_MADE" ]] || return 0
+  if [[ "$WORK" == "$WORK_MADE" ]]; then folder_ok "$WORK" "$WORK_MARK"; return; fi
+  [[ -n "$RECOVER_DIR" && "$WORK" == "$RECOVER_DIR" ]] && folder_ok "$WORK" "$RECOVER_MARK"
+}
+
+# The folder in use is gone, replaced, unreadable or unusable (review-lens rounds 95-96, C1 = SEC-1):
+# the run's own as the clean-up starts or during it, or a fresh one later. Its records are lost, and
+# named so (unknown_writes); it is never written to again or deleted (it may not be the run's), but
+# left for a later, owner-approved clean-up. What the run keeps in memory (its tokens, a pending
+# create, its issues) is kept. The clean-up's own requests use a fresh private folder, at most three
+# in all; with none left, the revocations are still sent (with_timeout needs none), and each request
+# that needs one is not sent, and said so (into).
 work_recover() {
-  local w=""
-  WORK_LOST="$WORK_MADE"
-  say "CLEANUP the run's work folder $WORK_MADE is gone, replaced or unreadable: its records of writes are lost (outcomes unknown); it is left as it is, not deleted"
-  w="$(umask 077 && mktemp -d "${TMPDIR:-/private/tmp}/frg26-recover.XXXXXX" 2>/dev/null)" || w=""
-  if [[ -n "$w" ]] && chmod 700 "$w" 2>/dev/null && mkdir -m 700 "$w/gh-app" 2>/dev/null; then
-    WORK="$w" RECOVER_DIR="$w"
-    return 0
+  local w="" m=""
+  if [[ -n "$WORK" && "$WORK" == "$RECOVER_DIR" ]]; then
+    RECOVER_LOST="$RECOVER_LOST $RECOVER_DIR"
+    say "CLEANUP the fresh folder $RECOVER_DIR is gone, replaced, unreadable or unusable: what was written there is lost; it is left as it is, not deleted"
+  elif [[ -z "$WORK_LOST" ]]; then
+    WORK_LOST="$WORK_MADE"
+    say "CLEANUP the run's work folder $WORK_MADE is gone, replaced, unreadable or unusable: its records of writes are lost (outcomes unknown); it is left as it is, not deleted"
   fi
-  [[ -z "$w" ]] || rm -rf "$w"
-  WORK="" SCRATCH_NONE=1
+  WORK="" RECOVER_DIR="" RECOVER_MARK=""
+  while [[ $RECOVER_COUNT -lt 3 ]]; do
+    RECOVER_COUNT=$((RECOVER_COUNT + 1))
+    w="$(umask 077 && mktemp -d "${TMPDIR:-/private/tmp}/frg26-recover.XXXXXX" 2>/dev/null)" || break
+    m="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    if [[ ${#m} -eq 32 ]] && chmod 700 "$w" 2>/dev/null && mkdir -m 700 "$w/gh-app" 2>/dev/null &&
+      (umask 077 && printf '%s' "$m" >"$w/work-mark") 2>/dev/null; then
+      WORK="$w" RECOVER_DIR="$w" RECOVER_MARK="$m"
+      say "CLEANUP a fresh private folder $w is used for the clean-up's own requests; it is kept, private, not deleted: remove it later, once you approve"
+      return 0
+    fi
+    # Made, but not usable: kept as it is, and named.
+    RECOVER_LOST="$RECOVER_LOST $w"
+  done
+  SCRATCH_NONE=1
   say "CLEANUP no fresh folder could be made for the clean-up's own requests: the revocations are sent, but none can be confirmed"
 }
 

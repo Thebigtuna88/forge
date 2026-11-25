@@ -593,11 +593,15 @@ gone, the records it held are named unreadable, their outcomes unknown (round 94
 clean-up first checks that the work folder is still the one the run made (a random marker it wrote
 there: supporting evidence, not protection against a folder swapped in later); gone, replaced or
 unreadable, its records are named lost and the clean-up is INCOMPLETE, what the run holds in memory
-(tokens, a pending create, its issues) is kept, its own requests use a fresh private folder (which
-it removes), and the folder at the old path is never deleted, but left for a later, owner-approved
-clean-up; if no fresh folder can be made, the revocations are still sent, the requests that need one
-are not sent and said so, and no revocation is claimed confirmed. Every record's read is checked:
-one that can't be read is named, never taken as empty. A close
+(tokens, a pending create, its issues) is kept, and its own requests use a fresh private folder; if
+no fresh folder can be made, the revocations are still sent, the requests that need one are not sent
+and said so, and no revocation is claimed confirmed. Every record's read is checked: one that can't
+be read is named, never taken as empty. Round 96: the folder in use is checked again before each
+file the clean-up makes there, and one that fails, or can't take a file, is set aside for a fresh one
+(at most three); a request still without a file is not sent, and the clean-up goes on to its
+summary, INCOMPLETE. No folder is deleted by the clean-up, neither the run's nor a fresh one, nor
+anything in them: they stay, private, for the owner to remove once approved, and the clean-up says
+so without showing what is in them. A close
 is marked started before it is sent, and never sent again; a stop before the run's issue sweep has
 ended (the final one included) has the clean-up resume it within its cap, its work list being the
 issues created, every close already started and what the list finds (round 93: a list read after a

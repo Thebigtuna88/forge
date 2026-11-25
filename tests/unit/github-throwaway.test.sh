@@ -3980,7 +3980,10 @@ probe_stubs() {
   APP_SLUG=frg26-test-app
   APP_BOT="frg26-test-app[bot]"
   WORK="$T_TMP/work"
-  [[ -d "$WORK" ]] || mkdir -m 700 "$WORK"
+  # A fresh folder for each run, as make_work makes one: the clean-up no longer deletes it (owner,
+  # round 96), so a test's earlier run would otherwise leave its records there.
+  rm -rf "$WORK"
+  mkdir -m 700 "$WORK"
   # A test may set up several runs: no stand-in state carries over from the one before.
   rm -f "$T_TMP/revoked" "$T_TMP/revoked-still-works" "$T_TMP/refs-change" "$T_TMP"/delete-fails-* "$T_TMP"/delete-lies-* \
     "$T_TMP"/extra-* "$T_TMP"/fail-* "$T_TMP"/reach-* "$T_TMP"/request-*.json
@@ -4817,7 +4820,9 @@ test_with_timeout_stops_the_real_command_under_a_function() {
 cleanup_stubs() {
   short_copy
   WORK="$T_TMP/work"
-  [[ -d "$WORK" ]] || mkdir -m 700 "$WORK"
+  # A fresh folder for each run, as make_work makes one (the clean-up no longer deletes it, round 96).
+  rm -rf "$WORK"
+  mkdir -m 700 "$WORK"
   : >"$T_TMP/calls"
   : >"$T_TMP/timeline"
   : >"$T_TMP/revoked"
@@ -5504,6 +5509,8 @@ test_no_request_bypasses_the_wrappers_or_holds_a_stop() {
 # read with a revoked token HTTP 401, mergeability MERGEABLE, anything else with nothing.
 request_tools() { # <seconds>
   local t
+  # A fresh work folder for each run, as make_work makes one (the clean-up no longer deletes it, round 96).
+  [[ "$WORK" != "$T_TMP"/* ]] || rm -rf "$WORK"
   mkdir -p "$T_TMP/bin" "$WORK/home" "$WORK/clone"
   for t in gh git curl; do
     cat >"$T_TMP/bin/$t" <<EOF
@@ -6035,7 +6042,7 @@ test_a_lost_work_folder_still_revokes_and_reports_incomplete() {
     assert_exit 1 "$RC" "$name: the run's status (137: still running after 20s; 2: the clean-up stopped)"
     ((SECS <= REVOKE_SECS + CLEANUP_SECS + 3)) || _t_fail "$name: ended after ${SECS}s"
     last="$(printf '%s\n' "$OUT" | tail -n 1)"
-    lost="this run's records of writes with no answer, in $WORK, can't be read (the folder is gone, replaced or unreadable): any write they held has an unknown outcome;"
+    lost="this run's records of writes with no answer, in $WORK, can't be read (the folder is gone, replaced, unreadable or unusable): any write they held has an unknown outcome;"
     assert_not_contains "$OUT" "CLEANUP DONE" "$name"
     case "$name" in
       "no fresh folder"*)
@@ -6054,18 +6061,110 @@ test_a_lost_work_folder_still_revokes_and_reports_incomplete() {
     case "$name" in
       "a record unreadable")
         assert_contains "$last" "this run's record unsettled, in $WORK, can't be read: any write it held has an unknown outcome;" "$name"
-        [[ ! -e "$WORK" ]] || _t_fail "$name: the run's own folder was not removed" ;;
+        [[ -d "$WORK" ]] || _t_fail "$name: the run's own folder was deleted (owner, round 96: never deleted)" ;;
       "no fresh folder"*) ;;
       *)
-        assert_contains "$OUT" "CLEANUP the run's work folder $WORK is gone, replaced or unreadable" "$name"
+        assert_contains "$OUT" "CLEANUP the run's work folder $WORK is gone, replaced, unreadable or unusable" "$name"
         assert_contains "$last" "$lost" "$name" ;;
     esac
     case "$name" in
       "the folder replaced") [[ -f "$WORK/keep" ]] || _t_fail "$name: the folder at the run's path was deleted" ;;
       "the folder unreadable") [[ -d "$WORK" ]] || _t_fail "$name: the folder at the run's path was deleted" ;;
     esac
-    [[ -z "$(ls -A "$T_TMP/tmpd" 2>/dev/null)" ]] || _t_fail "$name: a fresh folder was left behind: $(ls -A "$T_TMP/tmpd")"
+    # Owner, round 96: neither folder is deleted; each is kept, private, for the owner to remove.
+    assert_contains "$OUT" "CLEANUP this run's work folder $WORK is not deleted: it stays, private, for you to remove later once approved (nothing in it is shown)" "$name"
+    n="$(find "$T_TMP/tmpd" -mindepth 1 -maxdepth 1 -name 'frg26-recover.*' 2>/dev/null | wc -l | tr -d ' ')"
+    case "$name" in
+      "the folder"*)
+        assert_eq "$n" 1 "$name: the fresh folder, kept"
+        assert_eq "$(stat -f '%Lp' "$T_TMP"/tmpd/frg26-recover.*)" 700 "$name: the fresh folder's mode"
+        assert_contains "$OUT" "is used for the clean-up's own requests; it is kept, private, not deleted" "$name" ;;
+      *) assert_eq "$n" 0 "$name: a fresh folder made" ;;
+    esac
     rm -rf "$WORK" "$T_TMP/tmpd"
+  done
+}
+
+# Review-lens round 96 (C1 = SEC-1, C2 = SEC-2), owner 2026-11-24: the folder in use, the run's own or
+# a fresh one, lost, replaced or unwritable during the clean-up never stops it: before each request
+# that needs a file, the folder is checked against its marker; one that fails is set aside (never
+# written to or deleted, its contents untouched) and a fresh private folder used, at most three in
+# all. The revocations (which need none) are sent within the cap; a request that can't get a file is
+# not sent, and said so; nothing is claimed confirmed that wasn't read; the clean-up is INCOMPLETE.
+# Neither the run's folder nor a fresh one is ever deleted.
+test_a_folder_lost_during_the_clean_up_never_stops_it() {
+  local case name before lose tmpd child last n fresh
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  for case in "the run's folder removed during it%%rm -rf \"\$WORK\"" \
+    "the run's folder replaced during it%%rm -rf \"\$WORK\"; mkdir \"\$WORK\"; echo keep >\"\$WORK/keep\"" \
+    "the run's folder unwritable during it%%chmod 500 \"\$WORK\"" \
+    "the fresh folder removed during it%rm -rf \$WORK%rm -rf \"\$RECOVER_DIR\"" \
+    "the fresh folder replaced during it%rm -rf \$WORK%rm -rf \"\$RECOVER_DIR\"; mkdir \"\$RECOVER_DIR\"; echo keep >\"\$RECOVER_DIR/keep\"" \
+    "the run's folder unwritable, no fresh one possible%%chmod 500 \"\$WORK\"" \
+    "nothing lost%%"; do
+    IFS='%' read -r name before lose <<<"$case"
+    child=$((child + 1))
+    short_copy
+    WORK="$T_TMP/work"
+    request_tools "$child"
+    tmpd="$T_TMP/tmpd"
+    mkdir -p "$tmpd"
+    [[ "$name" != *"no fresh one possible" ]] || tmpd="$T_TMP/none"
+    # The change comes once the clean-up has begun, after its first check of the folder.
+    LOSE="$lose"
+    keep_as_orig settle_register
+    settle_register() { eval "$LOSE"; orig_settle_register; }
+    stopped_run_cleanup 0 "own_work; TMPDIR=$tmpd" "$before"
+    chmod -R u+rwx "$T_TMP/work" "$T_TMP/tmpd" 2>/dev/null
+    ((SECS <= REVOKE_SECS + CLEANUP_SECS + 3)) || _t_fail "$name: ended after ${SECS}s"
+    last="$(printf '%s\n' "$OUT" | tail -n 1)"
+    n="$(grep -c 'gh api -X DELETE installation/token' "$T_TMP/tools")"
+    ((n >= 3)) || _t_fail "$name: revocations sent: $n, not every token's"
+    if [[ "$name" == "nothing lost" ]]; then
+      assert_exit 0 "$RC" "$name: the run's status"
+      assert_eq "$last" "CLEANUP DONE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; nothing left undone" "$name"
+      [[ -f "$WORK/work-mark" ]] || _t_fail "$name: the run's folder was deleted"
+      rm -rf "$T_TMP/work" "$T_TMP/tmpd"
+      continue
+    fi
+    assert_exit 1 "$RC" "$name: the run's status (137: still running after 20s; 2: the clean-up stopped)"
+    assert_not_contains "$OUT" "CLEANUP DONE" "$name"
+    assert_contains "$last" "this run's records of writes with no answer, in $WORK, can't be read (the folder is gone, replaced, unreadable or unusable): any write they held has an unknown outcome;" "$name"
+    if [[ "$name" == *"no fresh one possible" ]]; then
+      assert_not_contains "$OUT" "revoked: a read with it now gets HTTP 401" "$name: a revocation claimed confirmed"
+      assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): none; NOT confirmed: token1 token2 token3;" "$name"
+      assert_contains "$OUT" "not sent: no usable folder for its output" "$name"
+      assert_contains "$last" "the clean-up's own requests or records that needed a file were not made (no usable folder): what they would have shown is unknown;" "$name"
+    else
+      for n in 1 2 3; do
+        assert_contains "$OUT" "TOKEN token$n revoked: a read with it now gets HTTP 401" "$name: token$n confirmed"
+      done
+      assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none;" "$name"
+    fi
+    case "$name" in
+      "the fresh folder"*)
+        assert_contains "$last" "can't be read (gone, replaced, unreadable or unusable): any record written there is lost;" "$name: the first fresh folder" ;;
+    esac
+    case "$name" in
+      "the run's folder replaced"*)
+        assert_eq "$(ls -A "$WORK")" "keep" "$name: the replacement's contents"
+        assert_eq "$(cat "$WORK/keep")" "keep" "$name: the replacement's file" ;;
+      "the fresh folder replaced"*)
+        for fresh in "$tmpd"/frg26-recover.*; do
+          [[ ! -f "$fresh/keep" ]] || break
+        done
+        assert_eq "$(ls -A "$fresh")" "keep" "$name: the replacement's contents"
+        assert_eq "$(cat "$fresh/keep")" "keep" "$name: the replacement's file" ;;
+    esac
+    # Kept, not deleted: the run's folder (where it still stands) and every fresh one still standing.
+    case "$name" in
+      *"unwritable"*) [[ -f "$WORK/work-mark" ]] || _t_fail "$name: the run's folder was deleted" ;;
+    esac
+    if [[ "$name" != *"no fresh one possible" ]]; then
+      n="$(find "$tmpd" -mindepth 1 -maxdepth 1 -name 'frg26-recover.*' | wc -l | tr -d ' ')"
+      ((n >= 1)) || _t_fail "$name: no fresh folder kept"
+    fi
+    rm -rf "$T_TMP/work" "$T_TMP/tmpd"
   done
 }
 
@@ -6078,7 +6177,7 @@ test_a_pending_create_or_a_lost_work_folder_is_never_an_empty_list() {
   end_stand_in_run
   local out rc pending gone
   pending="writes with outcome unknown (not retried, not reconciled: check them on GitHub): app gh issue create --repo $REPO (no complete answer registered: it may have been made);"
-  gone="this run's records of writes with no answer, in $T_TMP/gone, can't be read (the folder is gone, replaced or unreadable): any write they held has an unknown outcome;"
+  gone="this run's records of writes with no answer, in $T_TMP/gone, can't be read (the folder is gone, replaced, unreadable or unusable): any write they held has an unknown outcome;"
   WORK="" WORK_MADE="" PENDING_CREATE="app gh issue create --repo $REPO"
   rc=0; out="$(cleanup_summary)" || rc=$?
   assert_exit 1 "$rc" "no work folder, a create pending"
