@@ -951,20 +951,21 @@ test_a_ruleset_create_is_sent_once_whatever_its_answer() {
         echo "$*" >>"$T_TMP/owner"
         printf '%s\n' "$FIRST_OUT"
         return "$FIRST_RC" ;;
+      # Round 115: read back by its id, as GitHub returns it: the form sent, or the admin-role form.
+      "api repos/$REPO/rulesets/7")
+        if [[ "$SUMMARY" == user ]]; then ruleset_json User 1; else ruleset_json RepositoryRole 5; fi ;;
     esac
   }
   ruleset_count() { echo "$COUNT"; }
-  ruleset_summary() { echo "$SUMMARY"; }
+  ruleset_summary() { echo "a summary"; }
   die() { printf 'DIED: %s\n' "$*"; unknown_writes; exit 2; } # with the writes the clean-up would name
-  local case_ name rc want_rc out user admin
-  user="active branch refs/heads/main 0 deletion,non_fast_forward,update:false User:1:always"
-  admin="active branch refs/heads/main 0 deletion,non_fast_forward,update:false RepositoryRole:5:always"
-  for case_ in "a gateway error|gh: HTTP 502 Bad Gateway|1|0|$user|2" \
-    "a 422 with no ruleset after it (the old fallback)|gh: Validation Failed (HTTP 422)|1|0|$user|2" \
-    "a 422 with a ruleset after it|gh: Validation Failed (HTTP 422)|1|1|$user|2" \
-    "an unexpected answer, status 0|{\"message\":\"later\"}|0|0|$user|2" \
-    "its expected answer, another form read back|{\"id\":7}|0|1|$admin|2" \
-    "its expected answer, its form read back|{\"id\":7}|0|1|$user|0"; do
+  local case_ name rc want_rc out
+  for case_ in "a gateway error|gh: HTTP 502 Bad Gateway|1|0|user|2" \
+    "a 422 with no ruleset after it (the old fallback)|gh: Validation Failed (HTTP 422)|1|0|user|2" \
+    "a 422 with a ruleset after it|gh: Validation Failed (HTTP 422)|1|1|user|2" \
+    "an unexpected answer, status 0|{\"message\":\"later\"}|0|0|user|2" \
+    "its expected answer, another form read back|{\"id\":7}|0|1|admin|2" \
+    "its expected answer, its form read back|{\"id\":7}|0|1|user|0"; do
     IFS='|' read -r name FIRST_OUT FIRST_RC COUNT SUMMARY want_rc <<<"$case_"
     : >"$T_TMP/owner"
     rc=0
@@ -976,7 +977,7 @@ test_a_ruleset_create_is_sent_once_whatever_its_answer() {
       assert_contains "$(cat "$T_TMP/owner")" "VERIFY ruleset" "$name"
       assert_not_contains "$out" "POST repos/$REPO/rulesets (" "$name: named outcome unknown"
     elif [[ "$name" == *"another form"* ]]; then
-      assert_contains "$out" "DIED: the ruleset read back is not the one requested ($admin)" "$name"
+      assert_contains "$out" "DIED: the ruleset read back is not, field for field, the one requested" "$name"
       # Round 113 (review-lens round 100, C4; owner): its expected answer alone doesn't settle it; only
       # the read-back of the form sent does, so one that fails leaves it outcome unknown.
       assert_contains "$out" "owner gh api POST repos/$REPO/rulesets (" "$name: settled before its read-back"
@@ -1805,6 +1806,27 @@ p_stubs() { # app and owner calls are logged; answers come from $T_TMP/answers (
   app_gh() { answer app_gh "$@"; }
   app_git() { answer app_git "$@"; }
   owner_gh() { answer owner_gh "$@"; }
+  # Round 115: the app's attempt goes through curl; its stand-in answers as the gh-era stand-ins did
+  # (app_gh's answer for the same arguments; gh's exit 1 for a refusal), then gives curl's own report:
+  # the answer's own status, no redirect, TLS verified, the address asked. An answer with exit 0 and no
+  # status line is GitHub's 200 with it as the body ({} for nothing); words without an HTTP answer and a
+  # failure are a transfer that failed (curl 56).
+  attempt_send() {
+    local LC_ALL=C rc=0 st b
+    app_gh api "$@" >"$T_TMP/sent.out" || rc=$?
+    st="$(head -n 1 "$T_TMP/sent.out" | sed -n 's/^HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p')"
+    if [[ $rc -eq 0 && -z "$st" ]]; then
+      b="$(cat "$T_TMP/sent.out")"
+      [[ -n "$b" ]] || b='{}'
+      printf 'HTTP/2 200\r\nContent-Length: %s\r\n\r\n%s' "${#b}" "$b" >"$T_TMP/sent.out"
+    fi
+    st="$(head -n 1 "$T_TMP/sent.out" | sed -n 's/^HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p')"
+    cat "$T_TMP/sent.out"
+    [[ -n "$st" ]] || return 56
+    printf '\n@@FRG26-CURL %s 0 0 https://api.github.com/%s' "$st" "$AT_PATH"
+    if [[ $rc -le 1 ]]; then return 0; fi
+    return "$rc"
+  }
   fresh_from() { :; }
   add_commit() { echo "commit $1" >>"$T_TMP/calls"; }
   sleep() { :; }
@@ -1921,16 +1943,22 @@ test_a2_api_attempts_are_settled_only_against_the_second_throwaways_refs() {
     gh_reply reply drop=X-Accepted-Github-Permissions "add=X-Accepted-Github-Permissions: contents=write"
     a2_answers "app_gh api -X PUT repos/$REPO2/|1|@reply" "app_gh api -X POST repos/$REPO2/|1|@reply"
     echo "$more" >"$T_TMP/more"
+    # Round 115: the refs as GitHub's JSON (each page a list), as state_refs2 reads them.
     answer_refs() {
-      local n=0
+      local n=0 a
+      a="$(printf 'a%.0s' $(seq 1 40))"
       [[ -f "$T_TMP/refs-reads" ]] && n="$(cat "$T_TMP/refs-reads")"
       echo $((n + 1)) >"$T_TMP/refs-reads"
-      printf 'refs/heads/frg26-a2 %s\n' "$(printf 'a%.0s' $(seq 1 40))"
-      if [[ $n -ge 1 && "$(cat "$T_TMP/more")" == 1 ]]; then echo "refs/heads/sneaked 0123456789abcdef0123456789abcdef01234567"; fi
+      if [[ $n -ge 1 && "$(cat "$T_TMP/more")" == 1 ]]; then
+        printf '[{"ref":"refs/heads/frg26-a2","object":{"sha":"%s"}},{"ref":"refs/heads/sneaked","object":{"sha":"0123456789abcdef0123456789abcdef01234567"}}]\n' "$a"
+      else
+        printf '[{"ref":"refs/heads/frg26-a2","object":{"sha":"%s"}}]\n' "$a"
+      fi
     }
     owner_gh() {
       case "$*" in
         *"matching-refs/heads"*) echo "owner_gh $*" >>"$T_TMP/calls"; answer_refs ;;
+        *"matching-refs/tags"*) echo '[]' ;;
         *) answer owner_gh "$@" ;;
       esac
     }
@@ -2967,7 +2995,7 @@ s2c_replies() { # [extra answer line…]
     echo "app_gh api repos/$REPO/environments/frg26-test/secrets/public-key|1|@reply-environments=read"
     echo "app_gh api -X DELETE repos/$REPO/environments/frg26-test/secrets/|1|@reply-environments=write"
   } >"$T_TMP/answers"
-  environment_state() { echo "the Environment as it was"; }
+  state_environment() { echo '{"the Environment":"as it was"}'; }
 }
 
 test_s2c_the_app_cannot_change_the_environment() {
@@ -5022,7 +5050,8 @@ short_copy() {
   local short="$T_TMP/github-throwaway-short.sh"
   sed -e 's/^readonly CALL_SECS=20 /readonly CALL_SECS=1 /' -e 's/^readonly REVOKE_SECS=90 /readonly REVOKE_SECS=3 /' \
     -e 's/^readonly CLEANUP_SECS=180 /readonly CLEANUP_SECS=6 /' -e 's/^readonly CONTROL_SECS=240 /readonly CONTROL_SECS=12 /' \
-    -e 's/^readonly PUSH_SECS=60 /readonly PUSH_SECS=2 /' -e 's/^readonly CLONE_SECS=120 /readonly CLONE_SECS=3 /' "$GT" >"$short"
+    -e 's/^readonly PUSH_SECS=60 /readonly PUSH_SECS=2 /' -e 's/^readonly CLONE_SECS=120 /readonly CLONE_SECS=3 /' \
+    -e "s#^readonly APP_API_CURL=\"/usr/bin/curl\" #readonly APP_API_CURL=\"$T_TMP/bin/curl\" #" "$GT" >"$short"
   # shellcheck source=tests/permissions/github-throwaway.sh
   source "$short"
   # The clean-up runs in each stopped run's own subshell; here, the exit trap sourcing installs
@@ -5632,9 +5661,9 @@ test_no_request_bypasses_the_wrappers_or_holds_a_stop() {
   assert_contains "$out" " verify_phase " "a function that makes requests through others"
   # shellcheck disable=SC2016 # the canary is script text for the scan, never run
   printf '%s\n' 'owner_gh() { :; }' 'reads() { owner_gh api x; }' 'a() { x="$(owner_gh api y)"; }' 'b() { reads | head -n 1; }' \
-    'c() { gh api z; }' 'd() { sleep 3; }' 'e() { y="$(reads)"; }' >"$T_TMP/canary.sh"
+    'c() { gh api z; }' 'd() { sleep 3; }' 'e() { y="$(reads)"; }' 'f() { /usr/bin/curl https://x; }' >"$T_TMP/canary.sh"
   out="$(python3 -I "$SCAN" "$T_TMP/canary.sh")"
-  for want in "held 3:" "held 4:" "raw 5:" "sleep 6:" "held 7:"; do assert_contains "$out" "$want" "the canary"; done
+  for want in "held 3:" "held 4:" "raw 5:" "sleep 6:" "held 7:" "raw 8:"; do assert_contains "$out" "$want" "the canary"; done
   load
   assert_eq "$CALL_SECS ${PUSH_SECS:-none} ${CLONE_SECS:-none}" "20 60 120" "the stated limits"
   if declare -F git_secs >/dev/null; then
@@ -5644,7 +5673,8 @@ test_no_request_bypasses_the_wrappers_or_holds_a_stop() {
   fi
   # shellcheck disable=SC2016 # the literal source text is what's searched for
   for want in 'owner_gh() { with_timeout "$(call_secs)" owner_gh_run "$@"; }' 'app_gh() { with_timeout "$(call_secs)" app_gh_run "$@"; }' \
-    'app_git() { with_timeout "$(git_secs "$@")" app_git_run "$@"; }' 'app_curl() { with_timeout $((CALL_SECS + 5)) curl "$@"; }'; do
+    'app_git() { with_timeout "$(git_secs "$@")" app_git_run "$@"; }' 'app_curl() { with_timeout $((CALL_SECS + 5)) curl "$@"; }' \
+    'app_api_curl() { with_timeout "$(call_secs)" app_api_curl_run "$@"; }'; do
     grep -qxF -- "$want" <(sed 's/ *# .*$//' "$GT") || _t_fail "not bounded where it starts: $want"
   done
   end_stand_in_run
@@ -5662,11 +5692,46 @@ request_tools() { # <seconds>
   for t in gh git curl; do
     cat >"$T_TMP/bin/$t" <<EOF
 #!/bin/bash
+# Its folder written in (round 115): the app's attempt runs the fixed curl with an empty environment.
+[[ -n "\${T_TMP:-}" ]] || T_TMP="$T_TMP"
 printf '%s $t %s\n' "\$(date +%s)" "\$*" >>"\$T_TMP/tools"
 h="\$(cat "\$T_TMP/hang-on" 2>/dev/null)"
 if [[ -n "\$h" && "$t \$*" == *"\$h"* ]]; then /bin/sleep "\$(cat "\$T_TMP/child")" & wait; exit 1; fi
 EOF
   done
+  cat >>"$T_TMP/bin/curl" <<'EOF'
+# Round 115: the app's attempt through the fixed curl (a copy's APP_API_CURL is this stand-in). A call
+# containing the text in fd-probe notes its arguments, its environment (bash's own PWD, SHLVL, _ and
+# OLDPWD aside), the hash of the token on its standard input (never the token), its descriptors 0-254,
+# its pid, the process table and lsof's view, then answers with $T_TMP/reply and curl's own report.
+# No redirection before the descriptor checks, so the probe adds none of its own.
+p="$(cat "$T_TMP/fd-probe" 2>/dev/null)"
+if [[ -n "$p" && "$*" == *"$p"* ]]; then
+  r=""
+  if [[ -p /dev/fd/0 ]]; then r="${r}0 pipe;"; elif [[ /dev/fd/0 -ef /dev/null ]]; then r="${r}0 null;"; else r="${r}0 other;"; fi
+  if [[ -p /dev/fd/1 ]]; then r="${r}1 pipe;"; else r="${r}1 other;"; fi
+  if [[ /dev/fd/2 -ef /dev/null ]]; then r="${r}2 null;"; else r="${r}2 other;"; fi
+  for ((n = 3; n < 255; n++)); do
+    if [[ -e /dev/fd/$n ]]; then r="${r}$n open;"; fi
+  done
+  e="$(env | sed -E '/^(PWD|SHLVL|_|OLDPWD)=/d' | sort | tr '\n' ' ')"
+  a=""
+  while IFS= read -r l; do
+    case "$l" in "Authorization: Bearer "*) a="Authorization: Bearer sha256:$(printf '%s' "${l#Authorization: Bearer }" | shasum -a 256 | cut -d' ' -f1)" ;; esac
+  done
+  printf '%s\n' "$*" >"$T_TMP/probe-args"
+  printf '%s\n' "$r" >"$T_TMP/probe-fds"
+  printf '%s\n' "${e% }" >"$T_TMP/probe-env"
+  printf '%s\n' "$a" >"$T_TMP/probe-auth"
+  echo "$$" >"$T_TMP/probe-pid"
+  /bin/ps -ax -o pid= -o ppid= >"$T_TMP/probe-ps" 2>&1
+  /usr/sbin/lsof -nP -w >"$T_TMP/probe-lsof" 2>&1
+  st="$(head -n 1 "$T_TMP/reply" | sed -n 's/^HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p')"
+  cat "$T_TMP/reply"
+  printf '\n@@FRG26-CURL %s 0 0 %s' "$st" "${*: -1}"
+  exit 0
+fi
+EOF
   cat >>"$T_TMP/bin/gh" <<'EOF'
 # Round 114: a call containing the text in fd-probe notes what it was given (its arguments, its
 # descriptors 0-30, its pid, the process table and lsof's view of every process), then answers with
@@ -7054,7 +7119,7 @@ test_an_api_refusal_needs_a_complete_answer_attributable_to_its_operation() {
     WRITES_UNKNOWN="" WRITES_OUT=""
     app_attempt -X PATCH "repos/$REPO" -f description=x >/dev/null 2>&1
     assert_eq "$OBS" "$want" "$name"
-    assert_contains "$(cat "$T_TMP/calls")" "app_gh api -X PATCH repos/$REPO -f description=x -i -H Accept-Encoding: identity" "$name: GitHub's whole answer asked for"
+    assert_contains "$(cat "$T_TMP/calls")" "app_gh api -X PATCH repos/$REPO -f description=x" "$name: the attempt sent"
     assert_contains "$(unknown_writes)" "app gh api PATCH repos/$REPO (" "$name: the attempt named outcome unknown"
     assert_not_contains "$LAST_OUT" "CANARY" "$name: the body's text kept"
   done
@@ -7090,16 +7155,18 @@ test_a_refused_write_is_settled_only_with_its_baseline_read_back_unchanged() {
       echo "owner_gh $*" >>"$T_TMP/calls"
       local n r
       case "$*" in
-        "api repos/$REPO/branches/dev --jq .protected")
+        "api repos/$REPO/branches/dev")
           n=$(($(cat "$T_TMP/protected-n" 2>/dev/null || echo 0) + 1))
           echo "$n" >"$T_TMP/protected-n"
           r="$(cut -d' ' -f"$n" "$T_TMP/protected-reads")"
           if [[ "$r" == error ]]; then echo "gh: HTTP 502" >&2; return 1; fi
-          echo "$r" ;;
-        "api repos/$REPO/branches/dev/protection") echo '{"enforce_admins":{"enabled":false}}' ;;
+          printf '{"name":"dev","protected":%s}\n' "$r" ;;
+        "api repos/$REPO/branches/dev/protection")
+          echo '{"enforce_admins":{"enabled":false},"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}' ;;
       esac
     }
     rm -f "$T_TMP/protected-n"
+    printf '{"required_status_checks":null,"enforce_admins":false,"required_pull_request_reviews":null,"restrictions":null}\n' >"$WORK/weak.json"
     cat >"$T_TMP/answers" <<EOF
 app_gh api -X PUT repos/$REPO/branches/dev/protection|1|@reply
 app_gh api -X DELETE repos/$REPO/branches/dev/protection|1|@reply
@@ -7198,24 +7265,25 @@ test_an_app_attempts_answer_is_held_in_memory_whole_or_not_at_all() {
 }
 
 # Round 114 (review-lens round 100's C3 = SEC-1, item 1; owner): an attempt's answer is taken only from
-# the gh its own job starts, given exactly that attempt's method and path: gh's standard input is
-# /dev/null, its standard output the answer's pipe, its error output /dev/null, and it has no other
-# descriptor; the pipe's write end is held only by gh and the job's own shells, never by the run's
-# shell or anything else. lsof's view is supporting evidence from this test, not proof against every
-# way another process could interfere.
+# the program its own job starts (round 115: the fixed curl), given exactly that attempt's method and
+# path: its standard input the headers' pipe (round 115), its standard output the answer's pipe, its
+# error output /dev/null, and no other descriptor; the answer pipe's write end is held only by that
+# program and the job's own shells, never by the run's shell or anything else. lsof's view is
+# supporting evidence from this test, not proof against every way another process could interfere.
 test_an_app_attempts_answer_comes_only_from_the_gh_its_job_started() {
   local gh run dev holders h anc p
   short_copy
   WORK="$T_TMP/work"
   request_tools 0
   gh_reply reply
-  echo "api -X PATCH repos/$REPO -f description=x" >"$T_TMP/fd-probe"
+  echo "https://api.github.com/repos/$REPO" >"$T_TMP/fd-probe"
   # shellcheck disable=SC2016 # run inside the stopped run: $PPID there is the run itself
   stopped_run_cleanup 0 "PHASE=permissions CLONE=\$WORK/clone" \
     '/bin/sh -c "echo \$PPID" >$T_TMP/run-pid; app_attempt -X PATCH "repos/$REPO" -f description=x; echo "VERDICT $OBS"'
-  assert_contains "$OUT" "VERDICT refused" "the attempt judged on the answer gh gave"
-  assert_eq "$(cat "$T_TMP/probe-args")" "api -X PATCH repos/$REPO -f description=x -i -H Accept-Encoding: identity" "what gh was asked"
-  assert_eq "$(cat "$T_TMP/probe-fds")" "0 null;1 pipe;2 null;" "gh's descriptors"
+  assert_contains "$OUT" "VERDICT refused" "the attempt judged on the answer curl gave"
+  assert_contains " $(cat "$T_TMP/probe-args") " " -X PATCH " "what curl was asked: its method"
+  assert_contains " $(cat "$T_TMP/probe-args") " " https://api.github.com/repos/$REPO " "what curl was asked: its address"
+  assert_eq "$(cat "$T_TMP/probe-fds")" "0 pipe;1 pipe;2 null;" "curl's descriptors"
   gh="$(cat "$T_TMP/probe-pid")" run="$(cat "$T_TMP/run-pid")"
   dev="$(awk -v p="$gh" '$2 == p && $4 ~ /^1[uw]?$/ && $5 == "PIPE" { print $6 }' "$T_TMP/probe-lsof")"
   [[ "$dev" == 0x* ]] || _t_fail "gh's fd 1 is not a pipe in lsof's view: $(awk -v p="$gh" '$2 == p' "$T_TMP/probe-lsof" | head -n 5)"
@@ -7234,20 +7302,22 @@ test_an_app_attempts_answer_comes_only_from_the_gh_its_job_started() {
   [[ " $holders " != *" $run "* ]] || _t_fail "the run's own shell holds the answer's write end"
 }
 
-# Round 114 (owner: test partial output and child failure): an answer that isn't the whole of one gh's
-# own output, as it ended, is never complete: cut short, followed by gh's failure, or added to by a
-# process gh left behind after its end.
+# Round 114 (owner: test partial output and child failure): an answer that isn't the whole of one
+# program's own output, as it ended, is never complete: cut short, followed by its failure, or added to by
+# a process it left behind after its end. Round 115: the program is curl, so the stand-in is the
+# transport itself, with curl's own report where curl would give one.
 test_an_app_attempts_answer_partial_or_added_to_is_never_complete() {
   local case name how
   # shellcheck disable=SC2016 # each is run as written, in the stand-in
-  for case in "half the reply, then gh fails|head -c 120 \"\$T_TMP/reply\"; return 1" \
-    "the whole reply, then gh exits 2|cat \"\$T_TMP/reply\"; return 2" \
-    "the whole reply, then a process it left writes more|cat \"\$T_TMP/reply\"; (/bin/sleep 0.2; echo more) & return 1" \
-    "a process it left writes first, then the reply|(echo before) ; cat \"\$T_TMP/reply\"; return 1"; do
+  for case in "half the reply, then curl fails (18)|head -c 120 \"\$T_TMP/reply\"; return 18" \
+    "the whole reply and its report, then curl exits 56|cat \"\$T_TMP/reply\"; curl_report; return 56" \
+    "the whole reply and its report, then a process it left writes more|cat \"\$T_TMP/reply\"; curl_report; (/bin/sleep 0.2; echo more) & return 0" \
+    "a process it left writes first, then the reply and its report|(echo before) ; cat \"\$T_TMP/reply\"; curl_report; return 0"; do
     IFS='|' read -r name how <<<"$case"
     p_stubs
     gh_reply reply
-    eval "app_gh() { echo \"app_gh \$*\" >>\"\$T_TMP/calls\"; $how; }"
+    curl_report() { printf '\n@@FRG26-CURL 403 0 0 https://api.github.com/%s' "$AT_PATH"; }
+    eval "attempt_send() { echo \"attempt_send \$*\" >>\"\$T_TMP/calls\"; $how; }"
     WRITES_UNKNOWN="" WRITES_OUT=""
     app_attempt -X PATCH "repos/$REPO" -f description=x >/dev/null 2>&1
     assert_eq "$OBS" inconclusive "$name"
@@ -7284,10 +7354,250 @@ test_an_app_attempt_is_sent_only_in_its_fixed_form() {
   done
   # The forms its callers use are accepted as they are.
   p_stubs
+  printf '{"enforce_admins":false}\n' >"$WORK/weak.json"
   app_attempt "repos/$REPO/actions/secrets" >/dev/null 2>&1
   app_attempt -X PUT "repos/$REPO/branches/dev/protection" --input "$WORK/weak.json" >/dev/null 2>&1
   app_attempt -X POST "repos/$REPO/actions/runs/1/pending_deployments" -F "environment_ids[]=9" -f state=approved >/dev/null 2>&1
   assert_eq "$(grep -c '^app_gh api' "$T_TMP/calls")" 3 "the callers' forms sent"
+  end_stand_in_run
+}
+
+# Round 115 (review-lens round 101, C1 = SEC-2; owner): each part of a baseline is read on its own and
+# must parse as GitHub's JSON of its kind, of the expected type, with its required fields; a read that
+# fails, answers nothing, or answers anything else leaves the whole baseline unreadable. No word in an
+# answer decides it.
+test_each_baseline_part_is_validated_on_its_own() {
+  local case name reader answer rc want
+  # <name>|<reader and args>|<the owner's answer, one JSON text>|<its status>|<0 readable, 1 not>
+  for case in "an unprotected branch|state_protection dev|{\"name\":\"dev\",\"protected\":false}|0|0" \
+    "a branch read failing|state_protection dev|{\"name\":\"dev\",\"protected\":false}|1|1" \
+    "a branch read answering nothing|state_protection dev||0|1" \
+    "a branch read not JSON|state_protection dev|not json|0|1" \
+    "a branch read of another branch|state_protection dev|{\"name\":\"main\",\"protected\":false}|0|1" \
+    "a branch read without its protected flag|state_protection dev|{\"name\":\"dev\"}|0|1" \
+    "a branch read whose flag isn't a boolean|state_protection dev|{\"name\":\"dev\",\"protected\":\"false\"}|0|1" \
+    "the word error as a value|state_repo|{\"full_name\":\"@REPO@\",\"description\":\"error\",\"homepage\":null,\"default_branch\":\"main\",\"visibility\":\"public\",\"archived\":false}|0|0" \
+    "the repository, its settings whole|state_repo|{\"full_name\":\"@REPO@\",\"description\":\"m\",\"homepage\":null,\"default_branch\":\"main\",\"visibility\":\"public\",\"archived\":false}|0|0" \
+    "the repository read answering nothing|state_repo||0|1" \
+    "another repository|state_repo|{\"full_name\":\"someone/else\",\"description\":\"m\",\"homepage\":null,\"default_branch\":\"main\",\"visibility\":\"public\",\"archived\":false}|0|1" \
+    "the repository without its default branch|state_repo|{\"full_name\":\"@REPO@\",\"description\":\"m\",\"visibility\":\"public\",\"archived\":false}|0|1" \
+    "the repository as a list|state_repo|[]|0|1" \
+    "no rulesets|state_rulesets|[]|0|0" \
+    "the rulesets read answering nothing|state_rulesets||0|1" \
+    "the rulesets as an object|state_rulesets|{}|0|1" \
+    "a ruleset without a number id|state_rulesets|[{\"id\":\"5\"}]|0|1" \
+    "the Environment's read answering nothing|state_environment||0|1" \
+    "the second throwaway's refs answering nothing|state_refs2||0|1" \
+    "the second throwaway's refs, a ref with no commit|state_refs2|[{\"ref\":\"refs/heads/frg26-a2\",\"object\":{}}]|0|1"; do
+    IFS='|' read -r name reader answer rc want <<<"$case"
+    p_stubs
+    answer="${answer//@REPO@/$REPO}"
+    printf '%s' "$answer" >"$T_TMP/state-answer"
+    echo "$rc" >"$T_TMP/state-rc"
+    owner_gh() { echo "owner_gh $*" >>"$T_TMP/calls"; cat "$T_TMP/state-answer"; return "$(cat "$T_TMP/state-rc")"; }
+    local got=0 out
+    # shellcheck disable=SC2086 # the reader and its arguments
+    out="$($reader)" || got=$?
+    if [[ "$want" == 0 ]]; then
+      assert_exit 0 "$got" "$name: read as a state"
+      jq -e . >/dev/null 2>&1 <<<"$out" || _t_fail "$name: its state is not JSON: $out"
+    else
+      [[ "$got" != 0 ]] || _t_fail "$name: read as a state: $out"
+    fi
+  done
+  # A baseline any part of which is unreadable is unreadable whole, and settles nothing.
+  p_stubs
+  PHASE=open
+  owner_gh() {
+    case "$*" in
+      "api repos/$REPO/rulesets") echo '[]' ;;
+      "api repos/$REPO") return 0 ;; # the repository's settings: answered with nothing
+    esac
+  }
+  attempt_baseline B13
+  assert_eq "$ATTEMPT_BASE_OK" "" "B13's baseline with its repository part empty"
+  OBS=refused EV="" ATTEMPT_WRITES="PATCH repos/$REPO"$'\n'
+  WRITES_UNKNOWN="" WRITES_OUT=""
+  write_unknown "app gh api PATCH repos/$REPO" "answered HTTP 403: refused, not read back"
+  attempts_settle B13
+  assert_eq "$OBS" inconclusive "a refusal with an unreadable baseline"
+  assert_contains "$(unknown_writes)" "app gh api PATCH repos/$REPO (" "the PATCH cleared"
+  end_stand_in_run
+}
+
+# Round 115 (review-lens round 101, C2; owner): the ruleset is read back by the id its create answered
+# with, and every field submitted (name, target, enforcement, conditions, each rule with its
+# parameters, each bypass actor) must equal the read-back, normalised; GitHub's own extra fields aside.
+# Anything else, or a read-back that fails, leaves the write outcome unknown.
+test_the_ruleset_is_settled_only_on_every_field_it_was_sent() {
+  local case name change want rc out
+  for case in "the same, in GitHub's order, with GitHub's own fields|.|0" \
+    "another name|.name = \"main: anyone\"|2" \
+    "evaluate, not active|.enforcement = \"evaluate\"|2" \
+    "a rule more|.rules += [{\"type\":\"creation\"}]|2" \
+    "a rule's parameter changed|.rules[2].parameters.update_allows_fetch_and_merge = true|2" \
+    "a bypass actor more|.bypass_actors += [{\"actor_id\":5,\"actor_type\":\"RepositoryRole\",\"bypass_mode\":\"always\"}]|2" \
+    "its bypass mode changed|.bypass_actors[0].bypass_mode = \"pull_request\"|2" \
+    "an excluded branch|.conditions.ref_name.exclude = [\"refs/heads/x\"]|2" \
+    "another target|.target = \"tag\"|2" \
+    "unreadable|@fail|2"; do
+    IFS='|' read -r name change want <<<"$case"
+    owner_cmd_stubs
+    verify_phase() { :; }
+    app_gh() { rate_fixture 4000; }
+    die() { printf 'DIED: %s\n' "$*"; unknown_writes; exit 2; }
+    echo "$change" >"$T_TMP/change"
+    owner_gh() {
+      echo "$*" >>"$T_TMP/owner"
+      case "$*" in
+        *"-X POST repos/$REPO/rulesets"*) echo '{"id":7,"name":"main: only the owner"}' ;;
+        "api repos/$REPO/rulesets/7")
+          [[ "$(cat "$T_TMP/change")" != @fail ]] || { echo "gh: HTTP 502" >&2; return 1; }
+          # GitHub's copy: its own fields added, keys and rules in another order.
+          ruleset_json User 1 | jq -c '{id: 7, source: "x/y", source_type: "Repository", node_id: "RRS_1", _links: {}, created_at: "t", updated_at: "t",
+            current_user_can_bypass: "always", rules: (.rules | reverse), bypass_actors, conditions, enforcement, target, name}' |
+            jq -c "$(cat "$T_TMP/change")" ;;
+      esac
+    }
+    rc=0
+    out="$({ cmd_ruleset && unknown_writes; } 2>&1)" || rc=$?
+    assert_exit "$want" "$rc" "$name"
+    if [[ "$want" == 0 ]]; then
+      assert_not_contains "$out" "POST repos/$REPO/rulesets (" "$name: still named outcome unknown"
+    else
+      assert_contains "$out" "owner gh api POST repos/$REPO/rulesets (" "$name: settled"
+    fi
+  done
+}
+
+# Round 115 (owner: the curl transport): what each caller's fields become as the body the app's attempt
+# sends: -f a string, -F a number, true, false or null (else a string), name[] a list; --input a JSON
+# object file, alone. Anything else is refused before anything is sent.
+test_an_app_attempts_body_is_built_from_its_fields_exactly() {
+  local case name args want got rc
+  p_stubs
+  printf '{"b": [1, 2], "a": "x"}\n' >"$WORK/in.json"
+  printf 'not json\n' >"$WORK/bad.json"
+  printf '[1]\n' >"$WORK/list.json"
+  for case in "no fields|-X DELETE repos/\$REPO/branches/dev/protection|" \
+    "a string|-X PATCH repos/\$REPO -f 'description=a \"quoted\" line'|{\"description\":\"a \\\"quoted\\\" line\"}" \
+    "a string with = and a newline|-X PATCH repos/\$REPO -f \$'description=x=y\\nz'|{\"description\":\"x=y\\nz\"}" \
+    "three strings|-X PUT repos/\$REPO2/contents/f.txt -f message=m -f content=Zm9v -f branch=b|{\"branch\":\"b\",\"content\":\"Zm9v\",\"message\":\"m\"}" \
+    "a typed list and strings|-X POST repos/\$REPO/actions/runs/1/pending_deployments -F environment_ids[]=9 -f state=approved -f comment=c|{\"comment\":\"c\",\"environment_ids\":[9],\"state\":\"approved\"}" \
+    "typed values|-X PATCH repos/\$REPO -F a=true -F b=false -F c=null -F d=12 -F e=x1|{\"a\":true,\"b\":false,\"c\":null,\"d\":12,\"e\":\"x1\"}" \
+    "a JSON file|-X PUT repos/\$REPO/environments/e --input \$WORK/in.json|{\"a\":\"x\",\"b\":[1,2]}"; do
+    IFS='|' read -r name args want <<<"$case"
+    eval "attempt_form $args" || _t_fail "$name: not in its form"
+    got=""
+    eval "attempt_body $args" || _t_fail "$name: no body"
+    got="$ATTEMPT_BODY"
+    [[ -z "$got" ]] || got="$(jq -S -c . <<<"$got")"
+    assert_eq "$got" "$want" "$name"
+  done
+  for case in "a file not JSON|-X PUT repos/\$REPO/environments/e --input \$WORK/bad.json" \
+    "a file not an object|-X PUT repos/\$REPO/environments/e --input \$WORK/list.json" \
+    "a file and fields|-X PUT repos/\$REPO/environments/e --input \$WORK/in.json -f a=b" \
+    "a field read from a file|-X PATCH repos/\$REPO -F description=@\$WORK/in.json" \
+    "a nested key|-X PATCH repos/\$REPO -f a[b]=c" \
+    "a field with no name|-X PATCH repos/\$REPO -f =c" \
+    "a field with no =|-X PATCH repos/\$REPO -f description"; do
+    IFS='|' read -r name args <<<"$case"
+    rc=0
+    eval "attempt_body $args" >/dev/null 2>&1 || rc=$?
+    [[ $rc -ne 0 ]] || _t_fail "$name: a body was built"
+  done
+  end_stand_in_run
+}
+
+# Round 115 (owner: the curl transport): the app's attempt goes through the fixed /usr/bin/curl, to
+# https://api.github.com/<its path> only, with verified HTTPS (never -k), no redirect, no proxy and no
+# curl settings of anyone's (-q first; nothing of the run's environment: no proxy, CA or curl
+# variables), no retry, and the token only on curl's standard input (a pipe): never an argument, a
+# file, the environment, the answer kept or the output. With a stand-in at the fixed path in a copy of
+# the script, since the real one would reach GitHub.
+test_an_app_attempt_goes_through_the_system_curl_alone() {
+  local args envs tok
+  short_copy
+  WORK="$T_TMP/work"
+  request_tools 0
+  gh_reply reply
+  echo "https://api.github.com/repos/$REPO" >"$T_TMP/fd-probe"
+  # shellcheck disable=SC2016 # run inside the stopped run
+  stopped_run_cleanup 0 "PHASE=permissions CLONE=\$WORK/clone; export https_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 CURL_HOME=$T_TMP SSL_CERT_FILE=$T_TMP/ca.pem CURL_CA_BUNDLE=$T_TMP/ca.pem SSLKEYLOGFILE=$T_TMP/keys" \
+    'app_attempt -X PATCH "repos/$REPO" -f description=x; echo "VERDICT $OBS"; echo "OUT $LAST_OUT"'
+  tok="$(cleanup_token 1)"
+  assert_contains "$OUT" "VERDICT refused" "the attempt judged on curl's answer"
+  args="$(cat "$T_TMP/probe-args")"
+  assert_eq "${args%% *}" "-q" "curl's first argument (no .curlrc)"
+  for want in "--proto =https" "--max-redirs 0" "--noproxy *" "-H @-" "-X PATCH" "--include" "-H Accept-Encoding: identity" \
+    "--data-binary {\"description\":\"x\"}" "https://api.github.com/repos/$REPO"; do
+    assert_contains " $args " " $want " "curl's arguments"
+  done
+  for want in " -k " " --insecure " " -L " " --location " " --retry" " -K " " --config "; do
+    assert_not_contains " $args " "$want" "curl's arguments"
+  done
+  assert_eq "$(tr ' ' '\n' <<<"$args" | grep -c '^https://')" 1 "the one destination"
+  # The stand-in is a bash script, and bash makes PWD, SHLVL and _ of its own: those aside, all it got.
+  envs="$(cat "$T_TMP/probe-env")"
+  assert_eq "$envs" "HOME=/var/empty PATH=/usr/bin:/bin" "curl's environment, whole"
+  assert_eq "$(cat "$T_TMP/probe-auth")" "Authorization: Bearer sha256:$(printf '%s' "$tok" | shasum -a 256 | cut -d' ' -f1)" "the token, on curl's standard input"
+  assert_not_contains "$args" "$tok" "the token in curl's arguments"
+  assert_not_contains "$OUT" "$tok" "the token in the run's output"
+  assert_eq "$(grep -rlF -- "$tok" "$WORK" 2>/dev/null)" "" "the token in a file in the work folder"
+  assert_eq "$(cat "$T_TMP/probe-fds")" "0 pipe;1 pipe;2 null;" "curl's descriptors"
+  assert_eq "$(grep -c 'api.github.com' "$T_TMP/tools")" 1 "how often the attempt was sent (no retry)"
+}
+
+# Round 115 (owner: test redirects, malformed or empty answers, partial transfers, unexpected
+# destinations): curl's own report (-w: GitHub's status, the redirects followed, TLS verification, the
+# address it ended at) must agree with the answer and with the one request; anything else, or curl
+# failing, is never a refusal and never settles a write.
+test_an_app_attempt_through_curl_needs_curls_own_report_to_agree() {
+  local case name changes rc meta want
+  local -a ch
+  for case in "complete, as sent|||0|refused" \
+    "a 200|status=HTTP/2 200||0|allowed" \
+    "a redirect, not followed|status=HTTP/2 301;add=Location: https://api.github.com/repositories/1|301 0 0 @URL@|0|inconclusive" \
+    "a redirect curl says it followed||403 1 0 @URL@|0|inconclusive" \
+    "an address other than the one asked||403 0 0 https://api.github.com/repos/someone/else|0|inconclusive" \
+    "an address on another host||403 0 0 https://example.com/repos/@REPO@|0|inconclusive" \
+    "TLS not verified||403 0 1 @URL@|0|inconclusive" \
+    "a status other than the answer's||404 0 0 @URL@|0|inconclusive" \
+    "no report of curl's||none|0|inconclusive" \
+    "a report not of its form||403 x 0 @URL@|0|inconclusive" \
+    "a partial transfer (curl 18)|len=999||18|inconclusive" \
+    "a transfer cut (curl 56)|||56|inconclusive" \
+    "curl timing out (28)|||28|inconclusive" \
+    "an empty answer|raw=|000 0 0 @URL@|7|inconclusive" \
+    "an answer not HTTP|raw=garbage||0|inconclusive"; do
+    IFS='|' read -r name changes meta rc want <<<"$case"
+    p_stubs
+    IFS=';' read -r -a ch <<<"$changes"
+    gh_reply reply ${ch[@]+"${ch[@]}"}
+    meta="${meta//@URL@/https://api.github.com/repos/$REPO}"
+    meta="${meta//@REPO@/$REPO}"
+    printf '%s' "$meta" >"$T_TMP/curl-meta"
+    echo "$rc" >"$T_TMP/curl-rc"
+    # The transport's stand-in: the reply, then curl's report (by default the reply's own status, no
+    # redirect, TLS verified, the address asked), and curl's status.
+    attempt_send() {
+      local m st
+      echo "attempt_send $*" >>"$T_TMP/calls"
+      cat "$T_TMP/reply"
+      m="$(cat "$T_TMP/curl-meta")"
+      if [[ -z "$m" ]]; then
+        st="$(head -n 1 "$T_TMP/reply" | sed -n 's/^HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p')"
+        m="$st 0 0 https://api.github.com/$AT_PATH"
+      fi
+      [[ "$m" == none ]] || printf '\n@@FRG26-CURL %s' "$m"
+      return "$(cat "$T_TMP/curl-rc")"
+    }
+    WRITES_UNKNOWN="" WRITES_OUT=""
+    app_attempt -X PATCH "repos/$REPO" -f description=x >/dev/null 2>&1
+    assert_eq "$OBS" "$want" "$name"
+    assert_eq "$(grep -c '^attempt_send' "$T_TMP/calls")" 1 "$name: sent once"
+    assert_contains "$(unknown_writes)" "app gh api PATCH repos/$REPO (" "$name: the attempt named outcome unknown"
+  done
   end_stand_in_run
 }
 
@@ -7299,7 +7609,7 @@ test_a_stop_during_an_app_attempt_waits_for_its_answer_then_ends_the_run() {
   short_copy
   WORK="$T_TMP/work"
   request_tools 0.6 # its answer (none) comes 0.6s in, after the stop at 0.3s, inside its 1s limit
-  echo "-X PATCH repos/$REPO -f description=x" >"$T_TMP/hang-on"
+  echo "https://api.github.com/repos/$REPO" >"$T_TMP/hang-on"
   # shellcheck disable=SC2016 # run inside the stopped run: $PPID there is the run itself
   stopped_run_cleanup 0 "PHASE=permissions CLONE=\$WORK/clone" \
     '/bin/sh -c "/bin/sleep 0.3; kill -TERM \$PPID" & app_attempt -X PATCH "repos/$REPO" -f description=x; echo NEXT TEST ACTION; owner_gh api next-action'
@@ -7307,48 +7617,52 @@ test_a_stop_during_an_app_attempt_waits_for_its_answer_then_ends_the_run() {
   ((SECS <= CLEANUP_SECS + 3)) || _t_fail "ended after ${SECS}s; the clean-up's cap is ${CLEANUP_SECS}s"
   assert_not_contains "$OUT" "NEXT TEST ACTION" "a test action after the stop"
   assert_not_contains "$(cat "$T_TMP/tools")" "next-action" "a request after the stop"
-  assert_eq "$(grep -cF -- "-X PATCH repos/$REPO" "$T_TMP/tools")" 1 "how often the attempt was sent"
+  assert_eq "$(grep -cF -- "https://api.github.com/repos/$REPO" "$T_TMP/tools")" 1 "how often the attempt was sent"
   last="$(printf '%s\n' "$OUT" | tail -n 1)"
   assert_contains "$last" "CLEANUP INCOMPLETE:" "the attempt left unknown"
   # Its answer was waited for and judged (not cut short by the stop).
-  assert_contains "$last" "app gh api PATCH repos/$REPO (answered HTTP unknown (exit 1): inconclusive, not read back)" "the attempt judged before the stop"
+  assert_contains "$last" "app gh api PATCH repos/$REPO (answered HTTP unknown (curl exit 1): inconclusive, not read back)" "the attempt judged before the stop"
 }
 
 # Round 113 (review-lens round 100, C1 = SEC-2; owner): a baseline with any part unreadable is unreadable
-# whole, however the rest reads and even if that part fails the same way after the attempts.
+# whole, however the rest reads. Round 115: each part checked on its own (a failed read, or an answer
+# that isn't its kind of JSON), and the same failure before and after settles nothing either.
 test_a_baseline_with_a_failed_part_is_unreadable_whole() {
   local case name id phase fail
   for case in "B13, its repository settings unreadable|B13|open|repo" \
+    "B13, its repository settings not of their kind|B13|open|repo-kind" \
     "B13, one ruleset unreadable|B13|open|one-ruleset" \
     "M4 in the ruleset phase, main's protection unreadable|M4|ruleset|protection"; do
     IFS='|' read -r name id phase fail <<<"$case"
     p_stubs
     PHASE="$phase"
-    gh_reply reply
     echo "$fail" >"$T_TMP/fail"
     owner_gh() {
       echo "owner_gh $*" >>"$T_TMP/calls"
+      local f
+      f="$(cat "$T_TMP/fail")"
       case "$*" in
-        "api repos/$REPO/rulesets --jq .[].id") echo 5 ;;
-        "api repos/$REPO/rulesets/5") if [[ "$(cat "$T_TMP/fail")" == one-ruleset ]]; then echo "gh: HTTP 502" >&2; return 1; fi; echo '{"id":5}' ;;
-        "api repos/$REPO --jq "*) if [[ "$(cat "$T_TMP/fail")" == repo ]]; then echo "gh: HTTP 502" >&2; return 1; fi; printf 'm\tx\tmain\n' ;;
-        "api repos/$REPO/branches/main --jq .protected") if [[ "$(cat "$T_TMP/fail")" == protection ]]; then echo "gh: HTTP 502" >&2; return 1; fi; echo false ;;
+        "api repos/$REPO/rulesets") echo '[{"id":5}]' ;;
+        "api repos/$REPO/rulesets/5")
+          if [[ "$f" == one-ruleset ]]; then echo "gh: HTTP 502" >&2; return 1; fi
+          echo '{"id":5,"name":"r","enforcement":"active","target":"branch","rules":[]}' ;;
+        "api repos/$REPO")
+          if [[ "$f" == repo ]]; then echo "gh: HTTP 502" >&2; return 1; fi
+          if [[ "$f" == repo-kind ]]; then echo '"error"'; return 0; fi
+          printf '{"full_name":"%s","description":"m","homepage":null,"default_branch":"main","visibility":"public","archived":false}\n' "$REPO" ;;
+        "api repos/$REPO/branches/main")
+          if [[ "$f" == protection ]]; then echo "gh: HTTP 502" >&2; return 1; fi
+          echo '{"name":"main","protected":false}' ;;
       esac
     }
-    printf 'app_gh api -X|1|@reply\n' >"$T_TMP/answers"
     WRITES_UNKNOWN="" WRITES_OUT=""
     attempt_baseline "$id"
-    assert_eq "$ATTEMPT_BASE" error "$name: the baseline"
+    assert_eq "$ATTEMPT_BASE_OK" "" "$name: the baseline read as whole"
     OBS=refused EV="" ATTEMPT_WRITES="POST repos/$REPO/rulesets"$'\n'
-    write_unknown "app gh api POST repos/$REPO/rulesets" "answered HTTP 403 (exit 1): refused, not read back"
-    attempts_settle "$id" "$ATTEMPT_BASE"
+    write_unknown "app gh api POST repos/$REPO/rulesets" "answered HTTP 403: refused, not read back"
+    attempts_settle "$id"
     assert_eq "$OBS" inconclusive "$name"
     assert_contains "$(unknown_writes)" "app gh api POST repos/$REPO/rulesets (" "$name: the write cleared"
-    # The same part failing the same way before and after compares equal as text: still unreadable.
-    OBS=refused EV=""
-    attempts_settle "$id" "$(printf 'rulesets: 5 \nerror')"
-    assert_eq "$OBS" inconclusive "$name: a baseline holding an unreadable part"
-    assert_contains "$(unknown_writes)" "app gh api POST repos/$REPO/rulesets (" "$name: the write cleared by a part's error"
   done
   end_stand_in_run
 }

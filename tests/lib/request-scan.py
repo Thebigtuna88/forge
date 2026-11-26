@@ -10,8 +10,8 @@ Then "functions: <names>", the functions found to make requests.
 import re
 import sys
 
-RUNNERS = {"owner_gh_run": "gh", "app_gh_run": "gh", "app_git_run": "git", "app_curl": "curl"}
-SEEDS = {"owner_gh", "app_gh", "app_git", "app_curl"}
+RUNNERS = {"owner_gh_run": "gh", "app_gh_run": "gh", "app_git_run": "git", "app_curl": "curl", "app_api_curl_run": "curl"}
+SEEDS = {"owner_gh", "app_gh", "app_git", "app_curl", "app_api_curl"}
 
 
 def joined(lines):
@@ -141,11 +141,12 @@ def main():
             continue
         f = owner.get(n)
         # gh, git or curl as a command: only in its runner (and need_tools' version check). The
-        # command substitutions too: a quoted one is out of view in the unquoted line.
+        # command substitutions too: a quoted one is out of view in the unquoted line. Round 115: by an
+        # absolute path too (/usr/bin/curl).
         u = unquoted(c)
         views = [u] + [unquoted(s) for s in comsubs(c)]
         for tool in ("gh", "git", "curl"):
-            if any(re.search(r"(^|[\s;|&({])" + tool + r"(\s|$)", v) for v in views) and RUNNERS.get(f) != tool:
+            if any(re.search(r"(^|[\s;|&({/])" + tool + r"(\s|$)", v) for v in views) and RUNNERS.get(f) != tool:
                 if f == "need_tools" and (tool == "git" and "git --version" in c or c.strip().startswith("for t in")):
                     continue
                 problems.append(f"raw {n}: {l.strip()[:140]}")

@@ -111,6 +111,11 @@ readonly CLONE_SECS=120   # the longest a git clone may take (round 75, C1)
 readonly REVOKE_SECS=90   # the clean-up's first share, for the tokens alone (round 72, SEC-1)
 readonly CLEANUP_SECS=180 # the longest the whole clean-up may take
 readonly CONTROL_SECS=240 # the longest a control (A9, E1) may run, its own token clean-up included
+# Round 115 (owner): the app's API attempts go through the system's own curl, by this path only: it is on
+# macOS's sealed, read-only system volume, so no process running as the owner can replace it. That
+# narrows the replacement risk; it does NOT protect it from same-user debugging (an open limit, not
+# accepted).
+readonly APP_API_CURL="/usr/bin/curl" # the app's API attempts' only program
 CLEANUP_DEADLINE=""
 HELD_KEPT=""        # tokens this run stored for a later check: never revoked by its clean-up
 CONFIRMED_TOKENS="" # tokens confirmed revoked, outside a2-probe: see revocation_judged
@@ -576,6 +581,20 @@ owner_gh() { with_timeout "$(call_secs)" owner_gh_run "$@"; }
 app_gh() { with_timeout "$(call_secs)" app_gh_run "$@"; }
 app_git() { with_timeout "$(git_secs "$@")" app_git_run "$@"; }
 app_curl() { with_timeout $((CALL_SECS + 5)) curl "$@"; } # curl's own --max-time ends it first
+app_api_curl() { with_timeout "$(call_secs)" app_api_curl_run "$@"; } # the app's API attempts (round 115)
+
+# The system's curl for the app's API attempts (round 115, owner): an empty environment (env -i: no
+# proxy, CA bundle, key log or curl variable of anyone's, HOME the empty /var/empty), -q first so no
+# .curlrc is read. Its standard input is the caller's (the headers, through a pipe). Every other
+# descriptor (3-254) is closed first: bash keeps a process substitution's own descriptor (63) open, and
+# curl must hold nothing but its input, its answer and /dev/null (the test found 63).
+app_api_curl_run() {
+  (
+    local fd
+    for ((fd = 3; fd < 255; fd++)); do eval "exec $fd>&-"; done
+    exec /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty "$APP_API_CURL" -q "$@"
+  )
+}
 
 git_secs() { # <app git args…> — its time limit, by what it does
   case "$(git_subcommand "$@")" in
@@ -941,60 +960,141 @@ classify_push() { # after capture of an app git push
   fi
 }
 
-# An app's API attempt (round 112, review-lens round 99 C2; owner 2026-11-25): GitHub's whole answer
-# (gh api -i, identity encoding, as S2d's), judged by api_verdict, never by gh's or GitHub's words. A write
-# is noted before it is sent, and stays outcome unknown however it is answered, unless attempts_settle
-# later reads its target back unchanged after a complete refusal (owner: a read-back alone never does).
-# Sets OBS, AV_WHY, LAST_RC, LAST_OUT (what the answer is, in known forms only: never its body's text,
-# which can hold anything), AA_RAW (the whole answer) and adds a write to ATTEMPT_WRITES (its method and
-# path, one a line). Round 113 (review-lens round 100, C2 = SEC-3, SEC-4; owner chose (a)): the answer
-# is held in memory, straight from the gh process this attempt started, never through a file; so a stop
-# while it is out is held until it ends: at most the request's own tested limit, with_timeout's KILL at
-# CALL_SECS (20s). gh has no further backstop of its own (the 25s one is the token request's curl). The
-# owner accepted this for these stage 1 API attempts only, not for git, the broker or a control's stop.
-# The stop is acted on once the attempt is judged and noted: no further test action starts, and the
-# bounded clean-up runs.
+# An app's API attempt (round 112, review-lens round 99 C2; owner 2026-11-25): GitHub's whole answer,
+# judged by api_verdict, never by GitHub's words. A write is noted before it is sent, and stays outcome
+# unknown however it is answered, unless attempts_settle later reads its target back unchanged after a
+# complete refusal (owner: a read-back alone never does). Sets OBS, AV_WHY, LAST_RC, LAST_OUT (what the
+# answer is, in known forms only: never its body's text, which can hold anything) and adds a write to
+# ATTEMPT_WRITES (its method and path, one a line). Round 113 (review-lens
+# round 100, C2 = SEC-3, SEC-4; owner chose (a)): the answer is held in memory, straight from the program
+# this attempt's job started, never through a file; so a stop while it is out is held until it ends: at
+# most the request's own tested limit, with_timeout's KILL at CALL_SECS (20s), with curl's --max-time the
+# same. The owner accepted this for these stage 1 API attempts only, not for git, the broker or a
+# control's stop. The stop is acted on once the attempt is judged and noted: no further test action
+# starts, and the bounded clean-up runs. Round 115 (review-lens round 101, SEC-1; owner): sent through
+# the system's curl (attempt_send), which follows no redirect; curl's own report must agree.
 app_attempt() { # <gh api args…>
   local wn="" what rc=0 out held=""
   what="$(app_what api "$@")"
   attempt_form "$@" || die "an app attempt not in its fixed form (-X <method>, one endpoint path, -f/-F/--input fields only): $what"
+  attempt_body "$@" || die "an app attempt whose fields can't be sent as its body: $what"
   if [[ -z "$DEFERRING" ]]; then defer_signals; held=1; fi
   if request_writes app api "$@"; then
     write_out "$what"
     wn=$WRITE_N
   fi
   into out app_attempt_run "$@" || rc=$?
+  LAST_RC=$rc
   # Its end mark: an answer without it was cut off (its job ended before it was whole).
   if [[ "$out" == *x ]]; then
-    AA_RAW="${out%x}"
-    http_answer "$AA_RAW" "$rc"
+    attempt_answer "${out%x}" "$rc"
   else
-    AA_RAW="$out"
-    http_answer "$AA_RAW" "$rc"
+    attempt_answer "$out" "$rc"
     HA_INCOMPLETE="cut off before its end"
   fi
-  LAST_RC=$rc
   api_verdict "$(accepted_permission "$@")" "$wn"
-  LAST_OUT="HTTP $HA_STATUS (exit $rc); request id ${HA_REQUEST_ID:-none}; x-ratelimit-remaining ${HA_REMAINING:-none}; accepted permissions ${HA_PERMS:-none}; completion: ${HA_INCOMPLETE:-Content-Length $HA_LENGTH matches the body}; $OBS: $AV_WHY"
+  LAST_OUT="HTTP $HA_STATUS (curl exit $rc); request id ${HA_REQUEST_ID:-none}; x-ratelimit-remaining ${HA_REMAINING:-none}; accepted permissions ${HA_PERMS:-none}; completion: ${HA_INCOMPLETE:-Content-Length $HA_LENGTH matches the body}; $OBS: $AV_WHY"
   if [[ -n "$wn" ]]; then
-    write_unknown "$what" "answered HTTP $HA_STATUS (exit $rc): $OBS, not read back"
+    write_unknown "$what" "answered HTTP $HA_STATUS (curl exit $rc): $OBS, not read back"
     ATTEMPT_WRITES="$ATTEMPT_WRITES$(attempt_target "$@")"$'\n'
     write_done "$wn"
   fi
   [[ -z "$held" ]] || resume_signals
 }
 ATTEMPT_WRITES="" # the writes the attempts of the current test sent, each "<method> <path>"
-AA_RAW=""
+ATTEMPT_BODY=""   # the attempt's body, from its fields (attempt_body); empty for none
 
-# The attempt itself, in into's job: the whole answer on its standard output, then an end mark "x" (so
-# an answer cut off is seen, and its trailing newlines are kept for the length check); gh's own error
-# line is discarded. -i and the header follow the caller's arguments.
+# The attempt itself, in into's job: the whole answer and curl's own report on its standard output, then
+# an end mark "x" (so an answer cut off is seen, and its trailing newlines are kept for the length check);
+# curl's own error output is discarded.
 app_attempt_run() { # <gh api args…>
   local rc=0
   exec 2>/dev/null
-  app_gh api "$@" -i -H "Accept-Encoding: identity" || rc=$?
+  attempt_send "$@" || rc=$?
   printf x
   return "$rc"
+}
+
+# The request, through the system's curl (round 115, owner), as attempt_form and attempt_body read the
+# caller's arguments (AT_METHOD, AT_PATH, ATTEMPT_BODY, set in the run's shell before this job): to
+# https://api.github.com/<path> only; HTTPS only, verified (never -k), TLS 1.2 or newer; no redirect
+# followed (no -L, --max-redirs 0) and no proxy; no retry (curl retries nothing unless told); the whole
+# answer with its headers (--include), identity encoding, no "Expect: 100-continue"; then curl's own
+# report on one last line (-w): GitHub's status, the redirects followed, TLS verification's result, the
+# address it ended at. The token reaches curl only on its standard input, through a pipe from printf (a
+# builtin), never an argument, a file or its environment.
+attempt_send() { # <gh api args…> (already read into AT_*, ATTEMPT_BODY)
+  local args=(-s --include --proto "=https" --tlsv1.2 --max-redirs 0 --noproxy "*" --max-time "$(call_secs)"
+    -X "$AT_METHOD" -H @- -H "Accept-Encoding: identity" -H "Expect:"
+    -w '\n@@FRG26-CURL %{http_code} %{num_redirects} %{ssl_verify_result} %{url_effective}')
+  if [[ -n "$ATTEMPT_BODY" ]]; then args+=(-H "Content-Type: application/json" --data-binary "$ATTEMPT_BODY"); fi
+  # This job's own standard input, by exec: a redirection on the call itself would leave bash's copy of
+  # the old one (fd 10 and up) open to curl (round 110).
+  exec < <(printf 'Authorization: Bearer %s\nAccept: application/vnd.github+json\nX-GitHub-Api-Version: 2022-11-28\n' "$TOKEN")
+  WT_STDIN=1 app_api_curl "${args[@]}" "https://api.github.com/$AT_PATH"
+}
+
+# The answer as curl gave it: GitHub's part read by http_answer (curl's transport: complete only with
+# curl's exit 0), then curl's own report, which must agree: its status the answer's, no redirect
+# followed, TLS verified (0), and the very address asked. Anything else leaves it incomplete.
+attempt_answer() { # <curl's standard output> <curl's exit status>
+  local resp="$1" meta="" code redirs tls url want="https://api.github.com/$AT_PATH" re
+  re=$'\n''@@FRG26-CURL '
+  if [[ "$resp" == *"$re"* ]]; then
+    meta="${resp##*"$re"}"
+    resp="${resp%"$re"*}"
+  fi
+  http_answer "$resp" "$2" syscurl
+  [[ -z "$HA_INCOMPLETE" ]] || return 0
+  if [[ -z "$meta" ]]; then HA_INCOMPLETE="no report of curl's own"; return 0; fi
+  read -r code redirs tls url <<<"$meta"
+  if ! [[ "$code" =~ ^[0-9]{3}$ && "$redirs" =~ ^[0-9]+$ && "$tls" =~ ^[0-9]+$ ]]; then HA_INCOMPLETE="curl's report not of its form"
+  elif [[ "$code" != "$HA_STATUS" ]]; then HA_INCOMPLETE="curl reports HTTP $code, the answer $HA_STATUS"
+  elif [[ "$redirs" != 0 ]]; then HA_INCOMPLETE="curl reports a redirect followed"
+  elif [[ "$tls" != 0 ]]; then HA_INCOMPLETE="curl reports TLS not verified ($tls)"
+  elif [[ "$url" != "$want" ]]; then HA_INCOMPLETE="curl ended at another address than the one asked"
+  fi
+}
+
+# The body of an attempt, from its fields, as gh would send them (round 115): -f name=value a string;
+# -F name=value a number, true, false or null, else a string; name[] adds to a list; --input <file> one
+# JSON object, alone. Names are plain words (no nesting); nothing is read from a file but --input's.
+# Sets ATTEMPT_BODY (empty with no fields); 1 for anything else.
+attempt_body() { # <gh api args…>
+  local body="" input="" k v t
+  ATTEMPT_BODY=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -X) shift 2 ;;
+      --input)
+        [[ -z "$input" && -z "$body" && -f "${2:-}" ]] || return 1
+        input="$(cat "$2")" || return 1
+        json_one "$input" 'type == "object"' || return 1
+        input="$(jq -c . <<<"$input")" || return 1
+        shift 2 ;;
+      -f | -F)
+        [[ -z "$input" && "${2:-}" == *=* ]] || return 1
+        k="${2%%=*}" v="${2#*=}" t="$1"
+        [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*(\[\])?$ ]] || return 1
+        [[ -n "$body" ]] || body='{}'
+        if [[ "$t" == -F ]]; then
+          [[ "$v" != @* ]] || return 1
+          if [[ "$v" =~ ^(true|false|null|-?(0|[1-9][0-9]{0,15}))$ ]]; then t=json; else t=string; fi
+        else
+          t=string
+        fi
+        if [[ "$k" == *"[]" ]]; then
+          if [[ "$t" == json ]]; then body="$(jq -c --arg k "${k%\[\]}" --argjson v "$v" '.[$k] += [$v]' <<<"$body")" || return 1
+          else body="$(jq -c --arg k "${k%\[\]}" --arg v "$v" '.[$k] += [$v]' <<<"$body")" || return 1
+          fi
+        elif [[ "$t" == json ]]; then body="$(jq -c --arg k "$k" --argjson v "$v" '.[$k] = $v' <<<"$body")" || return 1
+        else body="$(jq -c --arg k "$k" --arg v "$v" '.[$k] = $v' <<<"$body")" || return 1
+        fi
+        shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  ATTEMPT_BODY="${input:-$body}"
 }
 
 # The one form an app attempt is sent in (round 114, review-lens round 100 C3 = SEC-1, item 1; owner): so
@@ -1041,11 +1141,13 @@ attempt_target() { # <gh api args…> — "<method> <path>", as request_what rea
 # of its form, else "[other]"), HA_RETRY (set if a retry-after header came), HA_PERMS (the permissions
 # x-accepted-github-permissions names, space-separated, or "[other]"), HA_LENGTH, HA_BODY and
 # HA_INCOMPLETE: why it isn't shown complete, empty when it is (GitHub's own Content-Length equal to the
-# body's bytes, no content or transfer encoding, gh's exit status 0 or 1, no timeout).
-http_answer() { # <gh's standard output> <gh's exit status>
+# body's bytes, no content or transfer encoding, no timeout, and the program's exit status: gh's 0 or 1;
+# round 115, the system curl's 0 only, as it exits 0 on any HTTP status). HA_TRANSPORT: gh or syscurl.
+http_answer() { # <the program's standard output> <its exit status> [gh | syscurl]
   local LC_ALL=C raw="$1" first line name value head=1 offset=0 coding=""
   local re='^HTTP/[0-9.]+ ([0-9]{3})( |$)'
   HA_STATUS=unknown HA_REQUEST_ID="" HA_REMAINING="" HA_RESOURCE="" HA_RETRY="" HA_PERMS="" HA_LENGTH="" HA_BODY="" HA_INCOMPLETE=""
+  HA_TRANSPORT="${3:-gh}"
   first="${raw%%$'\n'*}"
   line="${first%$'\r'}"
   if [[ "$line" =~ $re && "$raw" == *$'\n'* ]]; then
@@ -1091,6 +1193,7 @@ http_answer() { # <gh's standard output> <gh's exit status>
   # Complete only when GitHub's own length says so; gh's exit status only supports it.
   if [[ -z "$HA_INCOMPLETE" ]]; then
     if [[ -n "$STOP_LINES" || "$2" == 124 ]]; then HA_INCOMPLETE="a request timed out"
+    elif [[ "$HA_TRANSPORT" == syscurl && "$2" != 0 ]]; then HA_INCOMPLETE="the system curl's exit status $2"
     elif [[ "$2" != 0 && "$2" != 1 ]]; then HA_INCOMPLETE="gh exit status $2"
     elif [[ -n "$coding" ]]; then HA_INCOMPLETE="a content or transfer encoding: the length can't be checked"
     elif [[ -z "$HA_LENGTH" ]]; then HA_INCOMPLETE="no Content-Length: completion can't be told"
@@ -1136,14 +1239,17 @@ accepted_permission() { # <gh api args…>
   return 0
 }
 
-# allowed on gh's exit 0; refused only on a complete answer (http_answer), GitHub's 403 (or 404, to a
-# read: a write's 404 can mean nothing was there to change), a request id of its form (correlation only:
-# the authenticated HTTPS connection is what says GitHub answered), no rate-limit sign, and <permission>
-# named by GitHub; else inconclusive. Sets OBS and AV_WHY.
+# allowed on gh's exit 0 (round 115: through curl, on GitHub's 2xx); refused only on a complete answer
+# (http_answer), GitHub's 403 (or 404, to a read: a write's 404 can mean nothing was there to change), a
+# request id of its form (correlation only: the authenticated HTTPS connection is what says GitHub
+# answered), no rate-limit sign, and <permission> named by GitHub; else inconclusive. Sets OBS and AV_WHY.
 api_verdict() { # <the operation's permission> <its write number, or empty for a read>
   local limit=""
   AV_WHY=""
-  if [[ $LAST_RC -eq 0 ]]; then OBS=allowed AV_WHY="gh exit 0"; return; fi
+  if [[ "${HA_TRANSPORT:-gh}" == syscurl ]]; then
+    if [[ "$HA_STATUS" =~ ^2[0-9][0-9]$ ]]; then OBS=allowed AV_WHY="HTTP $HA_STATUS"; return; fi
+  elif [[ $LAST_RC -eq 0 ]]; then OBS=allowed AV_WHY="gh exit 0"; return
+  fi
   OBS=inconclusive
   [[ "$HA_STATUS" != 429 ]] || limit="$limit HTTP 429;"
   [[ -z "$HA_RETRY" ]] || limit="$limit a retry-after header;"
@@ -1164,124 +1270,151 @@ api_verdict() { # <the operation's permission> <its write number, or empty for a
 # A test's write attempts, all refused (round 112, owner): its state read again and compared with the
 # baseline read before the first attempt. Changed or unreadable: inconclusive, every write still unknown.
 # Unchanged: each write that would have shown against that baseline is settled (attempt_observable); a
-# no-op against it stays outcome unknown, whatever the verdict.
-attempts_settle() { # <test id> <baseline>
+# no-op against it stays outcome unknown, whatever the verdict. Round 115: "unreadable" is the readers'
+# own status (attempt_state), never a word found in what they read.
+attempts_settle() { # <test id> — against ATTEMPT_BASE, read whole before the first attempt if ATTEMPT_BASE_OK
   local now t
   [[ "$OBS" == refused && -n "$ATTEMPT_WRITES" ]] || return 0
-  if [[ "$2" == - ]]; then
+  if [[ "$ATTEMPT_BASE" == - ]]; then
     OBS=inconclusive
     EV="$EV no state of this test can show its writes unchanged |"
     return 0
   fi
-  into now attempt_state "$1"
-  if state_unreadable "$2" || state_unreadable "$now"; then
+  if [[ -z "$ATTEMPT_BASE_OK" ]]; then
     OBS=inconclusive
-    EV="$EV its state read back: unreadable (before or after the attempts) |"
-  elif [[ "$now" != "$2" ]]; then
+    EV="$EV its baseline: unreadable (a part failed, answered nothing, or wasn't of its kind) |"
+    return 0
+  fi
+  if ! into now attempt_state "$1"; then
+    OBS=inconclusive
+    EV="$EV its state read back: unreadable (a part failed, answered nothing, or wasn't of its kind) |"
+  elif [[ "$now" != "$ATTEMPT_BASE" ]]; then
     OBS=inconclusive
     EV="$EV its state read back: CHANGED since before the attempts |"
   else
     EV="$EV its state read back: unchanged since before the attempts |"
     while IFS= read -r t; do
       [[ -n "$t" ]] || continue
-      if attempt_observable "$1" "$t" "$2"; then write_resolved "app gh api $t"; else EV="$EV $t would change nothing it can show: outcome unknown |"; fi
+      if attempt_observable "$1" "$t" "$ATTEMPT_BASE"; then write_resolved "app gh api $t"; else EV="$EV $t would change nothing it can show: outcome unknown |"; fi
     done <<<"$ATTEMPT_WRITES"
   fi
 }
 
 # What a test's write attempts could change, as the owner reads it now, compared whole and never shown
 # (round 112; round112-plan.md says what "unchanged" means for each): "-" for a test with none that can
-# show them, "error" if any part can't be read.
-# Round 113 (review-lens round 100, C1 = SEC-2; owner): a state with any part unreadable (a line
-# "error", which each reader gives for a read that failed) is unreadable whole, even if that part fails
-# the same way each time.
+# show them. Round 115 (review-lens round 101, C1 = SEC-2; owner): each part read by its own reader,
+# which checks that GitHub's answer parses as one JSON value of its kind, with its required fields, and
+# prints it canonical; 1 if any part can't be read so (a failed read, an empty or other answer).
 attempt_state() { # <test id>
-  local s
+  local a b
   case "$1" in
-    B12) into s protection_state dev ;;
+    B12) into a state_protection dev || return 1; printf '%s\n' "$a" ;;
     M4)
-      if [[ "$PHASE" == ruleset ]]; then into s attempt_state_parts protection_state main ";;" rulesets_state
-      else into s protection_state main
+      into a state_protection main || return 1
+      if [[ "$PHASE" == ruleset ]]; then
+        into b state_rulesets || return 1
+        printf '%s\n%s\n' "$a" "$b"
+      else
+        printf '%s\n' "$a"
       fi ;;
-    B13) into s attempt_state_parts rulesets_state ";;" repo_state ;;
-    A2) into s probe_refs ;;
-    S2c) into s environment_state ;;
-    *) printf -- '-\n'; return ;;
+    B13)
+      into a state_rulesets || return 1
+      into b state_repo || return 1
+      printf '%s\n%s\n' "$a" "$b" ;;
+    A2) into a state_refs2 || return 1; printf '%s\n' "$a" ;;
+    S2c) into a state_environment || return 1; printf '%s\n' "$a" ;;
+    *) printf -- '-\n' ;;
   esac
-  if state_unreadable "$s"; then echo error; else printf '%s\n' "$s"; fi
 }
 
-attempt_state_parts() { # <reader args…> separated by ";;" — each part's lines, in order
-  local part
-  while [[ $# -gt 0 ]]; do
-    part=()
-    while [[ $# -gt 0 && "$1" != ";;" ]]; do part+=("$1"); shift; done
-    [[ $# -gt 0 ]] && shift
-    "${part[@]}"
-  done
-}
-
-state_unreadable() { # <state> — 0 if it is empty or any line of it is "error"
-  [[ -n "$1" && $'\n'"$1"$'\n' != *$'\n'error$'\n'* ]] && return 1
-  return 0
-}
-
-attempt_baseline() { # <test id> — sets ATTEMPT_BASE (round 112)
-  ATTEMPT_WRITES=""
+attempt_baseline() { # <test id> — sets ATTEMPT_BASE, and ATTEMPT_BASE_OK when it was read whole (round 112)
+  ATTEMPT_WRITES="" ATTEMPT_BASE_OK=""
   case "$1" in
-    B12 | M4 | B13 | A2 | S2c) into ATTEMPT_BASE attempt_state "$1" ;;
-    *) ATTEMPT_BASE=- ;;
+    B12 | M4 | B13 | A2 | S2c)
+      if into ATTEMPT_BASE attempt_state "$1"; then ATTEMPT_BASE_OK=1; else ATTEMPT_BASE=""; fi ;;
+    *) ATTEMPT_BASE=- ATTEMPT_BASE_OK=1 ;;
   esac
-  [[ -n "$ATTEMPT_BASE" ]] || ATTEMPT_BASE=error
 }
-ATTEMPT_BASE=""
+ATTEMPT_BASE="" ATTEMPT_BASE_OK=""
 
 # Whether a write would have shown against its test's baseline: a protection DELETE only where there was
 # one, the Environment PUT never (the settings it already has).
 attempt_observable() { # <test id> <method path> <baseline>
   case "$1 $2" in
-    "B12 DELETE "* | "M4 DELETE "*/protection) [[ "${3%%$'\n'*}" == protected* ]] ;;
+    "B12 DELETE "* | "M4 DELETE "*/protection) [[ "${3%%$'\n'*}" == '{"protected":true'* ]] ;;
     "S2c PUT "*) return 1 ;;
     B12* | M4* | B13* | A2* | "S2c DELETE "*) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-protection_state() { # <branch> — "unprotected", "protected <its whole protection>", or error
-  local s full
-  into s branch_state "$1"
-  case "$s" in
-    unprotected) echo unprotected ;;
-    protected)
-      into full protection_full "$1"
-      if [[ "$full" == error ]]; then echo error; else echo "protected $full"; fi ;;
-    *) echo error ;;
-  esac
+# 0 if <text> is exactly one JSON value that <test> (a jq expression, with the jq arguments given before
+# it) holds true for (round 115): nothing, two values, or anything not JSON fails.
+json_one() { # <text> [jq args…] <test>
+  local t="$1"
+  shift
+  local f="${*: -1}"
+  set -- "${@:1:$(($# - 1))}"
+  jq -e -s "$@" "length == 1 and (.[0] | $f)" >/dev/null 2>&1 <<<"$t"
 }
 
-rulesets_state() { # every ruleset, each read whole by its id, or error
-  local ids id one
-  into ids owner_gh api "repos/$REPO/rulesets" --jq '.[].id' 2>/dev/null || { echo error; return; }
-  echo "rulesets: $(printf '%s' "$ids" | tr '\n' ' ')"
-  for id in $ids; do
-    [[ "$id" =~ ^[0-9]+$ ]] || { echo error; return; }
-    into one owner_gh api "repos/$REPO/rulesets/$id" 2>/dev/null || { echo error; return; }
-    jq -S -c . <<<"$one" 2>/dev/null || { echo error; return; }
+# shellcheck disable=SC2016 # the $ names in these readers' tests are jq's own variables
+state_protection() { # <branch> — {"protected":false}, or {"protected":true,"protection":<it, whole>}
+  local b p
+  into b owner_gh api "repos/$REPO/branches/$1" 2>/dev/null || return 1
+  json_one "$b" --arg n "$1" 'type == "object" and .name == $n and (.protected | type) == "boolean"' || return 1
+  if [[ "$(jq -r .protected <<<"$b")" == false ]]; then printf '{"protected":false}\n'; return 0; fi
+  into p owner_gh api "repos/$REPO/branches/$1/protection" 2>/dev/null || return 1
+  json_one "$p" 'type == "object" and (.enforce_admins.enabled | type) == "boolean" and (.allow_force_pushes.enabled | type) == "boolean" and (.allow_deletions.enabled | type) == "boolean"' || return 1
+  jq -S -c '{protected: true, protection: .}' <<<"$p"
+}
+
+# shellcheck disable=SC2016 # jq's own $i
+state_rulesets() { # every ruleset, each read whole by its id, in id order
+  local l id one out='[]'
+  into l owner_gh api "repos/$REPO/rulesets" 2>/dev/null || return 1
+  json_one "$l" 'type == "array" and all(.[]; type == "object" and (.id | type) == "number" and .id > 0 and .id == (.id | floor))' || return 1
+  for id in $(jq -r '.[].id' <<<"$l"); do
+    into one owner_gh api "repos/$REPO/rulesets/$id" 2>/dev/null || return 1
+    json_one "$one" --argjson i "$id" 'type == "object" and .id == $i and (.name | type) == "string" and (.enforcement | type) == "string" and (.target | type) == "string" and (.rules | type) == "array"' || return 1
+    out="$(jq -c --argjson r "$one" '. + [$r]' <<<"$out")" || return 1
   done
+  jq -S -c 'sort_by(.id)' <<<"$out"
 }
 
-repo_state() { # the repository's settings a PATCH can change, or error
-  owner_gh api "repos/$REPO" --jq '[.description, .homepage, .default_branch, .visibility, .archived, .allow_auto_merge, .allow_merge_commit, .allow_squash_merge, .allow_rebase_merge, .delete_branch_on_merge, .has_issues, .has_wiki, .has_projects] | map(tostring) | join("\t")' 2>/dev/null || echo error
+# shellcheck disable=SC2016 # jq's own $f
+state_repo() { # the repository's settings a PATCH can change
+  local r
+  into r owner_gh api "repos/$REPO" 2>/dev/null || return 1
+  json_one "$r" --arg f "$REPO" 'type == "object" and .full_name == $f and ((.description | type) == "string" or .description == null) and ((.homepage | type) == "string" or .homepage == null) and (.default_branch | type) == "string" and (.visibility | type) == "string" and (.archived | type) == "boolean"' || return 1
+  jq -S -c '{full_name, description, homepage, default_branch, visibility, archived, allow_auto_merge, allow_merge_commit, allow_squash_merge, allow_rebase_merge, delete_branch_on_merge, has_issues, has_wiki, has_projects}' <<<"$r"
 }
 
-environment_state() { # the Environment whole, its branch policies, the disposable secret by name; or error
+# The second throwaway's branches (at least one) and tags, each a ref of its kind with a commit; gh's
+# --paginate gives each page's list in turn, and at least one page must come for each.
+# shellcheck disable=SC2016 # jq's own $p
+state_refs2() {
+  local h t k
+  into h owner_gh api --paginate "repos/$REPO2/git/matching-refs/heads" 2>/dev/null || return 1
+  into t owner_gh api --paginate "repos/$REPO2/git/matching-refs/tags" 2>/dev/null || return 1
+  k='length > 0 and all(.[]; type == "array") and ((add // []) | all(.[]; type == "object" and (.ref | type) == "string" and (.ref | startswith($p)) and ((.object.sha // "") | type == "string" and test("^[0-9a-f]{40}$"))))'
+  jq -e -s --arg p refs/heads/ "$k and ((add // []) | length > 0)" >/dev/null 2>&1 <<<"$h" || return 1
+  jq -e -s --arg p refs/tags/ "$k" >/dev/null 2>&1 <<<"$t" || return 1
+  h="$(jq -S -c -s 'add // [] | map({ref, sha: .object.sha}) | sort_by(.ref)' <<<"$h")" || return 1
+  t="$(jq -S -c -s 'add // [] | map({ref, sha: .object.sha}) | sort_by(.ref)' <<<"$t")" || return 1
+  printf '{"heads":%s,"tags":%s}\n' "$h" "$t"
+}
+
+# shellcheck disable=SC2016 # jq's own $n
+state_environment() { # the Environment whole, its branch policies, the disposable secret by name
   local e p s
-  into e owner_gh api "repos/$REPO/environments/$ENV_NAME" 2>/dev/null || { echo error; return; }
-  into p owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" 2>/dev/null || { echo error; return; }
-  into s owner_gh api "repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME" --jq '[.name, .created_at, .updated_at] | join(" ")' 2>/dev/null || { echo error; return; }
-  jq -S -c . <<<"$e" 2>/dev/null || { echo error; return; }
-  jq -S -c . <<<"$p" 2>/dev/null || { echo error; return; }
-  echo "$s"
+  into e owner_gh api "repos/$REPO/environments/$ENV_NAME" 2>/dev/null || return 1
+  json_one "$e" --arg n "$ENV_NAME" 'type == "object" and .name == $n and (.protection_rules | type) == "array" and (.updated_at | type) == "string"' || return 1
+  into p owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" 2>/dev/null || return 1
+  json_one "$p" 'type == "object" and (.branch_policies | type) == "array" and (.total_count | type) == "number"' || return 1
+  into s owner_gh api "repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME" 2>/dev/null || return 1
+  json_one "$s" --arg n "$DISPOSABLE_NAME" 'type == "object" and .name == $n and (.created_at | type) == "string" and (.updated_at | type) == "string"' || return 1
+  jq -n -S -c --argjson e "$e" --argjson p "$p" --argjson s "$s" '{environment: $e, policies: $p, secret: ($s | {name, created_at, updated_at})}'
 }
 
 # --- Guards -------------------------------------------------------------------------------------
@@ -1298,6 +1431,7 @@ need_tools() {
   for t in gh git jq shasum base64 curl openssl; do
     command -v "$t" >/dev/null 2>&1 || die "$t is required"
   done
+  [[ -x "$APP_API_CURL" && ! -L "$APP_API_CURL" ]] || die "$APP_API_CURL (the system's curl) is required"
   local v
   v="$(git --version | sed -E 's/^git version ([0-9]+)\.([0-9]+).*/\1 \2/')"
   # shellcheck disable=SC2086 # split "major minor" into $1 $2
@@ -2441,15 +2575,31 @@ cmd_ruleset() {
   if [[ $LAST_RC -ne 0 ]] || ! answer_expected 'json:.id | type == "number"' "$LAST_OUT"; then
     die "the ruleset request wasn't answered as made (its outcome is unknown; not sent again): check $REPO's rulesets on GitHub before running this again: $(evidence)"
   fi
+  local rid back sent sum
+  rid="$(jq -r .id <<<"$LAST_OUT")"
+  [[ "$rid" =~ ^[0-9]+$ ]] || die "the ruleset's id isn't a number (its outcome is unknown): check $REPO's rulesets on GitHub"
   say "ruleset created with bypass: the owner (User $uid)"
   verify_phase ruleset
-  # The one ruleset read back whole, and as the very form sent: its request is settled.
-  local sum
-  into sum ruleset_summary
-  [[ "$sum" == "active branch refs/heads/main 0 deletion,non_fast_forward,update:false User:$uid:always" ]] \
-    || die "the ruleset read back is not the one requested ($sum): check $REPO's rulesets on GitHub"
+  # Round 115 (review-lens round 101, C2; owner): read back by the id its create answered with, and
+  # every field submitted (ruleset_form) equal to the read-back, normalised: only then is it settled.
+  into back owner_gh api "repos/$REPO/rulesets/$rid" 2>/dev/null \
+    || die "the ruleset $rid can't be read back (its outcome stays unknown): check $REPO's rulesets on GitHub"
+  sent="$(ruleset_form "$(cat "$WORK/ruleset-user.json")")" || die "the ruleset sent can't be read as JSON"
+  [[ -n "$sent" && "$(ruleset_form "$back")" == "$sent" ]] \
+    || die "the ruleset read back is not, field for field, the one requested: check $REPO's rulesets on GitHub"
   write_resolved "$(owner_what api -X POST "repos/$REPO/rulesets")"
+  into sum ruleset_summary
   say "ruleset: $sum"
+}
+
+# The fields cmd_ruleset submits, from a ruleset as sent or as GitHub returns it, normalised: GitHub's own
+# extra fields left out, the rules (each its type, and its parameters where it has any) and the bypass
+# actors (each its id, type and mode) in a fixed order. Nothing if it isn't one JSON object.
+ruleset_form() { # <ruleset JSON>
+  json_one "$1" 'type == "object"' || return 1
+  jq -S -c '{name, target, enforcement, conditions,
+    rules: ((.rules // []) | map({type} + (if (.parameters // null) != null then {parameters} else {} end)) | sort_by(.type)),
+    bypass_actors: ((.bypass_actors // []) | map({actor_id, actor_type, bypass_mode}) | sort_by(.actor_type, .actor_id))}' <<<"$1"
 }
 
 cmd_actions_setting() {
@@ -2923,7 +3073,7 @@ admin_attempts() { # <id> <method path [input]>... separated by ";;" — refused
     ev="$ev ${c[0]} ${c[1]}: $LAST_OUT |"
   done
   OBS="$obs" EV="$ev"
-  attempts_settle "$id" "$ATTEMPT_BASE"
+  attempts_settle "$id"
   record "$id" "$OBS" "$EV"
 }
 
@@ -3099,7 +3249,7 @@ p_attempts() { # <kind api|push> <test id> <args…> separated by ";;"
       EV="$EV ${c[*]:0:4}: $LAST_OUT |"
     fi
   done
-  [[ "$kind" != api ]] || attempts_settle "$id" "$ATTEMPT_BASE"
+  [[ "$kind" != api ]] || attempts_settle "$id"
 }
 
 # Controls, all of which must succeed. Sets CTL (ok|failed) and adds to EV. The first one that fails
