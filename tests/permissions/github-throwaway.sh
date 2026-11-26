@@ -111,11 +111,15 @@ readonly CLONE_SECS=120   # the longest a git clone may take (round 75, C1)
 readonly REVOKE_SECS=90   # the clean-up's first share, for the tokens alone (round 72, SEC-1)
 readonly CLEANUP_SECS=180 # the longest the whole clean-up may take
 readonly CONTROL_SECS=240 # the longest a control (A9, E1) may run, its own token clean-up included
+readonly LIST_SECS=60     # no page of a baseline's list (or ruleset by id) is asked once this has passed (round 116)
+readonly PAGE_SIZE=100    # the entries asked for on each page of a list (GitHub's most)
+readonly PAGE_MAX=10      # the most pages a baseline's list may have: so at most 1,000 entries (round 116)
 # Round 115 (owner): the app's API attempts go through the system's own curl, by this path only: it is on
 # macOS's sealed, read-only system volume, so no process running as the owner can replace it. That
 # narrows the replacement risk; it does NOT protect it from same-user debugging (an open limit, not
 # accepted).
 readonly APP_API_CURL="/usr/bin/curl" # the app's API attempts' only program
+readonly FD_LIST="/dev/fd" # where a process's own open descriptors are listed (round 116)
 CLEANUP_DEADLINE=""
 HELD_KEPT=""        # tokens this run stored for a later check: never revoked by its clean-up
 CONFIRMED_TOKENS="" # tokens confirmed revoked, outside a2-probe: see revocation_judged
@@ -586,12 +590,26 @@ app_api_curl() { with_timeout "$(call_secs)" app_api_curl_run "$@"; } # the app'
 # The system's curl for the app's API attempts (round 115, owner): an empty environment (env -i: no
 # proxy, CA bundle, key log or curl variable of anyone's, HOME the empty /var/empty), -q first so no
 # .curlrc is read. Its standard input is the caller's (the headers, through a pipe). Every other
-# descriptor (3-254) is closed first: bash keeps a process substitution's own descriptor (63) open, and
-# curl must hold nothing but its input, its answer and /dev/null (the test found 63).
+# descriptor is closed first: bash keeps a process substitution's own descriptor (63) open, and curl
+# must hold nothing but its input, its answer and /dev/null (the test found 63). Round 116 (review-lens
+# round 102, C5; owner): whatever their numbers (above 254 too), as FD_LIST lists them, in this
+# subshell only (the run keeps its own). The list is read again once they are closed: if it can't
+# be read, lacks 0, 1 or 2, or still shows one open, curl is never started (status 125).
 app_api_curl_run() {
   (
-    local fd
-    for ((fd = 3; fd < 255; fd++)); do eval "exec $fd>&-"; done
+    local f fd seen pass
+    for pass in close check; do
+      seen=""
+      for f in "$FD_LIST"/*; do
+        fd="${f##*/}"
+        [[ "$fd" =~ ^[0-9]+$ ]] || exit 125
+        if [[ $fd -le 2 ]]; then seen="$seen $fd"
+        elif [[ "$pass" == close ]]; then eval "exec $fd>&-"
+        elif (: >&"$fd") 2>/dev/null; then exit 125 # still open (the list's own, closed once read, isn't)
+        fi
+      done
+      [[ "$seen" == *" 0"* && "$seen" == *" 1"* && "$seen" == *" 2"* ]] || exit 125
+    done
     exec /usr/bin/env -i PATH=/usr/bin:/bin HOME=/var/empty "$APP_API_CURL" -q "$@"
   )
 }
@@ -1239,24 +1257,23 @@ accepted_permission() { # <gh api args…>
   return 0
 }
 
-# allowed on gh's exit 0 (round 115: through curl, on GitHub's 2xx); refused only on a complete answer
-# (http_answer), GitHub's 403 (or 404, to a read: a write's 404 can mean nothing was there to change), a
-# request id of its form (correlation only: the authenticated HTTPS connection is what says GitHub
-# answered), no rate-limit sign, and <permission> named by GitHub; else inconclusive. Sets OBS and AV_WHY.
+# Neither allowed nor refused until the answer is shown complete (http_answer; through curl, with curl's
+# own report agreeing) and consistent: through gh, its exit agreeing with GitHub's status (round 116,
+# review-lens round 102 C1; owner). Then allowed on GitHub's 2xx; refused only on GitHub's 403 (or 404,
+# to a read: a write's 404 can mean nothing was there to change), a request id of its form (correlation
+# only: the authenticated HTTPS connection is what says GitHub answered), no rate-limit sign, and
+# <permission> named by GitHub; else inconclusive. Sets OBS and AV_WHY.
 api_verdict() { # <the operation's permission> <its write number, or empty for a read>
   local limit=""
-  AV_WHY=""
-  if [[ "${HA_TRANSPORT:-gh}" == syscurl ]]; then
-    if [[ "$HA_STATUS" =~ ^2[0-9][0-9]$ ]]; then OBS=allowed AV_WHY="HTTP $HA_STATUS"; return; fi
-  elif [[ $LAST_RC -eq 0 ]]; then OBS=allowed AV_WHY="gh exit 0"; return
-  fi
-  OBS=inconclusive
+  OBS=inconclusive AV_WHY=""
+  if [[ -n "$HA_INCOMPLETE" ]]; then AV_WHY="no complete answer: $HA_INCOMPLETE"; return; fi
+  if [[ "${HA_TRANSPORT:-gh}" != syscurl ]] && ! gh_agrees; then AV_WHY="gh's exit $LAST_RC doesn't agree with HTTP $HA_STATUS"; return; fi
+  if [[ "$HA_STATUS" =~ ^2[0-9][0-9]$ ]]; then OBS=allowed AV_WHY="a complete HTTP $HA_STATUS"; return; fi
   [[ "$HA_STATUS" != 429 ]] || limit="$limit HTTP 429;"
   [[ -z "$HA_RETRY" ]] || limit="$limit a retry-after header;"
   [[ "$HA_REMAINING" != 0 ]] || limit="$limit x-ratelimit-remaining 0;"
   if printf '%s' "$HA_BODY" | grep -Eiq 'rate limit|abuse detection|secondary rate'; then limit="$limit rate-limit words;"; fi
-  if [[ -n "$HA_INCOMPLETE" ]]; then AV_WHY="no complete answer: $HA_INCOMPLETE"
-  elif [[ "$HA_STATUS" != 403 && ! ("$HA_STATUS" == 404 && -z "$2") ]]; then AV_WHY="HTTP $HA_STATUS, not a refusal's status for this attempt"
+  if [[ "$HA_STATUS" != 403 && ! ("$HA_STATUS" == 404 && -z "$2") ]]; then AV_WHY="HTTP $HA_STATUS, not a refusal's status for this attempt"
   elif [[ -z "$HA_REQUEST_ID" || "$HA_REQUEST_ID" == "[other]" ]]; then AV_WHY="no x-github-request-id of its form"
   elif [[ -n "$limit" ]]; then AV_WHY="rate-limit signs:${limit%;}"
   elif ! [[ "$HA_REMAINING" =~ ^[0-9]+$ && "$HA_REMAINING" -gt 0 ]]; then AV_WHY="x-ratelimit-remaining '${HA_REMAINING}', not above 0"
@@ -1265,6 +1282,13 @@ api_verdict() { # <the operation's permission> <its write number, or empty for a
   elif [[ " $HA_PERMS " != *" $1 "* ]]; then AV_WHY="x-accepted-github-permissions '${HA_PERMS:-none}' doesn't name $1, this operation's"
   else OBS=refused AV_WHY="a complete HTTP $HA_STATUS, request $HA_REQUEST_ID, GitHub naming $1"
   fi
+}
+
+gh_agrees() { # gh's exit (LAST_RC) as GitHub's status (HA_STATUS) would have it: 0 for a 2xx, 1 for a 4xx or 5xx
+  case "$LAST_RC:$HA_STATUS" in
+    0:2[0-9][0-9] | 1:[45][0-9][0-9]) return 0 ;;
+  esac
+  return 1
 }
 
 # A test's write attempts, all refused (round 112, owner): its state read again and compared with the
@@ -1369,12 +1393,49 @@ state_protection() { # <branch> — {"protected":false}, or {"protected":true,"p
   jq -S -c '{protected: true, protection: .}' <<<"$p"
 }
 
+# A list GitHub gives in pages, read whole (round 116, review-lens round 102 C2 = SEC-1, C3; owner): each
+# page asked at an address built here on the fixed endpoint, <path>?per_page=100&page=<n> (never a Link
+# URL of GitHub's, so never gh's --paginate, which follows them), until a page that isn't full. Each page
+# must be one JSON value <test> holds for, its <list> (a jq path) at most a full page of objects, each
+# with a whole-number id not seen before; with <count> (a jq path: GitHub's total_count), that is the
+# same on every page and the number of entries collected. Bounded: at most PAGE_MAX pages (so PAGE_MAX x
+# PAGE_SIZE entries), and none asked once LIST_SECS have passed since the first was (each page within its
+# own request's limit). Prints the entries as one JSON list; 1 for a page missing, malformed, repeated or
+# inconsistent, or the list longer than its bounds.
+# shellcheck disable=SC2016 # jq's own $m
+state_pages() { # <path> <test> <list> [count]
+  local path="$1" test="$2" list="$3" count="${4:-}" n=0 start page got all='[]' total="" t
+  start="$(date +%s)"
+  while :; do
+    n=$((n + 1))
+    [[ $n -le $PAGE_MAX ]] || return 1
+    [[ $n -eq 1 || $(($(date +%s) - start)) -lt $LIST_SECS ]] || return 1
+    into page owner_gh api "$path?per_page=$PAGE_SIZE&page=$n" 2>/dev/null || return 1
+    json_one "$page" --argjson m "$PAGE_SIZE" "($test) and ($list | type == \"array\" and length <= \$m and all(.[]; type == \"object\" and (.id | type) == \"number\" and .id > 0 and .id == (.id | floor)))" || return 1
+    got="$(jq -c "$list" <<<"$page")" || return 1
+    if [[ -n "$count" ]]; then
+      t="$(jq -c "$count" <<<"$page")" || return 1
+      [[ "$t" =~ ^(0|[1-9][0-9]{0,8})$ && $t -le $((PAGE_MAX * PAGE_SIZE)) ]] || return 1
+      [[ -z "$total" || "$t" == "$total" ]] || return 1
+      total="$t"
+    fi
+    all="$(jq -c --argjson g "$got" '. + $g' <<<"$all")" || return 1
+    jq -e '(map(.id) | unique | length) == length' >/dev/null 2>&1 <<<"$all" || return 1
+    [[ "$(jq length <<<"$got")" == "$PAGE_SIZE" ]] || break
+  done
+  [[ -z "$count" || "$(jq length <<<"$all")" == "$total" ]] || return 1
+  printf '%s\n' "$all"
+}
+
+# Every ruleset, its list read whole (state_pages) and each read whole by its id, none once LIST_SECS have
+# passed since the list was begun, in id order.
 # shellcheck disable=SC2016 # jq's own $i
-state_rulesets() { # every ruleset, each read whole by its id, in id order
-  local l id one out='[]'
-  into l owner_gh api "repos/$REPO/rulesets" 2>/dev/null || return 1
-  json_one "$l" 'type == "array" and all(.[]; type == "object" and (.id | type) == "number" and .id > 0 and .id == (.id | floor))' || return 1
+state_rulesets() {
+  local l id one out='[]' start
+  start="$(date +%s)"
+  into l state_pages "repos/$REPO/rulesets" 'type == "array"' . || return 1
   for id in $(jq -r '.[].id' <<<"$l"); do
+    [[ $(($(date +%s) - start)) -lt $LIST_SECS ]] || return 1
     into one owner_gh api "repos/$REPO/rulesets/$id" 2>/dev/null || return 1
     json_one "$one" --argjson i "$id" 'type == "object" and .id == $i and (.name | type) == "string" and (.enforcement | type) == "string" and (.target | type) == "string" and (.rules | type) == "array"' || return 1
     out="$(jq -c --argjson r "$one" '. + [$r]' <<<"$out")" || return 1
@@ -1382,12 +1443,23 @@ state_rulesets() { # every ruleset, each read whole by its id, in id order
   jq -S -c 'sort_by(.id)' <<<"$out"
 }
 
-# shellcheck disable=SC2016 # jq's own $f
-state_repo() { # the repository's settings a PATCH can change
+# The repository's settings a PATCH can change (round 116, review-lens round 102 C4 = SEC-2; owner): each
+# must be in GitHub's answer, of its type, so one missing is never read as null; only description and
+# homepage may be null, when GitHub says so. The state holds exactly these.
+readonly REPO_STRINGS='["full_name","default_branch","visibility"]'
+readonly REPO_NULLABLE='["description","homepage"]'
+readonly REPO_BOOLEANS='["archived","allow_auto_merge","allow_merge_commit","allow_squash_merge","allow_rebase_merge","delete_branch_on_merge","has_issues","has_wiki","has_projects"]'
+# shellcheck disable=SC2016 # jq's own variables
+state_repo() {
   local r
   into r owner_gh api "repos/$REPO" 2>/dev/null || return 1
-  json_one "$r" --arg f "$REPO" 'type == "object" and .full_name == $f and ((.description | type) == "string" or .description == null) and ((.homepage | type) == "string" or .homepage == null) and (.default_branch | type) == "string" and (.visibility | type) == "string" and (.archived | type) == "boolean"' || return 1
-  jq -S -c '{full_name, description, homepage, default_branch, visibility, archived, allow_auto_merge, allow_merge_commit, allow_squash_merge, allow_rebase_merge, delete_branch_on_merge, has_issues, has_wiki, has_projects}' <<<"$r"
+  json_one "$r" --arg f "$REPO" --argjson s "$REPO_STRINGS" --argjson n "$REPO_NULLABLE" --argjson b "$REPO_BOOLEANS" \
+    '. as $o | type == "object" and .full_name == $f
+      and all($s[]; . as $k | $o | has($k) and (.[$k] | type) == "string")
+      and all($n[]; . as $k | $o | has($k) and ((.[$k] | type) == "string" or (.[$k] | type) == "null"))
+      and all($b[]; . as $k | $o | has($k) and (.[$k] | type) == "boolean")' || return 1
+  jq -S -c --argjson s "$REPO_STRINGS" --argjson n "$REPO_NULLABLE" --argjson b "$REPO_BOOLEANS" \
+    '. as $o | reduce ($s + $n + $b)[] as $f ({}; .[$f] = $o[$f])' <<<"$r"
 }
 
 # The second throwaway's branches (at least one) and tags, each a ref of its kind with a commit; gh's
@@ -1405,16 +1477,17 @@ state_refs2() {
   printf '{"heads":%s,"tags":%s}\n' "$h" "$t"
 }
 
+# The Environment whole, its branch policies (every page, as many as GitHub's total_count says: round 116,
+# review-lens round 102 C3; owner), in id order, and the disposable secret by name.
 # shellcheck disable=SC2016 # jq's own $n
-state_environment() { # the Environment whole, its branch policies, the disposable secret by name
+state_environment() {
   local e p s
   into e owner_gh api "repos/$REPO/environments/$ENV_NAME" 2>/dev/null || return 1
   json_one "$e" --arg n "$ENV_NAME" 'type == "object" and .name == $n and (.protection_rules | type) == "array" and (.updated_at | type) == "string"' || return 1
-  into p owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" 2>/dev/null || return 1
-  json_one "$p" 'type == "object" and (.branch_policies | type) == "array" and (.total_count | type) == "number"' || return 1
+  into p state_pages "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" 'type == "object"' .branch_policies .total_count || return 1
   into s owner_gh api "repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME" 2>/dev/null || return 1
   json_one "$s" --arg n "$DISPOSABLE_NAME" 'type == "object" and .name == $n and (.created_at | type) == "string" and (.updated_at | type) == "string"' || return 1
-  jq -n -S -c --argjson e "$e" --argjson p "$p" --argjson s "$s" '{environment: $e, policies: $p, secret: ($s | {name, created_at, updated_at})}'
+  jq -n -S -c --argjson e "$e" --argjson p "$p" --argjson s "$s" '{environment: $e, policies: ($p | sort_by(.id)), secret: ($s | {name, created_at, updated_at})}'
 }
 
 # --- Guards -------------------------------------------------------------------------------------
@@ -3873,8 +3946,10 @@ probe_attempt() { # <label> <kind|-> <jq path|-> <gh api args…>
 
 probe_run() { with_timeout "$(call_secs)" app_gh api -i "$@" -H "Accept-Encoding: identity" 2>/dev/null; } # <gh api args…>
 
-probe_keep() { # <kind> <jq path> — after an allowed attempt, note the object by the number GitHub returned
-  [[ "$OBS" == allowed ]] || return 0
+# After gh's exit 0, note the object by the number GitHub returned: an allowed attempt's, or (round 116)
+# one whose answer wasn't shown whole, so the clean-up still finds what it may have made.
+probe_keep() { # <kind> <jq path>
+  [[ $LAST_RC -eq 0 ]] || return 0
   local n
   n="$(printf '%s\n' "$LAST_OUT" | tr -d '\r' | awk 'body { print } /^$/ { body = 1 }' | jq -r "$2 // empty" 2>/dev/null)" || n=""
   if [[ "$n" =~ ^[0-9]+$ ]]; then

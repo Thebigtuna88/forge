@@ -4233,10 +4233,10 @@ app_gh tok2 api -i -X PUT repos/$REPO2/contents/|1|$(probe_reply 'HTTP/2.0 403 F
 app_gh tok2 api -i -X POST repos/$REPO2/git/refs|1|$(probe_reply 'HTTP/2.0 403 Forbidden' contents=write '{"message":"Resource not accessible by integration"}')
 app_gh tok2 api -X POST repos/$REPO/git/refs|0|{}
 app_gh tok2 api -X PUT repos/$REPO/contents/|0|{}
-app_gh tok2 api -i -X POST repos/$REPO2/issues/1/comments|0|HTTP/2.0 201 Created\n\n{"id":901}
-app_gh tok2 api -i -X POST repos/$REPO2/pulls|0|HTTP/2.0 201 Created\n\n{"number":3}
+app_gh tok2 api -i -X POST repos/$REPO2/issues/1/comments|0|$(probe_reply 'HTTP/2.0 201 Created' - '{"id":901}')
+app_gh tok2 api -i -X POST repos/$REPO2/pulls|0|$(probe_reply 'HTTP/2.0 201 Created' - '{"number":3}')
 app_gh tok3 api -i -X POST repos/$REPO2/issues|1|$(probe_reply 'HTTP/2.0 403 Forbidden' issues=write '{"message":"Resource not accessible by integration"}')
-app_gh tok4 api -i -X POST repos/$REPO2/issues|0|HTTP/2.0 201 Created\n\n{"number":4}
+app_gh tok4 api -i -X POST repos/$REPO2/issues|0|$(probe_reply 'HTTP/2.0 201 Created' - '{"number":4}')
 EOF
 }
 
@@ -4302,8 +4302,8 @@ test_a2_probe_runs_each_attempt_with_its_own_token_and_keeps_what_got_through() 
 test_a2_probe_stops_when_a_code_change_is_not_refused() {
   local name line out rc calls
   load
-  for name in "a file got through|app_gh tok2 api -i -X PUT repos/$REPO2/contents/|0|HTTP/2.0 201 Created\n\n{}|GOT THROUGH" \
-    "a branch got through|app_gh tok2 api -i -X POST repos/$REPO2/git/refs|0|HTTP/2.0 201 Created\n\n{}|GOT THROUGH" \
+  for name in "a file got through|app_gh tok2 api -i -X PUT repos/$REPO2/contents/|0|$(probe_reply 'HTTP/2.0 201 Created' - '{}')|GOT THROUGH" \
+    "a branch got through|app_gh tok2 api -i -X POST repos/$REPO2/git/refs|0|$(probe_reply 'HTTP/2.0 201 Created' - '{}')|GOT THROUGH" \
     "a refusal for another reason|app_gh tok2 api -i -X PUT repos/$REPO2/contents/|1|gh: Invalid request (HTTP 422)|proves nothing"; do
     IFS='|' read -r name line <<<"$name"
     probe_stubs
@@ -5046,12 +5046,12 @@ cleanup_stubs() {
 
 # The script with only its budget lines changed, sourced: CALL_SECS 1, REVOKE_SECS 3, CLEANUP_SECS 6,
 # CONTROL_SECS 12 (round 74), PUSH_SECS 2 and CLONE_SECS 3 (round 75).
-short_copy() {
+short_copy() { # [-e <sed expression>…] — a test's own changes to the copy, after the short budgets
   local short="$T_TMP/github-throwaway-short.sh"
   sed -e 's/^readonly CALL_SECS=20 /readonly CALL_SECS=1 /' -e 's/^readonly REVOKE_SECS=90 /readonly REVOKE_SECS=3 /' \
     -e 's/^readonly CLEANUP_SECS=180 /readonly CLEANUP_SECS=6 /' -e 's/^readonly CONTROL_SECS=240 /readonly CONTROL_SECS=12 /' \
     -e 's/^readonly PUSH_SECS=60 /readonly PUSH_SECS=2 /' -e 's/^readonly CLONE_SECS=120 /readonly CLONE_SECS=3 /' \
-    -e "s#^readonly APP_API_CURL=\"/usr/bin/curl\" #readonly APP_API_CURL=\"$T_TMP/bin/curl\" #" "$GT" >"$short"
+    -e "s#^readonly APP_API_CURL=\"/usr/bin/curl\" #readonly APP_API_CURL=\"$T_TMP/bin/curl\" #" "$@" "$GT" >"$short"
   # shellcheck source=tests/permissions/github-throwaway.sh
   source "$short"
   # The clean-up runs in each stopped run's own subshell; here, the exit trap sourcing installs
@@ -5556,7 +5556,7 @@ test_a_stop_signal_during_a_hung_request_reaches_the_clean_up_in_time() {
 # bounded clean-up.
 test_a_stop_revokes_before_it_reads_the_second_throwaways_branches() {
   probe_stubs
-  probe_answer_first "app_gh tok2 api -i -X PUT repos/$REPO2/contents/|0|HTTP/2.0 201 Created\n\n{}"
+  probe_answer_first "app_gh tok2 api -i -X PUT repos/$REPO2/contents/|0|$(probe_reply 'HTTP/2.0 201 Created' - '{}')"
   local out rc=0 calls del refs
   out="$(run_probe)" || rc=$?
   assert_exit 1 "$rc" "a code change got through"
@@ -5702,18 +5702,24 @@ EOF
   cat >>"$T_TMP/bin/curl" <<'EOF'
 # Round 115: the app's attempt through the fixed curl (a copy's APP_API_CURL is this stand-in). A call
 # containing the text in fd-probe notes its arguments, its environment (bash's own PWD, SHLVL, _ and
-# OLDPWD aside), the hash of the token on its standard input (never the token), its descriptors 0-254,
-# its pid, the process table and lsof's view, then answers with $T_TMP/reply and curl's own report.
-# No redirection before the descriptor checks, so the probe adds none of its own.
+# OLDPWD aside), the hash of the token on its standard input (never the token), every descriptor it
+# has open (round 116: all /dev/fd lists, above 254 too; aside: the listing's own, closed once it is
+# read, and the one bash opens on this script to read it, 255, shown by lsof to be this file), its pid,
+# the process table and lsof's view, then answers with $T_TMP/reply and curl's own report. No
+# redirection before the descriptor checks, so the probe adds none of its own.
 p="$(cat "$T_TMP/fd-probe" 2>/dev/null)"
 if [[ -n "$p" && "$*" == *"$p"* ]]; then
-  r=""
+  r="" o=""
   if [[ -p /dev/fd/0 ]]; then r="${r}0 pipe;"; elif [[ /dev/fd/0 -ef /dev/null ]]; then r="${r}0 null;"; else r="${r}0 other;"; fi
   if [[ -p /dev/fd/1 ]]; then r="${r}1 pipe;"; else r="${r}1 other;"; fi
   if [[ /dev/fd/2 -ef /dev/null ]]; then r="${r}2 null;"; else r="${r}2 other;"; fi
-  for ((n = 3; n < 255; n++)); do
-    if [[ -e /dev/fd/$n ]]; then r="${r}$n open;"; fi
+  own="$(/usr/sbin/lsof -nP -a -p $$ -d 255 -Fn 2>/dev/null | sed -n 's/^n//p')"
+  for f in /dev/fd/*; do
+    n="${f##*/}"
+    [[ ! ("$n" == 255 && -n "$own" && "$own" -ef "$0") ]] || continue
+    if [[ "$n" -gt 2 && -e /dev/fd/$n ]]; then o="$o $n"; fi
   done
+  for n in $(printf '%s\n' $o | sort -n); do r="${r}$n open;"; done
   e="$(env | sed -E '/^(PWD|SHLVL|_|OLDPWD)=/d' | sort | tr '\n' ' ')"
   a=""
   while IFS= read -r l; do
@@ -7376,11 +7382,11 @@ test_each_baseline_part_is_validated_on_its_own() {
     "a branch read of another branch|state_protection dev|{\"name\":\"main\",\"protected\":false}|0|1" \
     "a branch read without its protected flag|state_protection dev|{\"name\":\"dev\"}|0|1" \
     "a branch read whose flag isn't a boolean|state_protection dev|{\"name\":\"dev\",\"protected\":\"false\"}|0|1" \
-    "the word error as a value|state_repo|{\"full_name\":\"@REPO@\",\"description\":\"error\",\"homepage\":null,\"default_branch\":\"main\",\"visibility\":\"public\",\"archived\":false}|0|0" \
-    "the repository, its settings whole|state_repo|{\"full_name\":\"@REPO@\",\"description\":\"m\",\"homepage\":null,\"default_branch\":\"main\",\"visibility\":\"public\",\"archived\":false}|0|0" \
+    "the word error as a value|state_repo|@repo .description = \"error\"|0|0" \
+    "the repository, its settings whole|state_repo|@repo .|0|0" \
     "the repository read answering nothing|state_repo||0|1" \
-    "another repository|state_repo|{\"full_name\":\"someone/else\",\"description\":\"m\",\"homepage\":null,\"default_branch\":\"main\",\"visibility\":\"public\",\"archived\":false}|0|1" \
-    "the repository without its default branch|state_repo|{\"full_name\":\"@REPO@\",\"description\":\"m\",\"visibility\":\"public\",\"archived\":false}|0|1" \
+    "another repository|state_repo|@repo .full_name = \"someone/else\"|0|1" \
+    "the repository without its default branch|state_repo|@repo del(.default_branch)|0|1" \
     "the repository as a list|state_repo|[]|0|1" \
     "no rulesets|state_rulesets|[]|0|0" \
     "the rulesets read answering nothing|state_rulesets||0|1" \
@@ -7392,6 +7398,8 @@ test_each_baseline_part_is_validated_on_its_own() {
     IFS='|' read -r name reader answer rc want <<<"$case"
     p_stubs
     answer="${answer//@REPO@/$REPO}"
+    # @repo <jq>: the repository's settings whole (repo_answer), changed by <jq>
+    if [[ "$answer" == "@repo "* ]]; then answer="$(repo_answer | jq -c "${answer#@repo }")"; fi
     printf '%s' "$answer" >"$T_TMP/state-answer"
     echo "$rc" >"$T_TMP/state-rc"
     owner_gh() { echo "owner_gh $*" >>"$T_TMP/calls"; cat "$T_TMP/state-answer"; return "$(cat "$T_TMP/state-rc")"; }
@@ -7410,7 +7418,7 @@ test_each_baseline_part_is_validated_on_its_own() {
   PHASE=open
   owner_gh() {
     case "$*" in
-      "api repos/$REPO/rulesets") echo '[]' ;;
+      "api repos/$REPO/rulesets?per_page=100&page=1") echo '[]' ;;
       "api repos/$REPO") return 0 ;; # the repository's settings: answered with nothing
     esac
   }
@@ -7548,6 +7556,24 @@ test_an_app_attempt_goes_through_the_system_curl_alone() {
   assert_eq "$(grep -c 'api.github.com' "$T_TMP/tools")" 1 "how often the attempt was sent (no retry)"
 }
 
+# The transport's stand-in: $T_TMP/reply, then curl's report ($T_TMP/curl-meta; by default the reply's own
+# status, no redirect, TLS verified, the address asked; "none" for no report), and curl's status
+# ($T_TMP/curl-rc).
+curl_stand_in() {
+  attempt_send() {
+    local m st
+    echo "attempt_send $*" >>"$T_TMP/calls"
+    cat "$T_TMP/reply"
+    m="$(cat "$T_TMP/curl-meta")"
+    if [[ -z "$m" ]]; then
+      st="$(head -n 1 "$T_TMP/reply" | sed -n 's/^HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p')"
+      m="$st 0 0 https://api.github.com/$AT_PATH"
+    fi
+    [[ "$m" == none ]] || printf '\n@@FRG26-CURL %s' "$m"
+    return "$(cat "$T_TMP/curl-rc")"
+  }
+}
+
 # Round 115 (owner: test redirects, malformed or empty answers, partial transfers, unexpected
 # destinations): curl's own report (-w: GitHub's status, the redirects followed, TLS verification, the
 # address it ended at) must agree with the answer and with the one request; anything else, or curl
@@ -7578,20 +7604,7 @@ test_an_app_attempt_through_curl_needs_curls_own_report_to_agree() {
     meta="${meta//@REPO@/$REPO}"
     printf '%s' "$meta" >"$T_TMP/curl-meta"
     echo "$rc" >"$T_TMP/curl-rc"
-    # The transport's stand-in: the reply, then curl's report (by default the reply's own status, no
-    # redirect, TLS verified, the address asked), and curl's status.
-    attempt_send() {
-      local m st
-      echo "attempt_send $*" >>"$T_TMP/calls"
-      cat "$T_TMP/reply"
-      m="$(cat "$T_TMP/curl-meta")"
-      if [[ -z "$m" ]]; then
-        st="$(head -n 1 "$T_TMP/reply" | sed -n 's/^HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p')"
-        m="$st 0 0 https://api.github.com/$AT_PATH"
-      fi
-      [[ "$m" == none ]] || printf '\n@@FRG26-CURL %s' "$m"
-      return "$(cat "$T_TMP/curl-rc")"
-    }
+    curl_stand_in
     WRITES_UNKNOWN="" WRITES_OUT=""
     app_attempt -X PATCH "repos/$REPO" -f description=x >/dev/null 2>&1
     assert_eq "$OBS" "$want" "$name"
@@ -7642,14 +7655,14 @@ test_a_baseline_with_a_failed_part_is_unreadable_whole() {
       local f
       f="$(cat "$T_TMP/fail")"
       case "$*" in
-        "api repos/$REPO/rulesets") echo '[{"id":5}]' ;;
+        "api repos/$REPO/rulesets?per_page=100&page=1") echo '[{"id":5}]' ;;
         "api repos/$REPO/rulesets/5")
           if [[ "$f" == one-ruleset ]]; then echo "gh: HTTP 502" >&2; return 1; fi
           echo '{"id":5,"name":"r","enforcement":"active","target":"branch","rules":[]}' ;;
         "api repos/$REPO")
           if [[ "$f" == repo ]]; then echo "gh: HTTP 502" >&2; return 1; fi
           if [[ "$f" == repo-kind ]]; then echo '"error"'; return 0; fi
-          printf '{"full_name":"%s","description":"m","homepage":null,"default_branch":"main","visibility":"public","archived":false}\n' "$REPO" ;;
+          repo_answer ;;
         "api repos/$REPO/branches/main")
           if [[ "$f" == protection ]]; then echo "gh: HTTP 502" >&2; return 1; fi
           echo '{"name":"main","protected":false}' ;;
@@ -7665,6 +7678,298 @@ test_a_baseline_with_a_failed_part_is_unreadable_whole() {
     assert_contains "$(unknown_writes)" "app gh api POST repos/$REPO/rulesets (" "$name: the write cleared"
   done
   end_stand_in_run
+}
+
+# GitHub's answer for the repository: every setting its baseline compares, and fields of GitHub's own.
+repo_answer() {
+  printf '{"id":1,"full_name":"%s","private":false,"description":"m","homepage":null,"default_branch":"main","visibility":"public","archived":false,"allow_auto_merge":false,"allow_merge_commit":true,"allow_squash_merge":true,"allow_rebase_merge":true,"delete_branch_on_merge":false,"has_issues":true,"has_wiki":false,"has_projects":false}\n' "$REPO"
+}
+
+# Round 116 (review-lens round 102, C1; owner): an answer is shown complete and consistent before it is
+# classed allowed or refused. Through curl, a 2xx cut, failed, unreported, or disagreeing with curl's own
+# report is inconclusive, as a 403 would be; through gh (a2-probe), gh's exit must agree with GitHub's
+# status too. An incomplete 2xx to a2-probe still keeps the number GitHub gave, for the clean-up.
+test_an_answer_is_complete_and_consistent_before_it_is_allowed_or_refused() {
+  local case name changes meta rc want
+  local -a ch
+  for case in "a whole 200|status=HTTP/2 200;body={}||0|allowed" \
+    "a whole 204|status=HTTP/2 204;body=||0|allowed" \
+    "a 200 cut (curl 18)|status=HTTP/2 200;len=999||18|inconclusive" \
+    "a whole 200, then curl fails (56)|status=HTTP/2 200||56|inconclusive" \
+    "a 200 shorter than its Content-Length|status=HTTP/2 200;len=999||0|inconclusive" \
+    "a 200 in a transfer encoding|status=HTTP/2 200;add=Transfer-Encoding: chunked||0|inconclusive" \
+    "a 200 cut before its headers end|status=HTTP/2 200;cut||0|inconclusive" \
+    "a 200 curl reports as a 403|status=HTTP/2 200|403 0 0 @URL@|0|inconclusive" \
+    "a 200 after a redirect curl followed|status=HTTP/2 200|200 1 0 @URL@|0|inconclusive" \
+    "a 200 with TLS not verified|status=HTTP/2 200|200 0 1 @URL@|0|inconclusive" \
+    "a 200 from another address|status=HTTP/2 200|200 0 0 https://api.github.com/repos/someone/else|0|inconclusive" \
+    "a 200 with no report of curl's|status=HTTP/2 200|none|0|inconclusive" \
+    "a 200 whose report isn't of its form|status=HTTP/2 200|200 x 0 @URL@|0|inconclusive"; do
+    IFS='|' read -r name changes meta rc want <<<"$case"
+    p_stubs
+    IFS=';' read -r -a ch <<<"$changes"
+    gh_reply reply ${ch[@]+"${ch[@]}"}
+    printf '%s' "${meta//@URL@/https://api.github.com/repos/$REPO}" >"$T_TMP/curl-meta"
+    echo "$rc" >"$T_TMP/curl-rc"
+    curl_stand_in
+    WRITES_UNKNOWN="" WRITES_OUT=""
+    app_attempt -X PATCH "repos/$REPO" -f description=x >/dev/null 2>&1
+    assert_eq "$OBS" "$want" "through curl, $name"
+    assert_contains "$(unknown_writes)" "app gh api PATCH repos/$REPO (" "$name: the attempt named outcome unknown"
+  done
+  # Through gh: its exit (0 for GitHub's 2xx, 1 for an HTTP error) must agree with the status.
+  for case in "gh exit 0, a whole 200|status=HTTP/2.0 200 OK|0|allowed" \
+    "gh exit 1, a whole 403||1|refused" \
+    "gh exit 0, a 200 cut|status=HTTP/2.0 200 OK;len=999|0|inconclusive" \
+    "gh exit 0, a 200 in a transfer encoding|status=HTTP/2.0 200 OK;add=Transfer-Encoding: chunked|0|inconclusive" \
+    "gh exit 0, no status line|raw={}|0|inconclusive" \
+    "gh exit 0, a whole 403||0|inconclusive" \
+    "gh exit 1, a whole 200|status=HTTP/2.0 200 OK|1|inconclusive" \
+    "gh exit 0, a whole 302|status=HTTP/2.0 302 Found|0|inconclusive"; do
+    IFS='|' read -r name changes rc want <<<"$case"
+    p_stubs
+    IFS=';' read -r -a ch <<<"$changes"
+    gh_reply reply ${ch[@]+"${ch[@]}"}
+    http_answer "$(cat "$T_TMP/reply")" "$rc"
+    LAST_RC=$rc
+    api_verdict administration=write 1
+    assert_eq "$OBS" "$want" "through gh, $name"
+  done
+  # a2-probe: an issue made, its answer short of its Content-Length: inconclusive, its number kept.
+  p_stubs
+  gh_reply reply "status=HTTP/2.0 201 Created" 'body={"number":5}' len=999 "drop=X-Accepted-Github-Permissions" "add=X-Accepted-Github-Permissions: issues=write"
+  probe_run() { echo "probe_run $*" >>"$T_TMP/calls"; cat "$T_TMP/reply"; }
+  PROBE_MADE="" PROBE_LABEL=tok3
+  probe_attempt "an issue" issue .number -X POST "repos/$REPO2/issues" -f title=t >/dev/null 2>&1
+  assert_eq "$OBS" inconclusive "a2-probe's issue, its answer incomplete"
+  assert_contains "$PROBE_MADE" "issue:5" "the issue's number kept for the clean-up"
+  end_stand_in_run
+}
+
+# A page of a paged list for the next test, to $T_TMP/<kind>-<n>: <kind> rs (rulesets, a list) or bp (the
+# branch policies, with their total_count); <spec> <a>-<b> the entries with ids a to b (bp: <a>-<b>/<total>),
+# "fail" a read that fails, anything else that text as the page.
+list_page() { # <kind> <n> <spec>
+  local f="$T_TMP/$1-$2" a b t
+  case "$3" in
+    fail) rm -f "$f" ;;
+    [0-9]*-[0-9]*)
+      a="${3%%-*}" b="${3#*-}"
+      t="${b#*/}" b="${b%%/*}"
+      if [[ "$1" == rs ]]; then
+        jq -c -n --argjson a "$a" --argjson b "$b" '[range($a; $b + 1) | {id: ., name: "r\(.)"}]' >"$f"
+      else
+        jq -c -n --argjson a "$a" --argjson b "$b" --argjson t "$t" '{total_count: $t, branch_policies: [range($a; $b + 1) | {id: ., name: "b\(.)", type: "branch"}]}' >"$f"
+      fi ;;
+    *) printf '%s\n' "$3" >"$f" ;;
+  esac
+}
+
+# Round 116 (review-lens round 102, C2 = SEC-1, C3; owner): a list GitHub gives in pages is read whole:
+# each page asked at an address built on the fixed endpoint (per_page=100&page=<n>; never a Link URL of
+# GitHub's, never gh's --paginate), until a page that isn't full. Bounded: 10 pages (so 1,000 entries),
+# and no page or ruleset asked once 60s have passed. A page missing, malformed, over-full or repeating an
+# entry, or (the branch policies) a total_count that changes between pages or differs from the unique
+# entries collected, leaves the baseline unreadable.
+test_a_paged_list_is_read_whole_at_its_own_addresses() {
+  local case name kind pages step want asked full="" all="" i got out n p
+  local -a part
+  for i in 1 2 3 4 5 6 7 8 9 10; do full="$full $i=$(((i - 1) * 100 + 1))-$((i * 100))" all="$all $i"; done
+  # <name>|<kind>|<n>=<spec> for each page|<seconds each page read takes>|<entries read, or unreadable>|<pages asked>
+  for case in "one page, not full|rs|1=1-2|0|2|1" \
+    "two pages|rs|1=1-100 2=101-101|0|101|1 2" \
+    "a full page, then an empty one|rs|1=1-100 2=[]|0|100|1 2" \
+    "a second page that fails|rs|1=1-100 2=fail|0|unreadable|1 2" \
+    "a second page not a list|rs|1=1-100 2={}|0|unreadable|1 2" \
+    "a second page repeating an entry|rs|1=1-100 2=100-100|0|unreadable|1 2" \
+    "the first page again|rs|1=1-100 2=1-100|0|unreadable|1 2" \
+    "a page with more than a page's entries|rs|1=1-101|0|unreadable|1" \
+    "an entry whose id isn't a whole number|rs|1=[{\"id\":1.5}]|0|unreadable|1" \
+    "every page full, to the limit|rs|${full# }|0|unreadable|${all# }" \
+    "60s passed before the third page|rs|1=1-100 2=101-200 3=201-201|30|unreadable|1 2" \
+    "the same, in time|rs|1=1-100 2=101-200 3=201-201|0|201|1 2 3" \
+    "60s passed before its rulesets were read by id|rs|1=1-2|60|unreadable|1" \
+    "branch policies, one page|bp|1=1-2/2|0|2|1" \
+    "branch policies, two pages|bp|1=1-100/101 2=101-101/101|0|101|1 2" \
+    "a total_count above the entries|bp|1=1-2/3|0|unreadable|1" \
+    "a total_count below the entries|bp|1=1-2/1|0|unreadable|1" \
+    "a total_count changing between pages|bp|1=1-100/101 2=101-101/102|0|unreadable|1 2" \
+    "an entry twice, the total_count counting both|bp|1={\"total_count\":2,\"branch_policies\":[{\"id\":1,\"name\":\"b1\"},{\"id\":1,\"name\":\"b1\"}]}|0|unreadable|1" \
+    "a total_count not a number|bp|1={\"total_count\":\"2\",\"branch_policies\":[{\"id\":1,\"name\":\"b1\"},{\"id\":2,\"name\":\"b2\"}]}|0|unreadable|1" \
+    "a page without its list|bp|1={\"total_count\":0}|0|unreadable|1" \
+    "a second page that fails|bp|1=1-100/101 2=fail|0|unreadable|1 2"; do
+    IFS='|' read -r name kind pages step want asked <<<"$case"
+    p_stubs
+    rm -f "$T_TMP"/rs-* "$T_TMP"/bp-*
+    read -r -a part <<<"$pages"
+    for p in "${part[@]}"; do list_page "$kind" "${p%%=*}" "${p#*=}"; done
+    echo 0 >"$T_TMP/clock"
+    echo "$step" >"$T_TMP/step"
+    # The clock moves only as GitHub answers a page (or a ruleset by id), by <step> seconds.
+    date() { if [[ "$*" == +%s ]]; then cat "$T_TMP/clock"; else command date "$@"; fi; }
+    owner_gh() {
+      local a="$*" k
+      echo "owner_gh $a" >>"$T_TMP/calls"
+      case "$a" in
+        "api repos/$REPO/rulesets?per_page=100&page="*) k=rs ;;
+        "api repos/$REPO/environments/$ENV_NAME/deployment-branch-policies?per_page=100&page="*) k=bp ;;
+        "api repos/$REPO/rulesets/"*)
+          printf '{"id":%s,"name":"r","enforcement":"active","target":"branch","rules":[]}\n' "${a##*/}"
+          return 0 ;;
+        "api repos/$REPO/environments/$ENV_NAME") printf '{"name":"%s","protection_rules":[],"updated_at":"t"}\n' "$ENV_NAME"; return 0 ;;
+        "api repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME") printf '{"name":"%s","created_at":"t","updated_at":"t"}\n' "$DISPOSABLE_NAME"; return 0 ;;
+        *) echo "gh: HTTP 404" >&2; return 1 ;;
+      esac
+      echo $(($(cat "$T_TMP/clock") + $(cat "$T_TMP/step"))) >"$T_TMP/clock"
+      [[ -f "$T_TMP/$k-${a##*page=}" ]] || { echo "gh: HTTP 502" >&2; return 1; }
+      cat "$T_TMP/$k-${a##*page=}"
+    }
+    got=0 out=""
+    if [[ "$kind" == rs ]]; then
+      out="$(state_rulesets)" || got=$?
+      n="$(jq length <<<"$out" 2>/dev/null)"
+    else
+      out="$(state_environment)" || got=$?
+      n="$(jq '.policies | length' <<<"$out" 2>/dev/null)"
+    fi
+    if [[ "$want" == unreadable ]]; then
+      [[ "$got" != 0 ]] || _t_fail "$name: read as a state"
+    else
+      assert_exit 0 "$got" "$name: read as a state"
+      assert_eq "$n" "$want" "$name: the entries read"
+    fi
+    p="$(sed -n -E 's/^owner_gh api repos\/[^?]+\?per_page=100&page=([0-9]+)$/\1/p' "$T_TMP/calls" | tr '\n' ' ')"
+    assert_eq "${p% }" "$asked" "$name: the pages asked"
+    assert_eq "$(grep -c 'page=' "$T_TMP/calls")" "$(wc -w <<<"$asked" | tr -d ' ')" "$name: a page asked at another address"
+    assert_not_contains "$(cat "$T_TMP/calls")" "--paginate" "$name: gh following GitHub's links"
+    unset -f date
+  done
+  end_stand_in_run
+}
+
+# Round 116 (review-lens round 102, C4 = SEC-2; owner): every repository setting the baseline compares
+# must be in GitHub's answer and of its type, so a setting missing is never read as null: only description
+# and homepage may be null, and then only when GitHub says so. The state holds each, so a change to any
+# shows.
+test_every_compared_repository_setting_is_present_and_of_its_type() {
+  local f bad base now
+  local strings="default_branch visibility" nullable="description homepage"
+  local booleans="archived allow_auto_merge allow_merge_commit allow_squash_merge allow_rebase_merge delete_branch_on_merge has_issues has_wiki has_projects"
+  p_stubs
+  owner_gh() { cat "$T_TMP/state-answer"; }
+  repo_check() { # <jq change> — 0 if state_repo reads GitHub's settings, so changed, as a state
+    repo_answer | jq -c "$1" >"$T_TMP/state-answer"
+    state_repo >"$T_TMP/state-out"
+  }
+  repo_check . || _t_fail "the settings whole: unreadable"
+  base="$(cat "$T_TMP/state-out")"
+  assert_eq "$(jq -c keys <<<"$base")" \
+    '["allow_auto_merge","allow_merge_commit","allow_rebase_merge","allow_squash_merge","archived","default_branch","delete_branch_on_merge","description","full_name","has_issues","has_projects","has_wiki","homepage","visibility"]' \
+    "the settings the state holds"
+  repo_check '.description = null | .homepage = null' || _t_fail "description and homepage null: unreadable"
+  repo_check '.homepage = "https://example.com"' || _t_fail "a homepage: unreadable"
+  for f in full_name $strings $nullable $booleans; do
+    if repo_check "del(.$f)"; then _t_fail "$f missing: read as a state"; fi
+  done
+  for f in $strings; do
+    for bad in null 1 true '[]'; do
+      if repo_check ".$f = $bad"; then _t_fail "$f $bad: read as a state"; fi
+    done
+  done
+  for f in $nullable; do
+    for bad in 1 true '[]' '{}'; do
+      if repo_check ".$f = $bad"; then _t_fail "$f $bad: read as a state"; fi
+    done
+  done
+  for f in $booleans; do
+    for bad in null '"true"' 1 '[]'; do
+      if repo_check ".$f = $bad"; then _t_fail "$f $bad: read as a state"; fi
+    done
+  done
+  if repo_check '.full_name = null'; then _t_fail "full_name null: read as a state"; fi
+  # A change to any one shows.
+  for f in $strings $nullable $booleans; do
+    case " $booleans " in
+      *" $f "*) repo_check ".$f |= not" ;;
+      *) repo_check ".$f = \"other\"" ;;
+    esac || _t_fail "$f changed: unreadable"
+    now="$(cat "$T_TMP/state-out")"
+    [[ "$now" != "$base" ]] || _t_fail "$f changed: the state the same"
+  done
+  repo_check '.description = null'
+  [[ "$(cat "$T_TMP/state-out")" != "$base" ]] || _t_fail "description null: the state the same"
+  end_stand_in_run
+}
+
+# Round 116 (review-lens round 102, C5; owner): curl gets none of the run's descriptors, whatever their
+# numbers (above 254 too): only its input, its answer and /dev/null. The attempt's own shell lists every
+# descriptor it has (/dev/fd) and closes each, in curl's path only: the run keeps its own.
+test_curl_gets_no_descriptor_of_the_runs_whatever_its_number() {
+  local n
+  short_copy
+  WORK="$T_TMP/work"
+  request_tools 0
+  gh_reply reply
+  echo "https://api.github.com/repos/$REPO" >"$T_TMP/fd-probe"
+  # shellcheck disable=SC2016 # run inside the stopped run
+  stopped_run_cleanup 0 "PHASE=permissions CLONE=\$WORK/clone; ulimit -n 4096 2>/dev/null; exec 7>\$T_TMP/fd7 254>\$T_TMP/fd254 300>\$T_TMP/fd300 3000>\$T_TMP/fd3000" \
+    'for n in 7 254 300 3000; do [[ -e /dev/fd/$n ]] && echo "BEFORE $n"; done
+     /bin/bash -c "for n in 7 254 300 3000; do [[ -e /dev/fd/\$n ]] && echo CHILD \$n; done"
+     app_attempt -X PATCH "repos/$REPO" -f description=x; echo "VERDICT $OBS"
+     for n in 7 254 300 3000; do [[ -e /dev/fd/$n ]] && echo "AFTER $n"; done'
+  for n in 7 254 300 3000; do
+    assert_contains "$OUT" "BEFORE $n" "the run's descriptor $n open (ulimit -n $(ulimit -n))"
+    assert_contains "$OUT" "CHILD $n" "descriptor $n passed to a program the run starts its usual way"
+    assert_contains "$OUT" "AFTER $n" "the run's descriptor $n after the attempt"
+  done
+  assert_contains "$OUT" "VERDICT refused" "the attempt judged on curl's answer"
+  assert_eq "$(cat "$T_TMP/probe-fds")" "0 pipe;1 pipe;2 null;" "curl's descriptors"
+}
+
+# Round 116 (owner): curl is never started when the attempt's shell can't list its own descriptors: no
+# list, an empty one, an entry not a descriptor's number, or one without 0, 1 and 2. The attempt is
+# inconclusive, never sent, and named outcome unknown. With the list's place changed in a copy.
+test_curl_is_not_started_when_its_descriptors_cant_be_listed() {
+  local case name spec e
+  short_copy -e "s#^readonly FD_LIST=\"/dev/fd\" #readonly FD_LIST=\"$T_TMP/fd-list\" #"
+  assert_eq "${FD_LIST:-}" "$T_TMP/fd-list" "the copy's descriptor list"
+  WORK="$T_TMP/work"
+  request_tools 0
+  gh_reply reply
+  for case in "no list|none" "an empty list|" "an entry not a number|0 1 2 x" "no 0, 1 and 2|5"; do
+    IFS='|' read -r name spec <<<"$case"
+    rm -rf "$T_TMP/fd-list"
+    : >"$T_TMP/tools"
+    if [[ "$spec" != none ]]; then
+      mkdir "$T_TMP/fd-list"
+      for e in $spec; do : >"$T_TMP/fd-list/$e"; done
+    fi
+    # shellcheck disable=SC2016 # run inside the stopped run
+    stopped_run_cleanup 0 "PHASE=permissions CLONE=\$WORK/clone" \
+      'app_attempt -X PATCH "repos/$REPO" -f description=x; echo "VERDICT $OBS"'
+    assert_contains "$OUT" "VERDICT inconclusive" "$name"
+    assert_not_contains "$(cat "$T_TMP/tools")" "api.github.com" "$name: curl started"
+    assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "app gh api PATCH repos/$REPO (" "$name: the attempt named outcome unknown"
+  done
+}
+
+# Round 116 (owner): if a descriptor is still open once the attempt's shell has closed them, curl is never
+# started. A real close can't fail in bash (closing a closed one succeeds), so the copy here has its closing
+# switched off: the check that follows finds them open.
+test_curl_is_not_started_when_a_descriptor_stays_open() {
+  # shellcheck disable=SC2016 # the script's own text
+  short_copy -e 's/eval "exec \$fd>&-"/:/'
+  # shellcheck disable=SC2016 # the script's own text
+  assert_not_contains "$(declare -f app_api_curl_run)" 'exec $fd>&-' "the copy's closing switched off"
+  WORK="$T_TMP/work"
+  request_tools 0
+  gh_reply reply
+  # shellcheck disable=SC2016 # run inside the stopped run
+  stopped_run_cleanup 0 "PHASE=permissions CLONE=\$WORK/clone; exec 9>\$T_TMP/fd9" \
+    'app_attempt -X PATCH "repos/$REPO" -f description=x; echo "VERDICT $OBS"'
+  assert_contains "$OUT" "VERDICT inconclusive" "an attempt with a descriptor left open"
+  assert_not_contains "$(cat "$T_TMP/tools")" "api.github.com" "curl started with a descriptor left open"
+  assert_contains "$(printf '%s\n' "$OUT" | tail -n 1)" "app gh api PATCH repos/$REPO (" "the attempt named outcome unknown"
 }
 
 run_tests
