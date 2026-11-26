@@ -946,26 +946,33 @@ classify_push() { # after capture of an app git push
 # is noted before it is sent, and stays outcome unknown however it is answered, unless attempts_settle
 # later reads its target back unchanged after a complete refusal (owner: a read-back alone never does).
 # Sets OBS, AV_WHY, LAST_RC, LAST_OUT (what the answer is, in known forms only: never its body's text,
-# which can hold anything), AA_RAW (the whole answer, for a2-probe's own display) and adds a write to
-# ATTEMPT_WRITES (its method and path, one a line).
+# which can hold anything), AA_RAW (the whole answer) and adds a write to ATTEMPT_WRITES (its method and
+# path, one a line). Round 113 (review-lens round 100, C2 = SEC-3, SEC-4; owner chose (a)): the answer
+# is held in memory, straight from the gh process this attempt started, never through a file; so a stop
+# while it is out is held until it ends: at most the request's own tested limit, with_timeout's KILL at
+# CALL_SECS (20s). gh has no further backstop of its own (the 25s one is the token request's curl). The
+# owner accepted this for these stage 1 API attempts only, not for git, the broker or a control's stop.
+# The stop is acted on once the attempt is judged and noted: no further test action starts, and the
+# bounded clean-up runs.
 app_attempt() { # <gh api args…>
-  local wn="" what rc=0 ignored
+  local wn="" what rc=0 out held=""
   what="$(app_what api "$@")"
+  attempt_form "$@" || die "an app attempt not in its fixed form (-X <method>, one endpoint path, -f/-F/--input fields only): $what"
+  if [[ -z "$DEFERRING" ]]; then defer_signals; held=1; fi
   if request_writes app api "$@"; then
     write_out "$what"
     wn=$WRITE_N
   fi
-  : >"$WORK/attempt.out"
-  into ignored app_attempt_run "$@" || rc=$?
-  if [[ -f "$WORK/attempt.out" ]] && AA_RAW="$(cat "$WORK/attempt.out"; printf x)"; then
-    AA_RAW="${AA_RAW%x}"
+  into out app_attempt_run "$@" || rc=$?
+  # Its end mark: an answer without it was cut off (its job ended before it was whole).
+  if [[ "$out" == *x ]]; then
+    AA_RAW="${out%x}"
     http_answer "$AA_RAW" "$rc"
   else
-    AA_RAW=""
-    http_answer "" "$rc"
-    HA_INCOMPLETE="its answer could not be read"
+    AA_RAW="$out"
+    http_answer "$AA_RAW" "$rc"
+    HA_INCOMPLETE="cut off before its end"
   fi
-  rm -f "$WORK/attempt.out"
   LAST_RC=$rc
   api_verdict "$(accepted_permission "$@")" "$wn"
   LAST_OUT="HTTP $HA_STATUS (exit $rc); request id ${HA_REQUEST_ID:-none}; x-ratelimit-remaining ${HA_REMAINING:-none}; accepted permissions ${HA_PERMS:-none}; completion: ${HA_INCOMPLETE:-Content-Length $HA_LENGTH matches the body}; $OBS: $AV_WHY"
@@ -974,15 +981,54 @@ app_attempt() { # <gh api args…>
     ATTEMPT_WRITES="$ATTEMPT_WRITES$(attempt_target "$@")"$'\n'
     write_done "$wn"
   fi
+  [[ -z "$held" ]] || resume_signals
 }
 ATTEMPT_WRITES="" # the writes the attempts of the current test sent, each "<method> <path>"
 AA_RAW=""
 
-# The attempt itself: its standard output, the whole answer, to a file read whole (exact bytes, for the
-# length check); gh's own error line is discarded. -i and the header follow the caller's arguments.
+# The attempt itself, in into's job: the whole answer on its standard output, then an end mark "x" (so
+# an answer cut off is seen, and its trailing newlines are kept for the length check); gh's own error
+# line is discarded. -i and the header follow the caller's arguments.
 app_attempt_run() { # <gh api args…>
-  app_gh api "$@" -i -H "Accept-Encoding: identity" >"$WORK/attempt.out" 2>/dev/null
+  local rc=0
+  exec 2>/dev/null
+  app_gh api "$@" -i -H "Accept-Encoding: identity" || rc=$?
+  printf x
+  return "$rc"
 }
+
+# The one form an app attempt is sent in (round 114, review-lens round 100 C3 = SEC-1, item 1; owner): so
+# the gh its job starts is asked exactly the method and path the attempt is judged for. -X <method> at
+# most once, of GitHub's list (required when there are fields); exactly one endpoint path under repos/ or
+# user/, with no URL, host, query or "..": no graphql; and -f, -F or --input fields only (no -i, -H,
+# --hostname, --paginate, --jq or other gh option of the caller's). Sets AT_METHOD and AT_PATH; 1 else.
+attempt_form() { # <gh api args…>
+  local fields=""
+  AT_METHOD="" AT_PATH=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -X)
+        [[ -z "$AT_METHOD" && "${2:-}" =~ ^(GET|POST|PUT|PATCH|DELETE)$ ]] || return 1
+        AT_METHOD="$2"
+        shift 2 ;;
+      -f | -F | --input)
+        [[ $# -ge 2 ]] || return 1
+        fields=1
+        shift 2 ;;
+      -*) return 1 ;;
+      *)
+        [[ -z "$AT_PATH" && "$1" =~ ^(repos|user)/[A-Za-z0-9._/-]+$ && "$1" != *..* ]] || return 1
+        AT_PATH="$1"
+        shift ;;
+    esac
+  done
+  [[ -n "$AT_PATH" ]] || return 1
+  if [[ -z "$AT_METHOD" ]]; then
+    [[ -z "$fields" ]] || return 1
+    AT_METHOD=GET
+  fi
+}
+AT_METHOD="" AT_PATH=""
 
 attempt_target() { # <gh api args…> — "<method> <path>", as request_what reads them
   local w
@@ -1128,7 +1174,7 @@ attempts_settle() { # <test id> <baseline>
     return 0
   fi
   into now attempt_state "$1"
-  if [[ "$2" == error || "$now" == error || -z "$now" ]]; then
+  if state_unreadable "$2" || state_unreadable "$now"; then
     OBS=inconclusive
     EV="$EV its state read back: unreadable (before or after the attempts) |"
   elif [[ "$now" != "$2" ]]; then
@@ -1146,15 +1192,38 @@ attempts_settle() { # <test id> <baseline>
 # What a test's write attempts could change, as the owner reads it now, compared whole and never shown
 # (round 112; round112-plan.md says what "unchanged" means for each): "-" for a test with none that can
 # show them, "error" if any part can't be read.
+# Round 113 (review-lens round 100, C1 = SEC-2; owner): a state with any part unreadable (a line
+# "error", which each reader gives for a read that failed) is unreadable whole, even if that part fails
+# the same way each time.
 attempt_state() { # <test id>
+  local s
   case "$1" in
-    B12) protection_state dev ;;
-    M4) protection_state main; [[ "$PHASE" != ruleset ]] || rulesets_state ;;
-    B13) rulesets_state; repo_state ;;
-    A2) probe_refs ;;
-    S2c) environment_state ;;
-    *) printf -- '-\n' ;;
+    B12) into s protection_state dev ;;
+    M4)
+      if [[ "$PHASE" == ruleset ]]; then into s attempt_state_parts protection_state main ";;" rulesets_state
+      else into s protection_state main
+      fi ;;
+    B13) into s attempt_state_parts rulesets_state ";;" repo_state ;;
+    A2) into s probe_refs ;;
+    S2c) into s environment_state ;;
+    *) printf -- '-\n'; return ;;
   esac
+  if state_unreadable "$s"; then echo error; else printf '%s\n' "$s"; fi
+}
+
+attempt_state_parts() { # <reader args…> separated by ";;" — each part's lines, in order
+  local part
+  while [[ $# -gt 0 ]]; do
+    part=()
+    while [[ $# -gt 0 && "$1" != ";;" ]]; do part+=("$1"); shift; done
+    [[ $# -gt 0 ]] && shift
+    "${part[@]}"
+  done
+}
+
+state_unreadable() { # <state> — 0 if it is empty or any line of it is "error"
+  [[ -n "$1" && $'\n'"$1"$'\n' != *$'\n'error$'\n'* ]] && return 1
+  return 0
 }
 
 attempt_baseline() { # <test id> — sets ATTEMPT_BASE (round 112)
@@ -2363,12 +2432,15 @@ cmd_ruleset() {
   local uid
   into uid owner_uid || die "can't read the owner's user id, so no ruleset was requested"
   ruleset_json User "$uid" >"$WORK/ruleset-user.json"
-  # Round 110: settled only by its expected answer (the ruleset, with its id) and the read-back below
-  # (rule (b)). Round 111 (review-lens round 99, C3 = SEC-1; owner): sent once, with no fallback form:
-  # a failure, whatever its words, or a list showing no ruleset can't show the first request changed
-  # nothing, so a second could make two. Anything but its expected answer stops here, outcome unknown.
-  write_checked 'json:.id | type == "number"' owner_gh api -X POST "repos/$REPO/rulesets" --input "$WORK/ruleset-user.json" \
-    || die "the ruleset request wasn't answered as made (its outcome is unknown; not sent again): check $REPO's rulesets on GitHub before running this again: $(evidence)"
+  # Round 111 (review-lens round 99, C3 = SEC-1; owner): sent once, with no fallback form: a failure,
+  # whatever its words, or a list showing no ruleset can't show the first request changed nothing, so a
+  # second could make two. Anything but its expected answer (the ruleset, with its id) stops here.
+  # Round 113 (review-lens round 100, C4; owner): that answer doesn't settle it: sent with no expected
+  # answer of its own, so it stays outcome unknown until the read-back below of the very form sent.
+  capture owner_gh api -X POST "repos/$REPO/rulesets" --input "$WORK/ruleset-user.json" || true
+  if [[ $LAST_RC -ne 0 ]] || ! answer_expected 'json:.id | type == "number"' "$LAST_OUT"; then
+    die "the ruleset request wasn't answered as made (its outcome is unknown; not sent again): check $REPO's rulesets on GitHub before running this again: $(evidence)"
+  fi
   say "ruleset created with bypass: the owner (User $uid)"
   verify_phase ruleset
   # The one ruleset read back whole, and as the very form sent: its request is settled.

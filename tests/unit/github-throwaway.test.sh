@@ -977,6 +977,9 @@ test_a_ruleset_create_is_sent_once_whatever_its_answer() {
       assert_not_contains "$out" "POST repos/$REPO/rulesets (" "$name: named outcome unknown"
     elif [[ "$name" == *"another form"* ]]; then
       assert_contains "$out" "DIED: the ruleset read back is not the one requested ($admin)" "$name"
+      # Round 113 (review-lens round 100, C4; owner): its expected answer alone doesn't settle it; only
+      # the read-back of the form sent does, so one that fails leaves it outcome unknown.
+      assert_contains "$out" "owner gh api POST repos/$REPO/rulesets (" "$name: settled before its read-back"
     else
       assert_contains "$out" "owner gh api POST repos/$REPO/rulesets (" "$name: named outcome unknown"
     fi
@@ -5665,6 +5668,26 @@ if [[ -n "\$h" && "$t \$*" == *"\$h"* ]]; then /bin/sleep "\$(cat "\$T_TMP/child
 EOF
   done
   cat >>"$T_TMP/bin/gh" <<'EOF'
+# Round 114: a call containing the text in fd-probe notes what it was given (its arguments, its
+# descriptors 0-30, its pid, the process table and lsof's view of every process), then answers with
+# $T_TMP/reply. No redirection before the checks, so the probe adds no descriptor of its own.
+p="$(cat "$T_TMP/fd-probe" 2>/dev/null)"
+if [[ -n "$p" && "gh $*" == *"$p"* ]]; then
+  r=""
+  if [[ /dev/fd/0 -ef /dev/null ]]; then r="${r}0 null;"; else r="${r}0 other;"; fi
+  if [[ -p /dev/fd/1 ]]; then r="${r}1 pipe;"; else r="${r}1 other;"; fi
+  if [[ /dev/fd/2 -ef /dev/null ]]; then r="${r}2 null;"; else r="${r}2 other;"; fi
+  for n in 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+    if [[ -e /dev/fd/$n ]]; then r="${r}$n open;"; fi
+  done
+  printf '%s\n' "$*" >"$T_TMP/probe-args"
+  printf '%s\n' "$r" >"$T_TMP/probe-fds"
+  echo "$$" >"$T_TMP/probe-pid"
+  ps -ax -o pid= -o ppid= >"$T_TMP/probe-ps" 2>&1
+  lsof -nP -w >"$T_TMP/probe-lsof" 2>&1
+  cat "$T_TMP/reply"
+  exit 1
+fi
 # Each answered call's gh settings folder, with the call (round 108): app gh's; empty for the owner's.
 printf '%s %s\n' "${GH_CONFIG_DIR:-}" "$*" >>"$T_TMP/gh-config"
 # A write whose call contains the text in write-fails is refused, in GitHub's words (round 110).
@@ -5707,7 +5730,8 @@ EOF
   : >"$T_TMP/revoked"
   : >"$T_TMP/hang-on"
   rm -f "$T_TMP/open-issues" "$T_TMP/open-prs" "$T_TMP/pr-viewed" "$T_TMP/pr-state" "$T_TMP/runs-1" "$T_TMP/runs-2" "$T_TMP/runs-listed" \
-    "$T_TMP/create-url" "$T_TMP/create-rc" "$T_TMP"/issue-state-* "$T_TMP/patch-out" "$T_TMP/patch-rc" "$T_TMP/patch-unlink" "$T_TMP/write-fails"
+    "$T_TMP/create-url" "$T_TMP/create-rc" "$T_TMP"/issue-state-* "$T_TMP/patch-out" "$T_TMP/patch-rc" "$T_TMP/patch-unlink" "$T_TMP/write-fails" \
+    "$T_TMP/fd-probe" "$T_TMP"/probe-*
   export T_TMP FAKE_REPO="$REPO"
   PATH="$T_TMP/bin:$PATH"
 }
@@ -7130,6 +7154,202 @@ EOF
   assert_eq "$(classify_push_perm)" inconclusive "git's words of a permission refusal"
   LAST_RC=0
   assert_eq "$(classify_push_perm)" allowed
+  end_stand_in_run
+}
+
+# Round 113 (review-lens round 100, C2 = SEC-3, SEC-4; owner chose (a)): an app attempt's answer is held
+# in memory, from the gh process the attempt started, never through a file; its end is marked, so an
+# answer lost or cut off (its job ended before it was whole) is never complete, whatever it holds.
+test_an_app_attempts_answer_is_held_in_memory_whole_or_not_at_all() {
+  local case name how want
+  p_stubs
+  assert_not_contains "$(declare -f app_attempt app_attempt_run)" "attempt.out" "a file for the answer"
+  # shellcheck disable=SC2016 # the function's own text
+  assert_not_contains "$(declare -f app_attempt_run)" '>"$WORK' "a file for the answer"
+  # shellcheck disable=SC2016 # each is run as written, in the stand-in
+  for case in "whole|cat \"\$T_TMP/reply\"|refused" \
+    "lost: nothing came|return 1|inconclusive" \
+    "cut off in a tidy-up: its job ended after the whole reply, before its end|cat \"\$T_TMP/reply\"; /bin/sh -c 'kill -KILL \$PPID'|inconclusive"; do
+    IFS='|' read -r name how want <<<"$case"
+    p_stubs
+    gh_reply reply
+    eval "app_gh() { echo \"app_gh \$*\" >>\"\$T_TMP/calls\"; $how; return 1; }"
+    WRITES_UNKNOWN="" WRITES_OUT="" TIDY_UP=""
+    [[ "$name" != *tidy-up* ]] || TIDY_UP=1 # where a request ended by KILL doesn't stop the run
+    app_attempt -X PATCH "repos/$REPO" -f description=x >/dev/null 2>&1
+    TIDY_UP=""
+    assert_eq "$OBS" "$want" "$name"
+    [[ "$name" != *tidy-up* ]] || assert_contains "$AV_WHY" "cut off before its end" "$name"
+    assert_eq "$(find "$WORK" -type f | wc -l | tr -d ' ')" 0 "$name: a file left in the work folder"
+    assert_contains "$(unknown_writes)" "app gh api PATCH repos/$REPO (" "$name: the attempt named outcome unknown"
+  done
+  # Cut off in a test step: no answer within its limit (a KILL is taken so), so the run stops there,
+  # with no verdict, the attempt named outcome unknown.
+  p_stubs
+  gh_reply reply
+  # shellcheck disable=SC2016 # run in the stand-in
+  app_gh() { echo "app_gh $*" >>"$T_TMP/calls"; cat "$T_TMP/reply"; /bin/sh -c 'kill -KILL $PPID'; }
+  local rc=0 out
+  out="$( (trap 'unknown_writes >"$T_TMP/unknown"' EXIT; app_attempt -X PATCH "repos/$REPO" -f description=x; echo "VERDICT $OBS") 2>&1)" || rc=$?
+  assert_exit 2 "$rc" "the run's status after an attempt cut off"
+  assert_not_contains "$out" "VERDICT" "a verdict on an answer cut off"
+  assert_contains "$(cat "$T_TMP/unknown")" "app gh api PATCH repos/$REPO (" "the attempt named outcome unknown"
+  end_stand_in_run
+}
+
+# Round 114 (review-lens round 100's C3 = SEC-1, item 1; owner): an attempt's answer is taken only from
+# the gh its own job starts, given exactly that attempt's method and path: gh's standard input is
+# /dev/null, its standard output the answer's pipe, its error output /dev/null, and it has no other
+# descriptor; the pipe's write end is held only by gh and the job's own shells, never by the run's
+# shell or anything else. lsof's view is supporting evidence from this test, not proof against every
+# way another process could interfere.
+test_an_app_attempts_answer_comes_only_from_the_gh_its_job_started() {
+  local gh run dev holders h anc p
+  short_copy
+  WORK="$T_TMP/work"
+  request_tools 0
+  gh_reply reply
+  echo "api -X PATCH repos/$REPO -f description=x" >"$T_TMP/fd-probe"
+  # shellcheck disable=SC2016 # run inside the stopped run: $PPID there is the run itself
+  stopped_run_cleanup 0 "PHASE=permissions CLONE=\$WORK/clone" \
+    '/bin/sh -c "echo \$PPID" >$T_TMP/run-pid; app_attempt -X PATCH "repos/$REPO" -f description=x; echo "VERDICT $OBS"'
+  assert_contains "$OUT" "VERDICT refused" "the attempt judged on the answer gh gave"
+  assert_eq "$(cat "$T_TMP/probe-args")" "api -X PATCH repos/$REPO -f description=x -i -H Accept-Encoding: identity" "what gh was asked"
+  assert_eq "$(cat "$T_TMP/probe-fds")" "0 null;1 pipe;2 null;" "gh's descriptors"
+  gh="$(cat "$T_TMP/probe-pid")" run="$(cat "$T_TMP/run-pid")"
+  dev="$(awk -v p="$gh" '$2 == p && $4 ~ /^1[uw]?$/ && $5 == "PIPE" { print $6 }' "$T_TMP/probe-lsof")"
+  [[ "$dev" == 0x* ]] || _t_fail "gh's fd 1 is not a pipe in lsof's view: $(awk -v p="$gh" '$2 == p' "$T_TMP/probe-lsof" | head -n 5)"
+  holders="$(awk -v d="$dev" '$5 == "PIPE" && $6 == d { print $2 }' "$T_TMP/probe-lsof" | sort -u | tr '\n' ' ')"
+  [[ " $holders " == *" $gh "* ]] || _t_fail "lsof doesn't show gh holding the answer's write end: holders '$holders'"
+  # gh's ancestors, up to (not including) the run's own shell: the job that started it.
+  anc="" p="$gh"
+  while [[ -n "$p" && "$p" != "$run" && "$p" != 1 ]]; do
+    anc="$anc $p"
+    p="$(awk -v c="$p" '$1 == c { print $2 }' "$T_TMP/probe-ps")"
+  done
+  [[ "$p" == "$run" ]] || _t_fail "gh is not under the run's shell ($run): ancestors$anc"
+  for h in $holders; do
+    [[ " $anc " == *" $h "* ]] || _t_fail "a process outside the attempt's job holds the answer's write end: $h ($(awk -v p="$h" '$2 == p { print $1; exit }' "$T_TMP/probe-lsof"))"
+  done
+  [[ " $holders " != *" $run "* ]] || _t_fail "the run's own shell holds the answer's write end"
+}
+
+# Round 114 (owner: test partial output and child failure): an answer that isn't the whole of one gh's
+# own output, as it ended, is never complete: cut short, followed by gh's failure, or added to by a
+# process gh left behind after its end.
+test_an_app_attempts_answer_partial_or_added_to_is_never_complete() {
+  local case name how
+  # shellcheck disable=SC2016 # each is run as written, in the stand-in
+  for case in "half the reply, then gh fails|head -c 120 \"\$T_TMP/reply\"; return 1" \
+    "the whole reply, then gh exits 2|cat \"\$T_TMP/reply\"; return 2" \
+    "the whole reply, then a process it left writes more|cat \"\$T_TMP/reply\"; (/bin/sleep 0.2; echo more) & return 1" \
+    "a process it left writes first, then the reply|(echo before) ; cat \"\$T_TMP/reply\"; return 1"; do
+    IFS='|' read -r name how <<<"$case"
+    p_stubs
+    gh_reply reply
+    eval "app_gh() { echo \"app_gh \$*\" >>\"\$T_TMP/calls\"; $how; }"
+    WRITES_UNKNOWN="" WRITES_OUT=""
+    app_attempt -X PATCH "repos/$REPO" -f description=x >/dev/null 2>&1
+    assert_eq "$OBS" inconclusive "$name"
+    assert_contains "$(unknown_writes)" "app gh api PATCH repos/$REPO (" "$name: the attempt named outcome unknown"
+  done
+  end_stand_in_run
+}
+
+# Round 114 (owner: "the fixed method/path this attempt starts"): an attempt is sent only in its one
+# fixed form: -X <method> (required with fields), exactly one endpoint path (no URL, no host, no query,
+# not graphql), and only -f/-F/--input fields; anything else stops before it is sent, so what gh is
+# asked is exactly the method and path it is judged for.
+test_an_app_attempt_is_sent_only_in_its_fixed_form() {
+  local case name args rc
+  for case in "two endpoints|-X PATCH repos/\$REPO repos/\$REPO2" \
+    "no endpoint|-X PATCH -f description=x" \
+    "a full URL|-X PATCH https://example.com/repos/\$REPO" \
+    "graphql|-X POST graphql -f query=x" \
+    "a query string|repos/\$REPO/hooks?per_page=1" \
+    "another host|--hostname example.com repos/\$REPO/hooks" \
+    "a paginated read|--paginate repos/\$REPO/hooks" \
+    "its own -i|-i repos/\$REPO/hooks" \
+    "its own header|-H Accept: x repos/\$REPO/hooks" \
+    "a second method|-X PATCH -X DELETE repos/\$REPO" \
+    "fields without a method|repos/\$REPO -f description=x" \
+    "a method not of its list|-X patch repos/\$REPO" \
+    "a jq filter|repos/\$REPO/hooks --jq .[0]"; do
+    IFS='|' read -r name args <<<"$case"
+    p_stubs
+    rc=0
+    eval "(app_attempt $args) >\"\$T_TMP/out\" 2>&1" || rc=$?
+    assert_exit 2 "$rc" "$name"
+    assert_not_contains "$(cat "$T_TMP/calls")" "app_gh" "$name: sent"
+  done
+  # The forms its callers use are accepted as they are.
+  p_stubs
+  app_attempt "repos/$REPO/actions/secrets" >/dev/null 2>&1
+  app_attempt -X PUT "repos/$REPO/branches/dev/protection" --input "$WORK/weak.json" >/dev/null 2>&1
+  app_attempt -X POST "repos/$REPO/actions/runs/1/pending_deployments" -F "environment_ids[]=9" -f state=approved >/dev/null 2>&1
+  assert_eq "$(grep -c '^app_gh api' "$T_TMP/calls")" 3 "the callers' forms sent"
+  end_stand_in_run
+}
+
+# Round 113 (owner, 2026-11-25: accepted for these stage 1 API attempts only): a stop while an app
+# attempt is out is held until its answer is in, at most the request's own limit, then acted on: the
+# attempt is judged and named, no further test action starts, and the bounded clean-up runs.
+test_a_stop_during_an_app_attempt_waits_for_its_answer_then_ends_the_run() {
+  local last
+  short_copy
+  WORK="$T_TMP/work"
+  request_tools 0.6 # its answer (none) comes 0.6s in, after the stop at 0.3s, inside its 1s limit
+  echo "-X PATCH repos/$REPO -f description=x" >"$T_TMP/hang-on"
+  # shellcheck disable=SC2016 # run inside the stopped run: $PPID there is the run itself
+  stopped_run_cleanup 0 "PHASE=permissions CLONE=\$WORK/clone" \
+    '/bin/sh -c "/bin/sleep 0.3; kill -TERM \$PPID" & app_attempt -X PATCH "repos/$REPO" -f description=x; echo NEXT TEST ACTION; owner_gh api next-action'
+  assert_exit 143 "$RC" "the run's status (137: still running after 20s)"
+  ((SECS <= CLEANUP_SECS + 3)) || _t_fail "ended after ${SECS}s; the clean-up's cap is ${CLEANUP_SECS}s"
+  assert_not_contains "$OUT" "NEXT TEST ACTION" "a test action after the stop"
+  assert_not_contains "$(cat "$T_TMP/tools")" "next-action" "a request after the stop"
+  assert_eq "$(grep -cF -- "-X PATCH repos/$REPO" "$T_TMP/tools")" 1 "how often the attempt was sent"
+  last="$(printf '%s\n' "$OUT" | tail -n 1)"
+  assert_contains "$last" "CLEANUP INCOMPLETE:" "the attempt left unknown"
+  # Its answer was waited for and judged (not cut short by the stop).
+  assert_contains "$last" "app gh api PATCH repos/$REPO (answered HTTP unknown (exit 1): inconclusive, not read back)" "the attempt judged before the stop"
+}
+
+# Round 113 (review-lens round 100, C1 = SEC-2; owner): a baseline with any part unreadable is unreadable
+# whole, however the rest reads and even if that part fails the same way after the attempts.
+test_a_baseline_with_a_failed_part_is_unreadable_whole() {
+  local case name id phase fail
+  for case in "B13, its repository settings unreadable|B13|open|repo" \
+    "B13, one ruleset unreadable|B13|open|one-ruleset" \
+    "M4 in the ruleset phase, main's protection unreadable|M4|ruleset|protection"; do
+    IFS='|' read -r name id phase fail <<<"$case"
+    p_stubs
+    PHASE="$phase"
+    gh_reply reply
+    echo "$fail" >"$T_TMP/fail"
+    owner_gh() {
+      echo "owner_gh $*" >>"$T_TMP/calls"
+      case "$*" in
+        "api repos/$REPO/rulesets --jq .[].id") echo 5 ;;
+        "api repos/$REPO/rulesets/5") if [[ "$(cat "$T_TMP/fail")" == one-ruleset ]]; then echo "gh: HTTP 502" >&2; return 1; fi; echo '{"id":5}' ;;
+        "api repos/$REPO --jq "*) if [[ "$(cat "$T_TMP/fail")" == repo ]]; then echo "gh: HTTP 502" >&2; return 1; fi; printf 'm\tx\tmain\n' ;;
+        "api repos/$REPO/branches/main --jq .protected") if [[ "$(cat "$T_TMP/fail")" == protection ]]; then echo "gh: HTTP 502" >&2; return 1; fi; echo false ;;
+      esac
+    }
+    printf 'app_gh api -X|1|@reply\n' >"$T_TMP/answers"
+    WRITES_UNKNOWN="" WRITES_OUT=""
+    attempt_baseline "$id"
+    assert_eq "$ATTEMPT_BASE" error "$name: the baseline"
+    OBS=refused EV="" ATTEMPT_WRITES="POST repos/$REPO/rulesets"$'\n'
+    write_unknown "app gh api POST repos/$REPO/rulesets" "answered HTTP 403 (exit 1): refused, not read back"
+    attempts_settle "$id" "$ATTEMPT_BASE"
+    assert_eq "$OBS" inconclusive "$name"
+    assert_contains "$(unknown_writes)" "app gh api POST repos/$REPO/rulesets (" "$name: the write cleared"
+    # The same part failing the same way before and after compares equal as text: still unreadable.
+    OBS=refused EV=""
+    attempts_settle "$id" "$(printf 'rulesets: 5 \nerror')"
+    assert_eq "$OBS" inconclusive "$name: a baseline holding an unreadable part"
+    assert_contains "$(unknown_writes)" "app gh api POST repos/$REPO/rulesets (" "$name: the write cleared by a part's error"
+  done
   end_stand_in_run
 }
 
