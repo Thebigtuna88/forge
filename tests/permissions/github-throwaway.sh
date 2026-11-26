@@ -529,12 +529,16 @@ answer_expected() { # <expect> <answer>
 
 # A write whose operation's expected answer is declared (round 110): sent through capture, so its
 # answer is stored, and settled only by status 0 with that answer; anything else leaves it unknown.
-write_checked() { # <expect> <command…> — capture's status
+# Round 111 (review-lens round 99, C1; owner): it fails then too, so what depends on it doesn't run;
+# LAST_RC stays its command's own status.
+write_checked() { # <expect> <command…> — capture's status, else 1 if not settled on that answer
   WRITE_EXPECT="$1"
   shift
-  capture "$@"
+  capture "$@" || return
+  [[ -z "$WRITE_UNSETTLED" ]]
 }
 WRITE_EXPECT=""
+WRITE_UNSETTLED="" # set by into_settle: 1 if into's last write wasn't settled on its expected answer
 
 # Helper functions that send a write of their own when into runs them (round 109): into can't see
 # the request inside, so it notes the helper itself, by name and arguments, with the answer its
@@ -732,17 +736,23 @@ into_req() { # <command…> — sets IR_WHAT, IR_SECS (empty: unknown), IR_WRITE
 # refusal by its words), an answer unread, empty, unchecked (none expected declared) or not as
 # expected. A job ended by its limit (124, or 137 for a KILL) stops the run, as request_timed_out
 # does, except where a timeout doesn't (a clean-up, a tidy-up, a2-probe); inside a job of a job, that
-# job ends too, for the shell above it to note.
+# job ends too, for the shell above it to note. Round 111: WRITE_UNSETTLED says, for write_checked,
+# whether a write (or a command with an expected answer) was left unsettled, wherever it ran.
 into_settle() { # <status> <answer> <write number, or empty> <unread, or empty> <expected answer>
-  local rc="$1" secs="${IR_SECS:+${IR_SECS}s}"
-  if [[ -n "$3" ]]; then
-    if [[ $rc -eq 124 || $rc -eq 137 ]]; then write_unknown "$IR_WHAT" "no answer within ${secs:-its limit}"
-    elif [[ $rc -ne 0 ]]; then write_unknown "$IR_WHAT" "failed: status $rc"
-    elif [[ -n "$4" ]]; then write_unknown "$IR_WHAT" "its answer could not be read"
-    elif [[ -z "$2" ]]; then write_unknown "$IR_WHAT" "an empty answer"
-    elif [[ -z "$5" ]]; then write_unknown "$IR_WHAT" "answered; no expected answer to check it against"
-    elif ! answer_expected "$5" "$2"; then write_unknown "$IR_WHAT" "answered, not as expected"
+  local rc="$1" secs="${IR_SECS:+${IR_SECS}s}" why=""
+  WRITE_UNSETTLED=""
+  if [[ -n "$IR_WRITE$5" ]]; then
+    if [[ $rc -eq 124 || $rc -eq 137 ]]; then why="no answer within ${secs:-its limit}"
+    elif [[ $rc -ne 0 ]]; then why="failed: status $rc"
+    elif [[ -n "$4" ]]; then why="its answer could not be read"
+    elif [[ -z "$2" ]]; then why="an empty answer"
+    elif [[ -z "$5" ]]; then why="answered; no expected answer to check it against"
+    elif ! answer_expected "$5" "$2"; then why="answered, not as expected"
     fi
+    [[ -z "$why" ]] || WRITE_UNSETTLED=1
+  fi
+  if [[ -n "$3" ]]; then
+    [[ -z "$why" ]] || write_unknown "$IR_WHAT" "$why"
     write_done "$3"
   fi
   [[ $rc -eq 124 || $rc -eq 137 ]] || return 0
@@ -830,6 +840,7 @@ timeout_check() {
 }
 
 owner_what() { request_what owner "$@"; } # <gh args…> — how an owner's request is named (no request sent)
+app_what() { request_what app "$@"; }     # <gh args…> — the same for the app's (round 112)
 
 # Who asked what, in a few words: gh api's method and path, another gh command's first words, git's
 # command and what follows it, curl's method and address. Never a token: none is an argument.
@@ -837,7 +848,7 @@ request_what() { # <runner> <args…>
   local who m="" a s="" n=0 p="" r=""
   case "$1" in
     owner | owner_gh | owner_gh_run) who="owner gh" ;; # owner: owner_what's naming only
-    app_gh | app_gh_run) who="app gh" ;;
+    app | app_gh | app_gh_run) who="app gh" ;; # app: app_what's naming only
     app_git | app_git_run) who="app git" ;;
     app_curl | jwt_curl) who="app curl" ;;
     *) who="app $1" ;;
@@ -930,18 +941,278 @@ classify_push() { # after capture of an app git push
   fi
 }
 
-classify_api() { # after capture of an app gh api call to an admin endpoint
-  if [[ $LAST_RC -eq 0 ]]; then echo allowed; return; fi
-  # GitHub also answers 403 when a client sends too many requests: that proves nothing.
-  if printf '%s' "$LAST_OUT" | grep -Eiq 'rate limit|abuse detection|secondary rate'; then
-    echo inconclusive
-    return
+# An app's API attempt (round 112, review-lens round 99 C2; owner 2026-11-25): GitHub's whole answer
+# (gh api -i, identity encoding, as S2d's), judged by api_verdict, never by gh's or GitHub's words. A write
+# is noted before it is sent, and stays outcome unknown however it is answered, unless attempts_settle
+# later reads its target back unchanged after a complete refusal (owner: a read-back alone never does).
+# Sets OBS, AV_WHY, LAST_RC, LAST_OUT (what the answer is, in known forms only: never its body's text,
+# which can hold anything), AA_RAW (the whole answer, for a2-probe's own display) and adds a write to
+# ATTEMPT_WRITES (its method and path, one a line).
+app_attempt() { # <gh api args…>
+  local wn="" what rc=0 ignored
+  what="$(app_what api "$@")"
+  if request_writes app api "$@"; then
+    write_out "$what"
+    wn=$WRITE_N
   fi
-  if printf '%s' "$LAST_OUT" | grep -Eq 'HTTP 403|HTTP 404|Must have admin rights|Resource not accessible by integration'; then
-    echo refused
+  : >"$WORK/attempt.out"
+  into ignored app_attempt_run "$@" || rc=$?
+  if [[ -f "$WORK/attempt.out" ]] && AA_RAW="$(cat "$WORK/attempt.out"; printf x)"; then
+    AA_RAW="${AA_RAW%x}"
+    http_answer "$AA_RAW" "$rc"
   else
-    echo inconclusive
+    AA_RAW=""
+    http_answer "" "$rc"
+    HA_INCOMPLETE="its answer could not be read"
   fi
+  rm -f "$WORK/attempt.out"
+  LAST_RC=$rc
+  api_verdict "$(accepted_permission "$@")" "$wn"
+  LAST_OUT="HTTP $HA_STATUS (exit $rc); request id ${HA_REQUEST_ID:-none}; x-ratelimit-remaining ${HA_REMAINING:-none}; accepted permissions ${HA_PERMS:-none}; completion: ${HA_INCOMPLETE:-Content-Length $HA_LENGTH matches the body}; $OBS: $AV_WHY"
+  if [[ -n "$wn" ]]; then
+    write_unknown "$what" "answered HTTP $HA_STATUS (exit $rc): $OBS, not read back"
+    ATTEMPT_WRITES="$ATTEMPT_WRITES$(attempt_target "$@")"$'\n'
+    write_done "$wn"
+  fi
+}
+ATTEMPT_WRITES="" # the writes the attempts of the current test sent, each "<method> <path>"
+AA_RAW=""
+
+# The attempt itself: its standard output, the whole answer, to a file read whole (exact bytes, for the
+# length check); gh's own error line is discarded. -i and the header follow the caller's arguments.
+app_attempt_run() { # <gh api args…>
+  app_gh api "$@" -i -H "Accept-Encoding: identity" >"$WORK/attempt.out" 2>/dev/null
+}
+
+attempt_target() { # <gh api args…> — "<method> <path>", as request_what reads them
+  local w
+  w="$(app_what api "$@")"
+  printf '%s' "${w#app gh api }"
+}
+
+# GitHub's whole answer to a gh api -i request, in known forms only (round 80's reading of S2d's answer;
+# round 112, shared): HA_STATUS (its status, or unknown), HA_REQUEST_ID, HA_REMAINING, HA_RESOURCE (each
+# of its form, else "[other]"), HA_RETRY (set if a retry-after header came), HA_PERMS (the permissions
+# x-accepted-github-permissions names, space-separated, or "[other]"), HA_LENGTH, HA_BODY and
+# HA_INCOMPLETE: why it isn't shown complete, empty when it is (GitHub's own Content-Length equal to the
+# body's bytes, no content or transfer encoding, gh's exit status 0 or 1, no timeout).
+http_answer() { # <gh's standard output> <gh's exit status>
+  local LC_ALL=C raw="$1" first line name value head=1 offset=0 coding=""
+  local re='^HTTP/[0-9.]+ ([0-9]{3})( |$)'
+  HA_STATUS=unknown HA_REQUEST_ID="" HA_REMAINING="" HA_RESOURCE="" HA_RETRY="" HA_PERMS="" HA_LENGTH="" HA_BODY="" HA_INCOMPLETE=""
+  first="${raw%%$'\n'*}"
+  line="${first%$'\r'}"
+  if [[ "$line" =~ $re && "$raw" == *$'\n'* ]]; then
+    HA_STATUS="${BASH_REMATCH[1]}"
+    offset=$((${#first} + 1))
+    while IFS= read -r line; do
+      offset=$((offset + ${#line} + 1))
+      line="${line%$'\r'}"
+      if [[ -z "$line" ]]; then head=""; break; fi
+      name="$(printf '%s' "${line%%:*}" | tr '[:upper:]' '[:lower:]')"
+      value="${line#*:}"
+      value="${value# }"
+      case "$name" in
+        x-github-request-id)
+          [[ "$value" =~ ^[A-Fa-f0-9]{1,16}(:[A-Fa-f0-9]{1,16}){4}$ ]] || value="[other]"
+          HA_REQUEST_ID="$value"
+          ;;
+        x-ratelimit-remaining)
+          [[ "$value" =~ ^[0-9]{1,10}$ ]] || value="[other]"
+          HA_REMAINING="$value"
+          ;;
+        x-ratelimit-resource)
+          [[ " $S2D_RESOURCES " == *" $value "* && -n "$value" && "$value" != *" "* ]] || value="[other]"
+          HA_RESOURCE="$value"
+          ;;
+        x-accepted-github-permissions) HA_PERMS="$(accepted_permissions_of "$value")" ;;
+        retry-after) HA_RETRY=1 ;;
+        content-length) if [[ -z "$HA_LENGTH" && "$value" =~ ^[0-9]{1,12}$ ]]; then HA_LENGTH="$value"; else HA_LENGTH=bad; fi ;;
+        content-encoding) [[ "$value" == identity ]] || coding=1 ;;
+        transfer-encoding) coding=1 ;;
+      esac
+    done < <(printf '%s' "${raw#*$'\n'}")
+    if [[ -n "$head" ]]; then
+      HA_STATUS=unknown HA_REQUEST_ID="" HA_REMAINING="" HA_RESOURCE="" HA_RETRY="" HA_PERMS=""
+      HA_INCOMPLETE="cut before the end of its headers"
+    else
+      HA_BODY="${raw:$offset}"
+    fi
+  else
+    HA_BODY="$raw"
+    HA_INCOMPLETE="no HTTP status line"
+  fi
+  # Complete only when GitHub's own length says so; gh's exit status only supports it.
+  if [[ -z "$HA_INCOMPLETE" ]]; then
+    if [[ -n "$STOP_LINES" || "$2" == 124 ]]; then HA_INCOMPLETE="a request timed out"
+    elif [[ "$2" != 0 && "$2" != 1 ]]; then HA_INCOMPLETE="gh exit status $2"
+    elif [[ -n "$coding" ]]; then HA_INCOMPLETE="a content or transfer encoding: the length can't be checked"
+    elif [[ -z "$HA_LENGTH" ]]; then HA_INCOMPLETE="no Content-Length: completion can't be told"
+    elif [[ "$HA_LENGTH" == bad ]]; then HA_INCOMPLETE="a Content-Length not of its form, or more than one"
+    elif [[ "${#HA_BODY}" != "$HA_LENGTH" ]]; then HA_INCOMPLETE="the body is ${#HA_BODY} bytes, Content-Length $HA_LENGTH"
+    fi
+  fi
+}
+
+accepted_permissions_of() { # <x-accepted-github-permissions> — "name=level …", or "[other]" if any isn't of that form
+  local p out=""
+  for p in $(printf '%s' "$1" | tr ',;' '  '); do
+    [[ "$p" =~ ^[a-z_]{1,40}=(read|write|admin)$ ]] || { printf '[other]'; return; }
+    out="$out $p"
+  done
+  printf '%s' "${out# }"
+}
+
+# The permission GitHub's documentation says an operation needs from an app, as x-accepted-github-
+# permissions names it: the one line that ties a refusal to its endpoint and method. From the documented
+# permissions as known here, not checked against GitHub (round 112, offline): a wrong one can only make a
+# refusal inconclusive. None for an operation not listed (A6's installation PUT): never refused.
+accepted_permission() { # <gh api args…>
+  local t m p
+  t="$(attempt_target "$@")"
+  m="${t%% *}" p="${t#* }"
+  case "$m $p" in
+    "PATCH repos/"*) [[ "$p" =~ ^repos/[^/]+/[^/]+$ ]] && printf 'administration=write' ;;
+    "PUT repos/"*/branches/*/protection | "DELETE repos/"*/branches/*/protection) printf 'administration=write' ;;
+    "POST repos/"*/rulesets | "PUT repos/"*/rulesets/* | "DELETE repos/"*/rulesets/*) printf 'administration=write' ;;
+    "GET repos/"*/actions/secrets | "GET repos/"*/actions/secrets/public-key) printf 'secrets=read' ;;
+    "GET repos/"*/actions/variables) printf 'actions_variables=read' ;;
+    "GET repos/"*/keys | "GET repos/"*/invitations) printf 'administration=read' ;;
+    "GET repos/"*/hooks) printf 'repository_hooks=read' ;;
+    "PUT repos/"*/contents/* | "POST repos/"*/git/refs) printf 'contents=write' ;;
+    "PUT repos/"*/environments/*) [[ "$p" =~ ^repos/[^/]+/[^/]+/environments/[^/]+$ ]] && printf 'administration=write' ;;
+    "GET repos/"*/environments/*/secrets/public-key) printf 'environments=read' ;;
+    "DELETE repos/"*/environments/*/secrets/*) printf 'environments=write' ;;
+    "POST repos/"*/actions/runs/*/pending_deployments) printf 'deployments=write' ;;
+    "POST repos/"*/issues | "POST repos/"*/issues/*/comments) printf 'issues=write' ;;
+    "POST repos/"*/pulls) printf 'pull_requests=write' ;;
+  esac
+  return 0
+}
+
+# allowed on gh's exit 0; refused only on a complete answer (http_answer), GitHub's 403 (or 404, to a
+# read: a write's 404 can mean nothing was there to change), a request id of its form (correlation only:
+# the authenticated HTTPS connection is what says GitHub answered), no rate-limit sign, and <permission>
+# named by GitHub; else inconclusive. Sets OBS and AV_WHY.
+api_verdict() { # <the operation's permission> <its write number, or empty for a read>
+  local limit=""
+  AV_WHY=""
+  if [[ $LAST_RC -eq 0 ]]; then OBS=allowed AV_WHY="gh exit 0"; return; fi
+  OBS=inconclusive
+  [[ "$HA_STATUS" != 429 ]] || limit="$limit HTTP 429;"
+  [[ -z "$HA_RETRY" ]] || limit="$limit a retry-after header;"
+  [[ "$HA_REMAINING" != 0 ]] || limit="$limit x-ratelimit-remaining 0;"
+  if printf '%s' "$HA_BODY" | grep -Eiq 'rate limit|abuse detection|secondary rate'; then limit="$limit rate-limit words;"; fi
+  if [[ -n "$HA_INCOMPLETE" ]]; then AV_WHY="no complete answer: $HA_INCOMPLETE"
+  elif [[ "$HA_STATUS" != 403 && ! ("$HA_STATUS" == 404 && -z "$2") ]]; then AV_WHY="HTTP $HA_STATUS, not a refusal's status for this attempt"
+  elif [[ -z "$HA_REQUEST_ID" || "$HA_REQUEST_ID" == "[other]" ]]; then AV_WHY="no x-github-request-id of its form"
+  elif [[ -n "$limit" ]]; then AV_WHY="rate-limit signs:${limit%;}"
+  elif ! [[ "$HA_REMAINING" =~ ^[0-9]+$ && "$HA_REMAINING" -gt 0 ]]; then AV_WHY="x-ratelimit-remaining '${HA_REMAINING}', not above 0"
+  elif [[ -z "$HA_RESOURCE" || "$HA_RESOURCE" == "[other]" ]]; then AV_WHY="x-ratelimit-resource '${HA_RESOURCE}', not one of GitHub's listed resources"
+  elif [[ -z "$1" ]]; then AV_WHY="no permission is known for this operation, so its answer can't be tied to it"
+  elif [[ " $HA_PERMS " != *" $1 "* ]]; then AV_WHY="x-accepted-github-permissions '${HA_PERMS:-none}' doesn't name $1, this operation's"
+  else OBS=refused AV_WHY="a complete HTTP $HA_STATUS, request $HA_REQUEST_ID, GitHub naming $1"
+  fi
+}
+
+# A test's write attempts, all refused (round 112, owner): its state read again and compared with the
+# baseline read before the first attempt. Changed or unreadable: inconclusive, every write still unknown.
+# Unchanged: each write that would have shown against that baseline is settled (attempt_observable); a
+# no-op against it stays outcome unknown, whatever the verdict.
+attempts_settle() { # <test id> <baseline>
+  local now t
+  [[ "$OBS" == refused && -n "$ATTEMPT_WRITES" ]] || return 0
+  if [[ "$2" == - ]]; then
+    OBS=inconclusive
+    EV="$EV no state of this test can show its writes unchanged |"
+    return 0
+  fi
+  into now attempt_state "$1"
+  if [[ "$2" == error || "$now" == error || -z "$now" ]]; then
+    OBS=inconclusive
+    EV="$EV its state read back: unreadable (before or after the attempts) |"
+  elif [[ "$now" != "$2" ]]; then
+    OBS=inconclusive
+    EV="$EV its state read back: CHANGED since before the attempts |"
+  else
+    EV="$EV its state read back: unchanged since before the attempts |"
+    while IFS= read -r t; do
+      [[ -n "$t" ]] || continue
+      if attempt_observable "$1" "$t" "$2"; then write_resolved "app gh api $t"; else EV="$EV $t would change nothing it can show: outcome unknown |"; fi
+    done <<<"$ATTEMPT_WRITES"
+  fi
+}
+
+# What a test's write attempts could change, as the owner reads it now, compared whole and never shown
+# (round 112; round112-plan.md says what "unchanged" means for each): "-" for a test with none that can
+# show them, "error" if any part can't be read.
+attempt_state() { # <test id>
+  case "$1" in
+    B12) protection_state dev ;;
+    M4) protection_state main; [[ "$PHASE" != ruleset ]] || rulesets_state ;;
+    B13) rulesets_state; repo_state ;;
+    A2) probe_refs ;;
+    S2c) environment_state ;;
+    *) printf -- '-\n' ;;
+  esac
+}
+
+attempt_baseline() { # <test id> — sets ATTEMPT_BASE (round 112)
+  ATTEMPT_WRITES=""
+  case "$1" in
+    B12 | M4 | B13 | A2 | S2c) into ATTEMPT_BASE attempt_state "$1" ;;
+    *) ATTEMPT_BASE=- ;;
+  esac
+  [[ -n "$ATTEMPT_BASE" ]] || ATTEMPT_BASE=error
+}
+ATTEMPT_BASE=""
+
+# Whether a write would have shown against its test's baseline: a protection DELETE only where there was
+# one, the Environment PUT never (the settings it already has).
+attempt_observable() { # <test id> <method path> <baseline>
+  case "$1 $2" in
+    "B12 DELETE "* | "M4 DELETE "*/protection) [[ "${3%%$'\n'*}" == protected* ]] ;;
+    "S2c PUT "*) return 1 ;;
+    B12* | M4* | B13* | A2* | "S2c DELETE "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+protection_state() { # <branch> — "unprotected", "protected <its whole protection>", or error
+  local s full
+  into s branch_state "$1"
+  case "$s" in
+    unprotected) echo unprotected ;;
+    protected)
+      into full protection_full "$1"
+      if [[ "$full" == error ]]; then echo error; else echo "protected $full"; fi ;;
+    *) echo error ;;
+  esac
+}
+
+rulesets_state() { # every ruleset, each read whole by its id, or error
+  local ids id one
+  into ids owner_gh api "repos/$REPO/rulesets" --jq '.[].id' 2>/dev/null || { echo error; return; }
+  echo "rulesets: $(printf '%s' "$ids" | tr '\n' ' ')"
+  for id in $ids; do
+    [[ "$id" =~ ^[0-9]+$ ]] || { echo error; return; }
+    into one owner_gh api "repos/$REPO/rulesets/$id" 2>/dev/null || { echo error; return; }
+    jq -S -c . <<<"$one" 2>/dev/null || { echo error; return; }
+  done
+}
+
+repo_state() { # the repository's settings a PATCH can change, or error
+  owner_gh api "repos/$REPO" --jq '[.description, .homepage, .default_branch, .visibility, .archived, .allow_auto_merge, .allow_merge_commit, .allow_squash_merge, .allow_rebase_merge, .delete_branch_on_merge, .has_issues, .has_wiki, .has_projects] | map(tostring) | join("\t")' 2>/dev/null || echo error
+}
+
+environment_state() { # the Environment whole, its branch policies, the disposable secret by name; or error
+  local e p s
+  into e owner_gh api "repos/$REPO/environments/$ENV_NAME" 2>/dev/null || { echo error; return; }
+  into p owner_gh api "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" 2>/dev/null || { echo error; return; }
+  into s owner_gh api "repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME" --jq '[.name, .created_at, .updated_at] | join(" ")' 2>/dev/null || { echo error; return; }
+  jq -S -c . <<<"$e" 2>/dev/null || { echo error; return; }
+  jq -S -c . <<<"$p" 2>/dev/null || { echo error; return; }
+  echo "$s"
 }
 
 # --- Guards -------------------------------------------------------------------------------------
@@ -1732,7 +2003,7 @@ ruleset_summary() { # one line describing the only ruleset, or error
   owner_gh api "repos/$REPO/rulesets/$id" --jq '[.enforcement, .target, (.conditions.ref_name.include | join(",")), (.conditions.ref_name.exclude | length | tostring), ([.rules[] | if .type == "update" then "update:\(.parameters.update_allows_fetch_and_merge)" else .type end] | sort | join(",")), ([.bypass_actors[] | "\(.actor_type):\(.actor_id):\(.bypass_mode)"] | join(","))] | join(" ")' 2>/dev/null || echo error
 }
 
-want_ruleset() { # the two bypass choices this script may have installed
+want_ruleset() { # the two bypass choices this script may have installed (the second, before round 111)
   local uid
   into uid owner_uid || return 1 # owner_uid's die ends only its own job (review round 10)
   printf 'active branch refs/heads/main 0 deletion,non_fast_forward,update:false User:%s:always\n' "$uid"
@@ -2092,32 +2363,20 @@ cmd_ruleset() {
   local uid
   into uid owner_uid || die "can't read the owner's user id, so no ruleset was requested"
   ruleset_json User "$uid" >"$WORK/ruleset-user.json"
-  ruleset_json RepositoryRole 5 >"$WORK/ruleset-admin.json"
-  # Round 110: each settled only by its expected answer (the ruleset, with its id) or by the read-backs
-  # below (rule (b)).
-  if write_checked 'json:.id | type == "number"' owner_gh api -X POST "repos/$REPO/rulesets" --input "$WORK/ruleset-user.json"; then
-    say "ruleset created with bypass: the owner (User $uid)"
-  else
-    # Fall back only on a clear rejection that changed nothing: GitHub answered 422 (invalid) and
-    # there is still no ruleset. A lost answer after GitHub created it must not lead to a second.
-    local ev n
-    ev="$(evidence)"
-    into n ruleset_count
-    if ! printf '%s' "$LAST_OUT" | grep -q 'HTTP 422' || [[ "$n" != 0 ]]; then
-      die "the ruleset request failed without a clear rejection, or a ruleset exists now (rulesets: $n): check $REPO's rulesets on GitHub before running this again: $ev"
-    fi
-    say "GitHub refused a User bypass: $ev"
-    # None exists, read back: that first request changed nothing.
-    write_resolved "$(owner_what api -X POST "repos/$REPO/rulesets")"
-    write_checked 'json:.id | type == "number"' owner_gh api -X POST "repos/$REPO/rulesets" --input "$WORK/ruleset-admin.json" \
-      || die "GitHub refused the Repository admin bypass too: $(evidence)"
-    say "ruleset created with bypass: Repository admin role (5)"
-  fi
+  # Round 110: settled only by its expected answer (the ruleset, with its id) and the read-back below
+  # (rule (b)). Round 111 (review-lens round 99, C3 = SEC-1; owner): sent once, with no fallback form:
+  # a failure, whatever its words, or a list showing no ruleset can't show the first request changed
+  # nothing, so a second could make two. Anything but its expected answer stops here, outcome unknown.
+  write_checked 'json:.id | type == "number"' owner_gh api -X POST "repos/$REPO/rulesets" --input "$WORK/ruleset-user.json" \
+    || die "the ruleset request wasn't answered as made (its outcome is unknown; not sent again): check $REPO's rulesets on GitHub before running this again: $(evidence)"
+  say "ruleset created with bypass: the owner (User $uid)"
   verify_phase ruleset
-  # The one ruleset read back whole, as this script installs it: its request is settled.
-  write_resolved "$(owner_what api -X POST "repos/$REPO/rulesets")"
+  # The one ruleset read back whole, and as the very form sent: its request is settled.
   local sum
   into sum ruleset_summary
+  [[ "$sum" == "active branch refs/heads/main 0 deletion,non_fast_forward,update:false User:$uid:always" ]] \
+    || die "the ruleset read back is not the one requested ($sum): check $REPO's rulesets on GitHub"
+  write_resolved "$(owner_what api -X POST "repos/$REPO/rulesets")"
   say "ruleset: $sum"
 }
 
@@ -2578,18 +2837,22 @@ t_B11() {
 }
 
 admin_attempts() { # <id> <method path [input]>... separated by ";;" — refused only if every one is
-  # The first attempt that isn't refused ends the test: none after it is made (the stop rule).
+  # The first attempt that isn't refused ends the test: none after it is made (the stop rule). Round
+  # 112: each judged by GitHub's whole answer, then the test's state read back against its baseline.
   local id="$1" obs=refused ev="" c
   shift
+  attempt_baseline "$id"
   while [[ $# -gt 0 && "$obs" == refused ]]; do
     c=()
     while [[ $# -gt 0 && "$1" != ";;" ]]; do c+=("$1"); shift; done
     [[ $# -gt 0 ]] && shift
-    capture app_gh api "${c[@]}" || true
-    obs="$(classify_api)"
-    ev="$ev ${c[0]} ${c[1]}: $(evidence) |"
+    app_attempt "${c[@]}"
+    obs="$OBS"
+    ev="$ev ${c[0]} ${c[1]}: $LAST_OUT |"
   done
-  record "$id" "$obs" "$ev"
+  OBS="$obs" EV="$ev"
+  attempts_settle "$id" "$ATTEMPT_BASE"
+  record "$id" "$OBS" "$EV"
 }
 
 t_B12() {
@@ -2730,14 +2993,11 @@ reading() { # <id> <text> — a finding for the owner, never a pass or a fail (A
   say "READING $1 $2"
 }
 
-classify_push_perm() { # after capture of an app git push: refused only for a permission reason
-  if [[ $LAST_RC -eq 0 ]]; then echo allowed; return; fi
-  # shellcheck disable=SC2016 # the backticks are GitHub's own words, not a command
-  if printf '%s' "$LAST_OUT" | grep -Eiq 'Permission to [^ ]+ denied|Write access to repository not granted|without `workflows` permission'; then
-    echo refused
-  else
-    echo inconclusive
-  fi
+# After capture of an app git push (kind P). Round 112 (owner 2026-11-25): git's words can't tell a
+# rejection the remote completed from a transport failure, so a push that fails is inconclusive, its
+# write outcome unknown, until a way to tell them apart is approved (proposed: round112-plan.md).
+classify_push_perm() {
+  if [[ $LAST_RC -eq 0 ]]; then echo allowed; else echo inconclusive; fi
 }
 
 http_of() { # the HTTP status gh reported in LAST_OUT, or "allowed" after a success
@@ -2745,19 +3005,29 @@ http_of() { # the HTTP status gh reported in LAST_OUT, or "allowed" after a succ
   printf '%s' "$LAST_OUT" | grep -Eo 'HTTP [0-9]{3}' | tail -n 1 || echo "failed: $(evidence)"
 }
 
-# Attempts, in order; the first one not refused ends the list (the stop rule). Sets OBS and EV.
-p_attempts() { # <kind api|push> <args…> separated by ";;"
-  local kind="$1" c
-  shift
+# Attempts, in order; the first one not refused ends the list (the stop rule). Sets OBS and EV. Round
+# 112: an api attempt (app_gh api …) is judged by GitHub's whole answer (app_attempt), then the test's
+# state read back against its baseline (attempts_settle).
+p_attempts() { # <kind api|push> <test id> <args…> separated by ";;"
+  local kind="$1" id="$2" c
+  shift 2
   OBS=refused EV=""
+  [[ "$kind" != api ]] || attempt_baseline "$id"
   while [[ $# -gt 0 && "$OBS" == refused ]]; do
     c=()
     while [[ $# -gt 0 && "$1" != ";;" ]]; do c+=("$1"); shift; done
     [[ $# -gt 0 ]] && shift
-    capture "${c[@]}" || true
-    if [[ "$kind" == push ]]; then OBS="$(classify_push_perm)"; else OBS="$(classify_api)"; fi
-    EV="$EV ${c[*]:0:4}: $(evidence) |"
+    if [[ "$kind" == push ]]; then
+      capture "${c[@]}" || true
+      OBS="$(classify_push_perm)"
+      EV="$EV ${c[*]:0:4}: $(evidence) |"
+    else
+      [[ "${c[0]} ${c[1]}" == "app_gh api" ]] || die "p_attempts api: not an app gh api attempt: ${c[*]:0:2}"
+      app_attempt "${c[@]:2}"
+      EV="$EV ${c[*]:0:4}: $LAST_OUT |"
+    fi
   done
+  [[ "$kind" != api ]] || attempts_settle "$id" "$ATTEMPT_BASE"
 }
 
 # Controls, all of which must succeed. Sets CTL (ok|failed) and adds to EV. The first one that fails
@@ -2794,8 +3064,12 @@ t_A6() {
   local rid
   into rid owner_gh api "repos/$REPO" --jq .id 2>/dev/null || rid=""
   [[ "$rid" =~ ^[0-9]+$ ]] || { setup_fail_p A6 "could not read the repository id"; return; }
-  p_attempts api app_gh api -X PATCH "repos/$REPO" -f description="$MARKER" ";;" \
+  p_attempts api A6 app_gh api -X PATCH "repos/$REPO" -f description="$MARKER" ";;" \
     app_gh api -X PUT "user/installations/$INSTALLATION_ID/repositories/$rid"
+  # Owner 2026-11-25 (round 112): inconclusive whatever GitHub answers: both writes are no-ops (the
+  # description it has, the repository the installation has), which no read can show unchanged. Their
+  # outcome stays unknown.
+  if [[ "$OBS" == refused ]]; then OBS=inconclusive EV="$EV A6 stays inconclusive: its no-op writes can't be read back |"; fi
   [[ "$OBS" == refused ]] || { record_p A6 "$OBS" "not run" "$EV"; return; }
   p_controls owner_gh api -X PATCH "repos/$REPO" -f description="$MARKER"
   record_p A6 "$OBS" "$CTL" "$EV (the installation attempt has no control: only the owner's browser changes it)"
@@ -2805,7 +3079,7 @@ t_A6() {
 # only an admin may read). Control: the owner reads the same lists (nothing is created or written).
 # Round 13 (SEC-5): no collaborator write; see the evidence line.
 t_A8() {
-  p_attempts api app_gh api "repos/$REPO/actions/secrets" ";;" \
+  p_attempts api A8 app_gh api "repos/$REPO/actions/secrets" ";;" \
     app_gh api "repos/$REPO/actions/secrets/public-key" ";;" \
     app_gh api "repos/$REPO/actions/variables" ";;" \
     app_gh api "repos/$REPO/keys" ";;" \
@@ -2844,7 +3118,7 @@ t_A5() {
 t_A3() {
   fresh_from dev "a3-wf-$(stamp)"
   add_commit ".github/workflows/frg26-a3-$(stamp).yml" "name: frg26 a3"
-  p_attempts push app_git -C "$CLONE" push origin "HEAD:refs/heads/frg26/permissions/A3-wf-$(stamp)"
+  p_attempts push A3 app_git -C "$CLONE" push origin "HEAD:refs/heads/frg26/permissions/A3-wf-$(stamp)"
   [[ "$OBS" == refused ]] || { record_p A3 "$OBS" "not run" "$EV"; return; }
   fresh_from dev "a3-plain-$(stamp)"
   add_commit "tests/permissions-A3-$(stamp).txt" "FRG-26 A3 control"
@@ -2874,11 +3148,11 @@ t_A2() {
   fresh_from dev "a2-$(stamp)"
   add_commit "tests/permissions-A2-$(stamp).txt" "FRG-26 A2"
   # The push is judged by git's own words, the two API calls by GitHub's status.
-  p_attempts push app_git -C "$CLONE" push "https://github.com/$REPO2.git" "HEAD:refs/heads/frg26-a2-$(stamp)"
+  p_attempts push A2 app_git -C "$CLONE" push "https://github.com/$REPO2.git" "HEAD:refs/heads/frg26-a2-$(stamp)"
   [[ "$OBS" == refused ]] || { record_p A2 "$OBS" "not run" "$EV"; return; }
   local ev="$EV"
   content="$(printf 'FRG-26 A2\n' | base64 | tr -d '\n')"
-  p_attempts api app_gh api -X PUT "repos/$REPO2/contents/frg26-a2-$(stamp).txt" -f message="FRG-26 A2 ($(stamp))" \
+  p_attempts api A2 app_gh api -X PUT "repos/$REPO2/contents/frg26-a2-$(stamp).txt" -f message="FRG-26 A2 ($(stamp))" \
     -f content="$content" -f branch="$A2_BRANCH" ";;" \
     app_gh api -X POST "repos/$REPO2/git/refs" -f ref="refs/heads/frg26-a2-api-$(stamp)" -f sha="$main2"
   EV="$ev$EV"
@@ -2922,7 +3196,10 @@ t_A12() {
   WRITE_EXPECT="text:^https://github.com/$REPO/issues/[0-9]+\$"
   try_reading A12 "gh issue create" app_gh issue create --repo "$REPO" --title "FRG-26 A12 ($(stamp))" --body "FRG-26 throwaway test A12."
   n="${LAST_OUT##*/}"
-  if [[ $LAST_RC -eq 0 && "$n" =~ ^[0-9]+$ ]]; then
+  # Round 111 (review-lens round 99, C1): taken as the run's issue only if its answer was the new
+  # issue's address here; any other answer, even one ending in a number, leaves nothing to act on.
+  local unsettled="$WRITE_UNSETTLED"
+  if [[ $LAST_RC -eq 0 && -z "$unsettled" && "$n" =~ ^[0-9]+$ ]]; then
     # Closed by this number, not only if a list finds it (round 102: part 0's #129). The number is
     # kept before the pending record is cleared, in one command, so no stop comes between them.
     RUN_ISSUES="$RUN_ISSUES $n" PENDING_CREATE=""
@@ -2930,9 +3207,12 @@ t_A12() {
     try_reading A12 "gh issue comment" app_gh issue comment "$n" --repo "$REPO" --body "FRG-26 A12 comment."
     try_reading A12 "gh issue view" app_gh issue view "$n" --repo "$REPO" --json title --jq .title
   elif [[ $LAST_RC -eq 0 ]]; then
-    # Answered as made, with no number to close it by: its outcome is unknown. The pending record
-    # is cleared only once this one is written (review-lens round 93, C1), else it stays, named.
-    unsettled_write "answered without an issue number" app_gh issue create --repo "$REPO" && PENDING_CREATE=""
+    # Answered as made, with no number to close it by (or none shown to be this one's): its outcome
+    # is unknown. The pending record is cleared only once this one is written (review-lens round 93,
+    # C1), else it stays, named.
+    local why="answered without an issue number"
+    [[ ! "$n" =~ ^[0-9]+$ ]] || why="answered, not with a new issue's address in $REPO"
+    unsettled_write "$why" app_gh issue create --repo "$REPO" && PENDING_CREATE=""
   else
     # Failed, with no number: its outcome is unknown, whatever the answer says (no refusal is taken
     # from its text: rounds 92, C1 = SEC-3, and 93, C2 = SEC-1). Cleared as above.
@@ -3352,17 +3632,24 @@ probe_finish() {
 probe_attempt() { # <label> <kind|-> <jq path|-> <gh api args…>
   local label="$1" kind="$2" path="$3"
   shift 3
-  local status
+  local status out rc=0 w=""
   defer_signals
-  capture with_timeout "$(call_secs)" app_gh api -i "$@" || true
-  OBS="$(classify_api)"
-  if [[ $LAST_RC -eq 0 ]]; then status="$(printf '%s\n' "$LAST_OUT" | head -n 1 | tr -d '\r')"; else status="$(http_of)"; fi
+  # Round 112: judged as every attempt of the app's is (api_verdict on GitHub's whole answer), never by
+  # its words; gh's own error line is discarded.
+  into out probe_run "$@" || rc=$?
+  LAST_OUT="$(redact "$out")" LAST_RC=$rc
+  http_answer "$out" "$rc"
+  if request_writes app api "$@"; then w=1; fi
+  api_verdict "$(accepted_permission "$@")" "$w"
+  if [[ $LAST_RC -eq 0 ]]; then status="$(printf '%s\n' "$LAST_OUT" | head -n 1 | tr -d '\r')"; else status="HTTP $HA_STATUS"; fi
   say "ATTEMPT $label (token $PROBE_LABEL): $OBS ($status); GitHub's answer:"
   printf '%s\n' "$LAST_OUT" | tr -d '\r' | sed 's/^/    /'
   OBS_KEPT=""
   if [[ "$kind" != - ]]; then probe_keep "$kind" "$path"; fi
   resume_signals
 }
+
+probe_run() { with_timeout "$(call_secs)" app_gh api -i "$@" -H "Accept-Encoding: identity" 2>/dev/null; } # <gh api args…>
 
 probe_keep() { # <kind> <jq path> — after an allowed attempt, note the object by the number GitHub returned
   [[ "$OBS" == allowed ]] || return 0
@@ -3379,13 +3666,16 @@ probe_keep() { # <kind> <jq path> — after an allowed attempt, note the object 
 
 probe_reading() { # <id> <what was tried>
   local how
-  if [[ "$OBS" == allowed ]]; then how="allowed$OBS_KEPT"; else how="$OBS ($(http_of))"; fi
+  if [[ "$OBS" == allowed ]]; then how="allowed$OBS_KEPT"
+  elif [[ "$OBS" == refused ]]; then how="refused (HTTP $HA_STATUS)"
+  else how="$OBS (HTTP $HA_STATUS: $AV_WHY)"
+  fi
   PROBE_READINGS="$PROBE_READINGS $1=$OBS"
   say "READING $1 $2: $how"
   # Neither allowed nor refused for a permission reason (an error, a rate limit): no reading, and
   # what GitHub did is unknown, so nothing more is tried (round 49, C1).
   if [[ "$OBS" != allowed && "$OBS" != refused ]]; then
-    probe_stop "$1 got no clear answer from GitHub ($(http_of)): no reading; look on $REPO2 for anything it may have made"
+    probe_stop "$1 got no clear answer from GitHub (HTTP $HA_STATUS: $AV_WHY): no reading; look on $REPO2 for anything it may have made"
   fi
 }
 
@@ -3692,53 +3982,79 @@ unfinished_runs() {
     --jq '.workflow_runs[] | select(.name == "frg26-s2" and .status != "completed") | .id' 2>/dev/null
 }
 
-# The S2 cancels sent (round 77; round 110: every one, whatever its answer) are cancel_waiting_runs'
-# LATE, each id:<answer>:read, the answer the seconds of no answer or s<status>, settled only by a
-# list of unfinished runs read after the cancel. runs_reread, with each list read: a run no longer on
-# it is settled (its cancel's note resolved, rule (b)), said unless its cancel answered status 0;
-# one still on it is marked read.
-runs_reread() { # <the list>
-  local e id a keep=""
-  for e in $LATE; do
-    id="${e%%:*}"
-    if [[ " $(printf '%s' "$1" | tr '\n' ' ') " == *" $id "* ]]; then
-      keep="$keep ${e%:*}:read"
-    else
-      write_resolved "$(owner_what api -X POST "repos/$REPO/actions/runs/$id/cancel")"
-      a="${e#*:}" a="${a%:*}"
-      [[ "$a" == s0 ]] || say "CLEANUP S2 run $id in $REPO: its cancel $(cancel_answer "$a"); read back: no longer unfinished"
-    fi
-  done
-  LATE="$keep"
+# The S2 cancels this run has started (round 77; round 110: every one, whatever its answer). Round
+# 111 (review-lens round 99, SEC-2; owner: "record each S2 cancel before dispatch so a stop cannot
+# allow a resend"): one record for the whole run, each cancel entered before it is sent, never
+# removed, so no later tidy-up, test or clean-up after a stop sends a second for that run. Each entry
+# id:<answer>:<state>. The answer: - until it is kept (a stop came first), ok (GitHub's 202), the
+# seconds of no answer, or s<status> (s0: answered otherwise). The state: sent; read (a list of
+# unfinished runs read after it still shows the run); done (one no longer does: settled, rule (b)).
+S2_CANCELS=""
+
+s2_cancel() { # <run id> — sent only if this run's record has none for it; 1 unless GitHub accepted it (202)
+  local id="$1" a rc=0
+  [[ " $S2_CANCELS " != *" $id:"* ]] || return 1
+  S2_CANCELS="$S2_CANCELS $id:-:sent"
+  # Bounded by owner_gh alone, as in close_if_open (round 77); checked by GitHub's status line (round 110).
+  write_checked status:202 owner_gh api -i -X POST "repos/$REPO/actions/runs/$id/cancel" || rc=$?
+  if [[ $rc -eq 0 ]]; then a=ok
+  elif [[ $LAST_RC -eq 124 ]]; then a="$IR_SECS"
+  else a="s$LAST_RC"
+  fi
+  S2_CANCELS="${S2_CANCELS/ $id:-:sent/ $id:$a:sent}"
+  return "$rc"
 }
 
-cancel_answer() { # <seconds | s<status>> — how a cancel's answer is said
+# runs_reread, with each list of unfinished runs read: a run no longer on it is settled (its cancel's
+# note resolved, rule (b)), said unless GitHub accepted its cancel; one still on it is marked read.
+runs_reread() { # <the list>
+  local e id a st keep=""
+  for e in $S2_CANCELS; do
+    id="${e%%:*}" st="${e##*:}" a="${e#*:}" a="${a%:*}"
+    if [[ "$st" == "done" ]]; then
+      keep="$keep $e"
+    elif [[ " $(printf '%s' "$1" | tr '\n' ' ') " == *" $id "* ]]; then
+      keep="$keep $id:$a:read"
+    else
+      write_resolved "$(owner_what api -X POST "repos/$REPO/actions/runs/$id/cancel")"
+      [[ "$a" == ok ]] || say "CLEANUP S2 run $id in $REPO: its cancel $(cancel_answer "$a"); read back: no longer unfinished"
+      keep="$keep $id:$a:done"
+    fi
+  done
+  S2_CANCELS="$keep"
+}
+
+cancel_answer() { # <ok | - | seconds | s<status>> — how a cancel's answer is said
   case "$1" in
-    s0) printf 'answered' ;;
+    ok) printf 'was accepted (HTTP 202)' ;;
+    -) printf 'was started, its answer not kept (a stop came)' ;;
+    s0) printf 'answered, not as expected' ;;
     s*) printf 'failed (status %s)' "${1#s}" ;;
     *) printf 'got no answer within %ss' "$1" ;;
   esac
 }
 
-# runs_unsettled, when cancel_waiting_runs ends: each cancel still in LATE is named outcome unknown,
-# once, with what the list read back (round 110: its own note from capture gives way to this one).
+# runs_unsettled, when cancel_waiting_runs ends: each cancel not settled is named outcome unknown,
+# with what the list read back (round 110: its own note from capture gives way to this one). Kept in
+# the record: a later tidy-up's list may still settle it, and never sends it again.
 runs_unsettled() {
-  local e id a why what
-  for e in $LATE; do
-    id="${e%%:*}"
+  local e id a st why
+  for e in $S2_CANCELS; do
+    st="${e##*:}"
+    [[ "$st" != "done" ]] || continue
+    id="${e%%:*}" a="${e#*:}" a="${a%:*}"
     why="not read back"
-    [[ "$e" != *:read ]] || why="read back: still unfinished"
-    a="${e#*:}" a="${a%:*}"
-    what="$(owner_what api -X POST "repos/$REPO/actions/runs/$id/cancel")"
-    write_resolved "$what"
+    [[ "$st" != read ]] || why="read back: still unfinished"
     case "$a" in
-      s0) why="answered; $why" ;;
+      ok) why="accepted (HTTP 202); $why" ;;
+      -) why="its answer not kept (a stop came); $why" ;;
+      s0) why="answered, not as expected; $why" ;;
       s*) why="failed: status ${a#s}; $why" ;;
       *) why="no answer within ${a}s; $why" ;;
     esac
+    write_resolved "$(owner_what api -X POST "repos/$REPO/actions/runs/$id/cancel")"
     unsettled_write "$why" owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel"
   done
-  LATE=""
 }
 
 # Every unfinished S2 run GitHub shows is cancelled, and confirmed finished (rounds 14, 22, 25); then
@@ -3747,7 +4063,7 @@ runs_unsettled() {
 # are always dealt with first, whatever else failed (round 25, SEC-1). Each call bounded, and no
 # wait or poll runs past the clean-up's cap (round 72, SEC-1). 1 on any failure.
 cancel_waiting_runs() {
-  local ids id _ sha seen unseen="" ok="" rc runs TIDY_UP=1 LATE=""
+  local ids id _ sha seen unseen="" ok="" rc runs TIDY_UP=1
   for sha in $S2_SHAS; do
     seen=""
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
@@ -3776,12 +4092,10 @@ cancel_waiting_runs() {
     for id in $ids; do
       if [[ ! "$id" =~ ^[0-9]+$ ]]; then runs_unsettled; undone "cancelling the waiting S2 runs"; say "CLEANUP FAIL unexpected run id in $REPO: cancel any unfinished S2 run on GitHub"; return 1; fi
       in_time || break
-      # Bounded by owner_gh alone, as in close_if_open (round 77). Round 110 (owner's rule (b)): every
-      # cancel is sent once, whatever its answer (a failure is never taken as a refusal), and waits in
-      # LATE, its answer kept (seconds of no answer, or s<status>), for the lists that follow to settle it.
-      [[ " $LATE " != *" $id:"* ]] || continue
-      capture owner_gh api -X POST "repos/$REPO/actions/runs/$id/cancel" || true
-      if [[ $LAST_RC -eq 124 ]]; then LATE="$LATE $id:$IR_SECS:sent"; else LATE="$LATE $id:s$LAST_RC:sent"; fi
+      # Round 110 (owner's rule (b)): every cancel is sent once, whatever its answer (a failure is never
+      # taken as a refusal), and waits in the run's record for the lists that follow to settle it;
+      # round 111: one already in it, from this run's S2d, an earlier tidy-up or before a stop, is not sent.
+      s2_cancel "$id" || true
     done
     pause 5
   done
@@ -3821,9 +4135,22 @@ t_S2b() {
   [[ "$sha" =~ ^[0-9a-f]{40}$ && "$eid" =~ ^[0-9]+$ ]] || { setup_fail_p S2b "could not read the commit or the Environment"; return; }
   wait_run "$sha" waiting || { setup_fail_p S2b "the app's run never waited for review ($RUN)"; return; }
   id="${RUN%% *}"
-  approve_run app_gh "$id" "$eid" || true
-  OBS="$(classify_api)"
-  EV="the app approving its own run: $(evidence) |"
+  # Round 112 (owner): the app's attempt is judged by GitHub's whole answer, and settled only if the
+  # run, read back, is as its baseline was before the attempt: the same run, commit, Environment and one
+  # deployment, still pending, no approval recorded.
+  local base bdep
+  s2_reading "S2B baseline" "$id" "$sha" "$APP_BOT"
+  s2_pending_check "$id" "$sha" "$APP_BOT" "$eid" true
+  base="$S2_WHY" bdep="$S2R_DEP"
+  if [[ -n "$base" || -z "$bdep" ]]; then
+    setup_fail_p S2b "the app's run is not bound before its attempt (${base:-no deployment})"
+    cancel_waiting_runs || true
+    return
+  fi
+  ATTEMPT_WRITES=""
+  app_attempt -X POST "repos/$REPO/actions/runs/$id/pending_deployments" -F "environment_ids[]=$eid" \
+    -f state=approved -f comment="FRG-26 S2 approval attempt"
+  EV="the app approving its own run: $LAST_OUT |"
   if [[ "$OBS" != refused ]]; then record_p S2b "$OBS" "not run" "$EV"; cancel_waiting_runs || true; return; fi
   CTL=failed
   local can logv="" before dep
@@ -3832,6 +4159,15 @@ t_S2b() {
   s2_reading "S2B before" "$id" "$sha" "$APP_BOT"
   s2_pending_check "$id" "$sha" "$APP_BOT" "$eid" true
   before="$S2_WHY" dep="$S2R_DEP"
+  if [[ -n "$before" || "$dep" != "$bdep" ]]; then
+    OBS=inconclusive
+    EV="$EV its run read back: not as before the attempt (${before:-another deployment}) |"
+    record_p S2b "$OBS" "not run" "$EV"
+    cancel_waiting_runs || true
+    return
+  fi
+  write_resolved "app gh api POST repos/$REPO/actions/runs/$id/pending_deployments"
+  EV="$EV its run read back: as before the attempt |"
   if [[ "$can" == true ]] && approve_run owner_gh "$id" "$eid" && wait_run "$sha" completed && into logv run_log_value "$id" && [[ "$logv" == yes ]]; then CTL=ok; fi
   EV="$EV GitHub says the owner can approve it: $can; owner approving: $(evidence), run $RUN"
   s2_reading "S2B after" "$id" "$sha" "$APP_BOT" "$dep"
@@ -4080,8 +4416,7 @@ s2d_post() { # <run id> <Environment id>
 # Never kept: the body's text, gh's error text, any other header.
 s2d_approve() { # <run id> <Environment id>
   # shellcheck disable=SC2034 # ignored: into's output, empty (the request writes its own files)
-  local LC_ALL=C raw first line name value head=1 offset=0 body="" length="" coding="" err ignored=""
-  local re='^HTTP/[0-9.]+ ([0-9]{3})( |$)'
+  local LC_ALL=C raw body="" length="" err ignored=""
   S2D_RC=0 S2D_HTTP=unknown S2D_REQUEST_ID="" S2D_REMAINING="" S2D_RESOURCE="" S2D_RETRY="" S2D_ERRORS="" S2D_INCOMPLETE=""
   : >"$WORK/s2d.out"
   : >"$WORK/s2d.err"
@@ -4093,57 +4428,10 @@ s2d_approve() { # <run id> <Environment id>
   raw="$(cat "$WORK/s2d.out"; printf x)"
   raw="${raw%x}"
   err="$(cat "$WORK/s2d.err")"
-  first="${raw%%$'\n'*}"
-  line="${first%$'\r'}"
-  if [[ "$line" =~ $re && "$raw" == *$'\n'* ]]; then
-    S2D_HTTP="${BASH_REMATCH[1]}"
-    offset=$((${#first} + 1))
-    while IFS= read -r line; do
-      offset=$((offset + ${#line} + 1))
-      line="${line%$'\r'}"
-      if [[ -z "$line" ]]; then head=""; break; fi
-      name="$(printf '%s' "${line%%:*}" | tr '[:upper:]' '[:lower:]')"
-      value="${line#*:}"
-      value="${value# }"
-      case "$name" in
-        x-github-request-id)
-          [[ "$value" =~ ^[A-Fa-f0-9]{1,16}(:[A-Fa-f0-9]{1,16}){4}$ ]] || value="[other]"
-          S2D_REQUEST_ID="$value"
-          ;;
-        x-ratelimit-remaining)
-          [[ "$value" =~ ^[0-9]{1,10}$ ]] || value="[other]"
-          S2D_REMAINING="$value"
-          ;;
-        x-ratelimit-resource)
-          [[ " $S2D_RESOURCES " == *" $value "* && -n "$value" && "$value" != *" "* ]] || value="[other]"
-          S2D_RESOURCE="$value"
-          ;;
-        retry-after) S2D_RETRY=1 ;;
-        content-length) if [[ -z "$length" && "$value" =~ ^[0-9]{1,12}$ ]]; then length="$value"; else length=bad; fi ;;
-        content-encoding) [[ "$value" == identity ]] || coding=1 ;;
-        transfer-encoding) coding=1 ;;
-      esac
-    done < <(printf '%s' "${raw#*$'\n'}")
-    if [[ -n "$head" ]]; then
-      S2D_HTTP=unknown S2D_REQUEST_ID="" S2D_REMAINING="" S2D_RESOURCE="" S2D_RETRY=""
-      S2D_INCOMPLETE="cut before the end of its headers"
-    else
-      body="${raw:$offset}"
-    fi
-  else
-    body="$raw"
-    S2D_INCOMPLETE="no HTTP status line"
-  fi
-  # Complete only when GitHub's own length says so; gh's exit status and words only support it.
-  if [[ -z "$S2D_INCOMPLETE" ]]; then
-    if [[ -n "$STOP_LINES" || "$S2D_RC" == 124 ]]; then S2D_INCOMPLETE="a request timed out"
-    elif [[ "$S2D_RC" != 0 && "$S2D_RC" != 1 ]]; then S2D_INCOMPLETE="gh exit status $S2D_RC"
-    elif [[ -n "$coding" ]]; then S2D_INCOMPLETE="a content or transfer encoding: the length can't be checked"
-    elif [[ -z "$length" ]]; then S2D_INCOMPLETE="no Content-Length: completion can't be told"
-    elif [[ "$length" == bad ]]; then S2D_INCOMPLETE="a Content-Length not of its form, or more than one"
-    elif [[ "${#body}" != "$length" ]]; then S2D_INCOMPLETE="the body is ${#body} bytes, Content-Length $length"
-    fi
-  fi
+  # Read as every app attempt's answer is (round 112: one reader, http_answer).
+  http_answer "$raw" "$S2D_RC"
+  S2D_HTTP="$HA_STATUS" S2D_REQUEST_ID="$HA_REQUEST_ID" S2D_REMAINING="$HA_REMAINING" S2D_RESOURCE="$HA_RESOURCE"
+  S2D_RETRY="$HA_RETRY" S2D_INCOMPLETE="$HA_INCOMPLETE" body="$HA_BODY" length="$HA_LENGTH"
   if jq -e . >/dev/null 2>&1 <<<"$body"; then
     S2D_ANSWER="$(jq -r --arg words "$S2D_WORDS" '
       def msg: . as $m | if $m == null then "none" elif ($m | type) != "string" then "[other]"
@@ -4243,8 +4531,9 @@ t_S2d() {
     fi
   fi
   EV="$(s2_redact "$EV (S2D lines above; control: the owner's approval of the app's run in S2b)")"
-  # Checked by GitHub's status line (round 110): 202 for a cancel accepted, else outcome unknown.
-  write_checked status:202 owner_gh api -i -X POST "repos/$REPO/actions/runs/$id/cancel" || true
+  # Checked by GitHub's status line (round 110): 202 for a cancel accepted, else outcome unknown. In the
+  # run's record before it is sent (round 111), so no tidy-up after it sends a second.
+  s2_cancel "$id" || true
   record_p S2d "$OBS" "${S2B_OWNER_APPROVAL:-failed}" "$EV"
 }
 
@@ -4295,7 +4584,7 @@ t_S2c() {
     setup_fail_p S2c "could not make the disposable dummy secret: $(evidence)"
     return
   fi
-  p_attempts api app_gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input "$WORK/env.json" ";;" \
+  p_attempts api S2c app_gh api -X PUT "repos/$REPO/environments/$ENV_NAME" --input "$WORK/env.json" ";;" \
     app_gh api "repos/$REPO/environments/$ENV_NAME/secrets/public-key" ";;" \
     app_gh api -X DELETE "repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME"
   if [[ "$OBS" != refused ]]; then

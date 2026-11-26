@@ -243,9 +243,9 @@ test_admin_attempts_stop_at_the_first_change_that_gets_through() {
   load
   PHASE=protected
   FAILS=0
-  capture() { echo "CALL $*" >>"$T_TMP/calls"; }
-  classify_api() { echo allowed; }
-  evidence() { echo "HTTP 200"; }
+  : >"$T_TMP/calls"
+  attempt_baseline() { ATTEMPT_BASE=unprotected ATTEMPT_WRITES=""; } # round 112: its baseline, as read
+  app_attempt() { echo "CALL $*" >>"$T_TMP/calls"; OBS=allowed LAST_OUT="HTTP 200"; }
   local out
   out="$(admin_attempts B12 -X PUT "repos/$REPO/branches/dev/protection" ";;" -X DELETE "repos/$REPO/branches/dev/protection")"
   assert_contains "$out" "RESULT B12 protected FAIL"
@@ -262,16 +262,15 @@ test_b13_changes_nothing_after_its_attempts() {
   WORK="$T_TMP/work"
   mkdir -p "$WORK"
   owner_uid() { echo 1; }
-  capture() { :; }
-  evidence() { echo "stand-in"; }
   owner_gh() { echo "$*" >>"$T_TMP/owner"; }
   local obs
   for obs in allowed refused; do
     : >"$T_TMP/owner"
     FAILS=0
-    classify_api() { echo "$obs"; }
+    eval "app_attempt() { OBS=$obs LAST_OUT=stand-in; }"
     t_B13 >/dev/null
-    assert_eq "$(cat "$T_TMP/owner")" "" "owner writes after B13's attempts were $obs"
+    # Round 112: the owner reads B13's state before and after (its baseline); never a write.
+    assert_eq "$(grep -E -- '-X |-f |-F |--input' "$T_TMP/owner" || true)" "" "owner writes after B13's attempts were $obs"
   done
 }
 
@@ -422,6 +421,8 @@ test_reset_closes_every_open_pr_on_every_page() {
         echo 11
         if [[ "$*" == *--paginate* ]]; then echo 12; fi
         ;;
+      # Each close answered as gh does (round 111: an unexpected answer stops the reset).
+      "pr close "*) echo "$*" >>"$T_TMP/owner"; echo "Closed pull request $REPO#$3 (FRG-26 test)" ;;
       *) echo "$*" >>"$T_TMP/owner" ;;
     esac
   }
@@ -583,24 +584,6 @@ test_classify_push() {
   assert_eq "$(classify_push)" inconclusive "network failure"
   LAST_RC=1 LAST_OUT="remote: Invalid username or token."
   assert_eq "$(classify_push)" inconclusive "bad credentials"
-}
-
-test_classify_api() {
-  load
-  LAST_RC=0 LAST_OUT="{}"
-  assert_eq "$(classify_api)" allowed
-  LAST_RC=1 LAST_OUT="gh: Not Found (HTTP 404)"
-  assert_eq "$(classify_api)" refused "404"
-  LAST_RC=1 LAST_OUT="gh: Must have admin rights to Repository. (HTTP 403)"
-  assert_eq "$(classify_api)" refused "403"
-  LAST_RC=1 LAST_OUT="gh: Validation Failed (HTTP 422)"
-  assert_eq "$(classify_api)" inconclusive "422 is not an authorisation refusal"
-  LAST_RC=1 LAST_OUT="HTTP 503 Service Unavailable"
-  assert_eq "$(classify_api)" inconclusive "503"
-  LAST_RC=1 LAST_OUT="gh: API rate limit exceeded for user ID 1. (HTTP 403)"
-  assert_eq "$(classify_api)" inconclusive "a rate-limit 403 is not a permission refusal"
-  LAST_RC=1 LAST_OUT="gh: You have exceeded a secondary rate limit. (HTTP 403)"
-  assert_eq "$(classify_api)" inconclusive "secondary rate limit"
 }
 
 test_b11_open_needs_a_confirmed_result() {
@@ -953,32 +936,51 @@ test_ruleset_needs_enough_app_allowance_before_it_changes_anything() {
   assert_contains "$(cat "$T_TMP/owner")" "api -X POST repos/$REPO/rulesets"
 }
 
-test_ruleset_falls_back_only_after_a_clear_rejection() {
-  # Round 8 C1: a lost answer after GitHub created the ruleset must not lead to a second one. The
-  # Repository admin form is tried only when GitHub rejected the User form as invalid (HTTP 422)
-  # and there is still no ruleset.
+# Round 8 C1: a lost answer after GitHub created the ruleset must not lead to a second one. Round 111
+# (review-lens round 99, C3 = SEC-1; owner): no fallback form at all. A create not settled by its
+# expected answer (the ruleset, with its id) stops the command, its outcome unknown, whatever the
+# answer's words or a list read after it; one that is, is settled only by the read-back of the very
+# form it sent.
+test_a_ruleset_create_is_sent_once_whatever_its_answer() {
   owner_cmd_stubs
-  verify_phase() { :; }
+  verify_phase() { echo "VERIFY $1" >>"$T_TMP/owner"; }
   app_gh() { rate_fixture 4000; }
   owner_gh() {
     case "$*" in
       *"-X POST repos/$REPO/rulesets"*)
         echo "$*" >>"$T_TMP/owner"
-        if [[ "$(grep -c 'X POST' "$T_TMP/owner")" == 1 ]]; then echo "$FIRST_ERR" >&2; return 1; fi
-        ;;
+        printf '%s\n' "$FIRST_OUT"
+        return "$FIRST_RC" ;;
     esac
   }
-  local case_ err count rc posts
-  for case_ in "gh: HTTP 502 Bad Gateway|0|2|1" "gh: Validation Failed (HTTP 422)|1|2|1" \
-    "gh: Validation Failed (HTTP 422)|error|2|1" "gh: Validation Failed (HTTP 422)|0|0|2"; do
-    IFS='|' read -r err count rc posts <<<"$case_"
-    FIRST_ERR="$err"
-    eval "ruleset_count() { echo $count; }"
+  ruleset_count() { echo "$COUNT"; }
+  ruleset_summary() { echo "$SUMMARY"; }
+  die() { printf 'DIED: %s\n' "$*"; unknown_writes; exit 2; } # with the writes the clean-up would name
+  local case_ name rc want_rc out user admin
+  user="active branch refs/heads/main 0 deletion,non_fast_forward,update:false User:1:always"
+  admin="active branch refs/heads/main 0 deletion,non_fast_forward,update:false RepositoryRole:5:always"
+  for case_ in "a gateway error|gh: HTTP 502 Bad Gateway|1|0|$user|2" \
+    "a 422 with no ruleset after it (the old fallback)|gh: Validation Failed (HTTP 422)|1|0|$user|2" \
+    "a 422 with a ruleset after it|gh: Validation Failed (HTTP 422)|1|1|$user|2" \
+    "an unexpected answer, status 0|{\"message\":\"later\"}|0|0|$user|2" \
+    "its expected answer, another form read back|{\"id\":7}|0|1|$admin|2" \
+    "its expected answer, its form read back|{\"id\":7}|0|1|$user|0"; do
+    IFS='|' read -r name FIRST_OUT FIRST_RC COUNT SUMMARY want_rc <<<"$case_"
     : >"$T_TMP/owner"
-    local got=0
-    (cmd_ruleset) >/dev/null 2>&1 || got=$?
-    assert_exit "$rc" "$got" "first answer '$err', rulesets after it: $count"
-    assert_eq "$(grep -c 'X POST' "$T_TMP/owner")" "$posts" "ruleset requests after '$err' with $count rulesets"
+    rc=0
+    out="$({ cmd_ruleset && unknown_writes; } 2>&1)" || rc=$?
+    assert_exit "$want_rc" "$rc" "$name"
+    assert_eq "$(grep -c 'X POST' "$T_TMP/owner")" 1 "$name: ruleset creates sent"
+    assert_not_contains "$(cat "$T_TMP/owner")" "ruleset-admin.json" "$name: the fallback form"
+    if [[ "$want_rc" == 0 ]]; then
+      assert_contains "$(cat "$T_TMP/owner")" "VERIFY ruleset" "$name"
+      assert_not_contains "$out" "POST repos/$REPO/rulesets (" "$name: named outcome unknown"
+    elif [[ "$name" == *"another form"* ]]; then
+      assert_contains "$out" "DIED: the ruleset read back is not the one requested ($admin)" "$name"
+    else
+      assert_contains "$out" "owner gh api POST repos/$REPO/rulesets (" "$name: named outcome unknown"
+    fi
+    [[ "$name" == *"another form"* || "$want_rc" == 0 ]] || assert_not_contains "$(cat "$T_TMP/owner")" "VERIFY ruleset" "$name: read back as if made"
   done
 }
 
@@ -1757,11 +1759,12 @@ test_a_permission_test_needs_a_refusal_and_a_working_control() {
 test_classify_push_perm() {
   load
   LAST_RC=1
+  # Round 112 (owner): git's words of a refusal are not enough (round112-plan.md's proposal is pending).
   LAST_OUT="remote: Permission to Thebigtuna88/forge-frg26-throwaway-2.git denied to frg26-test-app[bot].
 fatal: unable to access 'https://github.com/Thebigtuna88/forge-frg26-throwaway-2.git/': The requested URL returned error: 403"
-  assert_eq "$(classify_push_perm)" refused "permission denied"
+  assert_eq "$(classify_push_perm)" inconclusive "permission denied"
   LAST_OUT="! [remote rejected] HEAD -> x (refusing to allow a GitHub App to create or update workflow \`.github/workflows/x.yml\` without \`workflows\` permission)"
-  assert_eq "$(classify_push_perm)" refused "the workflows permission"
+  assert_eq "$(classify_push_perm)" inconclusive "the workflows permission"
   LAST_OUT="fatal: unable to access 'https://github.com/x/': Could not resolve host: github.com"
   assert_eq "$(classify_push_perm)" inconclusive "a network error"
   LAST_OUT="remote: error: GH006: Protected branch update failed"
@@ -1789,7 +1792,8 @@ p_stubs() { # app and owner calls are logged; answers come from $T_TMP/answers (
     while IFS='|' read -r pat rc text; do
       [[ -n "$pat" ]] || continue
       if [[ "$who $*" == *$pat* ]]; then
-        [[ -n "$text" ]] && printf '%s\n' "$text"
+        # @<file>: that file's bytes exactly (round 112: a whole gh api -i answer, gh_reply's)
+        if [[ "$text" == @* ]]; then cat "$T_TMP/${text#@}"; elif [[ -n "$text" ]]; then printf '%s\n' "$text"; fi
         return "$rc"
       fi
     done <"$T_TMP/answers"
@@ -1801,6 +1805,38 @@ p_stubs() { # app and owner calls are logged; answers come from $T_TMP/answers (
   fresh_from() { :; }
   add_commit() { echo "commit $1" >>"$T_TMP/calls"; }
   sleep() { :; }
+}
+
+# A gh api -i answer as GitHub gives it (round 112), to $T_TMP/<file>: by default a complete 403 for an
+# operation that needs administration=write. Each change alters it: status=<line>, body=<text>,
+# drop=<header name>, add=<header line>, len=<a Content-Length of its own>, cut (no blank line after the
+# headers, no body), raw=<the whole output> (no status line).
+gh_reply() { # <file> [change…]
+  local LC_ALL=C f="$T_TMP/$1" status="HTTP/2.0 403 Forbidden" raw="" len="" cut="" c h
+  local body='{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/rest","status":"403"}'
+  local heads=("Content-Type: application/json" "X-Accepted-Github-Permissions: administration=write"
+    "X-Github-Request-Id: C0DE:1A2B:3C4D5E:6F7A8B:9C0D1E2F" "X-Ratelimit-Remaining: 4979" "X-Ratelimit-Resource: core")
+  shift
+  for c in "$@"; do
+    case "$c" in
+      status=*) status="${c#status=}" ;;
+      body=*) body="${c#body=}" ;;
+      raw=*) raw="${c#raw=}" ;;
+      len=*) len="${c#len=}" ;;
+      cut) cut=1 ;;
+      add=*) heads+=("${c#add=}") ;;
+      drop=*)
+        local keep=()
+        for h in "${heads[@]}"; do [[ "${h%%:*}" == "${c#drop=}" ]] || keep+=("$h"); done
+        heads=(${keep[@]+"${keep[@]}"}) ;;
+    esac
+  done
+  if [[ -n "$raw" ]]; then printf '%s' "$raw" >"$f"; return; fi
+  {
+    printf '%s\r\nContent-Length: %s\r\n' "$status" "${len:-${#body}}"
+    for h in ${heads[@]+"${heads[@]}"}; do printf '%s\r\n' "$h"; done
+    [[ -n "$cut" ]] || printf '\r\n%s' "$body"
+  } >"$f"
 }
 
 a2_answers() { # the owner's reads A2 needs, then the given lines
@@ -1819,37 +1855,29 @@ a2_answers() { # the owner's reads A2 needs, then the given lines
 
 test_a2_tries_code_changes_on_a_repo_the_app_is_not_installed_on() {
   p_stubs
-  a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot]." \
-    "app_gh api -X PUT repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)" \
-    "app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)"
+  # Round 112 (owner): a push that fails is inconclusive (its refusal can't yet be told from a
+  # transport failure), so A2 stops there, by the stop rule, before its API attempts.
+  a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot]."
   local out calls
-  out="$(t_A2)"
-  assert_contains "$out" "RESULT A2 permissions PASS attempt=refused control=ok"
+  WRITES_UNKNOWN="" WRITES_OUT=""
+  t_A2 >"$T_TMP/out" 2>&1
+  out="$(cat "$T_TMP/out")"
+  assert_contains "$out" "RESULT A2 permissions FAIL attempt=inconclusive control=not run"
   calls="$(cat "$T_TMP/calls")"
   assert_contains "$calls" "app_git -C $T_TMP/clone push https://github.com/$REPO2.git HEAD:refs/heads/frg26-a2-r1"
-  assert_contains "$calls" "app_gh api -X PUT repos/$REPO2/contents/frg26-a2-r1.txt"
-  assert_contains "$calls" "branch=frg26-a2"
-  assert_contains "$calls" "app_gh api -X POST repos/$REPO2/git/refs -f ref=refs/heads/frg26-a2-api-r1"
-  assert_contains "$calls" "app_git -C $T_TMP/clone push origin HEAD:refs/heads/frg26/permissions/A2-r1"
-  assert_contains "$calls" "app_gh api -X PUT repos/$REPO/contents/tests/permissions-A2-api-r1.txt"
-  assert_contains "$calls" "app_gh api -X POST repos/$REPO/git/refs -f ref=refs/heads/frg26/permissions/A2-api-r1"
+  assert_contains "$(unknown_writes)" "app git push https://github.com/$REPO2.git HEAD:refs/heads/frg26-a2-r1" "the push named outcome unknown"
+  assert_not_contains "$calls" "app_gh api -X PUT repos/$REPO2" "an API attempt after an inconclusive push"
+  assert_not_contains "$calls" "push origin" "a control after an inconclusive push"
   # Owner 2026-11-15: no issue or PR is tried there any more.
   assert_not_contains "$calls" "repos/$REPO2/issues" "an issue on the second throwaway"
   assert_not_contains "$calls" "repos/$REPO2/pulls" "a PR on the second throwaway"
-  assert_contains "$out" "opening an issue there is not tried"
   # A write that got through to the other repo fails the test, and nothing more is tried there.
   a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|0|"
   : >"$T_TMP/calls"
   out="$(t_A2)"
   assert_contains "$out" "RESULT A2 permissions FAIL attempt=allowed"
   assert_not_contains "$(cat "$T_TMP/calls")" "-X PUT repos/$REPO2" "attempts after one got through"
-  # So does a file write that got through, before the branch is tried.
-  a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot]." \
-    "app_gh api -X PUT repos/$REPO2/|0|{}"
-  : >"$T_TMP/calls"
-  out="$(t_A2)"
-  assert_contains "$out" "RESULT A2 permissions FAIL attempt=allowed"
-  assert_not_contains "$(cat "$T_TMP/calls")" "-X POST repos/$REPO2/git/refs" "the branch after the file got through"
+  end_stand_in_run
 }
 
 # Round 70 (C1, SEC-1): only the exact branch counts; a look-alike branch or tag, with frg26-a2
@@ -1879,49 +1907,62 @@ test_a2_needs_the_exact_branch_not_a_look_alike() {
   done
 }
 
-test_a2_fails_when_the_second_throwaways_branches_change() {
-  p_stubs
-  a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot]." \
-    "app_gh api -X PUT repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)" \
-    "app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)"
-  # Every refusal was clean, but a branch appeared there: the refs read differ the second time.
-  answer_refs() {
-    local n=0
-    [[ -f "$T_TMP/refs-reads" ]] && n="$(cat "$T_TMP/refs-reads")"
-    echo $((n + 1)) >"$T_TMP/refs-reads"
-    printf 'refs/heads/frg26-a2 %s\n' "$(printf 'a%.0s' $(seq 1 40))"
-    if [[ $n -ge 1 ]]; then echo "refs/heads/sneaked 0123456789abcdef0123456789abcdef01234567"; fi
-  }
-  owner_gh() {
-    case "$*" in
-      *"matching-refs/heads"*) echo "owner_gh $*" >>"$T_TMP/calls"; answer_refs ;;
-      *) answer owner_gh "$@" ;;
-    esac
-  }
-  local out
-  out="$(t_A2)"
-  assert_contains "$out" "RESULT A2 permissions FAIL attempt=allowed"
-  assert_contains "$out" "branches or tags changed"
-  assert_not_contains "$(cat "$T_TMP/calls")" "push origin" "a control after the change"
+# Round 112: A2's API attempts (reached once a push can be shown refused) are settled against the second
+# throwaway's whole branch and tag list read before them: a branch that appeared makes them inconclusive,
+# every write still unknown; an unchanged list, with complete refusals, settles both.
+test_a2_api_attempts_are_settled_only_against_the_second_throwaways_refs() {
+  local case name more want
+  for case in "unchanged|0|refused" "a branch appeared|1|inconclusive"; do
+    IFS='|' read -r name more want <<<"$case"
+    p_stubs
+    gh_reply reply drop=X-Accepted-Github-Permissions "add=X-Accepted-Github-Permissions: contents=write"
+    a2_answers "app_gh api -X PUT repos/$REPO2/|1|@reply" "app_gh api -X POST repos/$REPO2/|1|@reply"
+    echo "$more" >"$T_TMP/more"
+    answer_refs() {
+      local n=0
+      [[ -f "$T_TMP/refs-reads" ]] && n="$(cat "$T_TMP/refs-reads")"
+      echo $((n + 1)) >"$T_TMP/refs-reads"
+      printf 'refs/heads/frg26-a2 %s\n' "$(printf 'a%.0s' $(seq 1 40))"
+      if [[ $n -ge 1 && "$(cat "$T_TMP/more")" == 1 ]]; then echo "refs/heads/sneaked 0123456789abcdef0123456789abcdef01234567"; fi
+    }
+    owner_gh() {
+      case "$*" in
+        *"matching-refs/heads"*) echo "owner_gh $*" >>"$T_TMP/calls"; answer_refs ;;
+        *) answer owner_gh "$@" ;;
+      esac
+    }
+    rm -f "$T_TMP/refs-reads"
+    WRITES_UNKNOWN="" WRITES_OUT=""
+    p_attempts api A2 app_gh api -X PUT "repos/$REPO2/contents/x.txt" -f message=m ";;" \
+      app_gh api -X POST "repos/$REPO2/git/refs" -f ref=refs/heads/x -f sha=a >/dev/null 2>&1
+    assert_eq "$OBS" "$want" "$name"
+    if [[ "$want" == refused ]]; then
+      assert_eq "$(unknown_writes)" "" "$name: a write still named outcome unknown"
+    else
+      assert_contains "$EV" "CHANGED since before the attempts" "$name"
+      assert_contains "$(unknown_writes)" "app gh api PUT repos/$REPO2/contents/x.txt (" "$name: the file write named outcome unknown"
+      assert_contains "$(unknown_writes)" "app gh api POST repos/$REPO2/git/refs (" "$name: the branch write named outcome unknown"
+    fi
+  done
+  end_stand_in_run
 }
 
 test_a3_pushes_a_workflow_file_and_a_plain_file() {
   p_stubs
+  # Round 112 (owner): a failed push is inconclusive until a completed rejection can be told from a
+  # transport failure, so no control follows it.
   cat >"$T_TMP/answers" <<'EOF'
 push origin HEAD:refs/heads/frg26/permissions/A3-wf-r1|1|! [remote rejected] HEAD -> frg26/permissions/A3-wf-r1 (refusing to allow a GitHub App to create or update workflow `.github/workflows/frg26-a3-r1.yml` without `workflows` permission)
 EOF
   local out
   out="$(t_A3)"
-  assert_contains "$out" "RESULT A3 permissions PASS attempt=refused control=ok"
+  assert_contains "$out" "RESULT A3 permissions FAIL attempt=inconclusive control=not run"
   assert_contains "$(cat "$T_TMP/calls")" "commit .github/workflows/frg26-a3-r1.yml"
-  assert_contains "$(cat "$T_TMP/calls")" "commit tests/permissions-A3-r1.txt"
-  # The plain file must push, or the refusal proves nothing.
-  cat >"$T_TMP/answers" <<'EOF'
-push origin HEAD:refs/heads/frg26/permissions/A3-wf-r1|1|! [remote rejected] (refusing to allow a GitHub App to create or update workflow `x` without `workflows` permission)
-push origin HEAD:refs/heads/frg26/permissions/A3-plain-r1|1|fatal: unable to access: Could not resolve host
-EOF
+  assert_not_contains "$(cat "$T_TMP/calls")" "commit tests/permissions-A3-r1.txt" "a control after an inconclusive push"
+  # A workflow file pushed is a FAIL, the control not run.
+  : >"$T_TMP/answers"
   out="$(t_A3)"
-  assert_contains "$out" "RESULT A3 permissions FAIL attempt=refused control=failed"
+  assert_contains "$out" "RESULT A3 permissions FAIL attempt=allowed control=not run"
 }
 
 test_a5_a_revoked_token_stops_working() {
@@ -1949,27 +1990,41 @@ app_gh ghs_second api repos/$REPO --jq .full_name"
 
 test_a6_tries_settings_and_its_own_installation() {
   p_stubs
+  gh_reply reply
   cat >"$T_TMP/answers" <<EOF
 owner_gh api repos/$REPO --jq .id|0|4242
-app_gh api -X PATCH repos/$REPO|1|gh: Resource not accessible by integration (HTTP 403)
-app_gh api -X PUT user/installations/77/repositories/4242|1|gh: Resource not accessible by integration (HTTP 403)
+app_gh api -X PATCH repos/$REPO|1|@reply
+app_gh api -X PUT user/installations/77/repositories/4242|1|@reply
 EOF
   local out
   out="$(t_A6)"
-  assert_contains "$out" "RESULT A6 permissions PASS attempt=refused control=ok"
+  # Round 112 (owner): A6 stays inconclusive, so its control (the owner's same no-op) isn't run.
+  assert_contains "$out" "RESULT A6 permissions FAIL attempt=inconclusive control=not run"
   local calls
   calls="$(cat "$T_TMP/calls")"
-  # The control is the owner making the very same write, a no-op: the description it already has.
   assert_contains "$calls" "app_gh api -X PATCH repos/$REPO -f description=$MARKER"
-  assert_contains "$calls" "owner_gh api -X PATCH repos/$REPO -f description=$MARKER"
   assert_contains "$calls" "app_gh api -X PUT user/installations/77/repositories/4242"
+  end_stand_in_run
+}
+
+# A8's six reads, each answered by GitHub's complete refusal naming the permission its endpoint needs.
+a8_replies() {
+  local p
+  for p in secrets=read actions_variables=read administration=read repository_hooks=read; do
+    gh_reply "reply-${p%%=*}" drop=X-Accepted-Github-Permissions "add=X-Accepted-Github-Permissions: $p"
+  done
+  cat >"$T_TMP/answers" <<EOF
+app_gh api repos/$REPO/actions/secrets|1|@reply-secrets
+app_gh api repos/$REPO/actions/variables|1|@reply-actions_variables
+app_gh api repos/$REPO/keys|1|@reply-administration
+app_gh api repos/$REPO/invitations|1|@reply-administration
+app_gh api repos/$REPO/hooks|1|@reply-repository_hooks
+EOF
 }
 
 test_a8_tries_secrets_variables_keys_hooks_and_collaborators() {
   p_stubs
-  cat >"$T_TMP/answers" <<EOF
-app_gh api|1|gh: Resource not accessible by integration (HTTP 403)
-EOF
+  a8_replies
   local out calls p
   out="$(t_A8)"
   assert_contains "$out" "RESULT A8 permissions PASS attempt=refused control=ok"
@@ -1983,7 +2038,9 @@ EOF
     assert_contains "$calls" "owner_gh api repos/$REPO/$p"
   done
   # Round 15, C2: each attempt has its own control; one failing fails A8.
-  printf 'app_gh api|1|gh: Resource not accessible by integration (HTTP 403)\nowner_gh api repos/%s/actions/secrets/public-key|1|gh: HTTP 502\n' "$REPO" >"$T_TMP/answers"
+  a8_replies
+  printf 'owner_gh api repos/%s/actions/secrets/public-key|1|gh: HTTP 502\n' "$REPO" | cat - "$T_TMP/answers" >"$T_TMP/answers.new"
+  mv "$T_TMP/answers.new" "$T_TMP/answers"
   out="$(t_A8)"
   assert_contains "$out" "RESULT A8 permissions FAIL attempt=refused control=failed"
   assert_not_contains "$calls" "owner_gh api -X" "the control writes"
@@ -2064,7 +2121,10 @@ test_the_second_throwaways_branch_is_ahead_of_main() {
     echo "$*" >>"$T_TMP/owner"
     case "$*" in
       "api repos/$REPO2") [[ -f "$T_TMP/made" ]] || return 1 ;;
-      "repo create"*) touch "$T_TMP/made" ;;
+      # Each write answered as GitHub does (round 111: an unexpected answer stops the command).
+      "repo create"*) touch "$T_TMP/made"; echo "https://github.com/$REPO2" ;;
+      *"/git/refs "*) printf '{"ref":"refs/heads/%s"}\n' "$A2_BRANCH" ;;
+      *"/contents/a2.txt "*) printf '{"content":{"path":"a2.txt"}}\n' ;;
       *"--jq [.full_name"*) printf '%s\t%s\t%s\tfalse\n' "$REPO2" "$OWNER" "$MARKER2" ;;
       *"--jq .default_branch") echo main ;;
       *"--jq .commit.sha") printf 'e%.0s' $(seq 1 40); echo ;;
@@ -2197,28 +2257,29 @@ s2_stubs() {
 }
 
 test_s2b_the_app_cannot_approve_its_own_deployment() {
-  s2_stubs
-  can_approve() { echo true; }
-  app_git() { echo "app_git $*" >>"$T_TMP/calls"; [[ "$*" == *rev-parse* ]] && printf 'a%.0s' $(seq 1 40) && echo; return 0; }
-  local sha
-  sha="$(printf 'a%.0s' $(seq 1 40))"
-  echo "501 waiting null frg26-test-app[bot]" >"$T_TMP/run-$sha"
-  echo "gh: Resource not accessible by integration (HTTP 403)" >"$T_TMP/refuse-app_gh-501"
-  echo yes >"$T_TMP/log-501"
+  # Round 112: GitHub's complete refusal of the app's attempt, its run read the same before and after it.
+  s2d_stubs
+  s2b_fixtures
   local out
-  out="$(t_S2b)"
+  WRITES_UNKNOWN="" WRITES_OUT=""
+  t_S2b >"$T_TMP/s2b.out" 2>&1
+  out="$(cat "$T_TMP/s2b.out")"
   assert_contains "$out" "RESULT S2b permissions PASS attempt=refused control=ok"
-  assert_contains "$(cat "$T_TMP/calls")" "approve app_gh 501"
+  assert_contains "$(cat "$T_TMP/calls")" "app_gh api -X POST repos/$REPO/actions/runs/501/pending_deployments -F environment_ids[]=9 -f state=approved"
   assert_contains "$(cat "$T_TMP/calls")" "approve owner_gh 501"
   assert_contains "$(cat "$T_TMP/calls")" "app_git -C $T_TMP/clone push origin HEAD:refs/heads/main"
+  assert_not_contains "$(unknown_writes)" "app gh api POST repos/$REPO/actions/runs/501/pending_deployments (" "the attempt, read back as before it"
   # The control fails when the job never got the value after the owner's approval.
+  s2b_fixtures
   rm -f "$T_TMP/log-501"
   out="$(t_S2b)"
   assert_contains "$out" "RESULT S2b permissions FAIL attempt=refused control=failed"
   # The app approving its own run is a FAIL however the rest goes.
-  rm -f "$T_TMP/refuse-app_gh-501"
+  s2b_fixtures
+  : >"$T_TMP/answers"
   out="$(t_S2b)"
   assert_contains "$out" "RESULT S2b permissions FAIL attempt=allowed"
+  end_stand_in_run
 }
 
 # GitHub's answer to the owner's approval of their own run, 2026-11-20 (part 0's environment-tests.log).
@@ -2292,24 +2353,29 @@ s2d_fixtures() {
   s2d_post_answer 'HTTP/2.0 422 Unprocessable Entity' 1 "$S2D_422" "$S2D_GH_ERR"
 }
 
-# S2b's run (the app's, 501) as GitHub would show it around the owner's approval: waiting, the owner
-# able to approve it, then approved by the owner for the Environment, and its deployment started.
+# S2b's run (the app's, 501) as GitHub would show it: before the app's attempt (.1, its baseline,
+# round 112) and after it (.2) waiting, the owner able to approve it; then (.3) approved by the owner
+# for the Environment, and its deployment started. The app's attempt gets GitHub's complete refusal.
 s2b_fixtures() {
+  local n
   rm -rf "$T_TMP/gh-b"
   mkdir -p "$T_TMP/gh-b"
-  run_json 501 waiting "$S2B_SHA" "frg26-test-app[bot]" >"$T_TMP/gh-b/run.1"
-  run_json 501 completed "$S2B_SHA" "frg26-test-app[bot]" >"$T_TMP/gh-b/run.2"
-  echo '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":true,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}]}]' >"$T_TMP/gh-b/pending.1"
-  echo '[]' >"$T_TMP/gh-b/pending.2"
+  for n in 1 2; do
+    run_json 501 waiting "$S2B_SHA" "frg26-test-app[bot]" >"$T_TMP/gh-b/run.$n"
+    echo '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":true,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}]}]' >"$T_TMP/gh-b/pending.$n"
+    echo '[{"state":"waiting","created_at":"2026-11-20T01:30:40Z"}]' >"$T_TMP/gh-b/statuses.$n"
+    echo '[]' >"$T_TMP/gh-b/approvals.$n"
+  done
+  run_json 501 completed "$S2B_SHA" "frg26-test-app[bot]" >"$T_TMP/gh-b/run.3"
+  echo '[]' >"$T_TMP/gh-b/pending.3"
   printf '[{"id":6001,"sha":"%s","environment":"frg26-test"}]\n' "$S2B_SHA" >"$T_TMP/gh-b/deployments"
-  echo '[{"state":"waiting","created_at":"2026-11-20T01:30:40Z"}]' >"$T_TMP/gh-b/statuses.1"
-  echo '[{"state":"success","created_at":"2026-11-20T01:31:10Z"},{"state":"in_progress","created_at":"2026-11-20T01:31:00Z"},{"state":"waiting","created_at":"2026-11-20T01:30:40Z"}]' >"$T_TMP/gh-b/statuses.2"
-  echo '[]' >"$T_TMP/gh-b/approvals.1"
-  echo '[{"state":"approved","user":{"login":"Thebigtuna88"},"environments":[{"id":9}],"comment":"FRG-26 S2 approval attempt"}]' >"$T_TMP/gh-b/approvals.2"
+  echo '[{"state":"success","created_at":"2026-11-20T01:31:10Z"},{"state":"in_progress","created_at":"2026-11-20T01:31:00Z"},{"state":"waiting","created_at":"2026-11-20T01:30:40Z"}]' >"$T_TMP/gh-b/statuses.3"
+  echo '[{"state":"approved","user":{"login":"Thebigtuna88"},"environments":[{"id":9}],"comment":"FRG-26 S2 approval attempt"}]' >"$T_TMP/gh-b/approvals.3"
   can_approve() { echo true; }
   app_git() { echo "app_git $*" >>"$T_TMP/calls"; [[ "$*" == *rev-parse* ]] && printf 'a%.0s' $(seq 1 40) && echo; return 0; }
   echo "501 waiting null frg26-test-app[bot]" >"$T_TMP/run-$S2B_SHA"
-  echo "gh: Resource not accessible by integration (HTTP 403)" >"$T_TMP/refuse-app_gh-501"
+  gh_reply reply-s2b drop=X-Accepted-Github-Permissions "add=X-Accepted-Github-Permissions: deployments=write"
+  echo "app_gh api -X POST repos/$REPO/actions/runs/501/pending_deployments|1|@reply-s2b" >"$T_TMP/answers"
   echo yes >"$T_TMP/log-501"
 }
 
@@ -2559,17 +2625,21 @@ test_s2b_readings_must_show_the_owners_approval_or_s2d_cannot_pass() {
   s2d_stubs
   local cases ran=0 name setup why out
   read -r -d '' cases <<'EOF' || true
-the approval shows|:|ok
-no approval recorded|echo '[]' >"$T_TMP/gh-b/approvals.2"|after it: approvals '0 ': no approval by Thebigtuna88 for Environment 9
-an approval for another Environment|echo '[{"state":"approved","user":{"login":"Thebigtuna88"},"environments":[{"id":10}]}]' >"$T_TMP/gh-b/approvals.2"|no approval by Thebigtuna88 for Environment 9
-the deployment never started|echo '[{"state":"waiting"}]' >"$T_TMP/gh-b/statuses.2"|deployment 6001 states 'waiting': no sign it started
-still pending after it|cp "$T_TMP/gh-b/pending.1" "$T_TMP/gh-b/pending.2"|pending deployments '1 9 frg26-test true User:Thebigtuna88', not '0 null null null '
-another deployment after it|printf '[{"id":6002,"sha":"%s","environment":"frg26-test"}]\n' "$S2B_SHA" >"$T_TMP/gh-b/deployments.2"|deployments '1 6002 $S2B_SHA frg26-test', not '1 6001 $S2B_SHA frg26-test'
-GitHub showed no deployment|echo '[]' >"$T_TMP/gh-b/deployments"|before the owner's approval: deployments '0 null null null', not '1  $S2B_SHA frg26-test'
-the owner could not approve it|echo '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":false,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}]}]' >"$T_TMP/gh-b/pending.1"|before the owner's approval: pending deployments '1 9 frg26-test false User:Thebigtuna88'
-a failed read after it|: >"$T_TMP/gh-b/approvals.2"; echo 1 >"$T_TMP/gh-b/approvals.2.rc"|after it: the approvals read failed
+the approval shows|:|ok|
+no approval recorded|echo '[]' >"$T_TMP/gh-b/approvals.3"|after it: approvals '0 ': no approval by Thebigtuna88 for Environment 9|
+an approval for another Environment|echo '[{"state":"approved","user":{"login":"Thebigtuna88"},"environments":[{"id":10}]}]' >"$T_TMP/gh-b/approvals.3"|no approval by Thebigtuna88 for Environment 9|
+the deployment never started|echo '[{"state":"waiting"}]' >"$T_TMP/gh-b/statuses.3"|deployment 6001 states 'waiting': no sign it started|
+still pending after it|cp "$T_TMP/gh-b/pending.1" "$T_TMP/gh-b/pending.3"|pending deployments '1 9 frg26-test true User:Thebigtuna88', not '0 null null null '|
+another deployment after it|printf '[{"id":6002,"sha":"%s","environment":"frg26-test"}]\n' "$S2B_SHA" >"$T_TMP/gh-b/deployments.3"|deployments '1 6002 $S2B_SHA frg26-test', not '1 6001 $S2B_SHA frg26-test'|
+GitHub showed no deployment|echo '[]' >"$T_TMP/gh-b/deployments"|the app's run is not bound before its attempt|FAIL attempt=setup-failed
+the owner could not approve it|echo '[{"environment":{"id":9,"name":"frg26-test"},"current_user_can_approve":false,"reviewers":[{"type":"User","reviewer":{"login":"Thebigtuna88"}}]}]' >"$T_TMP/gh-b/pending.2"|its run read back: not as before the attempt (pending deployments '1 9 frg26-test false User:Thebigtuna88'|FAIL attempt=inconclusive control=not run
+a failed read after it|: >"$T_TMP/gh-b/approvals.3"; echo 1 >"$T_TMP/gh-b/approvals.3.rc"|after it: the approvals read failed|
 EOF
-  while IFS='|' read -r name setup why; do
+  # Round 112: S2b reads its run before the app's attempt too (its baseline), and the reading before the
+  # owner's approval is that attempt's read-back: S2b's own verdict depends on those two, never on the
+  # readings after the owner's approval.
+  local verdict
+  while IFS='|' read -r name setup why verdict; do
     ran=$((ran + 1))
     s2d_fixtures
     s2b_fixtures
@@ -2578,8 +2648,8 @@ EOF
     FAILS=0
     t_S2b >"$T_TMP/s2b.out" 2>&1
     out="$(cat "$T_TMP/s2b.out")"
-    assert_contains "$out" "RESULT S2b permissions PASS attempt=refused control=ok" "$name: S2b's own verdict"
-    assert_contains "$out" "S2B before run: 501 waiting $S2B_SHA frg26-test-app[bot] push main frg26-s2" "$name"
+    assert_contains "$out" "RESULT S2b permissions ${verdict:-PASS attempt=refused control=ok}" "$name: S2b's own verdict"
+    [[ -n "$verdict" ]] || assert_contains "$out" "S2B before run: 501 waiting $S2B_SHA frg26-test-app[bot] push main frg26-s2" "$name"
     assert_contains "$out" "$why" "$name"
     assert_not_contains "$out" "FRG-26 S2 approval attempt" "$name: an approval's comment"
     out="$(t_S2d)"
@@ -2668,20 +2738,28 @@ EOF
   assert_contains "$out" "answer: a list of 2, ids [other],7001;"
   assert_contains "$out" "RESULT S2d permissions FAIL attempt=allowed control=ok"
   assert_not_contains "$out" "$low" "an accepted answer's id"
-  # In S2b: GitHub's word on whether the owner can approve, and the run's actor.
+  # In S2b: GitHub's word on whether the owner can approve.
   s2d_fixtures
   s2b_fixtures
   can_approve() { printf '%s\n' "$low"; }
-  # shellcheck disable=SC2016 # jq's own $c
-  s2_put "$T_TMP/gh-b/run.1" '.actor.login = $c' "$mixed"
   FAILS=0
   t_S2b >"$T_TMP/s2b.out" 2>&1
   out="$(cat "$T_TMP/s2b.out")"
   assert_contains "$out" "GitHub says the owner can approve it: [other]"
   assert_contains "$out" "RESULT S2b permissions FAIL attempt=refused control=failed"
+  assert_not_contains "$out" "$low" "S2b: can-approve's text"
+  # And the run's actor, read back after the app's attempt (round 112: its read-back, so S2b is then
+  # inconclusive).
+  s2d_fixtures
+  s2b_fixtures
+  # shellcheck disable=SC2016 # jq's own $c
+  s2_put "$T_TMP/gh-b/run.2" '.actor.login = $c' "$mixed"
+  FAILS=0
+  t_S2b >"$T_TMP/s2b.out" 2>&1
+  out="$(cat "$T_TMP/s2b.out")"
+  assert_contains "$out" "RESULT S2b permissions FAIL attempt=inconclusive control=not run"
   assert_contains "$out" "S2B before run: 501 waiting $S2B_SHA [other] push main frg26-s2"
   [[ "$S2B_READINGS" != ok ]] || _t_fail "S2B_READINGS is ok with another actor"
-  assert_not_contains "$out" "$low" "S2b: can-approve's text"
   assert_not_contains "$out" "$mixed" "S2b: the run's actor"
   # Round 110: its S2d writes stay outcome unknown (stand-in answers); a stand-in run's end is no clean-up.
   end_stand_in_run
@@ -2750,7 +2828,7 @@ EOF
   # After the owner's approval in S2b, a state not on GitHub's list keeps S2b's readings from showing it.
   s2d_fixtures
   s2b_fixtures
-  echo '[{"state":"success","created_at":"2026-11-20T01:31:10Z"},{"state":"deploying","created_at":"2026-11-20T01:31:00Z"}]' >"$T_TMP/gh-b/statuses.2"
+  echo '[{"state":"success","created_at":"2026-11-20T01:31:10Z"},{"state":"deploying","created_at":"2026-11-20T01:31:00Z"}]' >"$T_TMP/gh-b/statuses.3"
   FAILS=0
   t_S2b >"$T_TMP/s2b.out" 2>&1
   out="$(cat "$T_TMP/s2b.out")"
@@ -2820,7 +2898,7 @@ EOF
   # After the owner's approval in S2b, more pages keep S2b's readings from showing it took effect.
   s2d_fixtures
   s2b_fixtures
-  printf 'Link: <https://api.github.com/x>; rel="next"\r\n' >"$T_TMP/gh-b/statuses.2.head"
+  printf 'Link: <https://api.github.com/x>; rel="next"\r\n' >"$T_TMP/gh-b/statuses.3.head"
   FAILS=0
   t_S2b >"$T_TMP/s2b.out" 2>&1
   out="$(cat "$T_TMP/s2b.out")"
@@ -2873,15 +2951,37 @@ test_an_unreadable_run_log_is_not_an_absent_value() {
   assert_eq "$(run_log_value 5)" error
 }
 
+# S2c's three attempts, each answered by GitHub's complete refusal naming its endpoint's permission
+# (round 112), then <extra> answer lines; the Environment's state reads the same each time.
+s2c_replies() { # [extra answer line…]
+  local p
+  for p in administration=write environments=read environments=write; do
+    gh_reply "reply-$p" drop=X-Accepted-Github-Permissions "add=X-Accepted-Github-Permissions: $p"
+  done
+  {
+    printf '%s\n' "$@"
+    echo "app_gh api -X PUT repos/$REPO/environments/frg26-test|1|@reply-administration=write"
+    echo "app_gh api repos/$REPO/environments/frg26-test/secrets/public-key|1|@reply-environments=read"
+    echo "app_gh api -X DELETE repos/$REPO/environments/frg26-test/secrets/|1|@reply-environments=write"
+  } >"$T_TMP/answers"
+  environment_state() { echo "the Environment as it was"; }
+}
+
 test_s2c_the_app_cannot_change_the_environment() {
   s2_stubs
   WORK="$T_TMP/work"
   owner_uid() { echo 42; }
-  printf 'app_gh api|1|gh: Resource not accessible by integration (HTTP 403)\n' >"$T_TMP/answers"
+  s2c_replies
   env_summary() { want_env; }
   local out calls
-  out="$(t_S2c)"
+  WRITES_UNKNOWN="" WRITES_OUT=""
+  t_S2c >"$T_TMP/out" 2>&1
+  out="$(cat "$T_TMP/out")"
   assert_contains "$out" "RESULT S2c permissions PASS attempt=refused control=ok"
+  # Round 112: the DELETE, read back unchanged, is settled; the PUT is a no-op no read can show, so its
+  # outcome stays unknown however it was refused.
+  assert_contains "$(unknown_writes)" "app gh api PUT repos/$REPO/environments/frg26-test (" "the no-op PUT named outcome unknown"
+  assert_not_contains "$(unknown_writes)" "app gh api DELETE repos/$REPO/environments/frg26-test/secrets/FRG26_DISPOSABLE (" "the DELETE read back unchanged"
   calls="$(cat "$T_TMP/calls")"
   # Round 15, SEC-2: the app's write is the same no-op update the owner then makes as the control.
   assert_contains "$calls" "app_gh api -X PUT repos/$REPO/environments/frg26-test --input $WORK/env.json"
@@ -2893,9 +2993,10 @@ test_s2c_the_app_cannot_change_the_environment() {
   assert_contains "$calls" "app_gh api -X DELETE repos/$REPO/environments/frg26-test/secrets/FRG26_DISPOSABLE"
   assert_contains "$calls" "owner_gh api -X DELETE repos/$REPO/environments/frg26-test/secrets/FRG26_DISPOSABLE"
   assert_not_contains "$calls" "secrets/FRG26_DUMMY" "the real dummy value is never a target"
-  printf 'app_gh api|1|gh: Resource not accessible by integration (HTTP 403)\nowner_gh api -X DELETE|1|gh: HTTP 500\n' >"$T_TMP/answers"
+  s2c_replies "owner_gh api -X DELETE|1|gh: HTTP 500"
   out="$(t_S2c)"
   assert_contains "$out" "RESULT S2c permissions FAIL attempt=refused control=failed"
+  end_stand_in_run
 }
 
 test_environment_tests_cover_the_plan() {
@@ -3941,21 +4042,15 @@ test_controls_stop_at_their_first_failure() {
   s2_stubs
   WORK="$T_TMP/work"
   owner_uid() { echo 42; }
-  printf 'app_gh api|1|gh: Resource not accessible by integration (HTTP 403)\nowner_gh api -X PUT repos/%s/environments|1|gh: HTTP 502\n' "$REPO" >"$T_TMP/answers"
+  s2c_replies "owner_gh api -X PUT repos/$REPO/environments|1|gh: HTTP 502"
   env_summary() { want_env; }
   local out
   out="$(t_S2c)"
   assert_contains "$out" "RESULT S2c permissions FAIL attempt=refused control=failed"
   assert_not_contains "$(cat "$T_TMP/calls")" "owner_gh api -X DELETE" "the disposable secret was deleted after a failed control"
-  # A2: a failed push control stops the file and branch controls.
-  p_stubs
-  a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot]." \
-    "app_gh api -X PUT repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)" \
-    "app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)" \
-    "app_git -C $T_TMP/clone push origin|1|fatal: unable to access: Could not resolve host"
-  out="$(t_A2)"
-  assert_contains "$out" "RESULT A2 permissions FAIL attempt=refused control=failed"
-  assert_not_contains "$(cat "$T_TMP/calls")" "-X PUT repos/$REPO/contents" "a control after the failed one"
+  # A2's controls follow only a push shown refused, which can't be yet (round 112): see
+  # test_a2_tries_code_changes_on_a_repo_the_app_is_not_installed_on.
+  end_stand_in_run
 }
 
 test_delete_check_needs_githubs_own_answer_that_the_app_is_gone() {
@@ -4103,15 +4198,24 @@ owner_gh api repos/$REPO2/branches/main --jq .commit.sha|0|$(printf 'b%.0s' $(se
 owner_gh api repos/$REPO/branches/dev --jq .commit.sha|0|$(printf 'd%.0s' $(seq 1 40))
 owner_gh api repos/$REPO2/compare/main...frg26-a2 --jq .ahead_by|0|1
 owner_gh api repos/$REPO2/issues|0|kept-object
-app_gh tok2 api -i -X PUT repos/$REPO2/contents/|1|HTTP/2.0 403 Forbidden\nX-Accepted-Github-Permissions: contents=write\n\n{"message":"Resource not accessible by integration"}\ngh: Resource not accessible by integration (HTTP 403)
-app_gh tok2 api -i -X POST repos/$REPO2/git/refs|1|HTTP/2.0 403 Forbidden\n\n{"message":"Resource not accessible by integration"}\ngh: Resource not accessible by integration (HTTP 403)
+app_gh tok2 api -i -X PUT repos/$REPO2/contents/|1|$(probe_reply 'HTTP/2.0 403 Forbidden' contents=write '{"message":"Resource not accessible by integration"}')
+app_gh tok2 api -i -X POST repos/$REPO2/git/refs|1|$(probe_reply 'HTTP/2.0 403 Forbidden' contents=write '{"message":"Resource not accessible by integration"}')
 app_gh tok2 api -X POST repos/$REPO/git/refs|0|{}
 app_gh tok2 api -X PUT repos/$REPO/contents/|0|{}
 app_gh tok2 api -i -X POST repos/$REPO2/issues/1/comments|0|HTTP/2.0 201 Created\n\n{"id":901}
 app_gh tok2 api -i -X POST repos/$REPO2/pulls|0|HTTP/2.0 201 Created\n\n{"number":3}
-app_gh tok3 api -i -X POST repos/$REPO2/issues|1|HTTP/2.0 403 Forbidden\nX-Accepted-Github-Permissions: issues=write\n\n{"message":"Resource not accessible by integration"}\ngh: Resource not accessible by integration (HTTP 403)
+app_gh tok3 api -i -X POST repos/$REPO2/issues|1|$(probe_reply 'HTTP/2.0 403 Forbidden' issues=write '{"message":"Resource not accessible by integration"}')
 app_gh tok4 api -i -X POST repos/$REPO2/issues|0|HTTP/2.0 201 Created\n\n{"number":4}
 EOF
+}
+
+# A complete gh api -i answer for probe_answer (escaped for its %b): <permission> named in
+# x-accepted-github-permissions (- for none), GitHub's Content-Length right (round 112).
+probe_reply() { # <status line> <permission or -> <body>
+  local LC_ALL=C p=""
+  [[ "$2" == - ]] || p="X-Accepted-Github-Permissions: $2\\r\\n"
+  printf '%s\\r\\nContent-Length: %s\\r\\n%sX-Github-Request-Id: C0DE:1A2B:3C4D5E:6F7A8B:9C0D1E2F\\r\\nX-Ratelimit-Remaining: 4979\\r\\nX-Ratelimit-Resource: core\\r\\n\\r\\n%s' \
+    "$1" "${#3}" "$p" "$3"
 }
 
 run_probe() { # a2-probe as the owner's run has it: the script's exit clean-up runs (a subshell has no trap)
@@ -5864,7 +5968,8 @@ test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
     "its create's connection fails%echo 'Post https://api.github.com/graphql: unexpected EOF' >\$T_TMP/create-url; echo 1 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
     "its create's refusal ends abnormally%echo 'GraphQL: Resource not accessible by integration (createIssue)' >\$T_TMP/create-url; echo 2 >\$T_TMP/create-rc%%t_A12; sweep_issues%%1" \
     "the list fails, the recorded issue still closed%rm -f \$T_TMP/open-issues%%t_A12; sweep_issues%%1" \
-    "its create answered without a number%echo 'Creating issue' >\$T_TMP/create-url%%t_A12; sweep_issues%%1"; do
+    "its create answered without a number%echo 'Creating issue' >\$T_TMP/create-url%%t_A12; sweep_issues%%1" \
+    "its create answered with another repository's address%echo 'https://github.com/someone/else/issues/129' >\$T_TMP/create-url%%t_A12; sweep_issues%%1"; do
     IFS='%' read -r name prep setup after hang rc_want <<<"$case"
     child=$((child + 1))
     issue_run "$child"
@@ -5920,6 +6025,14 @@ test_a_runs_test_issues_are_closed_once_and_read_back_by_number() {
         assert_eq "$(grep -c 'gh issue close 129 ' "$T_TMP/tools")" 1 "$name: closes of #129"
         assert_contains "$OUT" "CLEANUP FAIL could not list the open issues in $REPO" "$name"
         assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; test issues read back closed: #129; not done: closing the test issues (CLEANUP FAIL above);" "$name" ;;
+      # Round 111 (review-lens round 99, C1): an answer that isn't the new issue's address here is
+      # not one of the run's issues (it may not be the run's), and nothing is done on it.
+      *"another repository's address")
+        assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
+        assert_not_contains "$(cat "$T_TMP/tools")" "issue comment" "$name: a comment on an issue not shown to be the run's"
+        assert_not_contains "$(cat "$T_TMP/tools")" "issue view" "$name: a view of an issue not shown to be the run's"
+        assert_contains "$last" "CLEANUP INCOMPLETE: tokens confirmed revoked (HTTP 401): token1 token2 token3; NOT confirmed: none; $unknown (" "$name"
+        assert_contains "$last" "app gh issue create --repo $REPO (answered, not with a new issue's address in $REPO);" "$name" ;;
       *)
         assert_eq "$(grep -c 'gh issue close ' "$T_TMP/tools")" 0 "$name: closes"
         assert_not_contains "$(cat "$T_TMP/tools")" "issue comment" "$name: a comment on an unknown issue"
@@ -6785,6 +6898,239 @@ test_a_failed_tidy_up_write_is_settled_only_by_its_read_back() {
       assert_contains "$last" "CLEANUP DONE:" "$name"
     fi
   done
+}
+
+# Round 111 (review-lens round 99, C1; owner: "unexpected write responses must stop dependent actions
+# and remain unknown"): a checked write fails unless it settled on its expected answer, its command's
+# own status kept in LAST_RC; what follows it doesn't run; and every checked write's caller stops on
+# that failure.
+test_an_unexpected_write_answer_stops_what_depends_on_it() {
+  local case name want rc out f bad
+  load
+  end_stand_in_run
+  WORK="$T_TMP/work"
+  mkdir -m 700 "$WORK"
+  : >"$T_TMP/owner"
+  owner_gh() { echo "$*" >>"$T_TMP/owner"; printf '%s\n' "$ANSWER"; return "$ANSWER_RC"; }
+  for case in 'expected|{"name":"main"}|0|0' 'another answer|{"name":"x"}|0|1' 'empty||0|1' 'failed|{"name":"main"}|1|1'; do
+    IFS='|' read -r name ANSWER ANSWER_RC want <<<"$case"
+    WRITES_UNKNOWN="" WRITES_OUT=""
+    rc=0
+    write_checked 'json:.name == "main"' owner_gh api -X POST "repos/$REPO/branches/x/rename" -f new_name=main >/dev/null 2>&1 || rc=$?
+    assert_eq "$((rc != 0))" "$want" "write_checked, $name: failed"
+    assert_eq "$LAST_RC" "$ANSWER_RC" "write_checked, $name: LAST_RC is its command's own status"
+    if [[ "$want" == 1 ]]; then assert_contains "$(unknown_writes)" "owner gh api POST repos/$REPO/branches/x/rename (" "$name: named outcome unknown"; fi
+  done
+  # A setup write answered otherwise: the command stops there, with nothing after it sent.
+  ANSWER='{"message":"moved"}' ANSWER_RC=0
+  : >"$T_TMP/owner"
+  out="$(
+    die() { printf 'DIED: %s\n' "$*"; unknown_writes; exit 2; }
+    put_file a.txt hello
+    echo AFTER
+    put_file b.txt hello
+  )"
+  assert_contains "$out" "DIED: adding a.txt failed"
+  assert_contains "$out" "owner gh api PUT repos/$REPO/contents/a.txt (answered, not as expected)"
+  assert_not_contains "$out" "AFTER" "a step after the unexpected answer"
+  assert_eq "$(grep -c 'contents/' "$T_TMP/owner")" 1 "writes sent after the unexpected answer"
+  # Every checked write's caller stops on its failure; only the S2 cancel goes on (its record waits
+  # for the list, which settles it).
+  for f in $(grep -oE '^[a-z_0-9]+\(\)' "$GT" | tr -d '()'); do
+    [[ "$f" != write_checked ]] || continue
+    # shellcheck disable=SC2016 # protection_write's own $code, as declare -f prints it
+    bad="$(declare -f "$f" | grep -E '(^|[^_a-z])write_checked ' | grep -vE '\|\| die|^ *write_checked .*\$code' || true)"
+    [[ "$f" != s2_cancel ]] || bad="$(printf '%s\n' "$bad" | grep -vF '/cancel' || true)"
+    assert_eq "$bad" "" "$f: a checked write whose caller goes on after its failure"
+  done
+  # shellcheck disable=SC2016 # the function's own text
+  assert_contains "$(declare -f protection_write | tail -n 2)" 'write_checked "status:$code"' "protection_write: its status is the function's"
+}
+
+# Round 111 (review-lens round 99, SEC-2; owner: "record each S2 cancel before dispatch so a stop
+# cannot allow a resend"): a run's S2 cancel is sent at most once in that run: across its tidy-ups
+# (S2d's own, each test's, the final one, the clean-up's), and after a stop before or after it goes
+# out. One recorded but never answered, or not read back finished, stays outcome unknown.
+test_an_s2_cancel_is_sent_at_most_once_in_a_run() {
+  local case name call hook sent last child sha
+  child=$(((RANDOM % 900 + 100) * 100)) # as above
+  sha="$(printf 'e%.0s' $(seq 1 40))"
+  short_cap() { CLEANUP_DEADLINE=$(($(date +%s) + 3)); } # a tidy-up during the run, ended within 3s
+  for case in "two tidy-ups in one run%short_cap; cancel_waiting_runs; CLEANUP_DEADLINE=''%%1" \
+    "S2d's cancel, then the clean-up%s2_cancel 9001%%1" \
+    "a stop as a cancel is started, before it is sent%cancel_waiting_runs%before%0" \
+    "a stop after a cancel is sent, before its answer is kept%cancel_waiting_runs%after%1"; do
+    IFS='%' read -r name call hook sent <<<"$case"
+    child=$((child + 1))
+    short_copy
+    WORK="$T_TMP/work"
+    request_tools "$child"
+    echo 9001 >"$T_TMP/runs-1"
+    echo 9001 >"$T_TMP/runs-2"
+    case "$hook" in
+      before)
+        keep_as_orig capture
+        capture() { if [[ "$*" == *"/cancel"* ]]; then stop_here; fi; orig_capture "$@"; } ;;
+      after)
+        keep_as_orig capture
+        capture() {
+          local rc=0
+          orig_capture "$@" || rc=$?
+          if [[ "$*" == *"/cancel"* ]]; then stop_here; fi
+          return "$rc"
+        } ;;
+    esac
+    stopped_run_cleanup 1 "CANCEL_ON_EXIT=1 S2_SHAS=$sha" "$call; echo NEXT STEP"
+    assert_eq "$(grep -cF runs/9001/cancel "$T_TMP/tools")" "$sent" "$name: how often the cancel was sent"
+    last="$(printf '%s\n' "$OUT" | tail -n 1)"
+    assert_contains "$last" "CLEANUP INCOMPLETE:" "$name"
+    assert_contains "$last" "owner gh api POST repos/$REPO/actions/runs/9001/cancel (" "$name: the cancel named outcome unknown"
+    assert_contains "$last" "not done: cancelling the waiting S2 runs" "$name"
+    if [[ -n "$hook" ]]; then assert_not_contains "$OUT" "NEXT STEP" "$name: the run went on after the stop"; fi
+  done
+  load
+  end_stand_in_run
+  assert_contains "$(declare -f t_S2d)" "s2_cancel " "t_S2d: its cancel goes through the run's record"
+  assert_not_contains "$(declare -f cancel_waiting_runs)" "LATE=" "cancel_waiting_runs: a record of its own"
+}
+
+# Round 112 (review-lens round 99, C2; owner): an app's API attempt counts as refused only on GitHub's
+# complete answer (status line, headers' end, Content-Length matching, gh exit 1), a 403 (or a 404 to a
+# read), a request id of its form, no rate-limit sign, and the permission this operation needs named by
+# GitHub (x-accepted-github-permissions). gh's words and GitHub's message never decide; the body's
+# text is never kept; and an attempt that may write stays outcome unknown however it was answered.
+test_an_api_refusal_needs_a_complete_answer_attributable_to_its_operation() {
+  local case name changes rc want c
+  local -a ch
+  for case in "complete, its operation's permission named||1|refused" \
+    "gh's exit 0|status=HTTP/2.0 200 OK|0|allowed" \
+    "gh's words alone, no status line|raw=gh: Resource not accessible by integration (HTTP 403)|1|inconclusive" \
+    "cut before its headers end|cut|1|inconclusive" \
+    "a body shorter than its Content-Length|len=999|1|inconclusive" \
+    "a transfer encoding|add=Transfer-Encoding: chunked|1|inconclusive" \
+    "gh's exit 2||2|inconclusive" \
+    "no request id|drop=X-Github-Request-Id|1|inconclusive" \
+    "a request id not of its form|drop=X-Github-Request-Id;add=X-Github-Request-Id: from-elsewhere|1|inconclusive" \
+    "no x-ratelimit-remaining|drop=X-Ratelimit-Remaining|1|inconclusive" \
+    "x-ratelimit-remaining 0|drop=X-Ratelimit-Remaining;add=X-Ratelimit-Remaining: 0|1|inconclusive" \
+    "an x-ratelimit-resource not on GitHub's list|drop=X-Ratelimit-Resource;add=X-Ratelimit-Resource: other|1|inconclusive" \
+    "a retry-after header|add=Retry-After: 60|1|inconclusive" \
+    "HTTP 429|status=HTTP/2.0 429 Too Many Requests|1|inconclusive" \
+    "rate-limit words in its body|body={\"message\":\"You have exceeded a secondary rate limit\"}|1|inconclusive" \
+    "another operation's permission|drop=X-Accepted-Github-Permissions;add=X-Accepted-Github-Permissions: contents=write|1|inconclusive" \
+    "no permission named|drop=X-Accepted-Github-Permissions|1|inconclusive" \
+    "a 404 to a write|status=HTTP/2.0 404 Not Found|1|inconclusive" \
+    "a 422|status=HTTP/2.0 422 Unprocessable Entity|1|inconclusive" \
+    "a body with text of its own|body={\"message\":\"CANARY-not-kept\"}|1|refused"; do
+    IFS='|' read -r name changes rc want <<<"$case"
+    p_stubs
+    IFS=';' read -r -a ch <<<"$changes"
+    gh_reply reply ${ch[@]+"${ch[@]}"}
+    echo "app_gh api -X PATCH repos/$REPO -f description=x|$rc|@reply" >"$T_TMP/answers"
+    WRITES_UNKNOWN="" WRITES_OUT=""
+    app_attempt -X PATCH "repos/$REPO" -f description=x >/dev/null 2>&1
+    assert_eq "$OBS" "$want" "$name"
+    assert_contains "$(cat "$T_TMP/calls")" "app_gh api -X PATCH repos/$REPO -f description=x -i -H Accept-Encoding: identity" "$name: GitHub's whole answer asked for"
+    assert_contains "$(unknown_writes)" "app gh api PATCH repos/$REPO (" "$name: the attempt named outcome unknown"
+    assert_not_contains "$LAST_OUT" "CANARY" "$name: the body's text kept"
+  done
+  # A read's 404, with its operation's permission named, may be a refusal (its control shows the path).
+  for c in "status=HTTP/2.0 404 Not Found|secrets=read|refused" "status=HTTP/2.0 404 Not Found|administration=read|inconclusive"; do
+    IFS='|' read -r changes name want <<<"$c"
+    p_stubs
+    gh_reply reply "$changes" drop=X-Accepted-Github-Permissions "add=X-Accepted-Github-Permissions: $name"
+    echo "app_gh api repos/$REPO/actions/secrets|1|@reply" >"$T_TMP/answers"
+    WRITES_UNKNOWN="" WRITES_OUT=""
+    app_attempt "repos/$REPO/actions/secrets" >/dev/null 2>&1
+    assert_eq "$OBS" "$want" "a read's 404 naming $name"
+    assert_eq "$(unknown_writes)" "" "a read noted as a write"
+  done
+}
+
+# Round 112 (owner): an unchanged read-back never makes a refusal or clears a write alone. A write's note
+# goes only with its complete refusal, the test's state read back unchanged against the baseline read
+# before the first attempt, and a write that would have shown against it; a no-op (a protection DELETE on
+# an unprotected branch) stays unknown. A state changed or unreadable makes the test inconclusive.
+test_a_refused_write_is_settled_only_with_its_baseline_read_back_unchanged() {
+  local case name reads want unknown resolved
+  for case in "read back unchanged|false false|PASS expected=refused observed=refused|DELETE|PUT" \
+    "changed since its baseline|false true|FAIL expected=refused observed=inconclusive|PUT DELETE|" \
+    "its baseline unreadable|error false|FAIL expected=refused observed=inconclusive|PUT DELETE|" \
+    "its read-back unreadable|false error|FAIL expected=refused observed=inconclusive|PUT DELETE|"; do
+    IFS='|' read -r name reads want unknown resolved <<<"$case"
+    p_stubs
+    PHASE=open
+    gh_reply reply
+    echo "$reads" >"$T_TMP/protected-reads"
+    owner_gh() {
+      echo "owner_gh $*" >>"$T_TMP/calls"
+      local n r
+      case "$*" in
+        "api repos/$REPO/branches/dev --jq .protected")
+          n=$(($(cat "$T_TMP/protected-n" 2>/dev/null || echo 0) + 1))
+          echo "$n" >"$T_TMP/protected-n"
+          r="$(cut -d' ' -f"$n" "$T_TMP/protected-reads")"
+          if [[ "$r" == error ]]; then echo "gh: HTTP 502" >&2; return 1; fi
+          echo "$r" ;;
+        "api repos/$REPO/branches/dev/protection") echo '{"enforce_admins":{"enabled":false}}' ;;
+      esac
+    }
+    rm -f "$T_TMP/protected-n"
+    cat >"$T_TMP/answers" <<EOF
+app_gh api -X PUT repos/$REPO/branches/dev/protection|1|@reply
+app_gh api -X DELETE repos/$REPO/branches/dev/protection|1|@reply
+EOF
+    WRITES_UNKNOWN="" WRITES_OUT=""
+    admin_attempts B12 -X PUT "repos/$REPO/branches/dev/protection" --input "$WORK/weak.json" ";;" \
+      -X DELETE "repos/$REPO/branches/dev/protection" >"$T_TMP/out" 2>&1
+    assert_contains "$(cat "$T_TMP/out")" "RESULT B12 open $want" "$name"
+    for m in $unknown; do
+      assert_contains "$(unknown_writes)" "app gh api $m repos/$REPO/branches/dev/protection (" "$name: $m named outcome unknown"
+    done
+    for m in $resolved; do
+      assert_not_contains "$(unknown_writes)" "app gh api $m repos/$REPO/branches/dev/protection (" "$name: $m still named outcome unknown"
+    done
+  done
+  end_stand_in_run
+}
+
+# Round 112 (owner 2026-11-25): A6 stays inconclusive, its writes outcome unknown, however complete its
+# refusals: no read can show its no-op writes (the description it has; the repository the installation
+# has) unchanged.
+test_a6_stays_inconclusive_whatever_its_answers() {
+  p_stubs
+  gh_reply reply
+  cat >"$T_TMP/answers" <<EOF
+owner_gh api repos/$REPO --jq .id|0|4242
+app_gh api -X PATCH repos/$REPO|1|@reply
+app_gh api -X PUT user/installations/77/repositories/4242|1|@reply
+EOF
+  WRITES_UNKNOWN="" WRITES_OUT=""
+  t_A6 >"$T_TMP/out" 2>&1
+  assert_contains "$(cat "$T_TMP/out")" "RESULT A6 permissions FAIL attempt=inconclusive"
+  assert_contains "$(unknown_writes)" "app gh api PATCH repos/$REPO (" "A6's PATCH named outcome unknown"
+  assert_not_contains "$(cat "$T_TMP/calls")" "owner_gh api -X PATCH" "a control after an inconclusive attempt"
+  end_stand_in_run
+}
+
+# Round 112 (owner): until a completed remote rejection can be told from a transport failure (proposed,
+# round112-plan.md), a push that fails is inconclusive and its write outcome unknown, whatever git says.
+test_a_refused_looking_push_stays_inconclusive() {
+  p_stubs
+  cat >"$T_TMP/answers" <<'EOF'
+push origin HEAD:refs/heads/frg26/permissions/A3-wf-r1|1|! [remote rejected] HEAD -> frg26/permissions/A3-wf-r1 (refusing to allow a GitHub App to create or update workflow `.github/workflows/frg26-a3-r1.yml` without `workflows` permission)
+EOF
+  WRITES_UNKNOWN="" WRITES_OUT=""
+  t_A3 >"$T_TMP/out" 2>&1
+  assert_contains "$(cat "$T_TMP/out")" "RESULT A3 permissions FAIL attempt=inconclusive"
+  assert_contains "$(unknown_writes)" "app git push origin HEAD:refs/heads/frg26/permissions/A3-wf-r1" "the push named outcome unknown"
+  assert_not_contains "$(cat "$T_TMP/calls")" "A3-plain" "a control after an inconclusive attempt"
+  LAST_RC=1
+  LAST_OUT="remote: Permission to $REPO2.git denied to frg26-test-app[bot]."
+  assert_eq "$(classify_push_perm)" inconclusive "git's words of a permission refusal"
+  LAST_RC=0
+  assert_eq "$(classify_push_perm)" allowed
+  end_stand_in_run
 }
 
 run_tests
