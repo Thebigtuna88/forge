@@ -1873,7 +1873,11 @@ a2_answers() { # the owner's reads A2 needs, then the given lines
   {
     echo "owner_gh api repos/$REPO2/branches/main --jq .commit.sha|0|$a"
     echo "owner_gh api repos/$REPO/branches/dev --jq .commit.sha|0|$b"
-    echo "owner_gh api --paginate repos/$REPO2/git/matching-refs/heads|0|refs/heads/frg26-a2 $a"
+    # Round 117: its branches and tags as their paged lists, each read through to an empty page.
+    echo "owner_gh api repos/$REPO2/branches?per_page=100&page=1|0|[{\"name\":\"frg26-a2\",\"commit\":{\"sha\":\"$a\"}}]"
+    echo "owner_gh api repos/$REPO2/branches?per_page=100&page=2|0|[]"
+    echo "owner_gh api repos/$REPO2/tags?per_page=100&page=1|0|[]"
+    echo "owner_gh api repos/$REPO2/tags?per_page=100&page=2|0|[]" # (a look-alike's list, read through)
     printf '%s\n' "$@"
   } >"$T_TMP/answers"
 }
@@ -1910,18 +1914,20 @@ test_a2_tries_code_changes_on_a_repo_the_app_is_not_installed_on() {
 test_a2_needs_the_exact_branch_not_a_look_alike() {
   local a case heads tags out
   a="$(printf 'a%.0s' $(seq 1 40))"
-  for case in "a look-alike branch|refs/heads/main $a\\nrefs/heads/x/refs/heads/frg26-a2 $a|" \
-    "a look-alike tag|refs/heads/main $a|refs/tags/refs/heads/frg26-a2 $a"; do
+  # Round 117: the branches and tags as their lists give them (a name and its commit).
+  for case in "a look-alike branch|[{\"name\":\"main\",\"commit\":{\"sha\":\"$a\"}},{\"name\":\"x/refs/heads/frg26-a2\",\"commit\":{\"sha\":\"$a\"}}]|[]" \
+    "a look-alike tag|[{\"name\":\"main\",\"commit\":{\"sha\":\"$a\"}}]|[{\"name\":\"refs/heads/frg26-a2\",\"commit\":{\"sha\":\"$a\"}}]" \
+    "a tag named as the branch|[{\"name\":\"main\",\"commit\":{\"sha\":\"$a\"}}]|[{\"name\":\"frg26-a2\",\"commit\":{\"sha\":\"$a\"}}]"; do
     IFS='|' read -r name heads tags <<<"$case"
     p_stubs
     a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|1|remote: Permission to $REPO2.git denied to frg26-test-app[bot]." \
       "app_gh api -X PUT repos/$REPO2/|1|gh: Branch not found (HTTP 404)" \
       "app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)"
-    sed -i '' '/matching-refs\/heads/d' "$T_TMP/answers"
     owner_gh() {
       case "$*" in
-        *"matching-refs/heads"*) printf '%b\n' "$heads" ;;
-        *"matching-refs/tags"*) [[ -n "$tags" ]] && printf '%b\n' "$tags"; return 0 ;;
+        "api repos/$REPO2/branches?per_page=100&page=1") echo "owner_gh $*" >>"$T_TMP/calls"; printf '%s\n' "$heads" ;;
+        "api repos/$REPO2/tags?per_page=100&page=1") echo "owner_gh $*" >>"$T_TMP/calls"; printf '%s\n' "$tags" ;;
+        "api repos/$REPO2/git/ref/tags/"*) printf '{"ref":"refs/tags/%s","object":{"type":"commit","sha":"%s"}}\n' "${*#"api repos/$REPO2/git/ref/tags/"}" "$a" ;;
         *) answer owner_gh "$@" ;;
       esac
     }
@@ -1929,6 +1935,8 @@ test_a2_needs_the_exact_branch_not_a_look_alike() {
     assert_contains "$out" "RESULT A2 permissions FAIL attempt=setup-failed" "$name"
     assert_not_contains "$out" "permissions PASS" "$name"
     assert_not_contains "$(cat "$T_TMP/calls")" "app_git" "$name: an attempt without the branch"
+    assert_contains "$(cat "$T_TMP/calls")" "owner_gh api repos/$REPO2/tags?per_page=100&page=1" "$name: the tags read"
+    assert_not_contains "$(cat "$T_TMP/calls")" "matching-refs" "$name: the refs read by matching-refs"
   done
 }
 
@@ -1937,32 +1945,47 @@ test_a2_needs_the_exact_branch_not_a_look_alike() {
 # every write still unknown; an unchanged list, with complete refusals, settles both.
 test_a2_api_attempts_are_settled_only_against_the_second_throwaways_refs() {
   local case name more want
-  for case in "unchanged|0|refused" "a branch appeared|1|inconclusive"; do
+  for case in "unchanged|0|refused" "a branch appeared|1|inconclusive" \
+    "an annotated tag, unchanged|same-tag|refused" "an annotated tag made again on the same commit|tag|inconclusive"; do
     IFS='|' read -r name more want <<<"$case"
     p_stubs
     gh_reply reply drop=X-Accepted-Github-Permissions "add=X-Accepted-Github-Permissions: contents=write"
     a2_answers "app_gh api -X PUT repos/$REPO2/|1|@reply" "app_gh api -X POST repos/$REPO2/|1|@reply"
     echo "$more" >"$T_TMP/more"
-    # Round 115: the refs as GitHub's JSON (each page a list), as state_refs2 reads them.
+    # Round 117: the branches as their paged list gives them (round 115: as GitHub's JSON); the first
+    # read is the baseline's, before the attempts.
     answer_refs() {
       local n=0 a
       a="$(printf 'a%.0s' $(seq 1 40))"
       [[ -f "$T_TMP/refs-reads" ]] && n="$(cat "$T_TMP/refs-reads")"
       echo $((n + 1)) >"$T_TMP/refs-reads"
       if [[ $n -ge 1 && "$(cat "$T_TMP/more")" == 1 ]]; then
-        printf '[{"ref":"refs/heads/frg26-a2","object":{"sha":"%s"}},{"ref":"refs/heads/sneaked","object":{"sha":"0123456789abcdef0123456789abcdef01234567"}}]\n' "$a"
+        printf '[{"name":"frg26-a2","commit":{"sha":"%s"}},{"name":"sneaked","commit":{"sha":"0123456789abcdef0123456789abcdef01234567"}}]\n' "$a"
       else
-        printf '[{"ref":"refs/heads/frg26-a2","object":{"sha":"%s"}}]\n' "$a"
+        printf '[{"name":"frg26-a2","commit":{"sha":"%s"}}]\n' "$a"
       fi
+    }
+    # Round 117b: a tag v1 on the same commit throughout; "tag" makes it again (a new tag object) after
+    # the baseline's lookup.
+    answer_tag() {
+      local n=0 o
+      [[ -f "$T_TMP/tag-reads" ]] && n="$(cat "$T_TMP/tag-reads")"
+      echo $((n + 1)) >"$T_TMP/tag-reads"
+      o="$(printf 'c%.0s' $(seq 1 40))"
+      if [[ $n -ge 1 && "$(cat "$T_TMP/more")" == tag ]]; then o="$(printf 'd%.0s' $(seq 1 40))"; fi
+      printf '{"ref":"refs/tags/v1","object":{"type":"tag","sha":"%s"}}\n' "$o"
     }
     owner_gh() {
       case "$*" in
-        *"matching-refs/heads"*) echo "owner_gh $*" >>"$T_TMP/calls"; answer_refs ;;
-        *"matching-refs/tags"*) echo '[]' ;;
+        "api repos/$REPO2/branches?per_page=100&page=1") echo "owner_gh $*" >>"$T_TMP/calls"; answer_refs ;;
+        "api repos/$REPO2/branches?per_page=100&page=2" | "api repos/$REPO2/tags?per_page=100&page=2") echo '[]' ;;
+        "api repos/$REPO2/tags?per_page=100&page=1")
+          if [[ "$(cat "$T_TMP/more")" == *tag ]]; then printf '[{"name":"v1","commit":{"sha":"%s"}}]\n' "$(printf 'b%.0s' $(seq 1 40))"; else echo '[]'; fi ;;
+        "api repos/$REPO2/git/ref/tags/v1") echo "owner_gh $*" >>"$T_TMP/calls"; answer_tag ;;
         *) answer owner_gh "$@" ;;
       esac
     }
-    rm -f "$T_TMP/refs-reads"
+    rm -f "$T_TMP/refs-reads" "$T_TMP/tag-reads"
     WRITES_UNKNOWN="" WRITES_OUT=""
     p_attempts api A2 app_gh api -X PUT "repos/$REPO2/contents/x.txt" -f message=m ";;" \
       app_gh api -X POST "repos/$REPO2/git/refs" -f ref=refs/heads/x -f sha=a >/dev/null 2>&1
@@ -2170,8 +2193,8 @@ test_the_second_throwaways_branch_is_ahead_of_main() {
   assert_contains "$(grep "contents/a2.txt" "$T_TMP/owner")" "branch=frg26-a2"
   p_stubs
   a2_answers
-  sed -i '' '/matching-refs\/heads/d' "$T_TMP/answers"
-  echo "owner_gh api --paginate repos/$REPO2/git/matching-refs/heads|0|refs/heads/main $(printf 'a%.0s' $(seq 1 40))" >>"$T_TMP/answers"
+  sed -i '' '/branches?per_page=100&page=1/d' "$T_TMP/answers"
+  echo "owner_gh api repos/$REPO2/branches?per_page=100&page=1|0|[{\"name\":\"main\",\"commit\":{\"sha\":\"$(printf 'a%.0s' $(seq 1 40))\"}}]" >>"$T_TMP/answers"
   local out
   out="$(t_A2)"
   assert_contains "$out" "RESULT A2 permissions FAIL attempt=setup-failed" "frg26-a2 missing"
@@ -7394,7 +7417,7 @@ test_each_baseline_part_is_validated_on_its_own() {
     "a ruleset without a number id|state_rulesets|[{\"id\":\"5\"}]|0|1" \
     "the Environment's read answering nothing|state_environment||0|1" \
     "the second throwaway's refs answering nothing|state_refs2||0|1" \
-    "the second throwaway's refs, a ref with no commit|state_refs2|[{\"ref\":\"refs/heads/frg26-a2\",\"object\":{}}]|0|1"; do
+    "the second throwaway's refs, a branch with no commit|state_refs2|[{\"name\":\"frg26-a2\",\"commit\":{}}]|0|1"; do
     IFS='|' read -r name reader answer rc want <<<"$case"
     p_stubs
     answer="${answer//@REPO@/$REPO}"
@@ -7656,6 +7679,7 @@ test_a_baseline_with_a_failed_part_is_unreadable_whole() {
       f="$(cat "$T_TMP/fail")"
       case "$*" in
         "api repos/$REPO/rulesets?per_page=100&page=1") echo '[{"id":5}]' ;;
+        "api repos/$REPO/rulesets?per_page=100&page=2") echo '[]' ;;
         "api repos/$REPO/rulesets/5")
           if [[ "$f" == one-ruleset ]]; then echo "gh: HTTP 502" >&2; return 1; fi
           echo '{"id":5,"name":"r","enforcement":"active","target":"branch","rules":[]}' ;;
@@ -7748,11 +7772,13 @@ test_an_answer_is_complete_and_consistent_before_it_is_allowed_or_refused() {
 
 # A page of a paged list for the next test, to $T_TMP/<kind>-<n>: <kind> rs (rulesets, a list) or bp (the
 # branch policies, with their total_count); <spec> <a>-<b> the entries with ids a to b (bp: <a>-<b>/<total>),
-# "fail" a read that fails, anything else that text as the page.
+# "end" an empty page (bp: end/<total>), "fail" a read that fails, anything else that text as the page.
 list_page() { # <kind> <n> <spec>
   local f="$T_TMP/$1-$2" a b t
   case "$3" in
     fail) rm -f "$f" ;;
+    end) echo '[]' >"$f" ;;
+    end/*) jq -c -n --argjson t "${3#end/}" '{total_count: $t, branch_policies: []}' >"$f" ;;
     [0-9]*-[0-9]*)
       a="${3%%-*}" b="${3#*-}"
       t="${b#*/}" b="${b%%/*}"
@@ -7771,33 +7797,52 @@ list_page() { # <kind> <n> <spec>
 # and no page or ruleset asked once 60s have passed. A page missing, malformed, over-full or repeating an
 # entry, or (the branch policies) a total_count that changes between pages or differs from the unique
 # entries collected, leaves the baseline unreadable.
+# Round 117 (review-lens round 103, SEC-1, C2; owner): read through to an empty page, never ending at a
+# short one (a short page in the middle can't hide later ones); 10 pages with entries (so exactly 1,000
+# read) and the empty one that ends them; an entry on an 11th page, or no empty page in time, unreadable.
 test_a_paged_list_is_read_whole_at_its_own_addresses() {
-  local case name kind pages step want asked full="" all="" i got out n p
+  local case name kind pages step want asked full="" fbp="" all="" short="" i got out n p
   local -a part
-  for i in 1 2 3 4 5 6 7 8 9 10; do full="$full $i=$(((i - 1) * 100 + 1))-$((i * 100))" all="$all $i"; done
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    full="$full $i=$(((i - 1) * 100 + 1))-$((i * 100))" all="$all $i"
+    fbp="$fbp $i=$(((i - 1) * 100 + 1))-$((i * 100))/1000" short="$short $i=$i-$i"
+  done
   # <name>|<kind>|<n>=<spec> for each page|<seconds each page read takes>|<entries read, or unreadable>|<pages asked>
-  for case in "one page, not full|rs|1=1-2|0|2|1" \
-    "two pages|rs|1=1-100 2=101-101|0|101|1 2" \
-    "a full page, then an empty one|rs|1=1-100 2=[]|0|100|1 2" \
+  for case in "one page, not full, then the empty one|rs|1=1-2 2=end|0|2|1 2" \
+    "no rulesets: the first page empty|rs|1=end|0|0|1" \
+    "two pages|rs|1=1-100 2=101-101 3=end|0|101|1 2 3" \
+    "a full page, then an empty one|rs|1=1-100 2=end|0|100|1 2" \
+    "a short page in the middle|rs|1=1-40 2=41-45 3=46-145 4=end|0|145|1 2 3 4" \
+    "a short page, the page after it failing|rs|1=1-2 2=fail|0|unreadable|1 2" \
     "a second page that fails|rs|1=1-100 2=fail|0|unreadable|1 2" \
+    "the empty page that ends the list failing|rs|1=1-100 2=101-150 3=fail|0|unreadable|1 2 3" \
     "a second page not a list|rs|1=1-100 2={}|0|unreadable|1 2" \
     "a second page repeating an entry|rs|1=1-100 2=100-100|0|unreadable|1 2" \
     "the first page again|rs|1=1-100 2=1-100|0|unreadable|1 2" \
+    "a short page again|rs|1=1-2 2=1-2|0|unreadable|1 2" \
     "a page with more than a page's entries|rs|1=1-101|0|unreadable|1" \
     "an entry whose id isn't a whole number|rs|1=[{\"id\":1.5}]|0|unreadable|1" \
-    "every page full, to the limit|rs|${full# }|0|unreadable|${all# }" \
+    "exactly 1,000 entries: ten full pages, then the empty one|rs|${full# } 11=end|0|1000|${all# } 11" \
+    "an entry on an 11th page|rs|${full# } 11=1001-1001|0|unreadable|${all# } 11" \
+    "ten short pages, then an 11th with an entry|rs|${short# } 11=11-11|0|unreadable|${all# } 11" \
     "60s passed before the third page|rs|1=1-100 2=101-200 3=201-201|30|unreadable|1 2" \
-    "the same, in time|rs|1=1-100 2=101-200 3=201-201|0|201|1 2 3" \
-    "60s passed before its rulesets were read by id|rs|1=1-2|60|unreadable|1" \
-    "branch policies, one page|bp|1=1-2/2|0|2|1" \
-    "branch policies, two pages|bp|1=1-100/101 2=101-101/101|0|101|1 2" \
-    "a total_count above the entries|bp|1=1-2/3|0|unreadable|1" \
-    "a total_count below the entries|bp|1=1-2/1|0|unreadable|1" \
+    "60s passed before the empty page that ends the list|rs|1=1-100 2=101-150 3=end|30|unreadable|1 2" \
+    "the same, in time|rs|1=1-100 2=101-200 3=201-201 4=end|0|201|1 2 3 4" \
+    "60s passed before its rulesets were read by id|rs|1=1-2 2=end|30|unreadable|1 2" \
+    "branch policies, one page|bp|1=1-2/2 2=end/2|0|2|1 2" \
+    "branch policies, none|bp|1=end/0|0|0|1" \
+    "branch policies, two pages|bp|1=1-100/101 2=101-101/101 3=end/101|0|101|1 2 3" \
+    "branch policies, a short page in the middle|bp|1=1-3/5 2=4-5/5 3=end/5|0|5|1 2 3" \
+    "branch policies, exactly 1,000|bp|${fbp# } 11=end/1000|0|1000|${all# } 11" \
+    "a total_count above the entries|bp|1=1-2/3 2=end/3|0|unreadable|1 2" \
+    "a total_count below the entries|bp|1=1-2/1 2=end/1|0|unreadable|1 2" \
     "a total_count changing between pages|bp|1=1-100/101 2=101-101/102|0|unreadable|1 2" \
+    "a total_count changing on the empty page|bp|1=1-2/2 2=end/3|0|unreadable|1 2" \
     "an entry twice, the total_count counting both|bp|1={\"total_count\":2,\"branch_policies\":[{\"id\":1,\"name\":\"b1\"},{\"id\":1,\"name\":\"b1\"}]}|0|unreadable|1" \
     "a total_count not a number|bp|1={\"total_count\":\"2\",\"branch_policies\":[{\"id\":1,\"name\":\"b1\"},{\"id\":2,\"name\":\"b2\"}]}|0|unreadable|1" \
     "a page without its list|bp|1={\"total_count\":0}|0|unreadable|1" \
-    "a second page that fails|bp|1=1-100/101 2=fail|0|unreadable|1 2"; do
+    "a second page that fails|bp|1=1-100/101 2=fail|0|unreadable|1 2" \
+    "the empty page that ends the policies failing|bp|1=1-2/2 2=fail|0|unreadable|1 2"; do
     IFS='|' read -r name kind pages step want asked <<<"$case"
     p_stubs
     rm -f "$T_TMP"/rs-* "$T_TMP"/bp-*
@@ -7845,6 +7890,143 @@ test_a_paged_list_is_read_whole_at_its_own_addresses() {
     unset -f date
   done
   end_stand_in_run
+}
+
+# Round 117 (review-lens round 103, C1 = SEC-2; owner): A2's branches and tags are read from their own
+# lists, which GitHub documents as paged (per_page, page), each whole through the bounded reader (an
+# empty page ends it; never matching-refs, whose pages GitHub doesn't document, nor gh's --paginate);
+# each entry a name, not seen before, with a commit. t_A2's own before-and-after read is the same one.
+# Round 117b (owner): each listed tag is then looked up once by its exact ref (git/ref/tags/<name>): the
+# answer must be that ref, of kind commit (then the list's commit) or tag, with a 40-hex id, and its kind
+# and id are kept, so an annotated tag made again on the same commit reads changed. A name outside the
+# plain set (looked up never), more than 100 tags, a lookup that fails (a rate limit too: never asked
+# again) or answers anything else, or one not asked within 60s of the tags list's start: unreadable.
+test_a2s_branches_and_tags_are_read_from_their_paged_lists() {
+  local case name heads tags refs want got out a b c p br t100 t101 w100 calls bad
+  local -a part
+  a="$(printf 'a%.0s' $(seq 1 40))" b="$(printf 'b%.0s' $(seq 1 40))" c="$(printf 'c%.0s' $(seq 1 40))"
+  T() { printf '{"name":"%s","commit":{"sha":"%s"}}' "$1" "$2"; }       # a list entry
+  R() { printf '{"ref":"refs/tags/%s","object":{"type":"%s","sha":"%s"}}' "$1" "$2" "$3"; } # a lookup's answer
+  br="1=[$(T m "$a")] 2=[]"
+  t100="$(jq -c -n --arg b "$b" '[range(1; 101) | {name: "t\(.)", commit: {sha: $b}}]')"
+  t101="$(jq -c -n --arg b "$b" '[{name: "t101", commit: {sha: $b}}]')"
+  w100="$(jq -S -c -n --arg a "$a" --arg b "$b" '{heads: [{ref: "refs/heads/m", sha: $a}], tags: ([range(1; 101) | {ref: "refs/tags/t\(.)", sha: $b, type: "commit", object: $b}] | sort_by(.ref))}')"
+  # <name>|<branches page=JSON …>|<tags page=JSON …>|<tag=its lookup's answer …; @429 a rate limit, @auto
+  # each a plain tag on b>|<the state, or unreadable (", none looked up": no lookup asked)>
+  for case in "one branch, no tag|1=[$(T frg26-a2 "$a")] 2=[]|1=[]||{\"heads\":[{\"ref\":\"refs/heads/frg26-a2\",\"sha\":\"$a\"}],\"tags\":[]}" \
+    "a branch and a plain tag of one name|1=[$(T v1 "$a")] 2=[]|1=[$(T v1 "$b")] 2=[]|v1=$(R v1 commit "$b")|{\"heads\":[{\"ref\":\"refs/heads/v1\",\"sha\":\"$a\"}],\"tags\":[{\"ref\":\"refs/tags/v1\",\"sha\":\"$b\",\"type\":\"commit\",\"object\":\"$b\"}]}" \
+    "an annotated tag|$br|1=[$(T v1 "$b")] 2=[]|v1=$(R v1 tag "$c")|{\"heads\":[{\"ref\":\"refs/heads/m\",\"sha\":\"$a\"}],\"tags\":[{\"ref\":\"refs/tags/v1\",\"sha\":\"$b\",\"type\":\"tag\",\"object\":\"$c\"}]}" \
+    "a tag name with a slash|$br|1=[$(T release/v1 "$b")] 2=[]|release/v1=$(R release/v1 commit "$b")|{\"heads\":[{\"ref\":\"refs/heads/m\",\"sha\":\"$a\"}],\"tags\":[{\"ref\":\"refs/tags/release/v1\",\"sha\":\"$b\",\"type\":\"commit\",\"object\":\"$b\"}]}" \
+    "exactly 100 tags, each looked up|$br|1=$t100 2=[]|@auto|$w100" \
+    "101 tags|$br|1=$t100 2=$t101 3=[]|@auto|unreadable, none looked up" \
+    "a short page in the middle|1=[$(T m "$a")] 2=[$(T n "$b")] 3=[]|1=[]||{\"heads\":[{\"ref\":\"refs/heads/m\",\"sha\":\"$a\"},{\"ref\":\"refs/heads/n\",\"sha\":\"$b\"}],\"tags\":[]}" \
+    "no branch|1=[]|1=[]||unreadable" \
+    "a branch twice, on two pages|1=[$(T m "$a")] 2=[$(T m "$a")]|1=[]||unreadable" \
+    "a tag twice|$br|1=[$(T t "$a"),$(T t "$a")]|t=$(R t commit "$a")|unreadable, none looked up" \
+    "a branch without a name|1=[{\"commit\":{\"sha\":\"$a\"}}]|1=[]||unreadable" \
+    "a branch whose name is empty|1=[$(T "" "$a")] 2=[]|1=[]||unreadable" \
+    "a branch whose name isn't a string|1=[{\"name\":7,\"commit\":{\"sha\":\"$a\"}}] 2=[]|1=[]||unreadable" \
+    "a branch without its commit|1=[{\"name\":\"m\"}] 2=[]|1=[]||unreadable" \
+    "a tag whose commit isn't a commit id|$br|1=[$(T t main)] 2=[]||unreadable, none looked up" \
+    "the branches' empty page failing|1=[$(T m "$a")]|1=[]||unreadable" \
+    "the tags' read failing|$br|||unreadable" \
+    "the tags as an object|$br|1={}||unreadable" \
+    "a tag's lookup failing|$br|1=[$(T v1 "$b")] 2=[]||unreadable" \
+    "a tag's lookup rate limited|$br|1=[$(T v1 "$b")] 2=[]|v1=@429|unreadable" \
+    "a lookup naming another ref|$br|1=[$(T v1 "$b")] 2=[]|v1=$(R v2 commit "$b")|unreadable" \
+    "a lookup answering a list, as a prefix match would|$br|1=[$(T v1 "$b")] 2=[]|v1=[$(R v1 commit "$b")]|unreadable" \
+    "a plain tag on another commit than listed|$br|1=[$(T v1 "$b")] 2=[]|v1=$(R v1 commit "$c")|unreadable" \
+    "a lookup of another kind of object|$br|1=[$(T v1 "$b")] 2=[]|v1=$(R v1 tree "$b")|unreadable" \
+    "a lookup whose id isn't one|$br|1=[$(T v1 "$b")] 2=[]|v1=$(R v1 tag main)|unreadable" \
+    "a lookup without its object|$br|1=[$(T v1 "$b")] 2=[]|v1={\"ref\":\"refs/tags/v1\"}|unreadable" \
+    "a lookup not JSON|$br|1=[$(T v1 "$b")] 2=[]|v1=nope|unreadable"; do
+    IFS='|' read -r name heads tags refs want <<<"$case"
+    a2_list_case
+  done
+  # A name outside the plain set (letters, digits, . _ - and /, no .., no empty part) is never looked up.
+  for bad in 'a b' 'v1?x' 'v%41' 'v#1' 'v~1' 'v:1' 'v^1' 'v*1' 'v[1' 'v\\1' 'v@{1' 'a..b' '/v1' 'v1/' 'a//b' 'v\n1' '.'; do
+    name="a tag named $bad" heads="$br" tags="1=[$(T "$bad" "$b")] 2=[]" refs="@auto" want="unreadable, none looked up"
+    a2_list_case
+  done
+  # Every lookup within 60s of the tags list's start: two tags, each request taking 20s; the second
+  # lookup would begin 60s after it, so it is never asked.
+  name="60s passed before the second tag's lookup" heads="$br" tags="1=[$(T v1 "$b"),$(T v2 "$b")] 2=[]" refs="@auto" want=unreadable
+  a2_list_case 20
+  assert_eq "$(grep -c 'git/ref/tags/' "$T_TMP/calls")" 1 "$name: the lookups asked"
+  name="the same, in time" want="{\"heads\":[{\"ref\":\"refs/heads/m\",\"sha\":\"$a\"}],\"tags\":[{\"ref\":\"refs/tags/v1\",\"sha\":\"$b\",\"type\":\"commit\",\"object\":\"$b\"},{\"ref\":\"refs/tags/v2\",\"sha\":\"$b\",\"type\":\"commit\",\"object\":\"$b\"}]}"
+  a2_list_case 0
+  # An annotated tag made again on the same commit (a new tag object) reads changed.
+  name="an annotated tag" heads="$br" tags="1=[$(T v1 "$b")] 2=[]" refs="v1=$(R v1 tag "$c")" want=state
+  a2_list_case
+  local first="$out"
+  refs="v1=$(R v1 tag "$(printf 'd%.0s' $(seq 1 40))")"
+  a2_list_case
+  [[ -n "$first" && -n "$out" && "$first" != "$out" ]] || _t_fail "an annotated tag made again on the same commit read unchanged: $first"
+  # t_A2 reads them the same way before its attempts (its own read, then the baseline's).
+  p_stubs
+  a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|0|"
+  t_A2 >/dev/null 2>&1
+  assert_not_contains "$(cat "$T_TMP/calls")" "matching-refs" "t_A2: its refs read by matching-refs"
+  assert_contains "$(cat "$T_TMP/calls")" "owner_gh api repos/$REPO2/branches?per_page=100&page=1" "t_A2: its branches read"
+  unset -f T R
+  end_stand_in_run
+}
+
+# One case of the test above, from its name, heads, tags, refs and want; [step] the seconds each request
+# takes (the clock moves only as GitHub answers). Leaves the state read in out.
+a2_list_case() { # [step]
+  local p k f
+  local -a part
+  p_stubs
+  rm -f "$T_TMP"/heads-* "$T_TMP"/tags-* "$T_TMP"/ref-*
+  part=()
+  [[ -z "$heads" ]] || read -r -a part <<<"$heads"
+  for p in ${part[@]+"${part[@]}"}; do printf '%s\n' "${p#*=}" >"$T_TMP/heads-${p%%=*}"; done
+  part=()
+  [[ -z "$tags" ]] || read -r -a part <<<"$tags"
+  for p in ${part[@]+"${part[@]}"}; do printf '%s\n' "${p#*=}" >"$T_TMP/tags-${p%%=*}"; done
+  part=()
+  [[ -z "$refs" || "$refs" == @auto ]] || read -r -a part <<<"$refs"
+  for p in ${part[@]+"${part[@]}"}; do f="${p%%=*}"; printf '%s\n' "${p#*=}" >"$T_TMP/ref-${f//\//%}"; done
+  [[ "$refs" != @auto ]] || : >"$T_TMP/ref-auto"
+  echo 0 >"$T_TMP/clock"
+  echo "${1:-0}" >"$T_TMP/step"
+  date() { if [[ "$*" == +%s ]]; then cat "$T_TMP/clock"; else command date "$@"; fi; }
+  owner_gh() {
+    local a="$*" k n
+    echo "owner_gh $a" >>"$T_TMP/calls"
+    echo $(($(cat "$T_TMP/clock") + $(cat "$T_TMP/step"))) >"$T_TMP/clock"
+    case "$a" in
+      "api repos/$REPO2/branches?per_page=100&page="*) k="heads-${a##*page=}" ;;
+      "api repos/$REPO2/tags?per_page=100&page="*) k="tags-${a##*page=}" ;;
+      "api repos/$REPO2/git/ref/tags/"*)
+        n="${a#"api repos/$REPO2/git/ref/tags/"}"
+        if [[ -f "$T_TMP/ref-auto" ]]; then
+          jq -c -n --arg n "$n" --arg s "$(printf 'b%.0s' $(seq 1 40))" '{ref: "refs/tags/\($n)", object: {type: "commit", sha: $s}}'
+          return 0
+        fi
+        k="ref-${n//\//%}"
+        if [[ "$(cat "$T_TMP/$k" 2>/dev/null)" == @429 ]]; then echo "gh: API rate limit exceeded (HTTP 429)" >&2; return 1; fi ;;
+      *) echo "gh: HTTP 404" >&2; return 1 ;;
+    esac
+    [[ -f "$T_TMP/$k" ]] || { echo "gh: HTTP 502" >&2; return 1; }
+    cat "$T_TMP/$k"
+  }
+  local got=0
+  out=""
+  out="$(state_refs2)" || got=$?
+  case "$want" in
+    unreadable*) [[ "$got" != 0 ]] || _t_fail "$name: read as a state: $out" ;;
+    state) assert_exit 0 "$got" "$name: read as a state" ;;
+    *)
+      assert_exit 0 "$got" "$name: read as a state"
+      assert_eq "$out" "$(jq -S -c . <<<"$want")" "$name: the state" ;;
+  esac
+  [[ "$want" != *"none looked up"* ]] || assert_not_contains "$(cat "$T_TMP/calls")" "git/ref/" "$name: a tag looked up"
+  assert_eq "$(grep 'git/ref/' "$T_TMP/calls" | sort | uniq -d)" "" "$name: a tag looked up twice"
+  assert_not_contains "$(cat "$T_TMP/calls")" "matching-refs" "$name: read by matching-refs"
+  assert_not_contains "$(cat "$T_TMP/calls")" "--paginate" "$name: gh following GitHub's links"
+  unset -f date
 }
 
 # Round 116 (review-lens round 102, C4 = SEC-2; owner): every repository setting the baseline compares

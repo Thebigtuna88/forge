@@ -113,7 +113,8 @@ readonly CLEANUP_SECS=180 # the longest the whole clean-up may take
 readonly CONTROL_SECS=240 # the longest a control (A9, E1) may run, its own token clean-up included
 readonly LIST_SECS=60     # no page of a baseline's list (or ruleset by id) is asked once this has passed (round 116)
 readonly PAGE_SIZE=100    # the entries asked for on each page of a list (GitHub's most)
-readonly PAGE_MAX=10      # the most pages a baseline's list may have: so at most 1,000 entries (round 116)
+readonly PAGE_MAX=10      # the most pages with entries a baseline's list may have (1,000 entries), and then the empty one (rounds 116-117)
+readonly TAG_MAX=100      # the most tags A2's baseline looks up, each by its exact ref (round 117)
 # Round 115 (owner): the app's API attempts go through the system's own curl, by this path only: it is on
 # macOS's sealed, read-only system volume, so no process running as the owner can replace it. That
 # narrows the replacement risk; it does NOT protect it from same-user debugging (an open limit, not
@@ -1395,23 +1396,33 @@ state_protection() { # <branch> — {"protected":false}, or {"protected":true,"p
 
 # A list GitHub gives in pages, read whole (round 116, review-lens round 102 C2 = SEC-1, C3; owner): each
 # page asked at an address built here on the fixed endpoint, <path>?per_page=100&page=<n> (never a Link
-# URL of GitHub's, so never gh's --paginate, which follows them), until a page that isn't full. Each page
-# must be one JSON value <test> holds for, its <list> (a jq path) at most a full page of objects, each
-# with a whole-number id not seen before; with <count> (a jq path: GitHub's total_count), that is the
-# same on every page and the number of entries collected. Bounded: at most PAGE_MAX pages (so PAGE_MAX x
-# PAGE_SIZE entries), and none asked once LIST_SECS have passed since the first was (each page within its
-# own request's limit). Prints the entries as one JSON list; 1 for a page missing, malformed, repeated or
-# inconsistent, or the list longer than its bounds.
+# URL of GitHub's, so never gh's --paginate, which follows them), until an empty page (round 117,
+# review-lens round 103 SEC-1; owner): never a short one, so a short page in the middle can't hide later
+# ones. Each page must be one JSON value <test> holds for, its <list> (a jq path) at most a full page of
+# objects, each with its <key> not seen before (so a page repeated is refused): id, a whole number, or
+# (round 117, A2's branches and tags) name, a string not empty; with <count> (a jq
+# path: GitHub's total_count), that is the same on every page, the empty one too, and the number of
+# entries collected. Bounded: at most PAGE_MAX pages with entries (so PAGE_MAX x PAGE_SIZE: exactly 1,000
+# can be read, round 117 C2) and the empty page that ends them, and none asked once LIST_SECS have passed
+# since the first was (each page within its own request's limit). Prints the entries as one JSON list; 1
+# for a page missing, malformed, repeated or inconsistent, or the list longer than its bounds.
+# Pages are separate reads, not one snapshot: a list that changes while it is read can repeat an entry
+# (refused) or move one onto a page already read (unseen), and nothing here can tell that apart from a
+# list that never changed.
 # shellcheck disable=SC2016 # jq's own $m
-state_pages() { # <path> <test> <list> [count]
-  local path="$1" test="$2" list="$3" count="${4:-}" n=0 start page got all='[]' total="" t
+state_pages() { # <path> <test> <list> <key> [count]
+  local path="$1" test="$2" list="$3" key="$4" count="${5:-}" n=0 start page got all='[]' total="" t kt
+  case "$key" in
+    id) kt='(.id | type) == "number" and .id > 0 and .id == (.id | floor)' ;;
+    name) kt='(.name | type) == "string" and (.name | length) > 0' ;;
+    *) return 1 ;;
+  esac
   start="$(date +%s)"
   while :; do
     n=$((n + 1))
-    [[ $n -le $PAGE_MAX ]] || return 1
     [[ $n -eq 1 || $(($(date +%s) - start)) -lt $LIST_SECS ]] || return 1
     into page owner_gh api "$path?per_page=$PAGE_SIZE&page=$n" 2>/dev/null || return 1
-    json_one "$page" --argjson m "$PAGE_SIZE" "($test) and ($list | type == \"array\" and length <= \$m and all(.[]; type == \"object\" and (.id | type) == \"number\" and .id > 0 and .id == (.id | floor)))" || return 1
+    json_one "$page" --argjson m "$PAGE_SIZE" "($test) and ($list | type == \"array\" and length <= \$m and all(.[]; type == \"object\" and $kt))" || return 1
     got="$(jq -c "$list" <<<"$page")" || return 1
     if [[ -n "$count" ]]; then
       t="$(jq -c "$count" <<<"$page")" || return 1
@@ -1419,9 +1430,10 @@ state_pages() { # <path> <test> <list> [count]
       [[ -z "$total" || "$t" == "$total" ]] || return 1
       total="$t"
     fi
+    [[ "$got" != '[]' ]] || break
+    [[ $n -le $PAGE_MAX ]] || return 1 # an entry on the page after the last one allowed
     all="$(jq -c --argjson g "$got" '. + $g' <<<"$all")" || return 1
-    jq -e '(map(.id) | unique | length) == length' >/dev/null 2>&1 <<<"$all" || return 1
-    [[ "$(jq length <<<"$got")" == "$PAGE_SIZE" ]] || break
+    jq -e --arg k "$key" '(map(.[$k]) | unique | length) == length' >/dev/null 2>&1 <<<"$all" || return 1
   done
   [[ -z "$count" || "$(jq length <<<"$all")" == "$total" ]] || return 1
   printf '%s\n' "$all"
@@ -1433,7 +1445,7 @@ state_pages() { # <path> <test> <list> [count]
 state_rulesets() {
   local l id one out='[]' start
   start="$(date +%s)"
-  into l state_pages "repos/$REPO/rulesets" 'type == "array"' . || return 1
+  into l state_pages "repos/$REPO/rulesets" 'type == "array"' . id || return 1
   for id in $(jq -r '.[].id' <<<"$l"); do
     [[ $(($(date +%s) - start)) -lt $LIST_SECS ]] || return 1
     into one owner_gh api "repos/$REPO/rulesets/$id" 2>/dev/null || return 1
@@ -1462,19 +1474,47 @@ state_repo() {
     '. as $o | reduce ($s + $n + $b)[] as $f ({}; .[$f] = $o[$f])' <<<"$r"
 }
 
-# The second throwaway's branches (at least one) and tags, each a ref of its kind with a commit; gh's
-# --paginate gives each page's list in turn, and at least one page must come for each.
-# shellcheck disable=SC2016 # jq's own $p
+# The second throwaway's branches (at least one) and tags, each by its ref with its commit (round 117,
+# review-lens round 103 C1 = SEC-2; owner): read from its branches and tags lists, which GitHub documents
+# as paged (per_page, page), each whole by state_pages, keyed by name; never matching-refs, whose pages
+# GitHub doesn't document, nor gh's --paginate. Each name with a commit id.
+# The tags list gives a tag's commit, not the tag object (round 117b; owner): so each tag is then looked
+# up once, by its exact ref (git/ref/tags/<name>, which GitHub documents as 404 when nothing matches
+# exactly), and its answer must be that ref, an object of kind commit (then the list's commit) or tag,
+# with a 40-hex id; the kind and id are kept, so an annotated tag made again on the same commit reads
+# changed. Only plain names are looked up (REF_NAME: letters, digits, . _ - in parts joined by /, no part
+# starting with a dot, no ..), at most TAG_MAX, and none once LIST_SECS have passed since the tags list was
+# begun; anything else, or a lookup that fails (a rate limit or throttling too: never asked again), leaves
+# the state unreadable. Unverified offline: which kind GitHub gives a plain tag and an annotated one, and
+# how it reads a name with a slash in this address (either differing reads unreadable). These are
+# separate reads one after another, not one snapshot. jq's ^ and $ let a trailing newline through, so
+# these patterns are anchored with \A and \z.
+readonly REF_NAME='\A[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*\z'
+readonly SHA_ID='\A[0-9a-f]{40}\z'
+# shellcheck disable=SC2016 # jq's own variables
 state_refs2() {
-  local h t k
-  into h owner_gh api --paginate "repos/$REPO2/git/matching-refs/heads" 2>/dev/null || return 1
-  into t owner_gh api --paginate "repos/$REPO2/git/matching-refs/tags" 2>/dev/null || return 1
-  k='length > 0 and all(.[]; type == "array") and ((add // []) | all(.[]; type == "object" and (.ref | type) == "string" and (.ref | startswith($p)) and ((.object.sha // "") | type == "string" and test("^[0-9a-f]{40}$"))))'
-  jq -e -s --arg p refs/heads/ "$k and ((add // []) | length > 0)" >/dev/null 2>&1 <<<"$h" || return 1
-  jq -e -s --arg p refs/tags/ "$k" >/dev/null 2>&1 <<<"$t" || return 1
-  h="$(jq -S -c -s 'add // [] | map({ref, sha: .object.sha}) | sort_by(.ref)' <<<"$h")" || return 1
-  t="$(jq -S -c -s 'add // [] | map({ref, sha: .object.sha}) | sort_by(.ref)' <<<"$t")" || return 1
-  printf '{"heads":%s,"tags":%s}\n' "$h" "$t"
+  local h t k start name one out='[]'
+  into h state_pages "repos/$REPO2/branches" 'type == "array"' . name || return 1
+  start="$(date +%s)"
+  into t state_pages "repos/$REPO2/tags" 'type == "array"' . name || return 1
+  k='all(.[]; (.commit | type) == "object" and (.commit.sha | type) == "string" and (.commit.sha | test($id)))'
+  json_one "$h" --arg id "$SHA_ID" "length > 0 and $k" || return 1
+  json_one "$t" --arg id "$SHA_ID" --arg re "$REF_NAME" --argjson m "$TAG_MAX" \
+    "$k and length <= \$m and all(.[]; .name | test(\$re) and (contains(\"..\") | not))" || return 1
+  for name in $(jq -r '.[].name' <<<"$t"); do # plain names only: no space, newline or glob character
+    [[ $(($(date +%s) - start)) -lt $LIST_SECS ]] || return 1
+    into one owner_gh api "repos/$REPO2/git/ref/tags/$name" 2>/dev/null || return 1
+    json_one "$one" --arg r "refs/tags/$name" --arg n "$name" --arg id "$SHA_ID" --argjson t "$t" \
+      'type == "object" and .ref == $r and (.object | type) == "object" and (.object.sha | type) == "string"
+        and (.object.sha | test($id))
+        and (.object.type == "tag" or (.object.type == "commit" and .object.sha == ($t[] | select(.name == $n) | .commit.sha)))' || return 1
+    out="$(jq -c --argjson o "$one" '. + [{ref: $o.ref, type: $o.object.type, object: $o.object.sha}]' <<<"$out")" || return 1
+  done
+  json_one "$out" --argjson t "$t" 'length == ($t | length)' || return 1
+  jq -n -S -c --argjson h "$h" --argjson t "$t" --argjson o "$out" \
+    '{heads: ($h | map({ref: ("refs/heads/" + .name), sha: .commit.sha}) | sort_by(.ref)),
+      tags: ($t | map({ref: ("refs/tags/" + .name), sha: .commit.sha} as $e | $e + ($o[] | select(.ref == $e.ref) | {type, object}))
+        | sort_by(.ref))}'
 }
 
 # The Environment whole, its branch policies (every page, as many as GitHub's total_count says: round 116,
@@ -1484,7 +1524,7 @@ state_environment() {
   local e p s
   into e owner_gh api "repos/$REPO/environments/$ENV_NAME" 2>/dev/null || return 1
   json_one "$e" --arg n "$ENV_NAME" 'type == "object" and .name == $n and (.protection_rules | type) == "array" and (.updated_at | type) == "string"' || return 1
-  into p state_pages "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" 'type == "object"' .branch_policies .total_count || return 1
+  into p state_pages "repos/$REPO/environments/$ENV_NAME/deployment-branch-policies" 'type == "object"' .branch_policies id .total_count || return 1
   into s owner_gh api "repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME" 2>/dev/null || return 1
   json_one "$s" --arg n "$DISPOSABLE_NAME" 'type == "object" and .name == $n and (.created_at | type) == "string" and (.updated_at | type) == "string"' || return 1
   jq -n -S -c --argjson e "$e" --argjson p "$p" --argjson s "$s" '{environment: $e, policies: ($p | sort_by(.id)), secret: ($s | {name, created_at, updated_at})}'
@@ -3433,10 +3473,10 @@ t_A2() {
   into dev owner_gh api "repos/$REPO/branches/dev" --jq .commit.sha 2>/dev/null || dev=""
   [[ "$dev" =~ ^[0-9a-f]{40}$ ]] || { setup_fail_p A2 "could not read $REPO's dev"; return; }
   # The file goes on the owner's branch there: with that branch missing, a 404 would prove nothing.
-  # Only a whole line of the branch list counts, never a look-alike branch or tag (round 70, C1,
-  # SEC-1): branch lines are the only ones starting refs/heads/.
-  into before probe_refs || true
-  if [[ "$before" == error ]] || ! printf '%s\n' "$before" | grep -Eqx "refs/heads/$A2_BRANCH [0-9a-f]{40}"; then
+  # Only the exact branch counts, never a look-alike branch or tag (round 70, C1, SEC-1). Round 117
+  # (owner): read as the baseline reads them (state_refs2, the bounded lists), not probe_refs.
+  into before state_refs2 2>/dev/null || before=""
+  if [[ -z "$before" ]] || ! jq -e --arg r "refs/heads/$A2_BRANCH" '.heads | any(.ref == $r)' >/dev/null 2>&1 <<<"$before"; then
     setup_fail_p A2 "could not read $REPO2's branches and tags, or $A2_BRANCH is missing"
     return
   fi
@@ -3452,8 +3492,8 @@ t_A2() {
     app_gh api -X POST "repos/$REPO2/git/refs" -f ref="refs/heads/frg26-a2-api-$(stamp)" -f sha="$main2"
   EV="$ev$EV"
   [[ "$OBS" == refused ]] || { record_p A2 "$OBS" "not run" "$EV"; return; }
-  into after probe_refs || true
-  if [[ "$after" != "$before" ]]; then
+  into after state_refs2 2>/dev/null || after=""
+  if [[ -z "$after" || "$after" != "$before" ]]; then
     record_p A2 allowed "not run" "$EV $REPO2's branches or tags changed (or could not be read again)"
     return
   fi
