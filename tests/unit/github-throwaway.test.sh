@@ -1864,12 +1864,12 @@ gh_reply() { # <file> [change…]
   } >"$f"
 }
 
-# A page of a list as gh api -i prints it (round 118): GitHub's 200, its Content-Type and each header
-# line given, then an empty line and <body>.
+# A page of a list as gh api -i prints it (round 118): GitHub's 200, its Content-Type, a Content-Length of
+# <body>'s bytes (round 119) and each header line given, then an empty line and <body>.
 gh_page() { # <body> [header line…]
   local LC_ALL=C b="$1" h
   shift
-  printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n'
+  printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: %s\r\n' "${#b}"
   for h in ${1+"$@"}; do printf '%s\r\n' "$h"; done
   printf '\r\n%s' "$b"
 }
@@ -6473,6 +6473,47 @@ test_the_clean_up_holds_each_answer_in_memory() {
   end_stand_in_run
 }
 
+# Round 119 (review-lens round 105, C2; owner): into -b keeps every byte of an answer, its trailing
+# newlines too, through its private file or held in memory; the status is the command's, apart from the
+# answer. In memory, an answer whose end can't be told (the job ended the shell it ran in before its
+# end mark) is unread, never taken as whole. Without -b, into is unchanged: trailing newlines dropped.
+test_into_b_keeps_every_byte_of_an_answer() {
+  local v rc mode
+  load
+  quit() { printf 'part\n\n'; exit 4; }
+  for mode in file STOPS_HELD DEFERRING; do
+    rm -rf "$T_TMP/work"
+    mkdir -m 700 "$T_TMP/work"
+    WORK="$T_TMP/work" STOPS_HELD="" DEFERRING=""
+    [[ "$mode" == file ]] || printf -v "$mode" '%s' 1
+    rc=0
+    into -b v printf 'a\n\n\r\n' || rc=$?
+    assert_exit 0 "$rc" "$mode: the command's status"
+    assert_eq "$v" $'a\n\n\r\n' "$mode: every byte"
+    rc=0
+    into -b v /bin/sh -c 'printf "x\n"; exit 3' || rc=$?
+    assert_exit 3 "$rc" "$mode: a failure's status"
+    assert_eq "$v" $'x\n' "$mode: a failure's answer, kept apart from its status"
+    into -b v printf ''
+    assert_eq "$v" "" "$mode: an empty answer"
+    into -b v printf 'ends in a dot.'
+    assert_eq "$v" "ends in a dot." "$mode: an answer ending in a dot"
+    into v printf 'a\n\n'
+    assert_eq "$v" a "$mode: without -b, trailing newlines dropped"
+    rc=0
+    into -b v quit || rc=$?
+    assert_exit 4 "$rc" "$mode: a job ending its shell: the status"
+    if [[ "$mode" == file ]]; then
+      assert_eq "$v" $'part\n\n' "$mode: a job ending its shell: its file whole"
+    else
+      assert_eq "$v" "" "$mode: a job ending its shell: unread, not cut"
+    fi
+    assert_eq "$(ls -A "$T_TMP/work")" "" "$mode: a file left"
+  done
+  STOPS_HELD="" DEFERRING=""
+  end_stand_in_run
+}
+
 # Review-lens round 94 (C1 = SEC-1), owner 2026-11-24: a create still pending is named whether or not
 # the work folder is there, never an empty list. Round 109: the records are the run's memory, so a
 # folder there or gone adds nothing and loses nothing.
@@ -7818,12 +7859,14 @@ list_page() { # <kind> <n> <spec>
 
 # The same page as gh api -i prints it (round 118), to $T_TMP/<kind>-<n>.raw: list_page's body for <spec>
 # (none for "fail": that read fails) in GitHub's 200, changed by each <change>: link=<rel>:<page>,… (a
-# Link header in GitHub's form, gh_link's), name=<that header's name>, hdr=<a header line>, cl (a
-# Content-Length of the body's bytes), cl=<n>, status=<line>, cut (no empty line after the headers, no
-# body), raw=<the whole answer, as printf %b reads it>, rc=<gh's exit status>. In a change, + is a space.
+# Link header in GitHub's form, gh_link's), name=<that header's name>, hdr=<a header line>, status=<line>,
+# cut (no empty line after the headers, no body), raw=<the whole answer, as printf %b reads it>, rc=<gh's
+# exit status>. In a change, + is a space. Round 119: a Content-Length of the body's bytes unless a cl
+# change or nocl is given: cl (one of the body's bytes), cl=<n>, cl=+<k> or cl=-<k> (the body's bytes
+# and k more or fewer), each a Content-Length of its own; nocl, none; nl, a newline more at the body's end.
 list_answer() { # <kind> <n> <spec> [change…]
-  local LC_ALL=C f="$T_TMP/$1-$2" c v body status="HTTP/2.0 200 OK" lname=Link links="" cut="" raw=""
-  local -a heads=("Content-Type: application/json; charset=utf-8")
+  local LC_ALL=C f="$T_TMP/$1-$2" c v body status="HTTP/2.0 200 OK" lname=Link links="" cut="" raw="" nocl=""
+  local -a heads=("Content-Type: application/json; charset=utf-8") cls=()
   rm -f "$f.raw" "$f.rc"
   list_page "$1" "$2" "$3"
   [[ -f "$f" ]] || return 0
@@ -7835,8 +7878,9 @@ list_answer() { # <kind> <n> <spec> [change…]
       link=*) links="$v" ;;
       name=*) lname="$v" ;;
       hdr=*) heads+=("$v") ;;
-      cl) heads+=("Content-Length: ${#body}") ;;
-      cl=*) heads+=("Content-Length: $v") ;;
+      cl | cl=*) cls+=("$c") ;;
+      nocl) nocl=1 ;;
+      nl) body="$body"$'\n' ;;
       status=*) status="$v" ;;
       cut) cut=1 ;;
       raw=*) raw="$v" ;;
@@ -7844,6 +7888,16 @@ list_answer() { # <kind> <n> <spec> [change…]
     esac
   done
   if [[ -n "$raw" ]]; then printf '%b' "$raw" >"$f.raw"; return 0; fi
+  [[ ${#cls[@]} -gt 0 || -n "$nocl" ]] || cls=(cl)
+  for c in ${cls[@]+"${cls[@]}"}; do
+    case "$c" in
+      cl) v="${#body}" ;;
+      cl=+*) v=$((${#body} + ${c#cl=+})) ;;
+      cl=-*) v=$((${#body} - ${c#cl=-})) ;;
+      *) v="${c#cl=}" ;;
+    esac
+    heads+=("Content-Length: $v")
+  done
   [[ -z "$links" ]] || heads+=("$lname: $(gh_link "$links")")
   {
     printf '%s\r\n' "$status"
@@ -7995,6 +8049,12 @@ paged_case() {
 # n+1, prev n-1, first 1, last the list's last page with entries; a page names a next page exactly when
 # the page after it has entries, and the empty page that ends the list names none. Anything else, the
 # baseline unreadable.
+# Round 119 (review-lens round 105, C1 = SEC-1, C2, C3; owner): one JSON value is a parsing check, not
+# proof the answer is whole; gh's exit 0 stays required. Every page needs one Content-Length, exactly its
+# body's bytes as gh printed them, trailing newlines too (into -b keeps them); none, or another number,
+# unreadable, so a cut that still parses is refused. A Content-Encoding other than identity, or any
+# Transfer-Encoding (any case), unreadable. A Link URL's query exactly page=<n> and at most one
+# per_page=100, in either order, nothing else: the only parameters the reader sends.
 test_a_lists_pages_must_agree_with_their_headers() {
   local case name kind pages step=0 want asked u l1 l2
   # Each Link's form is tested on a one-page list, whose page 1 may name itself first and last: read
@@ -8008,7 +8068,32 @@ test_a_lists_pages_must_agree_with_their_headers() {
     "the header named LINK|rs|1=1-100!name=LINK 2=101-101 3=end|101|1 2 3" \
     "rel in capitals|rs|1=1-100!link=NEXT:2 2=101-101 3=end|101|1 2 3" \
     "a Content-Length of the body's bytes|rs|1=1-2!cl 2=end!cl|2|1 2" \
-    "a Content-Length with an encoding named|rs|1=1-2!cl=7!hdr=Content-Encoding:+gzip 2=end|2|1 2" \
+    "Content-Encoding identity|rs|1=1-2!hdr=Content-Encoding:+identity 2=end|2|1 2" \
+    "a body ending in a newline its Content-Length counts|rs|1=1-2!nl 2=end!nl|2|1 2" \
+    "a body ending in two newlines its Content-Length counts|rs|1=1-2!nl!nl 2=end|2|1 2" \
+    "branch policies, bodies ending in a newline counted|bp|1=1-2/2!nl 2=end/2!nl|2|1 2" \
+    "a trailing newline its Content-Length doesn't count|rs|1=1-2!nl!cl=-1 2=end|unreadable|1" \
+    "the empty page's trailing newline not counted|rs|1=1-2 2=end!nl!cl=-1|unreadable|1 2" \
+    "two trailing newlines, one counted|rs|1=1-2!nl!nl!cl=-1 2=end|unreadable|1" \
+    "a Content-Length counting a newline the body lacks|rs|1=1-2!cl=+1 2=end|unreadable|1" \
+    "a Content-Length written out|rs|1=1-2!cl=43 2=end|2|1 2" \
+    "the same with a leading zero|rs|1=1-2!cl=043 2=end|unreadable|1" \
+    "no Content-Length|rs|1=1-2!nocl 2=end|unreadable|1" \
+    "the empty page that ends the list with no Content-Length|rs|1=1-2 2=end!nocl|unreadable|1 2" \
+    "an empty first page with no Content-Length|rs|1=end!nocl|unreadable|1" \
+    "branch policies, no Content-Length|bp|1=1-2/2!nocl 2=end/2|unreadable|1" \
+    "a cut answer still one JSON value: an empty page short of its length|rs|1=1-2 2=end!cl=+20|unreadable|1 2" \
+    "the same, gzip named|rs|1=1-2 2=end!cl=+20!hdr=Content-Encoding:+gzip|unreadable|1 2" \
+    "the same, with gh failing|rs|1=1-2 2=end!rc=1|unreadable|1 2" \
+    "a Content-Length unlike the body, an encoding named|rs|1=1-2!cl=7!hdr=Content-Encoding:+gzip 2=end|unreadable|1" \
+    "gzip named, the length the body's|rs|1=1-2!hdr=Content-Encoding:+gzip 2=end|unreadable|1" \
+    "br named, in lower case|rs|1=1-2!hdr=content-encoding:+br 2=end|unreadable|1" \
+    "gzip named, in capitals|rs|1=1-2!hdr=CONTENT-ENCODING:+gzip 2=end|unreadable|1" \
+    "an empty Content-Encoding|rs|1=1-2!hdr=Content-Encoding: 2=end|unreadable|1" \
+    "identity, then gzip|rs|1=1-2!hdr=Content-Encoding:+identity!hdr=Content-Encoding:+gzip 2=end|unreadable|1" \
+    "Transfer-Encoding chunked|rs|1=1-2!hdr=Transfer-Encoding:+chunked 2=end|unreadable|1" \
+    "transfer-encoding identity, in lower case|rs|1=1-2!hdr=transfer-encoding:+identity 2=end|unreadable|1" \
+    "on the empty page, Transfer-Encoding chunked|rs|1=1-2 2=end!hdr=Transfer-Encoding:+chunked|unreadable|1 2" \
     "an empty page naming a next page|rs|1=1-100 2=end!link=next:3|unreadable|1 2" \
     "an empty page naming a next page, link in lower case|rs|1=1-100 2=end!name=link!link=next:3|unreadable|1 2" \
     "an empty page naming a next page, rel in mixed case|rs|1=1-100 2=end!link=Next:3|unreadable|1 2" \
@@ -8044,6 +8129,25 @@ test_a_lists_pages_must_agree_with_their_headers() {
     "a page not a number|rs|1=1-2!hdr=Link:+<$u?page=1x>;+rel=\"first\" 2=end|unreadable|1" \
     "a Link with nothing in it|rs|1=1-2!hdr=Link: 2=end|unreadable|1" \
     "a URL with a space|rs|1=1-2!hdr=Link:+<$u?a=b+c&page=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "page, then per_page|rs|1=1-2!hdr=Link:+<$u?page=1&per_page=100>;+rel=\"first\" 2=end|2|1 2" \
+    "a URL with another parameter|rs|1=1-2!hdr=Link:+<$u?page=1&sort=asc>;+rel=\"first\" 2=end|unreadable|1" \
+    "a URL with another parameter first|rs|1=1-2!hdr=Link:+<$u?direction=desc&per_page=100&page=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "another parameter after page and per_page|rs|1=1-2!hdr=Link:+<$u?page=1&per_page=100&x=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "another parameter before page and per_page|rs|1=1-2!hdr=Link:+<$u?x=1&page=1&per_page=100>;+rel=\"first\" 2=end|unreadable|1" \
+    "another parameter after per_page and page|rs|1=1-2!hdr=Link:+<$u?per_page=100&page=1&x=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "a URL with an encoded second page|rs|1=1-2!hdr=Link:+<$u?page=1&%70age=9>;+rel=\"first\" 2=end|unreadable|1" \
+    "a URL with an encoded page size|rs|1=1-2!hdr=Link:+<$u?per%5Fpage=30&page=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "a page number encoded|rs|1=1-2!hdr=Link:+<$u?page=%31>;+rel=\"first\" 2=end|unreadable|1" \
+    "a per_page with no value|rs|1=1-2!hdr=Link:+<$u?page=1&per_page>;+rel=\"first\" 2=end|unreadable|1" \
+    "a per_page with no =|rs|1=1-2!hdr=Link:+<$u?per_page&page=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "an empty part between|rs|1=1-2!hdr=Link:+<$u?page=1&&per_page=100>;+rel=\"first\" 2=end|unreadable|1" \
+    "an empty part at the end|rs|1=1-2!hdr=Link:+<$u?page=1&>;+rel=\"first\" 2=end|unreadable|1" \
+    "an empty part at the start|rs|1=1-2!hdr=Link:+<$u?&page=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "a part with no name|rs|1=1-2!hdr=Link:+<$u?page=1&=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "a second question mark|rs|1=1-2!hdr=Link:+<$u?page=1?x=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "a fragment|rs|1=1-2!hdr=Link:+<$u?page=1#x>;+rel=\"first\" 2=end|unreadable|1" \
+    "a next page's URL with page alone|rs|1=1-100!nolink!hdr=Link:+<$u?page=2>;+rel=\"next\" 2=101-101 3=end|101|1 2 3" \
+    "another parameter on a next page's URL|rs|1=1-100!nolink!hdr=Link:+<$u?page=2&q=1>;+rel=\"next\" 2=101-101 3=end|unreadable|1" \
     "no empty line after the headers|rs|1=1-2!cut|unreadable|1" \
     "the body cut short|rs|1=[{\"id\":1},{\"id\":2|unreadable|1" \
     "an empty page cut short|rs|1=1-2 2=[|unreadable|1 2" \

@@ -707,10 +707,23 @@ capture() {
 # from its file (gone, unreadable) is unread, never empty. In memory, the job's fds 3 and 8 are closed
 # with exec inside the substitution: a redirection on the call itself would leave bash's own copy of
 # them (fd 10 and up) open to every program the job runs.
-into() { # [-2] <var> <command…>
-  local _i_both="" _i_var _i_f _i_pid _i_rc=0 _i_out="" _i_n="" _i_unread="" _i_expect="$WRITE_EXPECT"
+# Round 119 (review-lens round 105, C2; owner): with -b, <var> gets every byte of the output, its trailing
+# newlines too (only a NUL byte, which bash can't hold, is lost: the caller must check the length), and
+# the status, as ever, is the command's alone. A mark this call makes is put after the output and taken
+# off: in memory, an output without it (the job ended its shell first, so where its end was can't be
+# told) is unread, never taken as whole.
+into() { # [-2] [-b] <var> <command…>
+  local _i_both="" _i_bytes="" _i_mark _i_var _i_f _i_pid _i_rc=0 _i_out="" _i_n="" _i_unread="" _i_expect="$WRITE_EXPECT"
   WRITE_EXPECT=""
-  if [[ "$1" == -2 ]]; then _i_both=1; shift; fi
+  while :; do
+    case "$1" in
+      -2) _i_both=1 ;;
+      -b) _i_bytes=1 ;;
+      *) break ;;
+    esac
+    shift
+  done
+  _i_mark=":end-$$-$RANDOM$RANDOM$RANDOM"
   _i_var="$1"
   shift
   into_req "$@"
@@ -720,7 +733,10 @@ into() { # [-2] <var> <command…>
     _i_n=$WRITE_N
   fi
   if [[ -n "$STOPS_HELD$DEFERRING" ]]; then
-    if [[ -n "$_i_both" ]]; then
+    if [[ -n "$_i_bytes" ]]; then
+      _i_out="$(exec 3>&- 8<&-; [[ -z "$_i_both" ]] || exec 2>&1; in_job "$@"; _i_rc=$?; printf '%s' "$_i_mark"; exit $_i_rc)" || _i_rc=$?
+      if [[ "$_i_out" == *"$_i_mark" ]]; then _i_out="${_i_out%"$_i_mark"}"; else _i_out="" _i_unread=1; fi
+    elif [[ -n "$_i_both" ]]; then
       _i_out="$(exec 3>&- 8<&- 2>&1; in_job "$@")" || _i_rc=$?
     else
       _i_out="$(exec 3>&- 8<&-; in_job "$@")" || _i_rc=$?
@@ -736,7 +752,13 @@ into() { # [-2] <var> <command…>
     REQ_JOBS="$REQ_JOBS $_i_pid"
     job_wait "$_i_pid" || _i_rc=$?
     jobs_drop "$_i_pid"
-    if [[ -f "$_i_f" ]] && _i_out="$(cat "$_i_f")"; then :; else _i_out="" _i_unread=1; fi
+    if [[ -n "$_i_bytes" ]]; then
+      if [[ -f "$_i_f" ]] && _i_out="$(cat "$_i_f" && printf '%s' "$_i_mark")" && [[ "$_i_out" == *"$_i_mark" ]]; then
+        _i_out="${_i_out%"$_i_mark"}"
+      else
+        _i_out="" _i_unread=1
+      fi
+    elif [[ -f "$_i_f" ]] && _i_out="$(cat "$_i_f")"; then :; else _i_out="" _i_unread=1; fi
     rm -f "$_i_f"
   fi
   printf -v "$_i_var" '%s' "$_i_out"
@@ -1397,12 +1419,17 @@ state_protection() { # <branch> — {"protected":false}, or {"protected":true,"p
 # One page of a list as gh api -i printed it (round 118, review-lens round 104 SEC-1; owner), gh having
 # exited 0 within its time limit (into's status): GitHub's 200, its headers whole (each a name of letters,
 # digits and hyphens, a colon and its value; ended by an empty line), at most one Link and at most one
-# Content-Length (any case). The answer is shown complete by its body, which the reader then requires to
-# be one JSON array or object: a cut one can't parse, as the bracket that closes it is its end. A
-# Content-Length, if any, must be a number and, with no content or transfer encoding named, the body's
-# bytes. Sets PA_BODY, and LP_* from the Link (link_pages); 1 for anything else. Nothing here prints.
+# Content-Length (any case). Sets PA_BODY, and LP_* from the Link (link_pages); 1 for anything else.
+# Nothing here prints.
+# Round 119 (review-lens round 105, C1 = SEC-1, C2; owner): the body that it is one JSON value (the
+# reader's own test) is a parsing check, not proof the answer is whole; gh's exit 0 stays required on its
+# own. The proof is the Content-Length: exactly one, required, a number, exactly the body's bytes as gh
+# printed them (into -b keeps its trailing newlines; a NUL byte lost shows as a byte short). With none, or
+# a Content-Encoding other than identity, or any Transfer-Encoding (any case), unreadable: the answer is
+# then shown whole by nothing more than gh's exit (unverified offline whether gh prints these headers for
+# GitHub's pages; if it doesn't print a Content-Length, every list reads unreadable, which fails safe).
 page_answer() { # <gh's output>
-  local LC_ALL=C raw="$1" first line name value offset links=0 link="" lengths=0 length="" coding="" head=1
+  local LC_ALL=C raw="$1" first line name value offset links=0 link="" lengths=0 length="" head=1
   PA_BODY="" LP_NEXT="" LP_PREV="" LP_FIRST="" LP_LAST=""
   first="${raw%%$'\n'*}"
   [[ "${first%$'\r'}" =~ ^HTTP/[0-9.]+\ 200( |$) && "$raw" == *$'\n'* ]] || return 1
@@ -1418,16 +1445,13 @@ page_answer() { # <gh's output>
     case "$name" in
       link) links=$((links + 1)) link="$value" ;;
       content-length) lengths=$((lengths + 1)) length="$value" ;;
-      content-encoding) [[ "$value" == identity ]] || coding=1 ;;
-      transfer-encoding) coding=1 ;;
+      content-encoding) [[ "$value" == identity ]] || return 1 ;;
+      transfer-encoding) return 1 ;;
     esac
   done < <(printf '%s' "${raw#*$'\n'}")
-  [[ -z "$head" && $links -le 1 && $lengths -le 1 ]] || return 1
+  [[ -z "$head" && $links -le 1 && $lengths -eq 1 && "$length" =~ ^(0|[1-9][0-9]{0,11})$ ]] || return 1
   PA_BODY="${raw:$offset}"
-  if [[ $lengths -eq 1 ]]; then
-    [[ "$length" =~ ^[0-9]{1,12}$ ]] || return 1
-    [[ -n "$coding" || "${#PA_BODY}" == "$length" ]] || return 1
-  fi
+  [[ "${#PA_BODY}" == "$length" ]] || return 1
   [[ $links -eq 0 ]] || link_pages "$link"
 }
 
@@ -1436,25 +1460,27 @@ page_answer() { # <gh's output>
 # page=<n> (n from 1) and at most one per_page, which must be PAGE_SIZE, in its query. A URL is read for
 # those numbers alone: never followed, kept or printed. Sets LP_NEXT, LP_PREV, LP_FIRST and LP_LAST (each
 # the page it names, or empty); 1 for a header not of that form.
+# Round 119 (review-lens round 105, C3; owner): a URL's query is exactly page=<n>, alone or with one
+# per_page=PAGE_SIZE before or after it: the only parameters state_pages sends (its four lists' paths
+# have none of their own), so the only ones allowed. Any other part, empty or not, encoded or not, and a
+# second ? or a #, unreadable.
 link_pages() { # <the Link header's value>
-  local LC_ALL=C rest="$1" url rel p q pages per more
+  local LC_ALL=C rest="$1" url rel p q more
   local re='^[[:space:]]*<([^<>[:space:]]+)>[[:space:]]*;[[:space:]]*rel="([A-Za-z]+)"[[:space:]]*(,(.*))?$'
-  local -a parts
+  local alone='^page=([1-9][0-9]{0,5})$' after='^page=([1-9][0-9]{0,5})&per_page='"$PAGE_SIZE"'$'
+  local before='^per_page='"$PAGE_SIZE"'&page=([1-9][0-9]{0,5})$'
   LP_NEXT="" LP_PREV="" LP_FIRST="" LP_LAST=""
   while :; do
     [[ "$rest" =~ $re ]] || return 1
     url="${BASH_REMATCH[1]}" more="${BASH_REMATCH[3]}" rest="${BASH_REMATCH[4]}"
     rel="$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')"
     [[ "$url" == *\?* ]] || return 1
-    pages=0 per=0 p=""
-    IFS='&' read -r -a parts <<<"${url#*\?}"
-    for q in ${parts[@]+"${parts[@]}"}; do
-      case "$q" in
-        page=*) pages=$((pages + 1)) p="${q#page=}" ;;
-        per_page=*) per=$((per + 1)); [[ "${q#per_page=}" == "$PAGE_SIZE" ]] || return 1 ;;
-      esac
-    done
-    [[ $pages -eq 1 && $per -le 1 && "$p" =~ ^[1-9][0-9]{0,5}$ ]] || return 1
+    q="${url#*\?}"
+    if [[ "$q" =~ $alone || "$q" =~ $after || "$q" =~ $before ]]; then
+      p="${BASH_REMATCH[1]}"
+    else
+      return 1
+    fi
     case "$rel" in
       next) [[ -z "$LP_NEXT" ]] || return 1; LP_NEXT="$p" ;;
       prev) [[ -z "$LP_PREV" ]] || return 1; LP_PREV="$p" ;;
@@ -1486,6 +1512,8 @@ PA_BODY="" LP_NEXT="" LP_PREV="" LP_FIRST="" LP_LAST=""
 # pages must agree with them: a page names a next page (n+1) exactly when the page after it has entries,
 # so the empty page that ends the list names none and no page follows one that named none; a prev names
 # n-1, a first 1, and every last the list's last page with entries.
+# Round 119 (review-lens round 105, C2; owner): each page's answer kept byte for byte (into -b), for
+# page_answer to match against its Content-Length; gh's status checked apart from it.
 # shellcheck disable=SC2016 # jq's own $m
 state_pages() { # <path> <test> <list> <key> [count]
   local path="$1" test="$2" list="$3" key="$4" count="${5:-}" n=0 start raw page got all='[]' total="" t kt named="" lasts=""
@@ -1498,7 +1526,7 @@ state_pages() { # <path> <test> <list> <key> [count]
   while :; do
     n=$((n + 1))
     [[ $n -eq 1 || $(($(date +%s) - start)) -lt $LIST_SECS ]] || return 1
-    into raw owner_gh api -i "$path?per_page=$PAGE_SIZE&page=$n" 2>/dev/null || return 1
+    into -b raw owner_gh api -i "$path?per_page=$PAGE_SIZE&page=$n" 2>/dev/null || return 1
     page_answer "$raw" || return 1
     page="$PA_BODY"
     json_one "$page" --argjson m "$PAGE_SIZE" "($test) and ($list | type == \"array\" and length <= \$m and all(.[]; type == \"object\" and $kt))" || return 1
