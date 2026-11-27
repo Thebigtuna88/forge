@@ -1864,20 +1864,41 @@ gh_reply() { # <file> [change…]
   } >"$f"
 }
 
+# A page of a list as gh api -i prints it (round 118): GitHub's 200, its Content-Type and each header
+# line given, then an empty line and <body>.
+gh_page() { # <body> [header line…]
+  local LC_ALL=C b="$1" h
+  shift
+  printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n'
+  for h in ${1+"$@"}; do printf '%s\r\n' "$h"; done
+  printf '\r\n%s' "$b"
+}
+
+# A Link header's value in GitHub's form (round 118), naming each <rel> at <page>: its URLs on a host
+# never asked, so a URL followed or printed shows.
+gh_link() { # <rel>:<page>[,<rel>:<page>…]
+  local l out="" IFS=,
+  for l in $1; do out="$out, <https://links.example.invalid/repositories/1/list?per_page=100&page=${l#*:}>; rel=\"${l%%:*}\""; done
+  printf '%s' "${out#, }"
+}
+
 a2_answers() { # the owner's reads A2 needs, then the given lines
   local a b
   # A2 reads the second throwaway's refs under with_timeout, whose watchdog needs the real sleep
   # (p_stubs makes it instant, which would stop every read at once).
   unset -f sleep
   a="$(printf 'a%.0s' $(seq 1 40))" b="$(printf 'b%.0s' $(seq 1 40))"
+  # Round 118: each page as gh api -i prints it.
+  gh_page "[{\"name\":\"frg26-a2\",\"commit\":{\"sha\":\"$a\"}}]" >"$T_TMP/page-heads"
+  gh_page '[]' >"$T_TMP/page-end"
   {
     echo "owner_gh api repos/$REPO2/branches/main --jq .commit.sha|0|$a"
     echo "owner_gh api repos/$REPO/branches/dev --jq .commit.sha|0|$b"
     # Round 117: its branches and tags as their paged lists, each read through to an empty page.
-    echo "owner_gh api repos/$REPO2/branches?per_page=100&page=1|0|[{\"name\":\"frg26-a2\",\"commit\":{\"sha\":\"$a\"}}]"
-    echo "owner_gh api repos/$REPO2/branches?per_page=100&page=2|0|[]"
-    echo "owner_gh api repos/$REPO2/tags?per_page=100&page=1|0|[]"
-    echo "owner_gh api repos/$REPO2/tags?per_page=100&page=2|0|[]" # (a look-alike's list, read through)
+    echo "owner_gh api -i repos/$REPO2/branches?per_page=100&page=1|0|@page-heads"
+    echo "owner_gh api -i repos/$REPO2/branches?per_page=100&page=2|0|@page-end"
+    echo "owner_gh api -i repos/$REPO2/tags?per_page=100&page=1|0|@page-end"
+    echo "owner_gh api -i repos/$REPO2/tags?per_page=100&page=2|0|@page-end" # (a look-alike's list, read through)
     printf '%s\n' "$@"
   } >"$T_TMP/answers"
 }
@@ -1925,8 +1946,8 @@ test_a2_needs_the_exact_branch_not_a_look_alike() {
       "app_gh api -X POST repos/$REPO2/|1|gh: Resource not accessible by integration (HTTP 403)"
     owner_gh() {
       case "$*" in
-        "api repos/$REPO2/branches?per_page=100&page=1") echo "owner_gh $*" >>"$T_TMP/calls"; printf '%s\n' "$heads" ;;
-        "api repos/$REPO2/tags?per_page=100&page=1") echo "owner_gh $*" >>"$T_TMP/calls"; printf '%s\n' "$tags" ;;
+        "api -i repos/$REPO2/branches?per_page=100&page=1") echo "owner_gh $*" >>"$T_TMP/calls"; gh_page "$heads" ;;
+        "api -i repos/$REPO2/tags?per_page=100&page=1") echo "owner_gh $*" >>"$T_TMP/calls"; gh_page "$tags" ;;
         "api repos/$REPO2/git/ref/tags/"*) printf '{"ref":"refs/tags/%s","object":{"type":"commit","sha":"%s"}}\n' "${*#"api repos/$REPO2/git/ref/tags/"}" "$a" ;;
         *) answer owner_gh "$@" ;;
       esac
@@ -1935,7 +1956,7 @@ test_a2_needs_the_exact_branch_not_a_look_alike() {
     assert_contains "$out" "RESULT A2 permissions FAIL attempt=setup-failed" "$name"
     assert_not_contains "$out" "permissions PASS" "$name"
     assert_not_contains "$(cat "$T_TMP/calls")" "app_git" "$name: an attempt without the branch"
-    assert_contains "$(cat "$T_TMP/calls")" "owner_gh api repos/$REPO2/tags?per_page=100&page=1" "$name: the tags read"
+    assert_contains "$(cat "$T_TMP/calls")" "owner_gh api -i repos/$REPO2/tags?per_page=100&page=1" "$name: the tags read"
     assert_not_contains "$(cat "$T_TMP/calls")" "matching-refs" "$name: the refs read by matching-refs"
   done
 }
@@ -1977,10 +1998,10 @@ test_a2_api_attempts_are_settled_only_against_the_second_throwaways_refs() {
     }
     owner_gh() {
       case "$*" in
-        "api repos/$REPO2/branches?per_page=100&page=1") echo "owner_gh $*" >>"$T_TMP/calls"; answer_refs ;;
-        "api repos/$REPO2/branches?per_page=100&page=2" | "api repos/$REPO2/tags?per_page=100&page=2") echo '[]' ;;
-        "api repos/$REPO2/tags?per_page=100&page=1")
-          if [[ "$(cat "$T_TMP/more")" == *tag ]]; then printf '[{"name":"v1","commit":{"sha":"%s"}}]\n' "$(printf 'b%.0s' $(seq 1 40))"; else echo '[]'; fi ;;
+        "api -i repos/$REPO2/branches?per_page=100&page=1") echo "owner_gh $*" >>"$T_TMP/calls"; gh_page "$(answer_refs)" ;;
+        "api -i repos/$REPO2/branches?per_page=100&page=2" | "api -i repos/$REPO2/tags?per_page=100&page=2") gh_page '[]' ;;
+        "api -i repos/$REPO2/tags?per_page=100&page=1")
+          if [[ "$(cat "$T_TMP/more")" == *tag ]]; then gh_page "[{\"name\":\"v1\",\"commit\":{\"sha\":\"$(printf 'b%.0s' $(seq 1 40))\"}}]"; else gh_page '[]'; fi ;;
         "api repos/$REPO2/git/ref/tags/v1") echo "owner_gh $*" >>"$T_TMP/calls"; answer_tag ;;
         *) answer owner_gh "$@" ;;
       esac
@@ -2193,8 +2214,7 @@ test_the_second_throwaways_branch_is_ahead_of_main() {
   assert_contains "$(grep "contents/a2.txt" "$T_TMP/owner")" "branch=frg26-a2"
   p_stubs
   a2_answers
-  sed -i '' '/branches?per_page=100&page=1/d' "$T_TMP/answers"
-  echo "owner_gh api repos/$REPO2/branches?per_page=100&page=1|0|[{\"name\":\"main\",\"commit\":{\"sha\":\"$(printf 'a%.0s' $(seq 1 40))\"}}]" >>"$T_TMP/answers"
+  gh_page "[{\"name\":\"main\",\"commit\":{\"sha\":\"$(printf 'a%.0s' $(seq 1 40))\"}}]" >"$T_TMP/page-heads"
   local out
   out="$(t_A2)"
   assert_contains "$out" "RESULT A2 permissions FAIL attempt=setup-failed" "frg26-a2 missing"
@@ -7425,7 +7445,12 @@ test_each_baseline_part_is_validated_on_its_own() {
     if [[ "$answer" == "@repo "* ]]; then answer="$(repo_answer | jq -c "${answer#@repo }")"; fi
     printf '%s' "$answer" >"$T_TMP/state-answer"
     echo "$rc" >"$T_TMP/state-rc"
-    owner_gh() { echo "owner_gh $*" >>"$T_TMP/calls"; cat "$T_TMP/state-answer"; return "$(cat "$T_TMP/state-rc")"; }
+    # Round 118: a list's page (asked with -i) is that answer as gh api -i prints it.
+    owner_gh() {
+      echo "owner_gh $*" >>"$T_TMP/calls"
+      if [[ "$1 $2" == "api -i" ]]; then gh_page "$(cat "$T_TMP/state-answer")"; else cat "$T_TMP/state-answer"; fi
+      return "$(cat "$T_TMP/state-rc")"
+    }
     local got=0 out
     # shellcheck disable=SC2086 # the reader and its arguments
     out="$($reader)" || got=$?
@@ -7441,7 +7466,7 @@ test_each_baseline_part_is_validated_on_its_own() {
   PHASE=open
   owner_gh() {
     case "$*" in
-      "api repos/$REPO/rulesets?per_page=100&page=1") echo '[]' ;;
+      "api -i repos/$REPO/rulesets?per_page=100&page=1") gh_page '[]' ;;
       "api repos/$REPO") return 0 ;; # the repository's settings: answered with nothing
     esac
   }
@@ -7678,8 +7703,8 @@ test_a_baseline_with_a_failed_part_is_unreadable_whole() {
       local f
       f="$(cat "$T_TMP/fail")"
       case "$*" in
-        "api repos/$REPO/rulesets?per_page=100&page=1") echo '[{"id":5}]' ;;
-        "api repos/$REPO/rulesets?per_page=100&page=2") echo '[]' ;;
+        "api -i repos/$REPO/rulesets?per_page=100&page=1") gh_page '[{"id":5}]' ;;
+        "api -i repos/$REPO/rulesets?per_page=100&page=2") gh_page '[]' ;;
         "api repos/$REPO/rulesets/5")
           if [[ "$f" == one-ruleset ]]; then echo "gh: HTTP 502" >&2; return 1; fi
           echo '{"id":5,"name":"r","enforcement":"active","target":"branch","rules":[]}' ;;
@@ -7791,18 +7816,74 @@ list_page() { # <kind> <n> <spec>
   esac
 }
 
+# The same page as gh api -i prints it (round 118), to $T_TMP/<kind>-<n>.raw: list_page's body for <spec>
+# (none for "fail": that read fails) in GitHub's 200, changed by each <change>: link=<rel>:<page>,… (a
+# Link header in GitHub's form, gh_link's), name=<that header's name>, hdr=<a header line>, cl (a
+# Content-Length of the body's bytes), cl=<n>, status=<line>, cut (no empty line after the headers, no
+# body), raw=<the whole answer, as printf %b reads it>, rc=<gh's exit status>. In a change, + is a space.
+list_answer() { # <kind> <n> <spec> [change…]
+  local LC_ALL=C f="$T_TMP/$1-$2" c v body status="HTTP/2.0 200 OK" lname=Link links="" cut="" raw=""
+  local -a heads=("Content-Type: application/json; charset=utf-8")
+  rm -f "$f.raw" "$f.rc"
+  list_page "$1" "$2" "$3"
+  [[ -f "$f" ]] || return 0
+  body="$(cat "$f")"
+  shift 3
+  for c in ${1+"$@"}; do
+    v="${c#*=}" v="${v//+/ }"
+    case "$c" in
+      link=*) links="$v" ;;
+      name=*) lname="$v" ;;
+      hdr=*) heads+=("$v") ;;
+      cl) heads+=("Content-Length: ${#body}") ;;
+      cl=*) heads+=("Content-Length: $v") ;;
+      status=*) status="$v" ;;
+      cut) cut=1 ;;
+      raw=*) raw="$v" ;;
+      rc=*) echo "$v" >"$f.rc" ;;
+    esac
+  done
+  if [[ -n "$raw" ]]; then printf '%b' "$raw" >"$f.raw"; return 0; fi
+  [[ -z "$links" ]] || heads+=("$lname: $(gh_link "$links")")
+  {
+    printf '%s\r\n' "$status"
+    for c in "${heads[@]}"; do printf '%s\r\n' "$c"; done
+    [[ -n "$cut" ]] || printf '\r\n%s' "$body"
+  } >"$f.raw"
+}
+
+# A case's pages, "<n>=<spec>[!<change>…] …", each written by list_answer; a page with no link= or nolink
+# change names the next page as GitHub would, when the case has one with entries (not end, end/<t> or []).
+list_answers() { # <kind> <pages>
+  local i j p n spec next
+  local -a part ch more
+  read -r -a part <<<"$2"
+  for ((i = 0; i < ${#part[@]}; i++)); do
+    p="${part[$i]}" n="${p%%=*}"
+    IFS='!' read -r -a ch <<<"${p#*=}"
+    spec="${ch[0]}" more=()
+    for ((j = 1; j < ${#ch[@]}; j++)); do more+=("${ch[$j]}"); done
+    next=""
+    if [[ $((i + 1)) -lt ${#part[@]} ]]; then next="${part[$((i + 1))]#*=}" next="${next%%!*}"; fi
+    if [[ " ${more[*]-} " != *" link="* && " ${more[*]-} " != *" nolink "* && -n "$next" && "$next" != end* && "$next" != '[]' ]]; then
+      more+=("link=next:$((n + 1))")
+    fi
+    list_answer "$1" "$n" "$spec" ${more[@]+"${more[@]}"}
+  done
+}
+
 # Round 116 (review-lens round 102, C2 = SEC-1, C3; owner): a list GitHub gives in pages is read whole:
 # each page asked at an address built on the fixed endpoint (per_page=100&page=<n>; never a Link URL of
-# GitHub's, never gh's --paginate), until a page that isn't full. Bounded: 10 pages (so 1,000 entries),
-# and no page or ruleset asked once 60s have passed. A page missing, malformed, over-full or repeating an
-# entry, or (the branch policies) a total_count that changes between pages or differs from the unique
-# entries collected, leaves the baseline unreadable.
+# GitHub's, never gh's --paginate). Bounded: 10 pages (so 1,000 entries), and no page or ruleset asked
+# once 60s have passed. A page missing, malformed, over-full or repeating an entry, or (the branch
+# policies) a total_count that changes between pages or differs from the unique entries collected,
+# leaves the baseline unreadable.
 # Round 117 (review-lens round 103, SEC-1, C2; owner): read through to an empty page, never ending at a
 # short one (a short page in the middle can't hide later ones); 10 pages with entries (so exactly 1,000
 # read) and the empty one that ends them; an entry on an 11th page, or no empty page in time, unreadable.
+# Round 118: each page as gh api -i prints it, naming the next page as GitHub would (list_answers).
 test_a_paged_list_is_read_whole_at_its_own_addresses() {
   local case name kind pages step want asked full="" fbp="" all="" short="" i got out n p
-  local -a part
   for i in 1 2 3 4 5 6 7 8 9 10; do
     full="$full $i=$(((i - 1) * 100 + 1))-$((i * 100))" all="$all $i"
     fbp="$fbp $i=$(((i - 1) * 100 + 1))-$((i * 100))/1000" short="$short $i=$i-$i"
@@ -7844,50 +7925,146 @@ test_a_paged_list_is_read_whole_at_its_own_addresses() {
     "a second page that fails|bp|1=1-100/101 2=fail|0|unreadable|1 2" \
     "the empty page that ends the policies failing|bp|1=1-2/2 2=fail|0|unreadable|1 2"; do
     IFS='|' read -r name kind pages step want asked <<<"$case"
-    p_stubs
-    rm -f "$T_TMP"/rs-* "$T_TMP"/bp-*
-    read -r -a part <<<"$pages"
-    for p in "${part[@]}"; do list_page "$kind" "${p%%=*}" "${p#*=}"; done
-    echo 0 >"$T_TMP/clock"
-    echo "$step" >"$T_TMP/step"
-    # The clock moves only as GitHub answers a page (or a ruleset by id), by <step> seconds.
-    date() { if [[ "$*" == +%s ]]; then cat "$T_TMP/clock"; else command date "$@"; fi; }
-    owner_gh() {
-      local a="$*" k
-      echo "owner_gh $a" >>"$T_TMP/calls"
-      case "$a" in
-        "api repos/$REPO/rulesets?per_page=100&page="*) k=rs ;;
-        "api repos/$REPO/environments/$ENV_NAME/deployment-branch-policies?per_page=100&page="*) k=bp ;;
-        "api repos/$REPO/rulesets/"*)
-          printf '{"id":%s,"name":"r","enforcement":"active","target":"branch","rules":[]}\n' "${a##*/}"
-          return 0 ;;
-        "api repos/$REPO/environments/$ENV_NAME") printf '{"name":"%s","protection_rules":[],"updated_at":"t"}\n' "$ENV_NAME"; return 0 ;;
-        "api repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME") printf '{"name":"%s","created_at":"t","updated_at":"t"}\n' "$DISPOSABLE_NAME"; return 0 ;;
-        *) echo "gh: HTTP 404" >&2; return 1 ;;
-      esac
-      echo $(($(cat "$T_TMP/clock") + $(cat "$T_TMP/step"))) >"$T_TMP/clock"
-      [[ -f "$T_TMP/$k-${a##*page=}" ]] || { echo "gh: HTTP 502" >&2; return 1; }
-      cat "$T_TMP/$k-${a##*page=}"
-    }
-    got=0 out=""
-    if [[ "$kind" == rs ]]; then
-      out="$(state_rulesets)" || got=$?
-      n="$(jq length <<<"$out" 2>/dev/null)"
-    else
-      out="$(state_environment)" || got=$?
-      n="$(jq '.policies | length' <<<"$out" 2>/dev/null)"
-    fi
-    if [[ "$want" == unreadable ]]; then
-      [[ "$got" != 0 ]] || _t_fail "$name: read as a state"
-    else
-      assert_exit 0 "$got" "$name: read as a state"
-      assert_eq "$n" "$want" "$name: the entries read"
-    fi
-    p="$(sed -n -E 's/^owner_gh api repos\/[^?]+\?per_page=100&page=([0-9]+)$/\1/p' "$T_TMP/calls" | tr '\n' ' ')"
-    assert_eq "${p% }" "$asked" "$name: the pages asked"
-    assert_eq "$(grep -c 'page=' "$T_TMP/calls")" "$(wc -w <<<"$asked" | tr -d ' ')" "$name: a page asked at another address"
-    assert_not_contains "$(cat "$T_TMP/calls")" "--paginate" "$name: gh following GitHub's links"
-    unset -f date
+    paged_case
+  done
+  end_stand_in_run
+}
+
+# One case of the paged-list tests, from its name, kind, pages, step, want and asked: the clock moves only
+# as GitHub answers a page (or a ruleset by id), by <step> seconds. What the reader printed, its errors
+# too, is in $T_TMP/paged-out.
+paged_case() {
+  local got=0 out="" n p
+  p_stubs
+  rm -f "$T_TMP"/rs-* "$T_TMP"/bp-*
+  list_answers "$kind" "$pages"
+  echo 0 >"$T_TMP/clock"
+  echo "$step" >"$T_TMP/step"
+  date() { if [[ "$*" == +%s ]]; then cat "$T_TMP/clock"; else command date "$@"; fi; }
+  owner_gh() {
+    local a="$*" k rc=0
+    echo "owner_gh $a" >>"$T_TMP/calls"
+    # A page asked without -i: its body alone, as gh prints it then.
+    case "${a/api -i /api }" in
+      "api repos/$REPO/rulesets?per_page=100&page="*) k=rs ;;
+      "api repos/$REPO/environments/$ENV_NAME/deployment-branch-policies?per_page=100&page="*) k=bp ;;
+      "api repos/$REPO/rulesets/"*)
+        printf '{"id":%s,"name":"r","enforcement":"active","target":"branch","rules":[]}\n' "${a##*/}"
+        return 0 ;;
+      "api repos/$REPO/environments/$ENV_NAME") printf '{"name":"%s","protection_rules":[],"updated_at":"t"}\n' "$ENV_NAME"; return 0 ;;
+      "api repos/$REPO/environments/$ENV_NAME/secrets/$DISPOSABLE_NAME") printf '{"name":"%s","created_at":"t","updated_at":"t"}\n' "$DISPOSABLE_NAME"; return 0 ;;
+      *) echo "gh: HTTP 404" >&2; return 1 ;;
+    esac
+    echo $(($(cat "$T_TMP/clock") + $(cat "$T_TMP/step"))) >"$T_TMP/clock"
+    k="$T_TMP/$k-${a##*page=}"
+    [[ -f "$k.raw" ]] || { echo "gh: HTTP 502" >&2; return 1; }
+    [[ ! -f "$k.rc" ]] || rc="$(cat "$k.rc")"
+    if [[ "$a" == "api -i "* ]]; then cat "$k.raw"; else cat "$k"; fi
+    return "$rc"
+  }
+  if [[ "$kind" == rs ]]; then
+    (state_rulesets) >"$T_TMP/paged-out" 2>&1 || got=$?
+    n="$(jq length "$T_TMP/paged-out" 2>/dev/null)"
+  else
+    (state_environment) >"$T_TMP/paged-out" 2>&1 || got=$?
+    n="$(jq '.policies | length' "$T_TMP/paged-out" 2>/dev/null)"
+  fi
+  out="$(cat "$T_TMP/paged-out")"
+  if [[ "$want" == unreadable ]]; then
+    [[ "$got" != 0 ]] || _t_fail "$name: read as a state"
+  else
+    assert_exit 0 "$got" "$name: read as a state"
+    assert_eq "$n" "$want" "$name: the entries read"
+  fi
+  p="$(sed -n -E 's/^owner_gh api -i repos\/[^?]+\?per_page=100&page=([0-9]+)$/\1/p' "$T_TMP/calls" | tr '\n' ' ')"
+  assert_eq "${p% }" "$asked" "$name: the pages asked"
+  assert_eq "$(grep -c 'page=' "$T_TMP/calls")" "$(wc -w <<<"$asked" | tr -d ' ')" "$name: a page asked at another address"
+  assert_not_contains "$(cat "$T_TMP/calls")" "--paginate" "$name: gh following GitHub's links"
+  assert_not_contains "$(cat "$T_TMP/calls")" "links.example" "$name: a Link URL asked"
+  assert_not_contains "$out" "links.example" "$name: a Link URL printed"
+  unset -f date
+}
+
+# Round 118 (review-lens round 104, SEC-1; owner): each page is read with its headers (gh api -i), its
+# Link header read for its page numbers only, never followed or printed. A page counts only when gh
+# exits 0 with GitHub's 200, its headers whole (each a name and a value, ended by an empty line) and its
+# body one JSON value of its kind: an array or object, which a cut answer can't be, as the bracket that
+# closes it ends it. A Content-Length, where there is one, must be the body's bytes (unless an encoding
+# is named). At most one Link (any case), in GitHub's form: <URL>; rel="next|prev|first|last" (any case),
+# each once, its URL with one page=<n> and at most one per_page=100. The pages must agree: next names
+# n+1, prev n-1, first 1, last the list's last page with entries; a page names a next page exactly when
+# the page after it has entries, and the empty page that ends the list names none. Anything else, the
+# baseline unreadable.
+test_a_lists_pages_must_agree_with_their_headers() {
+  local case name kind pages step=0 want asked u l1 l2
+  # Each Link's form is tested on a one-page list, whose page 1 may name itself first and last: read
+  # whole when the form is right (the first cases), unreadable for that form alone when it isn't.
+  u='https://links.example.invalid/repositories/1/list'
+  l1="Link:+<$u?per_page=100&page=1>;+rel=\"first\"" l2="<$u?per_page=100&page=1>;+rel=\"last\""
+  # <name>|<kind>|<pages, as list_answers reads them>|<entries read, or unreadable>|<pages asked>
+  for case in "no Link on one page|rs|1=1-2 2=end|2|1 2" \
+    "next, then prev, first and last on the pages after|rs|1=1-100!link=next:2,last:2 2=101-101!link=prev:1,first:1,last:2 3=end!link=prev:2,first:1,last:2|101|1 2 3" \
+    "the header named link|rs|1=1-100!name=link 2=101-101 3=end|101|1 2 3" \
+    "the header named LINK|rs|1=1-100!name=LINK 2=101-101 3=end|101|1 2 3" \
+    "rel in capitals|rs|1=1-100!link=NEXT:2 2=101-101 3=end|101|1 2 3" \
+    "a Content-Length of the body's bytes|rs|1=1-2!cl 2=end!cl|2|1 2" \
+    "a Content-Length with an encoding named|rs|1=1-2!cl=7!hdr=Content-Encoding:+gzip 2=end|2|1 2" \
+    "an empty page naming a next page|rs|1=1-100 2=end!link=next:3|unreadable|1 2" \
+    "an empty page naming a next page, link in lower case|rs|1=1-100 2=end!name=link!link=next:3|unreadable|1 2" \
+    "an empty page naming a next page, rel in mixed case|rs|1=1-100 2=end!link=Next:3|unreadable|1 2" \
+    "an empty first page naming a next page|rs|1=end!link=next:2|unreadable|1" \
+    "branch policies, an empty page naming a next page|bp|1=1-100/100 2=end/100!link=next:3|unreadable|1 2" \
+    "entries after a page that named no next page|rs|1=1-40!nolink 2=41-45 3=end|unreadable|1 2" \
+    "branch policies, entries after a page that named no next|bp|1=1-3/5!nolink 2=4-5/5 3=end/5|unreadable|1 2" \
+    "a page naming a next page, then an empty one|rs|1=1-2!link=next:2 2=end|unreadable|1 2" \
+    "next naming page 3 from page 1|rs|1=1-100!link=next:3 2=101-101 3=end|unreadable|1" \
+    "prev on the first page|rs|1=1-2!link=prev:1 2=end|unreadable|1" \
+    "prev naming another page|rs|1=1-100 2=101-101!link=prev:2 3=end|unreadable|1 2" \
+    "first naming page 2|rs|1=1-100!link=next:2,first:2 2=101-101 3=end|unreadable|1" \
+    "last naming a page past the list's end|rs|1=1-100!link=next:2,last:3 2=101-101 3=end|unreadable|1 2 3" \
+    "last naming the empty page|rs|1=1-2 2=end!link=prev:1,last:2|unreadable|1 2" \
+    "last on an empty first page|rs|1=end!link=last:1|unreadable|1" \
+    "first and last on a one-page list|rs|1=1-2!hdr=$l1,+$l2 2=end|2|1 2" \
+    "first alone, without per_page or spaces|rs|1=1-2!hdr=Link:<$u?page=1>;rel=\"first\" 2=end|2|1 2" \
+    "two Link headers|rs|1=1-100!link=next:2!hdr=link:+<$u?page=2>;+rel=\"next\" 2=101-101 3=end|unreadable|1" \
+    "two Link headers on a one-page list|rs|1=1-2!hdr=$l1!hdr=link:+$l2 2=end|unreadable|1" \
+    "rel twice|rs|1=1-2!hdr=$l1,+<$u?page=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "a rel GitHub doesn't give|rs|1=1-2!link=alternate:1 2=end|unreadable|1" \
+    "two rels in one|rs|1=1-2!hdr=Link:+<$u?page=1>;+rel=\"first+last\" 2=end|unreadable|1" \
+    "no angle brackets|rs|1=1-2!hdr=Link:+$u?page=1;+rel=\"first\" 2=end|unreadable|1" \
+    "rel not quoted|rs|1=1-2!hdr=Link:+<$u?page=1>;+rel=first 2=end|unreadable|1" \
+    "a trailing comma|rs|1=1-2!hdr=$l1, 2=end|unreadable|1" \
+    "two links without a comma|rs|1=1-2!hdr=$l1+$l2 2=end|unreadable|1" \
+    "a URL with no query|rs|1=1-2!hdr=Link:+<$u>;+rel=\"first\" 2=end|unreadable|1" \
+    "a URL with no page|rs|1=1-2!hdr=Link:+<$u?per_page=100>;+rel=\"first\" 2=end|unreadable|1" \
+    "a URL with two pages|rs|1=1-2!hdr=Link:+<$u?page=1&page=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "a URL with two page sizes|rs|1=1-2!hdr=Link:+<$u?per_page=100&per_page=100&page=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "a URL with another page size|rs|1=1-2!hdr=Link:+<$u?per_page=30&page=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "page 0|rs|1=1-2!hdr=Link:+<$u?page=0>;+rel=\"first\" 2=end|unreadable|1" \
+    "a page not a number|rs|1=1-2!hdr=Link:+<$u?page=1x>;+rel=\"first\" 2=end|unreadable|1" \
+    "a Link with nothing in it|rs|1=1-2!hdr=Link: 2=end|unreadable|1" \
+    "a URL with a space|rs|1=1-2!hdr=Link:+<$u?a=b+c&page=1>;+rel=\"first\" 2=end|unreadable|1" \
+    "no empty line after the headers|rs|1=1-2!cut|unreadable|1" \
+    "the body cut short|rs|1=[{\"id\":1},{\"id\":2|unreadable|1" \
+    "an empty page cut short|rs|1=1-2 2=[|unreadable|1 2" \
+    "an empty body|rs|1=1-2 2=!cl=0|unreadable|1 2" \
+    "no status line|rs|1=1-2!raw=[{\"id\":1}] 2=end|unreadable|1" \
+    "HTTP 206|rs|1=1-2!status=HTTP/2.0+206+Partial+Content 2=end|unreadable|1" \
+    "HTTP 304|rs|1=1-2!status=HTTP/2.0+304+Not+Modified 2=end|unreadable|1" \
+    "a 200 with gh failing|rs|1=1-2!rc=1 2=end|unreadable|1" \
+    "a 200 with gh timed out|rs|1=1-2!rc=124 2=end|unreadable|1" \
+    "a header line without a colon|rs|1=1-2!hdr=X-Note 2=end|unreadable|1" \
+    "a folded header line|rs|1=1-2!hdr=+continued 2=end|unreadable|1" \
+    "a header name not of its form|rs|1=1-2!hdr=X+Y:+1 2=end|unreadable|1" \
+    "a Content-Length longer than the body|rs|1=1-2!cl=500 2=end|unreadable|1" \
+    "a Content-Length shorter than the body|rs|1=1-2!cl=3 2=end|unreadable|1" \
+    "two Content-Lengths|rs|1=1-2!cl!cl 2=end|unreadable|1" \
+    "a Content-Length not a number|rs|1=1-2!cl=7x 2=end|unreadable|1" \
+    "a Content-Length not a number, an encoding named|rs|1=1-2!cl=7x!hdr=Content-Encoding:+gzip 2=end|unreadable|1" \
+    "a body not JSON|rs|1=nope|unreadable|1" \
+    "two JSON values|rs|1=[]!raw=HTTP/2.0+200+OK\r\n\r\n[]+[]|unreadable|1"; do
+    IFS='|' read -r name kind pages want asked <<<"$case"
+    paged_case
   done
   end_stand_in_run
 }
@@ -7944,6 +8121,7 @@ test_a2s_branches_and_tags_are_read_from_their_paged_lists() {
     a2_list_case
   done
   # A name outside the plain set (letters, digits, . _ - and /, no .., no empty part) is never looked up.
+  # (Round 118: the space as JSON's  , so the page stays one word of the case.)
   for bad in 'a b' 'v1?x' 'v%41' 'v#1' 'v~1' 'v:1' 'v^1' 'v*1' 'v[1' 'v\\1' 'v@{1' 'a..b' '/v1' 'v1/' 'a//b' 'v\n1' '.'; do
     name="a tag named $bad" heads="$br" tags="1=[$(T "$bad" "$b")] 2=[]" refs="@auto" want="unreadable, none looked up"
     a2_list_case
@@ -7967,7 +8145,7 @@ test_a2s_branches_and_tags_are_read_from_their_paged_lists() {
   a2_answers "app_git -C $T_TMP/clone push https://github.com/$REPO2.git|0|"
   t_A2 >/dev/null 2>&1
   assert_not_contains "$(cat "$T_TMP/calls")" "matching-refs" "t_A2: its refs read by matching-refs"
-  assert_contains "$(cat "$T_TMP/calls")" "owner_gh api repos/$REPO2/branches?per_page=100&page=1" "t_A2: its branches read"
+  assert_contains "$(cat "$T_TMP/calls")" "owner_gh api -i repos/$REPO2/branches?per_page=100&page=1" "t_A2: its branches read"
   unset -f T R
   end_stand_in_run
 }
@@ -7979,12 +8157,9 @@ a2_list_case() { # [step]
   local -a part
   p_stubs
   rm -f "$T_TMP"/heads-* "$T_TMP"/tags-* "$T_TMP"/ref-*
-  part=()
-  [[ -z "$heads" ]] || read -r -a part <<<"$heads"
-  for p in ${part[@]+"${part[@]}"}; do printf '%s\n' "${p#*=}" >"$T_TMP/heads-${p%%=*}"; done
-  part=()
-  [[ -z "$tags" ]] || read -r -a part <<<"$tags"
-  for p in ${part[@]+"${part[@]}"}; do printf '%s\n' "${p#*=}" >"$T_TMP/tags-${p%%=*}"; done
+  # Round 118: each list's pages as gh api -i prints them (list_answers).
+  [[ -z "$heads" ]] || list_answers heads "$heads"
+  [[ -z "$tags" ]] || list_answers tags "$tags"
   part=()
   [[ -z "$refs" || "$refs" == @auto ]] || read -r -a part <<<"$refs"
   for p in ${part[@]+"${part[@]}"}; do f="${p%%=*}"; printf '%s\n' "${p#*=}" >"$T_TMP/ref-${f//\//%}"; done
@@ -7997,8 +8172,12 @@ a2_list_case() { # [step]
     echo "owner_gh $a" >>"$T_TMP/calls"
     echo $(($(cat "$T_TMP/clock") + $(cat "$T_TMP/step"))) >"$T_TMP/clock"
     case "$a" in
-      "api repos/$REPO2/branches?per_page=100&page="*) k="heads-${a##*page=}" ;;
-      "api repos/$REPO2/tags?per_page=100&page="*) k="tags-${a##*page=}" ;;
+      "api -i repos/$REPO2/branches?per_page=100&page="* | "api -i repos/$REPO2/tags?per_page=100&page="*)
+        k="${a#"api -i repos/$REPO2/"}" k="$T_TMP/${k%%\?*}-${a##*page=}"
+        k="${k/branches-/heads-}"
+        [[ -f "$k.raw" ]] || { echo "gh: HTTP 502" >&2; return 1; }
+        cat "$k.raw"
+        return 0 ;;
       "api repos/$REPO2/git/ref/tags/"*)
         n="${a#"api repos/$REPO2/git/ref/tags/"}"
         if [[ -f "$T_TMP/ref-auto" ]]; then

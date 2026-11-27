@@ -1394,6 +1394,79 @@ state_protection() { # <branch> — {"protected":false}, or {"protected":true,"p
   jq -S -c '{protected: true, protection: .}' <<<"$p"
 }
 
+# One page of a list as gh api -i printed it (round 118, review-lens round 104 SEC-1; owner), gh having
+# exited 0 within its time limit (into's status): GitHub's 200, its headers whole (each a name of letters,
+# digits and hyphens, a colon and its value; ended by an empty line), at most one Link and at most one
+# Content-Length (any case). The answer is shown complete by its body, which the reader then requires to
+# be one JSON array or object: a cut one can't parse, as the bracket that closes it is its end. A
+# Content-Length, if any, must be a number and, with no content or transfer encoding named, the body's
+# bytes. Sets PA_BODY, and LP_* from the Link (link_pages); 1 for anything else. Nothing here prints.
+page_answer() { # <gh's output>
+  local LC_ALL=C raw="$1" first line name value offset links=0 link="" lengths=0 length="" coding="" head=1
+  PA_BODY="" LP_NEXT="" LP_PREV="" LP_FIRST="" LP_LAST=""
+  first="${raw%%$'\n'*}"
+  [[ "${first%$'\r'}" =~ ^HTTP/[0-9.]+\ 200( |$) && "$raw" == *$'\n'* ]] || return 1
+  offset=$((${#first} + 1))
+  while IFS= read -r line; do
+    offset=$((offset + ${#line} + 1))
+    line="${line%$'\r'}"
+    if [[ -z "$line" ]]; then head=""; break; fi
+    [[ "$line" =~ ^[A-Za-z0-9-]+: ]] || return 1
+    name="$(printf '%s' "${line%%:*}" | tr '[:upper:]' '[:lower:]')"
+    value="${line#*:}"
+    value="${value# }"
+    case "$name" in
+      link) links=$((links + 1)) link="$value" ;;
+      content-length) lengths=$((lengths + 1)) length="$value" ;;
+      content-encoding) [[ "$value" == identity ]] || coding=1 ;;
+      transfer-encoding) coding=1 ;;
+    esac
+  done < <(printf '%s' "${raw#*$'\n'}")
+  [[ -z "$head" && $links -le 1 && $lengths -le 1 ]] || return 1
+  PA_BODY="${raw:$offset}"
+  if [[ $lengths -eq 1 ]]; then
+    [[ "$length" =~ ^[0-9]{1,12}$ ]] || return 1
+    [[ -n "$coding" || "${#PA_BODY}" == "$length" ]] || return 1
+  fi
+  [[ $links -eq 0 ]] || link_pages "$link"
+}
+
+# The pages a Link header names (round 118), in GitHub's form only: comma-separated <URL>; rel="<r>",
+# each r next, prev, first or last (any case) and named once at most, each URL with no space, exactly one
+# page=<n> (n from 1) and at most one per_page, which must be PAGE_SIZE, in its query. A URL is read for
+# those numbers alone: never followed, kept or printed. Sets LP_NEXT, LP_PREV, LP_FIRST and LP_LAST (each
+# the page it names, or empty); 1 for a header not of that form.
+link_pages() { # <the Link header's value>
+  local LC_ALL=C rest="$1" url rel p q pages per more
+  local re='^[[:space:]]*<([^<>[:space:]]+)>[[:space:]]*;[[:space:]]*rel="([A-Za-z]+)"[[:space:]]*(,(.*))?$'
+  local -a parts
+  LP_NEXT="" LP_PREV="" LP_FIRST="" LP_LAST=""
+  while :; do
+    [[ "$rest" =~ $re ]] || return 1
+    url="${BASH_REMATCH[1]}" more="${BASH_REMATCH[3]}" rest="${BASH_REMATCH[4]}"
+    rel="$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')"
+    [[ "$url" == *\?* ]] || return 1
+    pages=0 per=0 p=""
+    IFS='&' read -r -a parts <<<"${url#*\?}"
+    for q in ${parts[@]+"${parts[@]}"}; do
+      case "$q" in
+        page=*) pages=$((pages + 1)) p="${q#page=}" ;;
+        per_page=*) per=$((per + 1)); [[ "${q#per_page=}" == "$PAGE_SIZE" ]] || return 1 ;;
+      esac
+    done
+    [[ $pages -eq 1 && $per -le 1 && "$p" =~ ^[1-9][0-9]{0,5}$ ]] || return 1
+    case "$rel" in
+      next) [[ -z "$LP_NEXT" ]] || return 1; LP_NEXT="$p" ;;
+      prev) [[ -z "$LP_PREV" ]] || return 1; LP_PREV="$p" ;;
+      first) [[ -z "$LP_FIRST" ]] || return 1; LP_FIRST="$p" ;;
+      last) [[ -z "$LP_LAST" ]] || return 1; LP_LAST="$p" ;;
+      *) return 1 ;;
+    esac
+    [[ -n "$more" ]] || return 0
+  done
+}
+PA_BODY="" LP_NEXT="" LP_PREV="" LP_FIRST="" LP_LAST=""
+
 # A list GitHub gives in pages, read whole (round 116, review-lens round 102 C2 = SEC-1, C3; owner): each
 # page asked at an address built here on the fixed endpoint, <path>?per_page=100&page=<n> (never a Link
 # URL of GitHub's, so never gh's --paginate, which follows them), until an empty page (round 117,
@@ -1409,9 +1482,13 @@ state_protection() { # <branch> — {"protected":false}, or {"protected":true,"p
 # Pages are separate reads, not one snapshot: a list that changes while it is read can repeat an entry
 # (refused) or move one onto a page already read (unseen), and nothing here can tell that apart from a
 # list that never changed.
+# Round 118 (review-lens round 104 SEC-1; owner): each page read with its headers (page_answer); the
+# pages must agree with them: a page names a next page (n+1) exactly when the page after it has entries,
+# so the empty page that ends the list names none and no page follows one that named none; a prev names
+# n-1, a first 1, and every last the list's last page with entries.
 # shellcheck disable=SC2016 # jq's own $m
 state_pages() { # <path> <test> <list> <key> [count]
-  local path="$1" test="$2" list="$3" key="$4" count="${5:-}" n=0 start page got all='[]' total="" t kt
+  local path="$1" test="$2" list="$3" key="$4" count="${5:-}" n=0 start raw page got all='[]' total="" t kt named="" lasts=""
   case "$key" in
     id) kt='(.id | type) == "number" and .id > 0 and .id == (.id | floor)' ;;
     name) kt='(.name | type) == "string" and (.name | length) > 0' ;;
@@ -1421,7 +1498,9 @@ state_pages() { # <path> <test> <list> <key> [count]
   while :; do
     n=$((n + 1))
     [[ $n -eq 1 || $(($(date +%s) - start)) -lt $LIST_SECS ]] || return 1
-    into page owner_gh api "$path?per_page=$PAGE_SIZE&page=$n" 2>/dev/null || return 1
+    into raw owner_gh api -i "$path?per_page=$PAGE_SIZE&page=$n" 2>/dev/null || return 1
+    page_answer "$raw" || return 1
+    page="$PA_BODY"
     json_one "$page" --argjson m "$PAGE_SIZE" "($test) and ($list | type == \"array\" and length <= \$m and all(.[]; type == \"object\" and $kt))" || return 1
     got="$(jq -c "$list" <<<"$page")" || return 1
     if [[ -n "$count" ]]; then
@@ -1430,11 +1509,21 @@ state_pages() { # <path> <test> <list> <key> [count]
       [[ -z "$total" || "$t" == "$total" ]] || return 1
       total="$t"
     fi
-    [[ "$got" != '[]' ]] || break
+    [[ -z "$LP_NEXT" || "$LP_NEXT" == $((n + 1)) ]] || return 1
+    [[ -z "$LP_PREV" || "$LP_PREV" == $((n - 1)) ]] || return 1
+    [[ -z "$LP_FIRST" || "$LP_FIRST" == 1 ]] || return 1
+    [[ -z "$LP_LAST" ]] || lasts="$lasts $LP_LAST"
+    if [[ "$got" == '[]' ]]; then
+      [[ -z "$named" && -z "$LP_NEXT" ]] || return 1 # a next page named, empty; or the empty page naming one
+      break
+    fi
+    [[ $n -eq 1 || -n "$named" ]] || return 1 # entries after a page that named no next one
+    named="$LP_NEXT"
     [[ $n -le $PAGE_MAX ]] || return 1 # an entry on the page after the last one allowed
     all="$(jq -c --argjson g "$got" '. + $g' <<<"$all")" || return 1
     jq -e --arg k "$key" '(map(.[$k]) | unique | length) == length' >/dev/null 2>&1 <<<"$all" || return 1
   done
+  for t in $lasts; do [[ "$t" == $((n - 1)) ]] || return 1; done
   [[ -z "$count" || "$(jq length <<<"$all")" == "$total" ]] || return 1
   printf '%s\n' "$all"
 }
