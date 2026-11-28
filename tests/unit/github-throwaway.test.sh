@@ -6475,12 +6475,19 @@ test_the_clean_up_holds_each_answer_in_memory() {
 
 # Round 119 (review-lens round 105, C2; owner): into -b keeps every byte of an answer, its trailing
 # newlines too, through its private file or held in memory; the status is the command's, apart from the
-# answer. In memory, an answer whose end can't be told (the job ended the shell it ran in before its
-# end mark) is unread, never taken as whole. Without -b, into is unchanged: trailing newlines dropped.
+# answer. Without -b, into is unchanged: trailing newlines dropped.
+# Round 120 (review-lens round 106, C1, SEC-2; owner): the end mark and the status are the outer capture's:
+# the job runs in a subshell of its own, so its exit ends only that, and the mark it can see, printed
+# by it, is only content. An answer with a NUL byte anywhere (status line, headers or body) is unread,
+# found on the bytes themselves before bash could drop it, whatever its status.
 test_into_b_keeps_every_byte_of_an_answer() {
-  local v rc mode
+  local v rc mode nul
   load
   quit() { printf 'part\n\n'; exit 4; }
+  # shellcheck disable=SC2154 # into's own local, seen by the job as bash scopes it
+  forge() { printf '%s' "$_i_mark" >"$T_TMP/mark"; printf 'partial0%s' "$_i_mark"; exit 0; }
+  # shellcheck disable=SC2154 # the same
+  forge_nul() { printf 'x\0y0%s' "$_i_mark"; exit 0; }
   for mode in file STOPS_HELD DEFERRING; do
     rm -rf "$T_TMP/work"
     mkdir -m 700 "$T_TMP/work"
@@ -6503,14 +6510,78 @@ test_into_b_keeps_every_byte_of_an_answer() {
     rc=0
     into -b v quit || rc=$?
     assert_exit 4 "$rc" "$mode: a job ending its shell: the status"
-    if [[ "$mode" == file ]]; then
-      assert_eq "$v" $'part\n\n' "$mode: a job ending its shell: its file whole"
-    else
-      assert_eq "$v" "" "$mode: a job ending its shell: unread, not cut"
-    fi
+    assert_eq "$v" $'part\n\n' "$mode: a job ending its shell: its answer whole"
+    rc=0
+    rm -f "$T_TMP/mark"
+    into -b v forge || rc=$?
+    assert_exit 0 "$rc" "$mode: a job printing the mark: the status"
+    assert_eq "$v" "partial0$(cat "$T_TMP/mark" 2>/dev/null)" "$mode: a job printing the mark: only content"
+    rc=0
+    into -b v forge_nul || rc=$?
+    assert_exit 0 "$rc" "$mode: a job printing the mark after a NUL: the status"
+    assert_eq "$v" "" "$mode: a job printing the mark after a NUL: unread"
+    for nul in 'a\0b' '\0' 'ab\0' '\0ab' 'a\n\0\n'; do
+      rc=0
+      # shellcheck disable=SC2059 # the NUL is in the format on purpose
+      into -b v printf "$nul" || rc=$?
+      assert_exit 0 "$rc" "$mode: a NUL ($nul): the command's status"
+      assert_eq "$v" "" "$mode: a NUL ($nul): unread"
+    done
+    rc=0
+    into -b v /bin/sh -c 'printf "x\000"; exit 3' || rc=$?
+    assert_exit 3 "$rc" "$mode: a NUL and a failure: the status"
+    assert_eq "$v" "" "$mode: a NUL and a failure: unread"
+    into -2 -b v /bin/sh -c 'printf out; printf "e\000" >&2'
+    assert_eq "$v" "" "$mode: -2, a NUL in the error output: unread"
+    into -2 -b v /bin/sh -c 'printf "out\n"; printf "err\n" >&2'
+    assert_eq "$v" $'out\nerr\n' "$mode: -2: both, every byte"
+    into v printf 'a\0b'
+    assert_eq "$v" ab "$mode: without -b, unchanged"
     assert_eq "$(ls -A "$T_TMP/work")" "" "$mode: a file left"
   done
   STOPS_HELD="" DEFERRING=""
+  end_stand_in_run
+}
+
+# Round 120 (review-lens round 106, C2; owner): one status-line check (status_line) for every reader of
+# one: answer_expected's status:<nnn>, http_answer, page_answer and s2_json_page. HTTP/ and a version gh or
+# the system curl prints (1.0, 1.1, 2, 2.0, 3 or 3.0), one space, three digits, then a space or the line's
+# end. Any other version or form: no status (http_answer's unknown, the others' no).
+test_one_status_line_check_for_every_reader() {
+  local line ans
+  load
+  WORK="$T_TMP/work"
+  rm -rf "$WORK"
+  mkdir -m 700 "$WORK"
+  owner_gh() { printf '%s' "$ANSWER"; }
+  for line in "HTTP/1.0 200 OK" "HTTP/1.1 200 OK" "HTTP/2 200" "HTTP/2.0 200 OK" "HTTP/3 200" "HTTP/3.0 200 OK" \
+    "HTTP/2 200 " "HTTP/1.1 200 Anything at all"; do
+    status_line "$line" || _t_fail "[$line]: refused"
+    assert_eq "$HTTP_STATUS" 200 "[$line]: its status"
+    status_line "$line"$'\r' || _t_fail "[$line\\r]: refused"
+    ans="$line"$'\r\n''Content-Length: 2'$'\r\n\r\n''[]'
+    answer_expected status:200 "$ans" || _t_fail "answer_expected [$line]: refused"
+    ! answer_expected status:201 "$ans" || _t_fail "answer_expected [$line]: another status taken"
+    http_answer "$ans" 0
+    assert_eq "$HA_STATUS" 200 "http_answer [$line]: its status"
+    page_answer "$ans" || _t_fail "page_answer [$line]: refused"
+    ANSWER="$ans"
+    s2_json_page x || _t_fail "s2_json_page [$line]: refused"
+  done
+  for line in "HTTP/... 200 OK" "HTTP/2.0.0 200" "HTTP/1.2 200" "HTTP/0.9 200" "HTTP/20 200" "HTTP/4 200" \
+    "HTTP/1. 200" "HTTP/.1 200" "HTTP/ 200" "HTTP 200" "http/2.0 200" "Http/2.0 200" "HTTP/2.0  200" \
+    "HTTP/2.0 2000" "HTTP/2.0 20" "HTTP/2.0 200OK" " HTTP/2.0 200" "HTTP/2.0 +200" "HTTP/2.0"$'\t'"200" \
+    "HTTP/1.1x 200" "HTTP/2.0 200"$'\r\r' "xHTTP/2.0 200"; do
+    ! status_line "$line" || _t_fail "[$line]: taken"
+    assert_eq "$HTTP_STATUS" "" "[$line]: a status"
+    ans="$line"$'\r\n''Content-Length: 2'$'\r\n\r\n''[]'
+    ! answer_expected status:200 "$ans" || _t_fail "answer_expected [$line]: taken"
+    http_answer "$ans" 0
+    assert_eq "$HA_STATUS" unknown "http_answer [$line]: its status"
+    ! page_answer "$ans" || _t_fail "page_answer [$line]: taken"
+    ANSWER="$ans"
+    ! s2_json_page x || _t_fail "s2_json_page [$line]: taken"
+  done
   end_stand_in_run
 }
 
@@ -8055,6 +8126,8 @@ paged_case() {
 # unreadable, so a cut that still parses is refused. A Content-Encoding other than identity, or any
 # Transfer-Encoding (any case), unreadable. A Link URL's query exactly page=<n> and at most one
 # per_page=100, in either order, nothing else: the only parameters the reader sends.
+# Round 120 (review-lens round 106, C2, SEC-2; owner): a NUL byte anywhere in the answer, unreadable; the
+# status line checked by status_line (HTTP/1.0, 1.1, 2, 2.0, 3 or 3.0 only).
 test_a_lists_pages_must_agree_with_their_headers() {
   local case name kind pages step=0 want asked u l1 l2
   # Each Link's form is tested on a one-page list, whose page 1 may name itself first and last: read
@@ -8153,6 +8226,20 @@ test_a_lists_pages_must_agree_with_their_headers() {
     "an empty page cut short|rs|1=1-2 2=[|unreadable|1 2" \
     "an empty body|rs|1=1-2 2=!cl=0|unreadable|1 2" \
     "no status line|rs|1=1-2!raw=[{\"id\":1}] 2=end|unreadable|1" \
+    "HTTP/1.1|rs|1=1-2!status=HTTP/1.1+200+OK 2=end!status=HTTP/1.1+200+OK|2|1 2" \
+    "HTTP/2, as curl prints it|rs|1=1-2!status=HTTP/2+200 2=end!status=HTTP/2+200|2|1 2" \
+    "HTTP/3.0|rs|1=1-2!status=HTTP/3.0+200+OK 2=end|2|1 2" \
+    "a version of dots|rs|1=1-2!status=HTTP/...+200+OK 2=end|unreadable|1" \
+    "a version of three parts|rs|1=1-2!status=HTTP/2.0.0+200+OK 2=end|unreadable|1" \
+    "HTTP/1.2|rs|1=1-2!status=HTTP/1.2+200+OK 2=end|unreadable|1" \
+    "on the empty page, HTTP/0.9|rs|1=1-2 2=end!status=HTTP/0.9+200+OK|unreadable|1 2" \
+    "a whole answer, read without its NUL|rs|1=[]!raw=HTTP/2.0+200+OK\r\nContent-Length:+2\r\n\r\n[]|0|1" \
+    "a NUL in a header's name|rs|1=[]!raw=HTTP/2.0+200+OK\r\nContent-Len\0gth:+2\r\n\r\n[]|unreadable|1" \
+    "a NUL in a header's value|rs|1=[]!raw=HTTP/2.0+200+OK\r\nContent-Length:+\00002\r\n\r\n[]|unreadable|1" \
+    "a NUL in the status line|rs|1=[]!raw=HTTP/2.0+20\00000+OK\r\nContent-Length:+2\r\n\r\n[]|unreadable|1" \
+    "a NUL ending the body, not counted|rs|1=[]!raw=HTTP/2.0+200+OK\r\nContent-Length:+2\r\n\r\n[]\0|unreadable|1" \
+    "a NUL in the body, counted|rs|1=[]!raw=HTTP/2.0+200+OK\r\nContent-Length:+3\r\n\r\n[\0]|unreadable|1" \
+    "a NUL in a Link header|rs|1=[]!raw=HTTP/2.0+200+OK\r\nContent-Length:+2\r\nLink:+<$u?page=1>;+rel=\"fi\0rst\"\r\n\r\n[]|unreadable|1" \
     "HTTP 206|rs|1=1-2!status=HTTP/2.0+206+Partial+Content 2=end|unreadable|1" \
     "HTTP 304|rs|1=1-2!status=HTTP/2.0+304+Not+Modified 2=end|unreadable|1" \
     "a 200 with gh failing|rs|1=1-2!rc=1 2=end|unreadable|1" \

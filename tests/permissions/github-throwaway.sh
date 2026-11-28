@@ -517,22 +517,30 @@ write_resolved() { # <what>
   WRITES_UNKNOWN="$keep"
 }
 
+# An HTTP status line, the one check every reader of one uses (round 120, review-lens round 106 C2;
+# owner): HTTP/ and a version gh or the system curl prints (1.0, 1.1, 2, 2.0, 3 or 3.0), one space, the
+# status's three digits, then a space (and its reason) or the line's end; one \r at the end is taken off.
+# Sets HTTP_STATUS (the three digits, else empty); 1 for any other line.
+status_line() { # <line>
+  local line="${1%$'\r'}" re='^HTTP/(1\.0|1\.1|2|2\.0|3|3\.0) ([0-9]{3})( |$)'
+  HTTP_STATUS=""
+  [[ "$line" =~ $re ]] || return 1
+  HTTP_STATUS="${BASH_REMATCH[2]}"
+}
+HTTP_STATUS=""
+
 # 0 if a write's stored answer is the one its operation expects (round 110, owner: status 0 alone is
 # never enough, and by rule (b) a failure is never taken as a refusal, whatever its words). <expect>:
 # json:<jq filter that prints true>, text:<ERE a line of it must match>, status:<nnn> (the status line
 # gh api -i prints first). An empty answer never is.
 answer_expected() { # <expect> <answer>
-  local got re
+  local got
   [[ -n "$2" ]] || return 1
   case "$1" in
     json:?*) got="$(printf '%s' "$2" | jq -r "${1#json:}" 2>/dev/null)" || return 1; [[ "$got" == true ]] ;;
     # grep reads it all (no -q): an early exit would fail printf under pipefail.
     text:?*) printf '%s\n' "$2" | grep -E -- "${1#text:}" >/dev/null ;;
-    status:[0-9][0-9][0-9])
-      re="^HTTP/[0-9.]+ ${1#status:}( |\$)" # through a variable: bash 3.2 misreads it inline
-      got="${2%%$'\n'*}"
-      got="${got%$'\r'}"
-      [[ "$got" =~ $re ]] ;;
+    status:[0-9][0-9][0-9]) status_line "${2%%$'\n'*}" && [[ "$HTTP_STATUS" == "${1#status:}" ]] ;;
     *) return 1 ;;
   esac
 }
@@ -708,10 +716,13 @@ capture() {
 # with exec inside the substitution: a redirection on the call itself would leave bash's own copy of
 # them (fd 10 and up) open to every program the job runs.
 # Round 119 (review-lens round 105, C2; owner): with -b, <var> gets every byte of the output, its trailing
-# newlines too (only a NUL byte, which bash can't hold, is lost: the caller must check the length), and
-# the status, as ever, is the command's alone. A mark this call makes is put after the output and taken
-# off: in memory, an output without it (the job ended its shell first, so where its end was can't be
-# told) is unread, never taken as whole.
+# newlines too, and the status, as ever, is the command's alone.
+# Round 120 (review-lens round 106, C1, SEC-2; owner): the end mark and the status are this capture's,
+# never the job's: in memory the job runs in a subshell of its own, whose exit ends only that, and the
+# capture then puts its own suffix last: pass_bytes's word on NULs (0: none) and a mark made for this
+# call. A mark the job prints (it can see this function's locals) is only content. The output is read
+# through pass_bytes, which finds a NUL byte on the bytes themselves, before bash could drop it: an
+# output with one, or without the suffix, is unread and empty, whatever the command's status.
 into() { # [-2] [-b] <var> <command…>
   local _i_both="" _i_bytes="" _i_mark _i_var _i_f _i_pid _i_rc=0 _i_out="" _i_n="" _i_unread="" _i_expect="$WRITE_EXPECT"
   WRITE_EXPECT=""
@@ -734,8 +745,14 @@ into() { # [-2] [-b] <var> <command…>
   fi
   if [[ -n "$STOPS_HELD$DEFERRING" ]]; then
     if [[ -n "$_i_bytes" ]]; then
-      _i_out="$(exec 3>&- 8<&-; [[ -z "$_i_both" ]] || exec 2>&1; in_job "$@"; _i_rc=$?; printf '%s' "$_i_mark"; exit $_i_rc)" || _i_rc=$?
-      if [[ "$_i_out" == *"$_i_mark" ]]; then _i_out="${_i_out%"$_i_mark"}"; else _i_out="" _i_unread=1; fi
+      _i_out="$(
+        exec 3>&- 8<&-
+        ([[ -z "$_i_both" ]] || exec 2>&1; in_job "$@") | pass_bytes
+        _i_s=("${PIPESTATUS[@]}")
+        printf '%s%s' "${_i_s[1]}" "$_i_mark"
+        exit "${_i_s[0]}"
+      )" || _i_rc=$?
+      if [[ "$_i_out" == *"0$_i_mark" ]]; then _i_out="${_i_out%"0$_i_mark"}"; else _i_out="" _i_unread=1; fi
     elif [[ -n "$_i_both" ]]; then
       _i_out="$(exec 3>&- 8<&- 2>&1; in_job "$@")" || _i_rc=$?
     else
@@ -753,8 +770,8 @@ into() { # [-2] [-b] <var> <command…>
     job_wait "$_i_pid" || _i_rc=$?
     jobs_drop "$_i_pid"
     if [[ -n "$_i_bytes" ]]; then
-      if [[ -f "$_i_f" ]] && _i_out="$(cat "$_i_f" && printf '%s' "$_i_mark")" && [[ "$_i_out" == *"$_i_mark" ]]; then
-        _i_out="${_i_out%"$_i_mark"}"
+      if [[ -f "$_i_f" ]] && _i_out="$(pass_bytes <"$_i_f"; printf '%s%s' "$?" "$_i_mark")" && [[ "$_i_out" == *"0$_i_mark" ]]; then
+        _i_out="${_i_out%"0$_i_mark"}"
       else
         _i_out="" _i_unread=1
       fi
@@ -768,6 +785,19 @@ into() { # [-2] [-b] <var> <command…>
 }
 
 in_job() { IN_JOB=1; "$@"; } # <command…> — into's job (a subshell): what it means is into's to note
+
+# Its input to its output, but for any NUL byte (round 120, review-lens round 106 SEC-2; owner): each
+# one found as the delimiter read stops at, so it is told, not silently dropped as bash drops it from a
+# variable. 0 if there was none, 1 if there was.
+pass_bytes() {
+  local LC_ALL=C c="" nul=0
+  while IFS= read -r -d '' c; do
+    printf '%s' "$c"
+    nul=1
+  done
+  printf '%s' "$c"
+  return $nul
+}
 
 # What into is about to run, for its notes (round 109): the request's own words (request_what), its
 # time limit and whether it may write, past a leading "with_timeout <seconds>". A helper function is
@@ -1186,13 +1216,11 @@ attempt_target() { # <gh api args…> — "<method> <path>", as request_what rea
 # round 115, the system curl's 0 only, as it exits 0 on any HTTP status). HA_TRANSPORT: gh or syscurl.
 http_answer() { # <the program's standard output> <its exit status> [gh | syscurl]
   local LC_ALL=C raw="$1" first line name value head=1 offset=0 coding=""
-  local re='^HTTP/[0-9.]+ ([0-9]{3})( |$)'
   HA_STATUS=unknown HA_REQUEST_ID="" HA_REMAINING="" HA_RESOURCE="" HA_RETRY="" HA_PERMS="" HA_LENGTH="" HA_BODY="" HA_INCOMPLETE=""
   HA_TRANSPORT="${3:-gh}"
   first="${raw%%$'\n'*}"
-  line="${first%$'\r'}"
-  if [[ "$line" =~ $re && "$raw" == *$'\n'* ]]; then
-    HA_STATUS="${BASH_REMATCH[1]}"
+  if status_line "$first" && [[ "$raw" == *$'\n'* ]]; then
+    HA_STATUS="$HTTP_STATUS"
     offset=$((${#first} + 1))
     while IFS= read -r line; do
       offset=$((offset + ${#line} + 1))
@@ -1424,15 +1452,17 @@ state_protection() { # <branch> — {"protected":false}, or {"protected":true,"p
 # Round 119 (review-lens round 105, C1 = SEC-1, C2; owner): the body that it is one JSON value (the
 # reader's own test) is a parsing check, not proof the answer is whole; gh's exit 0 stays required on its
 # own. The proof is the Content-Length: exactly one, required, a number, exactly the body's bytes as gh
-# printed them (into -b keeps its trailing newlines; a NUL byte lost shows as a byte short). With none, or
-# a Content-Encoding other than identity, or any Transfer-Encoding (any case), unreadable: the answer is
-# then shown whole by nothing more than gh's exit (unverified offline whether gh prints these headers for
-# GitHub's pages; if it doesn't print a Content-Length, every list reads unreadable, which fails safe).
+# printed them (into -b keeps its trailing newlines, and round 120 refuses an answer with a NUL byte
+# anywhere). A Content-Encoding other than identity, or any Transfer-Encoding (any case), unreadable.
+# Round 120 (owner): with no Content-Length the page is unreadable for now (the baseline inconclusive):
+# nothing here shows such an answer whole, which is not to say it isn't. An unresolved compatibility
+# constraint: unverified offline whether gh prints a Content-Length for GitHub's pages; if it doesn't,
+# every list reads unreadable.
 page_answer() { # <gh's output>
   local LC_ALL=C raw="$1" first line name value offset links=0 link="" lengths=0 length="" head=1
   PA_BODY="" LP_NEXT="" LP_PREV="" LP_FIRST="" LP_LAST=""
   first="${raw%%$'\n'*}"
-  [[ "${first%$'\r'}" =~ ^HTTP/[0-9.]+\ 200( |$) && "$raw" == *$'\n'* ]] || return 1
+  status_line "$first" && [[ "$HTTP_STATUS" == 200 && "$raw" == *$'\n'* ]] || return 1
   offset=$((${#first} + 1))
   while IFS= read -r line; do
     offset=$((offset + ${#line} + 1))
@@ -4708,7 +4738,7 @@ s2_json_page() { # <path>
   S2_J="" S2_PAGED=""
   into raw owner_gh api -i "repos/$REPO/$1" 2>/dev/null || return 1
   line="${raw%%$'\n'*}"
-  [[ "${line%$'\r'}" =~ ^HTTP/[0-9.]+\ 200( |$) && "$raw" == *$'\n'* ]] || return 1
+  status_line "$line" && [[ "$HTTP_STATUS" == 200 && "$raw" == *$'\n'* ]] || return 1
   rest="${raw#*$'\n'}"
   while [[ "$rest" == *$'\n'* ]]; do
     line="${rest%%$'\n'*}"
